@@ -1,25 +1,41 @@
+use dsolver_simulator::models::rfq::hashflow::read_hashflow_csv;
+use reqwest::Client;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dsolver_simulator::models::rfq::bebop::BebopResponse;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
-
+use tycho_simulation::tycho_common::{models::token::Token, Bytes};
 use tycho_simulation::utils::load_all_tokens;
 
 use dsolver_simulator::api::create_router;
-use dsolver_simulator::config::{hosted_tycho_url, init_logging, load_config};
+use dsolver_simulator::config::{
+    hosted_bebop_url, hosted_hashflow_filename, hosted_tycho_url, init_logging, load_config,
+};
 use dsolver_simulator::handlers::stream::{
-    supervise_native_stream, supervise_vm_stream, StreamSupervisorConfig, VmStreamControls,
+    supervise_native_stream, supervise_rfq_stream, supervise_vm_stream, RfqStreamControls,
+    StreamSupervisorConfig, VmStreamControls,
 };
 use dsolver_simulator::memory::maybe_log_memory_snapshot;
-use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use dsolver_simulator::models::stream_health::StreamHealth;
 use dsolver_simulator::models::tokens::TokenStore;
-use dsolver_simulator::services::stream_builder::{build_native_stream, build_vm_stream};
+use dsolver_simulator::services::stream_builder::{
+    build_native_stream, build_rfq_stream, build_vm_stream, RFQConfig,
+};
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+struct RfqStreamDeps<'a> {
+    resources: &'a StreamResources,
+    app_state: &'a AppState,
+    bebop_tokens: &'a Arc<TokenStore>,
+    hashflow_tokens: &'a Arc<TokenStore>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,12 +43,25 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config();
     let chain = config.chain_profile.chain;
     let tycho_url = hosted_tycho_url(chain).map_err(anyhow::Error::msg)?;
+    let bebop_url = hosted_bebop_url(chain).map_err(anyhow::Error::msg)?;
+    let hashflow_filename = hosted_hashflow_filename(chain).map_err(anyhow::Error::msg)?;
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
     log_memory_config(config.memory);
     log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
 
     let tokens = load_token_store(&config, &tycho_url).await?;
+    let bebop_tokens: Arc<TokenStore>;
+    let hashflow_tokens: Arc<TokenStore>;
+
+    if config.enable_rfq_pools {
+        bebop_tokens = load_bebop_token_store(&config, &tycho_url, &bebop_url).await?;
+        hashflow_tokens = load_hashflow_token_store(&config, &tycho_url, &hashflow_filename)?;
+    } else {
+        bebop_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
+        hashflow_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
+    }
+
     let stream_resources = create_stream_resources(&tokens);
     let app_state = build_app_state(&config, &tokens, &stream_resources);
     let supervisor_cfg = build_supervisor_config(&config);
@@ -53,6 +82,24 @@ async fn main() -> anyhow::Result<()> {
         &stream_resources,
         &app_state,
     );
+    let rfq_config = RFQConfig {
+        bebop_user: config.bebop_user.clone(),
+        bebop_key: config.bebop_key.clone(),
+        hashflow_user: config.hashflow_user.clone(),
+        hashflow_key: config.hashflow_key.clone(),
+    };
+    spawn_rfq_stream_task(
+        &config,
+        &supervisor_cfg,
+        &tokens,
+        RfqStreamDeps {
+            resources: &stream_resources,
+            app_state: &app_state,
+            bebop_tokens: &bebop_tokens,
+            hashflow_tokens: &hashflow_tokens,
+        },
+        rfq_config,
+    );
 
     let app = create_router(app_state);
     serve(app, &config).await?;
@@ -63,9 +110,12 @@ async fn main() -> anyhow::Result<()> {
 struct StreamResources {
     native_state_store: Arc<StateStore>,
     vm_state_store: Arc<StateStore>,
+    rfq_state_store: Arc<StateStore>,
     native_stream_health: Arc<StreamHealth>,
     vm_stream_health: Arc<StreamHealth>,
+    rfq_stream_health: Arc<StreamHealth>,
     vm_stream: Arc<tokio::sync::RwLock<VmStreamStatus>>,
+    rfq_stream: Arc<tokio::sync::RwLock<RfqStreamStatus>>,
 }
 
 fn log_memory_config(memory: dsolver_simulator::config::MemoryConfig) {
@@ -124,20 +174,91 @@ async fn load_token_store(
     )))
 }
 
+async fn load_bebop_token_store(
+    config: &dsolver_simulator::config::AppConfig,
+    tycho_url: &str,
+    bebop_url: &str,
+) -> anyhow::Result<Arc<TokenStore>> {
+    let client = Client::new();
+    let bebop_tokens = load_bebop_tokens(&client, bebop_url).await?;
+    info!("all bebop tokens: {:?}", bebop_tokens);
+    Ok(new_token_store(bebop_tokens, tycho_url, config))
+}
+
+async fn load_bebop_tokens(
+    client: &Client,
+    bebop_url: &str,
+) -> anyhow::Result<HashMap<Bytes, Token>> {
+    let response: BebopResponse = client
+        .get(bebop_url)
+        .query(&[
+            ("active_only", "true"),
+            ("gasless", "false"),
+            ("expiry_type", "standard"),
+        ])
+        .header("accept", "application/json")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    response
+        .tokens
+        .into_iter()
+        .filter_map(|(_ticker, token)| match token.to_tycho_token() {
+            Ok(Some(new)) => Some(Ok((new.address.clone(), new))),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|error| anyhow::anyhow!("Failed to parse Bebop token: {}", error))
+}
+
+fn load_hashflow_token_store(
+    config: &dsolver_simulator::config::AppConfig,
+    tycho_url: &str,
+    hashflow_filename: &str,
+) -> anyhow::Result<Arc<TokenStore>> {
+    let hashflow_tokens = read_hashflow_csv(hashflow_filename)
+        .map_err(|error| anyhow::anyhow!("Failed to read hashflow CSV: {}", error))?;
+    info!("all_hashflow_tokens: {:?}", hashflow_tokens);
+    Ok(new_token_store(hashflow_tokens, tycho_url, config))
+}
+
+fn new_token_store(
+    tokens: HashMap<Bytes, Token>,
+    tycho_url: &str,
+    config: &dsolver_simulator::config::AppConfig,
+) -> Arc<TokenStore> {
+    Arc::new(TokenStore::new(
+        tokens,
+        tycho_url.to_string(),
+        config.api_key.clone(),
+        config.chain_profile.chain,
+        Duration::from_millis(config.token_refresh_timeout_ms),
+    ))
+}
+
 fn create_stream_resources(tokens: &Arc<TokenStore>) -> StreamResources {
     let native_state_store = Arc::new(StateStore::new(Arc::clone(tokens)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(tokens)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(tokens)));
     let native_stream_health = Arc::new(StreamHealth::new());
     let vm_stream_health = Arc::new(StreamHealth::new());
+    let rfq_stream_health = Arc::new(StreamHealth::new());
     let vm_stream = Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default()));
+    let rfq_stream = Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default()));
     debug!("Created shared state");
 
     StreamResources {
         native_state_store,
         vm_state_store,
+        rfq_state_store,
         native_stream_health,
         vm_stream_health,
+        rfq_stream_health,
         vm_stream,
+        rfq_stream,
     }
 }
 
@@ -149,14 +270,19 @@ fn build_app_state(
     let chain = config.chain_profile.chain;
     let native_sim_concurrency = config.global_native_sim_concurrency;
     let vm_sim_concurrency = config.global_vm_sim_concurrency;
+    let rfq_sim_concurrency = config.global_rfq_sim_concurrency;
     let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
     let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
     let pool_timeout_native = Duration::from_millis(config.pool_timeout_native_ms);
     let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
+    let pool_timeout_rfq = Duration::from_millis(config.pool_timeout_rfq_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
     // VM is only effective when enabled and the selected chain exposes VM protocols.
     let effective_vm_enabled =
         config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
+    // RFQ is only effective when enabled and the selected chain exposes RFQ protocols.
+    let effective_rfq_enabled =
+        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
 
     AppState {
         chain,
@@ -166,21 +292,28 @@ fn build_app_state(
         tokens: Arc::clone(tokens),
         native_state_store: Arc::clone(&resources.native_state_store),
         vm_state_store: Arc::clone(&resources.vm_state_store),
+        rfq_state_store: Arc::clone(&resources.rfq_state_store),
         native_stream_health: Arc::clone(&resources.native_stream_health),
         vm_stream_health: Arc::clone(&resources.vm_stream_health),
+        rfq_stream_health: Arc::clone(&resources.rfq_stream_health),
         vm_stream: Arc::clone(&resources.vm_stream),
+        rfq_stream: Arc::clone(&resources.rfq_stream),
         enable_vm_pools: effective_vm_enabled,
+        enable_rfq_pools: effective_rfq_enabled,
         readiness_stale,
         quote_timeout,
         pool_timeout_native,
         pool_timeout_vm,
+        pool_timeout_rfq,
         request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
         vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(rfq_sim_concurrency)),
         erc4626_deposits_enabled: config.rpc_url.is_some(),
         reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
         native_sim_concurrency,
         vm_sim_concurrency,
+        rfq_sim_concurrency,
     }
 }
 
@@ -211,11 +344,16 @@ fn build_supervisor_config(
 fn log_concurrency_config(config: &dsolver_simulator::config::AppConfig) {
     let effective_vm_enabled =
         config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
+    let effective_rfq_enabled =
+        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(
         native_sim_concurrency = config.global_native_sim_concurrency,
         vm_sim_concurrency = config.global_vm_sim_concurrency,
         enable_vm_pools = effective_vm_enabled,
         requested_vm_pools = config.enable_vm_pools,
+        rfq_sim_concurrency = config.global_rfq_sim_concurrency,
+        enable_rfq_pools = effective_rfq_enabled,
+        requested_rfq_pools = config.enable_rfq_pools,
         "Initialized simulation concurrency limits"
     );
 }
@@ -339,6 +477,76 @@ fn spawn_vm_stream_task(
     debug!("VM stream supervisor task spawned");
 }
 
+fn spawn_rfq_stream_task(
+    config: &dsolver_simulator::config::AppConfig,
+    supervisor_cfg: &StreamSupervisorConfig,
+    tokens: &Arc<TokenStore>,
+    deps: RfqStreamDeps<'_>,
+    rfq_config: RFQConfig,
+) {
+    let chain = config.chain_profile.chain;
+    let effective_rfq_enabled =
+        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
+    if !effective_rfq_enabled {
+        if !config.enable_rfq_pools {
+            info!("RFQ pool feeds disabled");
+        } else {
+            info!(
+                chain = %chain,
+                "RFQ pool feeds enabled but no RFQ protocols configured for this chain; skipping RFQ stream"
+            );
+        }
+        return;
+    }
+
+    let rfq_supervisor_cfg = supervisor_cfg.clone();
+    let tokens_bg = Arc::clone(tokens);
+    let bebop_tokens_bg = Arc::clone(deps.bebop_tokens);
+    let hashflow_tokens_bg = Arc::clone(deps.hashflow_tokens);
+    let state_store_bg = Arc::clone(&deps.resources.rfq_state_store);
+    let health_bg = Arc::clone(&deps.resources.rfq_stream_health);
+    let rfq_stream_bg = Arc::clone(&deps.resources.rfq_stream);
+    let rfq_semaphore_bg = deps.app_state.rfq_sim_semaphore();
+    let tvl_threshold = config.tvl_threshold;
+    let rfq_protocols = config.chain_profile.rfq_protocols.clone();
+    let rfq_sim_concurrency = rfq_sim_concurrency_u32(config.global_rfq_sim_concurrency);
+
+    tokio::spawn(async move {
+        info!("Starting RFQ protocol stream supervisor...");
+        supervise_rfq_stream(
+            move || {
+                let tokens = Arc::clone(&tokens_bg);
+                let bebop_tokens = Arc::clone(&bebop_tokens_bg);
+                let hashflow_tokens = Arc::clone(&hashflow_tokens_bg);
+                let protocols = rfq_protocols.clone();
+                let rfq_config = rfq_config.clone();
+                async move {
+                    build_rfq_stream(
+                        tvl_threshold,
+                        tokens,
+                        chain,
+                        &protocols,
+                        bebop_tokens,
+                        hashflow_tokens,
+                        rfq_config,
+                    )
+                    .await
+                }
+            },
+            state_store_bg,
+            health_bg,
+            rfq_supervisor_cfg,
+            RfqStreamControls {
+                rfq_stream: rfq_stream_bg,
+                rfq_sim_semaphore: rfq_semaphore_bg,
+                rfq_sim_concurrency,
+            },
+        )
+        .await;
+    });
+    debug!("RFQ stream supervisor task spawned");
+}
+
 async fn serve(
     app: axum::Router,
     config: &dsolver_simulator::config::AppConfig,
@@ -373,6 +581,17 @@ fn vm_sim_concurrency_u32(value: usize) -> u32 {
     }
 }
 
+#[expect(
+    clippy::panic,
+    reason = "invalid startup concurrency is a hard configuration invariant"
+)]
+fn rfq_sim_concurrency_u32(value: usize) -> u32 {
+    match u32::try_from(value) {
+        Ok(concurrency) => concurrency,
+        Err(_) => panic!("RFQ simulation concurrency exceeds u32 range"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -389,6 +608,7 @@ mod tests {
     fn build_test_config(
         chain_profile: ChainProfile,
         enable_vm_pools: bool,
+        enable_rfq_pools: bool,
         rpc_url: Option<&str>,
     ) -> AppConfig {
         let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
@@ -404,11 +624,14 @@ mod tests {
             quote_timeout_ms: 150,
             pool_timeout_native_ms: 20,
             pool_timeout_vm_ms: 150,
+            pool_timeout_rfq_ms: 150,
             request_timeout_ms: 4_000,
             token_refresh_timeout_ms: 1_000,
             enable_vm_pools,
+            enable_rfq_pools,
             global_native_sim_concurrency: 8,
             global_vm_sim_concurrency: 4,
+            global_rfq_sim_concurrency: 4,
             reset_allowance_tokens,
             stream_stale_secs: 120,
             stream_missing_block_burst: 3,
@@ -427,6 +650,10 @@ mod tests {
                 snapshots_min_new_pairs: 1_000,
                 snapshots_emit_emf: false,
             },
+            bebop_user: "bebop-user".to_string(),
+            bebop_key: "bebop-key".to_string(),
+            hashflow_user: "hashflow-user".to_string(),
+            hashflow_key: "hashflow-key".to_string(),
         }
     }
 
@@ -450,6 +677,7 @@ mod tests {
                 "pancakeswap_v3".to_string(),
             ],
             vm_protocols: Vec::new(),
+            rfq_protocols: Vec::new(),
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
         }
@@ -467,6 +695,7 @@ mod tests {
                 "rocketpool".to_string(),
             ],
             vm_protocols: vec!["vm:curve".to_string()],
+            rfq_protocols: vec!["rfq:hashflow".to_string()],
             native_token_protocol_allowlist: vec!["rocketpool".to_string()],
             reset_allowance_tokens,
         }
@@ -474,7 +703,7 @@ mod tests {
 
     #[test]
     fn build_app_state_disables_effective_vm_for_base_profile() {
-        let config = build_test_config(base_chain_profile(), true, None);
+        let config = build_test_config(base_chain_profile(), true, true, None);
         let tokens = build_test_token_store(Chain::Base);
         let resources = create_stream_resources(&tokens);
 
@@ -482,6 +711,7 @@ mod tests {
 
         assert_eq!(app_state.chain, Chain::Base);
         assert!(!app_state.enable_vm_pools);
+        assert!(!app_state.enable_rfq_pools);
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
@@ -492,6 +722,7 @@ mod tests {
         let config = build_test_config(
             ethereum_chain_profile(),
             true,
+            true,
             Some("http://localhost:8545"),
         );
         let tokens = build_test_token_store(Chain::Ethereum);
@@ -501,6 +732,7 @@ mod tests {
 
         assert_eq!(app_state.chain, Chain::Ethereum);
         assert!(app_state.enable_vm_pools);
+        assert!(app_state.enable_rfq_pools);
         assert_eq!(
             app_state.native_token_protocol_allowlist.as_ref(),
             &vec!["rocketpool".to_string()]

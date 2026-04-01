@@ -14,7 +14,7 @@ use dsolver_simulator::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
 };
-use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use dsolver_simulator::models::stream_health::StreamHealth;
 use dsolver_simulator::models::tokens::TokenStore;
 use num_bigint::BigUint;
@@ -293,13 +293,17 @@ struct EncodeFixtureConfig<'a> {
     component_protocol_type_name: &'a str,
     component_static_attributes: HashMap<String, Bytes>,
     vm_pool: bool,
+    rfq_pool: bool,
     enable_vm_pools: bool,
+    enable_rfq_pools: bool,
     erc4626_deposits_enabled: bool,
     reset_allowance: bool,
     ensure_native_ready_store: bool,
     mark_native_healthy: bool,
     mark_vm_healthy: bool,
+    mark_rfq_healthy: bool,
     vm_rebuilding: bool,
+    rfq_rebuilding: bool,
     request_id: &'a str,
 }
 
@@ -317,13 +321,17 @@ impl Default for EncodeFixtureConfig<'_> {
             component_protocol_type_name: "uniswap_v2",
             component_static_attributes: HashMap::new(),
             vm_pool: false,
+            rfq_pool: false,
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             erc4626_deposits_enabled: false,
             reset_allowance: true,
             ensure_native_ready_store: true,
             mark_native_healthy: true,
             mark_vm_healthy: true,
+            mark_rfq_healthy: true,
             vm_rebuilding: false,
+            rfq_rebuilding: false,
             request_id: "req-1",
         }
     }
@@ -369,9 +377,10 @@ async fn build_fixture_stores(
     config: &EncodeFixtureConfig<'_>,
     fixture_tokens: &FixtureTokens,
     pool_id: &str,
-) -> Result<(Arc<StateStore>, Arc<StateStore>)> {
+) -> Result<(Arc<StateStore>, Arc<StateStore>, Arc<StateStore>)> {
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
     let component = ProtocolComponent::new(
         parse_bytes(config.component_address_hex)?,
         config.component_protocol_system.to_string(),
@@ -395,10 +404,12 @@ async fn build_fixture_stores(
     let update = Update::new(42, states, new_pairs);
     if config.vm_pool {
         vm_state_store.apply_update(update).await;
+    } else if config.rfq_pool {
+        rfq_state_store.apply_update(update).await;
     } else {
         native_state_store.apply_update(update).await;
     }
-    Ok((native_state_store, vm_state_store))
+    Ok((native_state_store, vm_state_store, rfq_state_store))
 }
 
 async fn ensure_native_store_ready(
@@ -480,7 +491,7 @@ async fn build_app_state_and_request(
     let settlement = "0x0000000000000000000000000000000000000003".to_string();
     let router = "0x0000000000000000000000000000000000000004".to_string();
     let pool_id = config.pool_id.to_string();
-    let (native_state_store, vm_state_store) =
+    let (native_state_store, vm_state_store, rfq_state_store) =
         build_fixture_stores(&config, &fixture_tokens, &pool_id).await?;
     if config.ensure_native_ready_store {
         ensure_native_store_ready(&native_state_store, &fixture_tokens).await?;
@@ -503,9 +514,19 @@ async fn build_app_state_and_request(
         vm_stream_health.record_update(42).await;
     }
 
+    let rfq_stream_health = Arc::new(StreamHealth::new());
+    if config.mark_rfq_healthy {
+        rfq_stream_health.record_update(42).await;
+    }
+
     let vm_stream = Arc::new(tokio::sync::RwLock::new(VmStreamStatus {
         rebuilding: config.vm_rebuilding,
         ..VmStreamStatus::default()
+    }));
+
+    let rfq_stream = Arc::new(tokio::sync::RwLock::new(RfqStreamStatus {
+        rebuilding: config.rfq_rebuilding,
+        ..RfqStreamStatus::default()
     }));
 
     let state = AppState {
@@ -514,21 +535,28 @@ async fn build_app_state_and_request(
         tokens: Arc::clone(&fixture_tokens.store),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
         native_stream_health,
         vm_stream_health,
+        rfq_stream_health,
         vm_stream,
+        rfq_stream,
         enable_vm_pools: config.enable_vm_pools,
+        enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native: Duration::from_secs(1),
         pool_timeout_vm: Duration::from_secs(1),
+        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         reset_allowance_tokens: Arc::new(reset_allowance_tokens),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     };
 
     Ok((
@@ -574,6 +602,7 @@ async fn setup_timeout_app(
     let pool_id = config.pool_id.to_string();
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&fixture_tokens.store)));
     let component = ProtocolComponent::new(
         parse_bytes(config.component_address_hex)?,
         config.component_protocol_system.to_string(),
@@ -597,6 +626,7 @@ async fn setup_timeout_app(
     let native_stream_health = Arc::new(StreamHealth::new());
     native_stream_health.record_update(42).await;
     let vm_stream_health = Arc::new(StreamHealth::new());
+    let rfq_stream_health = Arc::new(StreamHealth::new());
     let native_sim_semaphore = Arc::new(Semaphore::new(1));
 
     let state = AppState {
@@ -605,21 +635,28 @@ async fn setup_timeout_app(
         tokens: Arc::clone(&fixture_tokens.store),
         native_state_store,
         vm_state_store,
+        rfq_state_store,
         native_stream_health,
         vm_stream_health,
+        rfq_stream_health,
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         enable_vm_pools: false,
+        enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native,
         pool_timeout_vm: Duration::from_secs(1),
+        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout,
         native_sim_semaphore: Arc::clone(&native_sim_semaphore),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 1,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     };
 
     Ok((
@@ -1322,28 +1359,36 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         Duration::from_millis(10),
     ));
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let vm_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
         chain: Chain::Ethereum,
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_state_store,
         vm_state_store,
+        rfq_state_store,
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         enable_vm_pools: false,
+        enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: Duration::from_secs(1),
         pool_timeout_native: Duration::from_secs(1),
         pool_timeout_vm: Duration::from_secs(1),
+        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
         native_sim_semaphore: Arc::new(Semaphore::new(4)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         erc4626_deposits_enabled: false,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 4,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     };
     let app = create_router(state);
     let request = RouteEncodeRequest {

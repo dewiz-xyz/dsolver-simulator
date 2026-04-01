@@ -680,15 +680,19 @@ mod tests {
 
     fn timeout_test_config(
         enable_vm_pools: bool,
+        enable_rfq_pools: bool,
         pool_timeout_native: Duration,
         pool_timeout_vm: Duration,
+        pool_timeout_rfq: Duration,
     ) -> TestAppStateConfig {
         TestAppStateConfig {
             enable_vm_pools,
+            enable_rfq_pools,
             erc4626_deposits_enabled: false,
             quote_timeout: Duration::from_millis(1000),
             pool_timeout_native,
             pool_timeout_vm,
+            pool_timeout_rfq,
             request_timeout: Duration::from_millis(1000),
         }
     }
@@ -710,7 +714,8 @@ mod tests {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         let component = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -730,6 +735,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -781,7 +787,8 @@ mod tests {
         let token_in = dummy_token("0xdC035D45d973E3EC169d2276DDab16f1e407384F");
         let token_out = dummy_token("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         let component = component_with_protocol(
             "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
@@ -821,6 +828,7 @@ mod tests {
             Arc::clone(&tokens_store),
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
         let err = match resimulate_route(
@@ -845,6 +853,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig {
                 erc4626_deposits_enabled: true,
                 ..TestAppStateConfig::default()
@@ -880,7 +889,8 @@ mod tests {
         let token_c = dummy_token("0x0000000000000000000000000000000000000003");
         let tokens_store =
             token_store_with_tokens(vec![token_a.clone(), token_b.clone(), token_c.clone()]);
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         let component_a = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -910,6 +920,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -983,7 +994,8 @@ mod tests {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         let component = component_with_tokens(
             "0x0000000000000000000000000000000000000009",
@@ -1006,9 +1018,12 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             timeout_test_config(
                 false,
+                false,
                 Duration::from_millis(10),
+                Duration::from_millis(1000),
                 Duration::from_millis(1000),
             ),
         );
@@ -1052,7 +1067,8 @@ mod tests {
         let token_in = dummy_token("0x0000000000000000000000000000000000000001");
         let token_out = dummy_token("0x0000000000000000000000000000000000000002");
         let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         let component = component_with_protocol(
             "0x0000000000000000000000000000000000000009",
@@ -1078,7 +1094,14 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
-            timeout_test_config(true, Duration::from_millis(1000), Duration::from_millis(10)),
+            rfq_state_store,
+            timeout_test_config(
+                true,
+                false,
+                Duration::from_millis(1000),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ),
         );
 
         let normalized = NormalizedRouteInternal {
@@ -1125,11 +1148,13 @@ mod tests {
             Chain::Ethereum,
             Duration::from_millis(10),
         ));
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
         let app_state = test_app_state(
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
         let mut cache = TokenCache::new(&app_state);

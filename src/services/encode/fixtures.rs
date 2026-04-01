@@ -11,7 +11,7 @@ use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::Bytes;
 
 use crate::models::messages::PoolRef;
-use crate::models::state::{AppState, StateStore, VmStreamStatus};
+use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
 
@@ -85,8 +85,9 @@ pub(super) fn token_store_with_tokens(tokens: impl IntoIterator<Item = Token>) -
 
 pub(super) fn test_state_stores(
     token_store: &Arc<TokenStore>,
-) -> (Arc<StateStore>, Arc<StateStore>) {
+) -> (Arc<StateStore>, Arc<StateStore>, Arc<StateStore>) {
     (
+        Arc::new(StateStore::new(Arc::clone(token_store))),
         Arc::new(StateStore::new(Arc::clone(token_store))),
         Arc::new(StateStore::new(Arc::clone(token_store))),
     )
@@ -94,10 +95,12 @@ pub(super) fn test_state_stores(
 
 pub(super) struct TestAppStateConfig {
     pub(super) enable_vm_pools: bool,
+    pub(super) enable_rfq_pools: bool,
     pub(super) erc4626_deposits_enabled: bool,
     pub(super) quote_timeout: Duration,
     pub(super) pool_timeout_native: Duration,
     pub(super) pool_timeout_vm: Duration,
+    pub(super) pool_timeout_rfq: Duration,
     pub(super) request_timeout: Duration,
 }
 
@@ -105,10 +108,12 @@ impl Default for TestAppStateConfig {
     fn default() -> Self {
         Self {
             enable_vm_pools: false,
+            enable_rfq_pools: false,
             erc4626_deposits_enabled: false,
             quote_timeout: Duration::from_millis(10),
             pool_timeout_native: Duration::from_millis(10),
             pool_timeout_vm: Duration::from_millis(10),
+            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
         }
     }
@@ -118,6 +123,7 @@ pub(super) fn test_app_state(
     token_store: Arc<TokenStore>,
     native_state_store: Arc<StateStore>,
     vm_state_store: Arc<StateStore>,
+    rfq_state_store: Arc<StateStore>,
     config: TestAppStateConfig,
 ) -> AppState {
     AppState {
@@ -126,20 +132,27 @@ pub(super) fn test_app_state(
         tokens: token_store,
         native_state_store,
         vm_state_store,
+        rfq_state_store,
         native_stream_health: Arc::new(StreamHealth::new()),
         vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
         enable_vm_pools: config.enable_vm_pools,
+        enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
         quote_timeout: config.quote_timeout,
         pool_timeout_native: config.pool_timeout_native,
         pool_timeout_vm: config.pool_timeout_vm,
+        pool_timeout_rfq: config.pool_timeout_rfq,
         request_timeout: config.request_timeout,
         native_sim_semaphore: Arc::new(Semaphore::new(1)),
         vm_sim_semaphore: Arc::new(Semaphore::new(1)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         reset_allowance_tokens: Arc::new(HashMap::new()),
         native_sim_concurrency: 1,
         vm_sim_concurrency: 1,
+        rfq_sim_concurrency: 1,
     }
 }

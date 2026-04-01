@@ -1,12 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use tycho_simulation::{
-    tycho_common::{models::Chain, Bytes},
-    utils::get_default_url,
-};
+use tycho_simulation::tycho_common::{models::Chain, Bytes};
+use tycho_simulation::utils::get_default_url;
 
 mod logging;
 mod memory;
@@ -19,6 +18,7 @@ pub struct ChainProfile {
     pub chain: Chain,
     pub native_protocols: Vec<String>,
     pub vm_protocols: Vec<String>,
+    pub rfq_protocols: Vec<String>,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
     pub native_token_protocol_allowlist: Vec<String>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
@@ -38,6 +38,7 @@ pub(crate) const ETHEREUM_NATIVE_PROTOCOLS: &[&str] = &[
     "erc4626",
 ];
 pub(crate) const ETHEREUM_VM_PROTOCOLS: &[&str] = &["vm:curve", "vm:balancer_v2", "vm:maverick_v2"];
+pub(crate) const ETHEREUM_RFQ_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow"];
 pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] = &[
     "uniswap_v2",
     "uniswap_v3",
@@ -46,6 +47,23 @@ pub(crate) const BASE_NATIVE_PROTOCOLS: &[&str] = &[
     "aerodrome_slipstreams",
 ];
 pub(crate) const BASE_VM_PROTOCOLS: &[&str] = &[];
+pub(crate) const BASE_RFQ_PROTOCOLS: &[&str] = &[];
+
+/// Get the default Bebop URL for the given chain.
+pub fn get_default_bebop_url(chain: &Chain) -> Option<String> {
+    match chain {
+        Chain::Ethereum => Some("https://api.bebop.xyz/pmm/ethereum/v3/tokens".to_string()),
+        _ => None,
+    }
+}
+
+/// Get the default Hashflow Filename for the given chain.
+pub fn get_default_hashflow_filename(chain: &Chain) -> Option<String> {
+    match chain {
+        Chain::Ethereum => Some("./hashflow_supported_tokens.csv".to_string()),
+        _ => None,
+    }
+}
 
 fn profile_protocols(protocols: &[&str]) -> Vec<String> {
     protocols
@@ -64,6 +82,7 @@ fn ethereum_profile() -> ChainProfile {
         chain: Chain::Ethereum,
         native_protocols: profile_protocols(ETHEREUM_NATIVE_PROTOCOLS),
         vm_protocols: profile_protocols(ETHEREUM_VM_PROTOCOLS),
+        rfq_protocols: profile_protocols(ETHEREUM_RFQ_PROTOCOLS),
         native_token_protocol_allowlist: vec!["rocketpool".into()],
         reset_allowance_tokens: reset_tokens,
     }
@@ -74,6 +93,7 @@ fn base_profile() -> ChainProfile {
         chain: Chain::Base,
         native_protocols: profile_protocols(BASE_NATIVE_PROTOCOLS),
         vm_protocols: profile_protocols(BASE_VM_PROTOCOLS),
+        rfq_protocols: profile_protocols(BASE_RFQ_PROTOCOLS),
         native_token_protocol_allowlist: vec![],
         reset_allowance_tokens: HashMap::new(),
     }
@@ -114,6 +134,38 @@ pub fn load_config() -> AppConfig {
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let memory = MemoryConfig::from_env();
 
+    let bebop_user = match env::var("BEBOP_USER") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let bebop_key = match env::var("BEBOP_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let hashflow_user = match env::var("HASHFLOW_USER") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let hashflow_key = match env::var("HASHFLOW_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
     AppConfig {
         chain_profile,
         api_key: network.api_key,
@@ -125,11 +177,14 @@ pub fn load_config() -> AppConfig {
         quote_timeout_ms: timeouts.quote_timeout_ms,
         pool_timeout_native_ms: timeouts.pool_timeout_native_ms,
         pool_timeout_vm_ms: timeouts.pool_timeout_vm_ms,
+        pool_timeout_rfq_ms: timeouts.pool_timeout_rfq_ms,
         request_timeout_ms: timeouts.request_timeout_ms,
         token_refresh_timeout_ms: timeouts.token_refresh_timeout_ms,
         enable_vm_pools: network.enable_vm_pools,
+        enable_rfq_pools: network.enable_rfq_pools,
         global_native_sim_concurrency: concurrency.global_native_sim_concurrency,
         global_vm_sim_concurrency: concurrency.global_vm_sim_concurrency,
+        global_rfq_sim_concurrency: concurrency.global_rfq_sim_concurrency,
         reset_allowance_tokens,
         stream_stale_secs: stream.stream_stale_secs,
         stream_missing_block_burst: stream.stream_missing_block_burst,
@@ -142,6 +197,10 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
         readiness_stale_secs: stream.readiness_stale_secs,
         memory,
+        bebop_key,
+        bebop_user,
+        hashflow_key,
+        hashflow_user,
     }
 }
 
@@ -153,12 +212,14 @@ struct NetworkConfig {
     port: u16,
     host: IpAddr,
     enable_vm_pools: bool,
+    enable_rfq_pools: bool,
 }
 
 struct TimeoutConfig {
     quote_timeout_ms: u64,
     pool_timeout_native_ms: u64,
     pool_timeout_vm_ms: u64,
+    pool_timeout_rfq_ms: u64,
     request_timeout_ms: u64,
     token_refresh_timeout_ms: u64,
 }
@@ -166,6 +227,7 @@ struct TimeoutConfig {
 struct ConcurrencyConfig {
     global_native_sim_concurrency: usize,
     global_vm_sim_concurrency: usize,
+    global_rfq_sim_concurrency: usize,
 }
 
 struct StreamConfig {
@@ -185,6 +247,18 @@ struct StreamConfig {
 pub fn hosted_tycho_url(chain: Chain) -> Result<String, String> {
     get_default_url(&chain)
         .ok_or_else(|| format!("No default Tycho URL configured for supported chain {chain}"))
+}
+
+/// Resolve the hosted Bebop endpoint for a supported runtime chain.
+pub fn hosted_bebop_url(chain: Chain) -> Result<String, String> {
+    get_default_bebop_url(&chain)
+        .ok_or_else(|| format!("No default Bebop URL configured for supported chain {chain}"))
+}
+
+/// Resolve the hosted Hashflow endpoint for a supported runtime chain.
+pub fn hosted_hashflow_filename(chain: Chain) -> Result<String, String> {
+    get_default_hashflow_filename(&chain)
+        .ok_or_else(|| format!("No default Hashflow URL configured for supported chain {chain}"))
 }
 
 fn load_network_config() -> NetworkConfig {
@@ -213,6 +287,7 @@ fn load_network_config() -> NetworkConfig {
         port,
         host,
         enable_vm_pools: parse_env_or_default("ENABLE_VM_POOLS", "true"),
+        enable_rfq_pools: parse_env_or_default("ENABLE_RFQ_POOLS", "true"),
     }
 }
 
@@ -220,6 +295,7 @@ fn load_timeout_config() -> TimeoutConfig {
     let quote_timeout_ms = parse_env_or_default("QUOTE_TIMEOUT_MS", "150");
     let pool_timeout_native_ms = parse_env_or_default("POOL_TIMEOUT_NATIVE_MS", "20");
     let pool_timeout_vm_ms = parse_env_or_default("POOL_TIMEOUT_VM_MS", "150");
+    let pool_timeout_rfq_ms = parse_env_or_default("POOL_TIMEOUT_RFQ_MS", "150");
     let request_timeout_ms = parse_env_or_default("REQUEST_TIMEOUT_MS", "4000");
     let token_refresh_timeout_ms = parse_env_or_default("TOKEN_REFRESH_TIMEOUT_MS", "1000");
 
@@ -229,6 +305,7 @@ fn load_timeout_config() -> TimeoutConfig {
         "POOL_TIMEOUT_NATIVE_MS must be > 0"
     );
     assert!(pool_timeout_vm_ms > 0, "POOL_TIMEOUT_VM_MS must be > 0");
+    assert!(pool_timeout_rfq_ms > 0, "POOL_TIMEOUT_RFQ_MS must be > 0");
     assert!(
         token_refresh_timeout_ms > 0,
         "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
@@ -238,6 +315,7 @@ fn load_timeout_config() -> TimeoutConfig {
         quote_timeout_ms,
         pool_timeout_native_ms,
         pool_timeout_vm_ms,
+        pool_timeout_rfq_ms,
         request_timeout_ms,
         token_refresh_timeout_ms,
     }
@@ -249,6 +327,7 @@ fn load_concurrency_config() -> ConcurrencyConfig {
         .unwrap_or(1);
     let default_native = (cpu_count.saturating_mul(4)).max(1);
     let default_vm = cpu_count.max(1);
+    let default_rfq = cpu_count.max(1);
 
     ConcurrencyConfig {
         global_native_sim_concurrency: optional_parsed_env("GLOBAL_NATIVE_SIM_CONCURRENCY")
@@ -256,6 +335,9 @@ fn load_concurrency_config() -> ConcurrencyConfig {
             .max(1),
         global_vm_sim_concurrency: optional_parsed_env("GLOBAL_VM_SIM_CONCURRENCY")
             .unwrap_or(default_vm)
+            .max(1),
+        global_rfq_sim_concurrency: optional_parsed_env("GLOBAL_RFQ_SIM_CONCURRENCY")
+            .unwrap_or(default_rfq)
             .max(1),
     }
 }
@@ -335,11 +417,14 @@ pub struct AppConfig {
     pub quote_timeout_ms: u64,
     pub pool_timeout_native_ms: u64,
     pub pool_timeout_vm_ms: u64,
+    pub pool_timeout_rfq_ms: u64,
     pub request_timeout_ms: u64,
     pub token_refresh_timeout_ms: u64,
     pub enable_vm_pools: bool,
+    pub enable_rfq_pools: bool,
     pub global_native_sim_concurrency: usize,
     pub global_vm_sim_concurrency: usize,
+    pub global_rfq_sim_concurrency: usize,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub stream_stale_secs: u64,
     pub stream_missing_block_burst: u64,
@@ -352,6 +437,10 @@ pub struct AppConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub readiness_stale_secs: u64,
     pub memory: MemoryConfig,
+    pub bebop_user: String,
+    pub bebop_key: String,
+    pub hashflow_user: String,
+    pub hashflow_key: String,
 }
 
 const ETHEREUM_CHAIN_ID: u64 = 1;
@@ -438,6 +527,7 @@ mod tests {
         assert!(profile.native_protocols.contains(&"rocketpool".to_string()));
         assert!(profile.native_protocols.contains(&"erc4626".to_string()));
         assert!(profile.vm_protocols.contains(&"vm:curve".to_string()));
+        assert!(profile.rfq_protocols.contains(&"rfq:bebop".to_string()));
         assert!(profile
             .native_token_protocol_allowlist
             .contains(&"rocketpool".to_string()));
@@ -461,6 +551,7 @@ mod tests {
             .contains(&"aerodrome_slipstreams".to_string()));
         assert_eq!(profile.native_protocols.len(), 5);
         assert!(profile.vm_protocols.is_empty());
+        assert!(profile.rfq_protocols.is_empty());
         assert!(profile.native_token_protocol_allowlist.is_empty());
         assert!(profile.reset_allowance_tokens.is_empty());
     }

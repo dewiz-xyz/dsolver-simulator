@@ -16,6 +16,7 @@ pub fn router_timeout_result() -> QuoteResult {
             None,
             None,
             None,
+            None,
             "Simulate request timed out".to_string(),
         ),
     }
@@ -24,6 +25,7 @@ pub fn router_timeout_result() -> QuoteResult {
 pub fn simulate_timeout_meta(
     block_number: u64,
     vm_block_number: Option<u64>,
+    rfq_block_number: Option<u64>,
     total_pools: Option<usize>,
     auction_id: Option<String>,
     message: String,
@@ -43,12 +45,14 @@ pub fn simulate_timeout_meta(
         partial_kind: None,
         block_number,
         vm_block_number,
+        rfq_block_number,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools,
         auction_id,
         pool_results: Vec::new(),
         vm_unavailable: false,
+        rfq_unavailable: false,
         failures: vec![failure],
     }
 }
@@ -79,6 +83,7 @@ mod tests {
         assert!(result.meta.partial_kind.is_none());
         assert!(result.meta.pool_results.is_empty());
         assert!(!result.meta.vm_unavailable);
+        assert!(!result.meta.rfq_unavailable);
         assert_eq!(result.meta.failures.len(), 1);
     }
 
@@ -87,6 +92,7 @@ mod tests {
         let meta = simulate_timeout_meta(
             42,
             Some(41),
+            Some(42),
             Some(12),
             Some("auction-1".to_string()),
             "Simulate request timed out after 123ms".to_string(),
@@ -96,6 +102,7 @@ mod tests {
         assert!(meta.partial_kind.is_none());
         assert_eq!(meta.block_number, 42);
         assert_eq!(meta.vm_block_number, Some(41));
+        assert_eq!(meta.rfq_block_number, Some(42));
         assert_eq!(meta.total_pools, Some(12));
         assert_eq!(meta.auction_id.as_deref(), Some("auction-1"));
         assert_eq!(meta.failures.len(), 1);

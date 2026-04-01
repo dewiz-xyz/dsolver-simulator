@@ -96,6 +96,7 @@ async fn build_request_guard_timeout_result(
 ) -> QuoteResult {
     let block_number = state.current_block().await;
     let vm_block_number = state.current_vm_block().await;
+    let rfq_block_number = state.current_rfq_block().await;
     let total_pools = state.total_pools().await;
     let timeout_ms = request_timeout.as_millis() as u64;
 
@@ -118,6 +119,7 @@ async fn build_request_guard_timeout_result(
         meta: simulate_timeout_meta(
             block_number,
             vm_block_number,
+            rfq_block_number,
             Some(total_pools),
             request.auction_id.clone(),
             format!("Simulate request timed out after {}ms", timeout_ms),
@@ -654,6 +656,7 @@ mod tests {
         let meta = simulate_timeout_meta(
             12,
             Some(11),
+            Some(12),
             Some(42),
             Some("auction-1".to_string()),
             "Simulate request timed out after 1500ms".to_string(),

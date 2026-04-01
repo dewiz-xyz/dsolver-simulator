@@ -171,6 +171,8 @@ pub struct QuoteMeta {
     pub block_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfq_block_number: Option<u64>,
     pub matching_pools: usize,
     pub candidate_pools: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +183,8 @@ pub struct QuoteMeta {
     pub pool_results: Vec<PoolSimulationOutcome>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub vm_unavailable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rfq_unavailable: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<QuoteFailure>,
 }
@@ -363,12 +367,14 @@ mod tests {
             partial_kind: None,
             block_number: 1,
             vm_block_number: None,
+            rfq_block_number: None,
             matching_pools: 0,
             candidate_pools: 0,
             total_pools: None,
             auction_id: None,
             pool_results: Vec::new(),
             vm_unavailable: false,
+            rfq_unavailable: false,
             failures: Vec::new(),
         };
         let value = serde_json::to_value(meta)?;

@@ -38,16 +38,25 @@ fn native_token_address() -> Bytes {
 pub struct QuoteMetrics {
     pub scheduled_native_pools: usize,
     pub scheduled_vm_pools: usize,
+    pub scheduled_rfq_pools: usize,
     pub skipped_vm_unavailable: bool,
+    pub skipped_rfq_unavailable: bool,
     pub skipped_native_concurrency: usize,
     pub skipped_vm_concurrency: usize,
+    pub skipped_rfq_concurrency: usize,
     pub skipped_native_deadline: usize,
     pub skipped_vm_deadline: usize,
+    pub skipped_rfq_deadline: usize,
     pub vm_completed_pools: usize,
+    pub rfq_completed_pools: usize,
     pub vm_median_first_gas: Option<u64>,
+    pub rfq_median_first_gas: Option<u64>,
     pub vm_low_first_gas_count: usize,
+    pub rfq_low_first_gas_count: usize,
     pub vm_low_first_gas_ratio: Option<f64>,
+    pub rfq_low_first_gas_ratio: Option<f64>,
     pub vm_low_first_gas_samples: Vec<String>,
+    pub rfq_low_first_gas_samples: Vec<String>,
 }
 
 pub struct QuoteComputation {
@@ -72,6 +81,7 @@ fn build_request_exit(
     meta.partial_kind = exit.partial_kind;
     meta.pool_results = pool_results;
     meta.vm_unavailable = metrics.skipped_vm_unavailable;
+    meta.rfq_unavailable = metrics.skipped_rfq_unavailable;
     meta.failures = failures;
     QuoteComputation {
         responses,
@@ -84,6 +94,7 @@ fn build_request_exit(
 enum ScheduledPoolKind {
     Native,
     Vm,
+    Rfq,
 }
 
 impl ScheduledPoolKind {
@@ -93,6 +104,7 @@ impl ScheduledPoolKind {
                 "Pool scheduling skipped because native concurrency permits were exhausted"
             }
             Self::Vm => "Pool scheduling skipped because VM concurrency permits were exhausted",
+            Self::Rfq => "Pool scheduling skipped because RFQ concurrency permits were exhausted",
         }
     }
 
@@ -100,6 +112,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => "Native pool semaphore closed",
             Self::Vm => "VM pool semaphore closed",
+            Self::Rfq => "RFQ pool semaphore closed",
         }
     }
 
@@ -107,6 +120,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => metrics.skipped_native_deadline += 1,
             Self::Vm => metrics.skipped_vm_deadline += 1,
+            Self::Rfq => metrics.skipped_rfq_deadline += 1,
         }
     }
 
@@ -114,6 +128,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => metrics.skipped_native_concurrency += 1,
             Self::Vm => metrics.skipped_vm_concurrency += 1,
+            Self::Rfq => metrics.skipped_rfq_concurrency += 1,
         }
     }
 
@@ -121,6 +136,7 @@ impl ScheduledPoolKind {
         match self {
             Self::Native => metrics.scheduled_native_pools += 1,
             Self::Vm => metrics.scheduled_vm_pools += 1,
+            Self::Rfq => metrics.scheduled_rfq_pools += 1,
         }
     }
 }
@@ -335,6 +351,7 @@ struct RequestPair {
 struct CandidateSets {
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
+    rfq_candidates: Vec<CandidatePool>,
 }
 
 struct PreparedQuoteExecution {
@@ -345,6 +362,7 @@ struct PreparedQuoteExecution {
     quote_deadline: Instant,
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
+    rfq_candidates: Vec<CandidatePool>,
     cancel_token: CancellationToken,
 }
 
@@ -462,6 +480,7 @@ impl QuoteRequestRunner {
     ) -> Self {
         let current_block = state.current_block().await;
         let current_vm_block = state.current_vm_block().await;
+        let current_rfq_block = state.current_rfq_block().await;
         let total_pools = state.total_pools().await;
         let quote_timeout = state.quote_timeout();
         let meta = QuoteMeta {
@@ -470,12 +489,14 @@ impl QuoteRequestRunner {
             partial_kind: None,
             block_number: current_block,
             vm_block_number: current_vm_block,
+            rfq_block_number: current_rfq_block,
             matching_pools: 0,
             candidate_pools: 0,
             total_pools: Some(total_pools),
             auction_id: request.auction_id.clone(),
             pool_results: Vec::new(),
             vm_unavailable: false,
+            rfq_unavailable: false,
             failures: Vec::new(),
         };
         Self {
@@ -671,6 +692,7 @@ impl QuoteRequestRunner {
         }
         self.run.meta.block_number = self.state.current_block().await;
         self.run.meta.vm_block_number = self.state.current_vm_block().await;
+        self.run.meta.rfq_block_number = self.state.current_rfq_block().await;
         self.run.meta.total_pools = Some(self.state.total_pools().await);
         Ok(())
     }
@@ -803,6 +825,7 @@ impl QuoteRequestRunner {
             quote_deadline,
             native_candidates: candidates.native_candidates,
             vm_candidates: candidates.vm_candidates,
+            rfq_candidates: candidates.rfq_candidates,
             cancel_token: self
                 .cancel
                 .as_ref()
@@ -841,9 +864,25 @@ impl QuoteRequestRunner {
         } else {
             Vec::new()
         };
+        let rfq_ready = self.state.rfq_ready().await;
+        if self.state.enable_rfq_pools && !rfq_ready {
+            self.run.metrics.skipped_rfq_unavailable = true;
+        }
+        let rfq_candidates = if rfq_ready {
+            self.state
+                .rfq_state_store
+                .matching_pools_by_addresses(&pair.token_in_bytes, &pair.token_out_bytes)
+                .await
+                .into_iter()
+                .map(|(id, (pool_state, component))| (id, pool_state, component))
+                .collect()
+        } else {
+            Vec::new()
+        };
         CandidateSets {
             native_candidates,
             vm_candidates,
+            rfq_candidates,
         }
     }
 
@@ -856,7 +895,9 @@ impl QuoteRequestRunner {
         amounts_in: &Arc<Vec<BigUint>>,
         candidates: &mut CandidateSets,
     ) -> Result<(), RequestExit> {
-        let total_candidates = candidates.native_candidates.len() + candidates.vm_candidates.len();
+        let total_candidates = candidates.native_candidates.len()
+            + candidates.vm_candidates.len()
+            + candidates.rfq_candidates.len();
         self.run.meta.matching_pools = total_candidates;
         self.run.meta.candidate_pools = total_candidates;
         self.run.failures.reserve(total_candidates);
@@ -885,18 +926,26 @@ impl QuoteRequestRunner {
         );
         candidates.native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
         candidates.vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.rfq_candidates.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(())
     }
 
     async fn execute_pool_quotes(&mut self, prepared: PreparedQuoteExecution) {
         let mut tasks = self.schedule_pool_tasks(&prepared);
         let mut vm_first_gases = Vec::new();
+        let mut rfq_first_gases = Vec::new();
         if !tasks.is_empty() {
-            self.collect_pool_task_results(&prepared, &mut tasks, &mut vm_first_gases)
-                .await;
+            self.collect_pool_task_results(
+                &prepared,
+                &mut tasks,
+                &mut vm_first_gases,
+                &mut rfq_first_gases,
+            )
+            .await;
         }
         drop(tasks);
         finalize_vm_first_gas_metrics(&mut self.run.metrics, &mut vm_first_gases);
+        finalize_rfq_first_gas_metrics(&mut self.run.metrics, &mut rfq_first_gases);
         self.apply_scheduling_failures();
         self.apply_empty_response_state();
     }
@@ -908,6 +957,7 @@ impl QuoteRequestRunner {
         let mut tasks = FuturesUnordered::new();
         let native_semaphore = self.state.native_sim_semaphore();
         let vm_semaphore = self.state.vm_sim_semaphore();
+        let rfq_semaphore = self.state.rfq_sim_semaphore();
         for (kind, candidates, pool_timeout, semaphore) in [
             (
                 ScheduledPoolKind::Native,
@@ -920,6 +970,12 @@ impl QuoteRequestRunner {
                 &prepared.vm_candidates,
                 self.state.pool_timeout_vm(),
                 vm_semaphore,
+            ),
+            (
+                ScheduledPoolKind::Rfq,
+                &prepared.rfq_candidates,
+                self.state.pool_timeout_rfq(),
+                rfq_semaphore,
             ),
         ] {
             self.schedule_pool_group(
@@ -992,6 +1048,7 @@ impl QuoteRequestRunner {
         prepared: &PreparedQuoteExecution,
         tasks: &mut FuturesUnordered<PoolTask>,
         vm_first_gases: &mut Vec<u64>,
+        rfq_first_gases: &mut Vec<u64>,
     ) {
         let remaining = prepared
             .quote_deadline
@@ -1030,7 +1087,12 @@ impl QuoteRequestRunner {
                     let Some(outcome) = maybe_outcome else {
                         break;
                     };
-                    self.handle_pool_task_outcome(outcome, prepared, vm_first_gases);
+                    self.handle_pool_task_outcome(
+                        outcome,
+                        prepared,
+                        vm_first_gases,
+                        rfq_first_gases,
+                    );
                 }
             }
         }
@@ -1041,10 +1103,11 @@ impl QuoteRequestRunner {
         outcome: Result<PoolSimOutcome, QuoteFailure>,
         prepared: &PreparedQuoteExecution,
         vm_first_gases: &mut Vec<u64>,
+        rfq_first_gases: &mut Vec<u64>,
     ) {
         match outcome {
             Ok(PoolSimOutcome::Simulated(result)) => {
-                self.handle_simulated_pool_result(result, prepared, vm_first_gases)
+                self.handle_simulated_pool_result(result, prepared, vm_first_gases, rfq_first_gases)
             }
             Err(failure) => self.handle_pool_failure(failure, prepared.expected_len),
         }
@@ -1055,6 +1118,7 @@ impl QuoteRequestRunner {
         mut result: PoolQuoteResult,
         prepared: &PreparedQuoteExecution,
         vm_first_gases: &mut Vec<u64>,
+        rfq_first_gases: &mut Vec<u64>,
     ) {
         if result.successful_steps > 0 {
             while result.amounts_out.len() < prepared.expected_len {
@@ -1068,6 +1132,13 @@ impl QuoteRequestRunner {
         record_vm_first_gas_metrics(
             &mut self.run.metrics,
             vm_first_gases,
+            result.protocol.as_str(),
+            result.pool.as_str(),
+            result.first_successful_gas_used,
+        );
+        record_rfq_first_gas_metrics(
+            &mut self.run.metrics,
+            rfq_first_gases,
             result.protocol.as_str(),
             result.pool.as_str(),
             result.first_successful_gas_used,
@@ -1174,8 +1245,10 @@ impl QuoteRequestRunner {
     fn apply_scheduling_failures(&mut self) {
         if self.run.metrics.skipped_native_concurrency == 0
             && self.run.metrics.skipped_vm_concurrency == 0
+            && self.run.metrics.skipped_rfq_concurrency == 0
             && self.run.metrics.skipped_native_deadline == 0
             && self.run.metrics.skipped_vm_deadline == 0
+            && self.run.metrics.skipped_rfq_deadline == 0
         {
             return;
         }
@@ -1183,11 +1256,13 @@ impl QuoteRequestRunner {
         self.push_failure(make_failure(
             QuoteFailureKind::ConcurrencyLimit,
             format!(
-                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} native_deadline={} vm_deadline={}",
+                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} rfq_concurrency={} native_deadline={} vm_deadline={} rfq_deadline={}",
                 self.run.metrics.skipped_native_concurrency,
                 self.run.metrics.skipped_vm_concurrency,
+                self.run.metrics.skipped_rfq_concurrency,
                 self.run.metrics.skipped_native_deadline,
-                self.run.metrics.skipped_vm_deadline
+                self.run.metrics.skipped_vm_deadline,
+                self.run.metrics.skipped_rfq_deadline
             ),
             None,
         ));
@@ -1900,6 +1975,43 @@ fn finalize_vm_first_gas_metrics(metrics: &mut QuoteMetrics, vm_first_gases: &mu
         Some(metrics.vm_low_first_gas_count as f64 / metrics.vm_completed_pools as f64);
 }
 
+fn record_rfq_first_gas_metrics(
+    metrics: &mut QuoteMetrics,
+    rfq_first_gases: &mut Vec<u64>,
+    protocol: &str,
+    pool_id: &str,
+    first_gas: Option<u64>,
+) {
+    if !protocol.starts_with("rfq:") {
+        return;
+    }
+
+    let Some(first_gas) = first_gas else {
+        return;
+    };
+
+    metrics.rfq_completed_pools += 1;
+    rfq_first_gases.push(first_gas);
+    if first_gas < VM_LOW_FIRST_GAS_THRESHOLD {
+        metrics.rfq_low_first_gas_count += 1;
+        if metrics.rfq_low_first_gas_samples.len() < VM_LOW_FIRST_GAS_SAMPLE_CAP {
+            metrics
+                .rfq_low_first_gas_samples
+                .push(format!("{protocol}:{pool_id}:{first_gas}"));
+        }
+    }
+}
+
+fn finalize_rfq_first_gas_metrics(metrics: &mut QuoteMetrics, rfq_first_gases: &mut [u64]) {
+    let Some(median_gas) = median_u64(rfq_first_gases) else {
+        return;
+    };
+
+    metrics.rfq_median_first_gas = Some(median_gas);
+    metrics.rfq_low_first_gas_ratio =
+        Some(metrics.rfq_low_first_gas_count as f64 / metrics.rfq_completed_pools as f64);
+}
+
 fn median_u64(values: &mut [u64]) -> Option<u64> {
     if values.is_empty() {
         return None;
@@ -2045,7 +2157,7 @@ mod tests {
     };
     use tycho_simulation::tycho_common::Bytes;
 
-    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::state::{RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
 
@@ -2426,12 +2538,15 @@ mod tests {
 
     struct TestAppStateConfig {
         enable_vm_pools: bool,
+        enable_rfq_pools: bool,
         erc4626_deposits_enabled: bool,
         native_sim_concurrency: usize,
         vm_sim_concurrency: usize,
+        rfq_sim_concurrency: usize,
         quote_timeout: Duration,
         pool_timeout_native: Duration,
         pool_timeout_vm: Duration,
+        pool_timeout_rfq: Duration,
         request_timeout: Duration,
     }
 
@@ -2439,12 +2554,15 @@ mod tests {
         fn default() -> Self {
             Self {
                 enable_vm_pools: false,
+                enable_rfq_pools: false,
                 erc4626_deposits_enabled: false,
                 native_sim_concurrency: 1,
                 vm_sim_concurrency: 1,
+                rfq_sim_concurrency: 1,
                 quote_timeout: Duration::from_secs(1),
                 pool_timeout_native: Duration::from_millis(50),
                 pool_timeout_vm: Duration::from_millis(50),
+                pool_timeout_rfq: Duration::from_millis(50),
                 request_timeout: Duration::from_secs(2),
             }
         }
@@ -2454,6 +2572,7 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
         config: TestAppStateConfig,
     ) -> AppState {
         AppState {
@@ -2462,26 +2581,36 @@ mod tests {
             tokens: token_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools: config.enable_vm_pools,
+            enable_rfq_pools: config.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: config.quote_timeout,
             pool_timeout_native: config.pool_timeout_native,
             pool_timeout_vm: config.pool_timeout_vm,
+            pool_timeout_rfq: config.pool_timeout_rfq,
             request_timeout: config.request_timeout,
             native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
             vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
+            rfq_sim_semaphore: Arc::new(Semaphore::new(config.rfq_sim_concurrency)),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: config.native_sim_concurrency,
             vm_sim_concurrency: config.vm_sim_concurrency,
+            rfq_sim_concurrency: config.rfq_sim_concurrency,
         }
     }
 
-    fn make_test_state_stores(token_store: &Arc<TokenStore>) -> (Arc<StateStore>, Arc<StateStore>) {
+    fn make_test_state_stores(
+        token_store: &Arc<TokenStore>,
+    ) -> (Arc<StateStore>, Arc<StateStore>, Arc<StateStore>) {
         (
+            Arc::new(StateStore::new(Arc::clone(token_store))),
             Arc::new(StateStore::new(Arc::clone(token_store))),
             Arc::new(StateStore::new(Arc::clone(token_store))),
         )
@@ -2510,6 +2639,7 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
     }
 
     impl BasicQuoteFixture {
@@ -2521,7 +2651,8 @@ mod tests {
             let token_in_meta = make_token(&token_in, "TK1");
             let token_out_meta = make_token(&token_out, "TK2");
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
-            let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+            let (native_state_store, vm_state_store, rfq_state_store) =
+                make_test_state_stores(&token_store);
 
             Self {
                 token_in_hex,
@@ -2531,6 +2662,7 @@ mod tests {
                 token_store,
                 native_state_store,
                 vm_state_store,
+                rfq_state_store,
             }
         }
 
@@ -2551,6 +2683,7 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
     }
 
     impl Erc4626QuoteFixture {
@@ -2569,7 +2702,8 @@ mod tests {
             let token_out_meta =
                 make_token_with_decimals(&token_out, token_out_symbol, token_out_decimals);
             let token_store = make_token_store(vec![token_in_meta.clone(), token_out_meta.clone()]);
-            let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+            let (native_state_store, vm_state_store, rfq_state_store) =
+                make_test_state_stores(&token_store);
 
             Self {
                 token_in_hex,
@@ -2579,6 +2713,7 @@ mod tests {
                 token_store,
                 native_state_store,
                 vm_state_store,
+                rfq_state_store,
             }
         }
 
@@ -2649,6 +2784,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 enable_vm_pools,
                 ..TestAppStateConfig::default()
@@ -2758,11 +2894,13 @@ mod tests {
     #[tokio::test]
     async fn get_amounts_out_rejects_native_wrapped_pair_invalid_request() {
         let token_store = make_token_store(Vec::new());
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
         let app_state = make_test_app_state(
             token_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -2840,6 +2978,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 erc4626_deposits_enabled: true,
                 ..TestAppStateConfig::default()
@@ -2894,6 +3033,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-filtered", &["2"]);
@@ -2947,6 +3087,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-deposit-disabled", &["2"]);
@@ -3000,6 +3141,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-redeem-disabled", &["2"]);
@@ -3068,6 +3210,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-erc4626-mixed", &["2"]);
@@ -3098,7 +3241,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3128,6 +3272,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3163,7 +3308,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3211,6 +3357,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3250,7 +3397,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let wrapped_limit_calls = Arc::new(AtomicUsize::new(0));
         let wrapped_quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3298,6 +3446,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3337,7 +3486,8 @@ mod tests {
             native_meta.clone(),
             token_in_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         let limit_calls = Arc::new(AtomicUsize::new(0));
         let quote_calls = Arc::new(AtomicUsize::new(0));
@@ -3367,6 +3517,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig::default(),
         );
 
@@ -3402,7 +3553,8 @@ mod tests {
             native_meta.clone(),
             token_out_meta.clone(),
         ]);
-        let (native_state_store, vm_state_store) = make_test_state_stores(&token_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(&token_store);
 
         // Keep native store ready without creating any matching pools for the request pair.
         let native_dummy_token_a =
@@ -3457,6 +3609,7 @@ mod tests {
             token_store,
             Arc::clone(&native_state_store),
             Arc::clone(&vm_state_store),
+            Arc::clone(&rfq_state_store),
             TestAppStateConfig {
                 enable_vm_pools: true,
                 ..TestAppStateConfig::default()
@@ -3529,6 +3682,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-1", &["1", "5", "11"]);
@@ -3891,6 +4045,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-2", &["1", "11"]);
@@ -3943,6 +4098,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-zero-then-positive", &["1", "2"]);
@@ -4140,6 +4296,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-limit-partial-amounts", &["1", "11"]);
@@ -4212,6 +4369,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 native_sim_concurrency: 2,
                 ..TestAppStateConfig::default()
@@ -4295,6 +4453,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig {
                 native_sim_concurrency: 1,
                 ..TestAppStateConfig::default()
@@ -4357,6 +4516,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-insufficient-reserve", &["1", "11"]);
@@ -4390,6 +4550,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-internal-fallback", &["1"]);
@@ -4428,6 +4589,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-finalize-order", &["1", "2"]);
@@ -4472,6 +4634,7 @@ mod tests {
             Arc::clone(&fixture.token_store),
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
             TestAppStateConfig::default(),
         );
         let request = fixture.request("req-finalize-tiebreak", &["1"]);

@@ -456,7 +456,8 @@ mod tests {
     #[tokio::test]
     async fn build_debug_omits_when_request_id_missing() {
         let tokens_store = token_store_with_tokens(Vec::new());
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -466,6 +467,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 
@@ -477,7 +479,8 @@ mod tests {
     #[tokio::test]
     async fn build_debug_includes_block_when_request_id_present() {
         let tokens_store = token_store_with_tokens(Vec::new());
-        let (native_state_store, vm_state_store) = test_state_stores(&tokens_store);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(&tokens_store);
 
         native_state_store
             .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
@@ -487,6 +490,7 @@ mod tests {
             tokens_store,
             native_state_store,
             vm_state_store,
+            rfq_state_store,
             TestAppStateConfig::default(),
         );
 

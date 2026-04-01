@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{bail, Result};
 use futures::StreamExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use tycho_simulation::{
     evm::{
@@ -21,6 +23,14 @@ use tycho_simulation::{
             vm::state::EVMPoolState,
         },
         stream::ProtocolStreamBuilder,
+    },
+    protocol::models::Update,
+    rfq::{
+        protocols::{
+            bebop::{client_builder::BebopClientBuilder, state::BebopState},
+            hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
+        },
+        stream::RFQStreamBuilder,
     },
     tycho_client::feed::component_tracker::ComponentFilter,
     tycho_common::models::Chain,
@@ -144,6 +154,74 @@ pub async fn build_vm_stream(
     Ok(stream.map(|item| {
         item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
     }))
+}
+
+#[derive(Clone)]
+pub struct RFQConfig {
+    pub bebop_user: String,
+    pub bebop_key: String,
+    pub hashflow_user: String,
+    pub hashflow_key: String,
+}
+
+pub async fn build_rfq_stream(
+    tvl_add_threshold: f64,
+    tokens: Arc<TokenStore>,
+    _chain: Chain,
+    _protocols: &[String],
+    bebop_tokens: Arc<TokenStore>,
+    hashflow_tokens: Arc<TokenStore>,
+    rfq_config: RFQConfig,
+) -> Result<
+    impl futures::Stream<
+            Item = Result<
+                tycho_simulation::protocol::models::Update,
+                Box<dyn std::error::Error + Send + Sync + 'static>,
+            >,
+        > + Unpin
+        + Send,
+> {
+    let mut rfq_builder = RFQStreamBuilder::new();
+
+    info!("Setting up Bebop RFQ client...\n");
+    let (user, key) = (rfq_config.bebop_user, rfq_config.bebop_key);
+    let mut rfq_tokens_bebop = HashSet::new();
+    for bebop_token_addr in bebop_tokens.snapshot().await.keys().clone() {
+        rfq_tokens_bebop.insert(bebop_token_addr.clone());
+    }
+    let bebop_client = BebopClientBuilder::new(Chain::Ethereum, user, key)
+        .tokens(rfq_tokens_bebop)
+        .tvl_threshold(tvl_add_threshold)
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
+    rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
+
+    info!("Setting up Hashflow RFQ client...\n");
+    let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+    let mut rfq_tokens_hashflow = HashSet::new();
+    for hashflow_token_addr in hashflow_tokens.snapshot().await.keys() {
+        rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
+    }
+    let hashflow_client = HashflowClientBuilder::new(Chain::Ethereum, user, key)
+        .tokens(rfq_tokens_hashflow)
+        .tvl_threshold(tvl_add_threshold)
+        .poll_time(Duration::from_secs(5))
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
+    rfq_builder = rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
+
+    info!("Building RFQ Stream...\n");
+    let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
+
+    let snapshot = tokens.snapshot().await;
+
+    rfq_builder = rfq_builder.set_tokens(snapshot.clone()).await;
+    tokio::spawn(rfq_builder.build(tx));
+    info!("Connected to RFQs! Streaming live price levels...\n");
+
+    // todo consider implementing register_rfq_protocol...
+
+    Ok(ReceiverStream::new(rx).map(Ok).boxed())
 }
 
 fn register_vm_protocol(

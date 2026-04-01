@@ -35,6 +35,9 @@ tower = { version = "0.5", features = ["timeout", "util"] }
 rand = "0.8"
 jemalloc-ctl = "0.5"
 jemallocator = "0.5"
+tokio-stream = "0.1.18"
+csv = "1.4.0"
+tycho-common = "0.152.4"
 
 [dev-dependencies]
 chrono = "0.4"

@@ -82,9 +82,10 @@ pub(super) fn normalize_route(
     })
 }
 
-pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool, bool) {
+pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool, bool, bool) {
     let mut uses_native = false;
     let mut uses_vm = false;
+    let mut uses_rfq = false;
 
     for swap in normalized
         .segments
@@ -94,16 +95,18 @@ pub(super) fn route_backend_usage(normalized: &NormalizedRouteInternal) -> (bool
     {
         if swap.pool.protocol.starts_with("vm:") {
             uses_vm = true;
+        } else if swap.pool.protocol.starts_with("rfq:") {
+            uses_rfq = true;
         } else {
             uses_native = true;
         }
 
-        if uses_native && uses_vm {
+        if uses_native && uses_vm && uses_rfq {
             break;
         }
     }
 
-    (uses_native, uses_vm)
+    (uses_native, uses_vm, uses_rfq)
 }
 
 fn validate_segment_shape(segment: &SegmentDraft, segment_index: usize) -> Result<(), EncodeError> {
@@ -348,7 +351,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(route_backend_usage(&normalized), (true, true));
+        assert_eq!(route_backend_usage(&normalized), (true, true, false));
     }
 
     #[test]

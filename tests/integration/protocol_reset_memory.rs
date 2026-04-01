@@ -10,7 +10,7 @@ use dsolver_simulator::handlers::stream::{
     process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig,
 };
 use dsolver_simulator::models::messages::AmountOutRequest;
-use dsolver_simulator::models::state::{AppState, StateStore, VmStreamStatus};
+use dsolver_simulator::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
 use dsolver_simulator::models::stream_health::StreamHealth;
 use dsolver_simulator::models::tokens::TokenStore;
 use dsolver_simulator::services::quotes::get_amounts_out;
@@ -98,6 +98,12 @@ impl ProtocolSim for DummySim {
     }
 }
 
+struct QuoteBlockingFixture {
+    app_state: AppState,
+    vm_state_store: Arc<StateStore>,
+    rfq_state_store: Arc<StateStore>,
+}
+
 fn address_hex(seed: u8) -> String {
     format!("{:02x}", seed).repeat(20)
 }
@@ -112,6 +118,123 @@ fn address(seed: u8) -> Bytes {
 
 fn make_token(seed: u8, symbol: &str) -> Token {
     Token::new(&address(seed), symbol, 18, 0, &[], Chain::Ethereum, 100)
+}
+
+async fn build_quote_blocking_fixture() -> QuoteBlockingFixture {
+    let token_a = make_token(1, "TKNA");
+    let token_b = make_token(2, "TKNB");
+
+    let mut token_map = HashMap::new();
+    token_map.insert(token_a.address.clone(), token_a.clone());
+    token_map.insert(token_b.address.clone(), token_b.clone());
+
+    let token_store = Arc::new(TokenStore::new(
+        token_map,
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Ethereum,
+        Duration::from_secs(1),
+    ));
+
+    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+
+    let native_component = make_component(
+        10,
+        "uniswap_v2",
+        "uniswap_v2_pool",
+        vec![token_a.clone(), token_b.clone()],
+    );
+    let vm_component = make_component(
+        11,
+        "vm:curve",
+        "curve_pool",
+        vec![token_a.clone(), token_b.clone()],
+    );
+    let rfq_component = make_component(
+        11,
+        "rfq:hashflow",
+        "curve_pool",
+        vec![token_a.clone(), token_b.clone()],
+    );
+
+    let native_update = make_update(
+        1,
+        vec![(
+            "pool-native".to_string(),
+            native_component,
+            Box::new(DummySim),
+        )],
+        HashMap::from([ready_state("uniswap_v2", 1)]),
+    );
+    let vm_update = make_update(
+        1,
+        vec![("pool-vm".to_string(), vm_component, Box::new(DummySim))],
+        HashMap::from([ready_state("vm:curve", 1)]),
+    );
+    let rfq_update = make_update(
+        1,
+        vec![("pool-rfq".to_string(), rfq_component, Box::new(DummySim))],
+        HashMap::from([ready_state("rfq:hashflow", 1)]),
+    );
+
+    native_state_store.apply_update(native_update).await;
+    vm_state_store.apply_update(vm_update).await;
+    rfq_state_store.apply_update(rfq_update).await;
+
+    let app_state = AppState {
+        chain: Chain::Ethereum,
+        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        tokens: Arc::clone(&token_store),
+        native_state_store,
+        vm_state_store: Arc::clone(&vm_state_store),
+        rfq_state_store: Arc::clone(&rfq_state_store),
+        native_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream_health: Arc::new(StreamHealth::new()),
+        rfq_stream_health: Arc::new(StreamHealth::new()),
+        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
+        enable_vm_pools: true,
+        enable_rfq_pools: true,
+        readiness_stale: Duration::from_secs(120),
+        quote_timeout: Duration::from_millis(100),
+        pool_timeout_native: Duration::from_millis(50),
+        pool_timeout_vm: Duration::from_millis(50),
+        pool_timeout_rfq: Duration::from_millis(50),
+        request_timeout: Duration::from_millis(1000),
+        native_sim_semaphore: Arc::new(Semaphore::new(4)),
+        vm_sim_semaphore: Arc::new(Semaphore::new(4)),
+        rfq_sim_semaphore: Arc::new(Semaphore::new(4)),
+        erc4626_deposits_enabled: false,
+        reset_allowance_tokens: Arc::new(HashMap::new()),
+        native_sim_concurrency: 4,
+        vm_sim_concurrency: 4,
+        rfq_sim_concurrency: 4,
+    };
+
+    QuoteBlockingFixture {
+        app_state,
+        vm_state_store,
+        rfq_state_store,
+    }
+}
+
+async fn assert_quotes_block_vm_and_rfq(app_state: AppState) {
+    let request = AmountOutRequest {
+        request_id: "req-1".to_string(),
+        auction_id: None,
+        token_in: format!("0x{}", address_hex(1)),
+        token_out: format!("0x{}", address_hex(2)),
+        amounts: vec!["1000".to_string()],
+    };
+
+    let computation = get_amounts_out(app_state, request, None).await;
+    assert!(computation.metrics.skipped_vm_unavailable);
+    assert!(computation.metrics.skipped_rfq_unavailable);
+    assert_eq!(computation.metrics.scheduled_vm_pools, 0);
+    assert_eq!(computation.metrics.scheduled_rfq_pools, 0);
+    assert!(computation.metrics.scheduled_native_pools > 0);
 }
 
 fn address_hex_from_seed(seed: u64) -> String {
@@ -464,78 +587,13 @@ async fn native_stream_restarts_on_stale() {
 
 #[tokio::test]
 async fn vm_rebuild_resets_store_and_blocks_quotes() {
-    let token_a = make_token(1, "TKNA");
-    let token_b = make_token(2, "TKNB");
-
-    let mut token_map = HashMap::new();
-    token_map.insert(token_a.address.clone(), token_a.clone());
-    token_map.insert(token_b.address.clone(), token_b.clone());
-
-    let token_store = Arc::new(TokenStore::new(
-        token_map,
-        "http://localhost".to_string(),
-        "test".to_string(),
-        Chain::Ethereum,
-        Duration::from_secs(1),
-    ));
-
-    let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-
-    let native_component = make_component(
-        10,
-        "uniswap_v2",
-        "uniswap_v2_pool",
-        vec![token_a.clone(), token_b.clone()],
-    );
-    let native_update = make_update(
-        1,
-        vec![(
-            "pool-native".to_string(),
-            native_component,
-            Box::new(DummySim),
-        )],
-        HashMap::from([ready_state("uniswap_v2", 1)]),
-    );
-    native_state_store.apply_update(native_update).await;
-
-    let vm_component = make_component(
-        11,
-        "vm:curve",
-        "curve_pool",
-        vec![token_a.clone(), token_b.clone()],
-    );
-    let vm_update = make_update(
-        1,
-        vec![("pool-vm".to_string(), vm_component, Box::new(DummySim))],
-        HashMap::from([ready_state("vm:curve", 1)]),
-    );
-    vm_state_store.apply_update(vm_update).await;
-
-    let app_state = AppState {
-        chain: Chain::Ethereum,
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
-        tokens: Arc::clone(&token_store),
-        native_state_store: Arc::clone(&native_state_store),
-        vm_state_store: Arc::clone(&vm_state_store),
-        native_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream_health: Arc::new(StreamHealth::new()),
-        vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        enable_vm_pools: true,
-        readiness_stale: Duration::from_secs(120),
-        quote_timeout: Duration::from_millis(100),
-        pool_timeout_native: Duration::from_millis(50),
-        pool_timeout_vm: Duration::from_millis(50),
-        request_timeout: Duration::from_millis(1000),
-        native_sim_semaphore: Arc::new(Semaphore::new(4)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(4)),
-        erc4626_deposits_enabled: false,
-        reset_allowance_tokens: Arc::new(HashMap::new()),
-        native_sim_concurrency: 4,
-        vm_sim_concurrency: 4,
-    };
+    let fixture = build_quote_blocking_fixture().await;
+    let app_state = fixture.app_state.clone();
+    let vm_state_store = fixture.vm_state_store;
+    let rfq_state_store = fixture.rfq_state_store;
 
     assert!(app_state.vm_ready().await);
+    assert!(app_state.rfq_ready().await);
 
     vm_state_store.reset().await;
     {
@@ -544,21 +602,20 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         status.rebuild_started_at = Some(tokio::time::Instant::now());
     }
 
+    rfq_state_store.reset().await;
+    {
+        let mut status = app_state.rfq_stream.write().await;
+        status.rebuilding = true;
+        status.rebuild_started_at = Some(tokio::time::Instant::now());
+    }
+
     assert!(!app_state.vm_ready().await);
     assert_eq!(vm_state_store.total_states().await, 0);
 
-    let request = AmountOutRequest {
-        request_id: "req-1".to_string(),
-        auction_id: None,
-        token_in: format!("0x{}", address_hex(1)),
-        token_out: format!("0x{}", address_hex(2)),
-        amounts: vec!["1000".to_string()],
-    };
+    assert!(!app_state.rfq_ready().await);
+    assert_eq!(rfq_state_store.total_states().await, 0);
 
-    let computation = get_amounts_out(app_state.clone(), request, None).await;
-    assert!(computation.metrics.skipped_vm_unavailable);
-    assert_eq!(computation.metrics.scheduled_vm_pools, 0);
-    assert!(computation.metrics.scheduled_native_pools > 0);
+    assert_quotes_block_vm_and_rfq(app_state).await;
 }
 
 #[tokio::test]

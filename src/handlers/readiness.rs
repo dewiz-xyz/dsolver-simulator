@@ -79,7 +79,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{status, StatusPayload};
-    use crate::models::state::{AppState, StateStore, VmStreamStatus};
+    use crate::models::state::{AppState, RfqStreamStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use axum::{extract::State, http::StatusCode, Json};
@@ -186,7 +186,7 @@ mod tests {
             .await;
     }
 
-    fn test_state(enable_vm_pools: bool) -> AppState {
+    fn test_state(enable_vm_pools: bool, enable_rfq_pools: bool) -> AppState {
         let token_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
@@ -199,28 +199,35 @@ mod tests {
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: Arc::clone(&token_store),
             native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
-            vm_state_store: Arc::new(StateStore::new(token_store)),
+            vm_state_store: Arc::new(StateStore::new(token_store.clone())),
+            rfq_state_store: Arc::new(StateStore::new(token_store)),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
+            rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
+            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             enable_vm_pools,
+            enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             quote_timeout: Duration::from_millis(100),
             pool_timeout_native: Duration::from_millis(50),
             pool_timeout_vm: Duration::from_millis(50),
+            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
             native_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            rfq_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             erc4626_deposits_enabled: false,
             reset_allowance_tokens: Arc::new(HashMap::new()),
             native_sim_concurrency: 1,
             vm_sim_concurrency: 1,
+            rfq_sim_concurrency: 1,
         }
     }
 
     #[tokio::test]
     async fn status_returns_service_unavailable_for_stale_native_state() {
-        let mut state = test_state(false);
+        let mut state = test_state(false, false);
         seed_native_ready_store(&state).await;
         assert!(state.native_state_store.is_ready());
         state.native_stream_health.record_update(1).await;
@@ -234,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_vm_rebuilding() {
-        let state = test_state(true);
+        let state = test_state(true, true);
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = true;
