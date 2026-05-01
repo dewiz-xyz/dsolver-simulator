@@ -166,7 +166,7 @@ async fn load_token_store(
         Some(&config.api_key),
         true,
         chain,
-        Some(10),
+        Some(0),
         None,
     )
     .await?;
