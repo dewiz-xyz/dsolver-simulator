@@ -1,0 +1,64 @@
+name: Auto-merge Release PRs
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: auto-merge-releases
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    name: Merge pending release PRs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.SOLVER_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SOLVER_RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Find and merge release PRs
+        id: merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          NUMBERS=$(gh pr list \
+            --repo "$REPO" \
+            --label "autorelease: pending" \
+            --state open \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName == "release-please--branches--master") | .number')
+
+          MERGED=0
+          for NUMBER in $NUMBERS; do
+            [ -z "$NUMBER" ] && continue
+            echo "Merging release PR #${NUMBER}"
+            gh pr merge "$NUMBER" --repo "$REPO" --merge
+            MERGED=$((MERGED + 1))
+          done
+
+          echo "merged=${MERGED}" >> "$GITHUB_OUTPUT"
+          echo "Total merged: ${MERGED}"
+
+      - name: Dispatch release-please to create tag
+        if: steps.merge.outputs.merged != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching release-please.yaml for immediate tagging"
+          gh workflow run release-please.yaml --repo "$REPO" --ref master
+
