@@ -465,15 +465,16 @@ pub fn derive_broadcaster_token_lookup_url(ws_url: &str) -> Result<String, Token
             )))
         }
     };
-    if url.path() != "/ws" {
+    let Some(prefix) = url.path().strip_suffix("/ws") else {
         return Err(TokenStoreError::RequestFailed(
             "TYCHO_BROADCASTER_WS_URL must end with /ws".to_string(),
         ));
-    }
+    };
+    let lookup_path = format!("{prefix}/tokens/lookup");
     url.set_scheme(scheme).map_err(|_| {
         TokenStoreError::RequestFailed("invalid broadcaster URL scheme".to_string())
     })?;
-    url.set_path("/tokens/lookup");
+    url.set_path(&lookup_path);
     Ok(url.to_string())
 }
 
@@ -690,6 +691,10 @@ mod tests {
         assert_eq!(
             derive_broadcaster_token_lookup_url("wss://broadcaster.example/ws")?,
             "https://broadcaster.example/tokens/lookup"
+        );
+        assert_eq!(
+            derive_broadcaster_token_lookup_url("wss://broadcaster.example/prod/base/ws")?,
+            "https://broadcaster.example/prod/base/tokens/lookup"
         );
         Ok(())
     }
