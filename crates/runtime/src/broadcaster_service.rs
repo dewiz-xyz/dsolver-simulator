@@ -9,21 +9,29 @@ use crate::config::{init_logging, load_broadcaster_config, BroadcasterConfig, Me
 use crate::memory::maybe_log_memory_snapshot;
 use crate::models::broadcaster::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
 use crate::models::stream_health::StreamHealth;
-use crate::models::tokens::TokenStore;
+use crate::models::tokens::{TokenStore, TokenStoreError};
 use crate::services::broadcaster::BroadcasterServiceState;
 use crate::services::stream_builder::{build_broadcaster_stream, BroadcasterProtocols};
 use crate::stream::{
     supervise_broadcaster_stream, BroadcasterStreamControls, StreamSupervisorConfig,
 };
+use simulator_core::broadcaster::{BroadcasterTokenDto, BroadcasterTokenLookupResponse};
+use tycho_simulation::tycho_common::Bytes;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BroadcasterAppState {
     service: BroadcasterServiceState,
+    tokens: Arc<TokenStore>,
+    chain_id: u64,
 }
 
 impl BroadcasterAppState {
-    pub fn new(service: BroadcasterServiceState) -> Self {
-        Self { service }
+    pub fn new(service: BroadcasterServiceState, tokens: Arc<TokenStore>, chain_id: u64) -> Self {
+        Self {
+            service,
+            tokens,
+            chain_id,
+        }
     }
 
     pub async fn subscribe(
@@ -38,6 +46,27 @@ impl BroadcasterAppState {
 
     pub async fn remove_subscriber(&self, session_id: u64) {
         self.service.remove_subscriber(session_id).await;
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub async fn lookup_tokens(
+        &self,
+        addresses: Vec<Bytes>,
+    ) -> Result<BroadcasterTokenLookupResponse, TokenStoreError> {
+        let mut tokens = Vec::new();
+        let mut missing = Vec::new();
+
+        for address in addresses {
+            match self.tokens.ensure(&address).await? {
+                Some(token) => tokens.push(BroadcasterTokenDto::from(token)),
+                None => missing.push(address),
+            }
+        }
+
+        Ok(BroadcasterTokenLookupResponse { tokens, missing })
     }
 }
 
@@ -81,7 +110,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
 
     Ok(BroadcasterServiceParts {
         config,
-        app_state: BroadcasterAppState::new(service),
+        app_state: BroadcasterAppState::new(service, tokens, chain.id()),
     })
 }
 

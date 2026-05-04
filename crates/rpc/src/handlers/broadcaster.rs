@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use axum::{
     extract::{
+        rejection::JsonRejection,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
@@ -18,7 +19,10 @@ use runtime::{
     models::broadcaster::BroadcasterReadiness,
     services::broadcaster_sessions::{BroadcasterSessionRegistration, SessionCloseReason},
 };
-use simulator_core::broadcaster::{BroadcasterEnvelope, BroadcasterPayload};
+use serde_json::json;
+use simulator_core::broadcaster::{
+    BroadcasterEnvelope, BroadcasterPayload, BroadcasterTokenLookupRequest,
+};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -64,6 +68,58 @@ pub async fn ws(ws: WebSocketUpgrade, State(state): State<BroadcasterAppState>) 
 
     ws.on_upgrade(move |socket| handle_session(socket, state, registration))
         .into_response()
+}
+
+pub async fn token_lookup(
+    State(state): State<BroadcasterAppState>,
+    payload: Result<Json<BroadcasterTokenLookupRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid token lookup request: {error}") })),
+            )
+                .into_response()
+        }
+    };
+
+    if request.chain_id != state.chain_id() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "token lookup chain_id {} does not match broadcaster chain_id {}",
+                    request.chain_id,
+                    state.chain_id()
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(address) = request.addresses.iter().find(|address| address.len() != 20) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("token lookup address {address} is not a 20-byte EVM address")
+            })),
+        )
+            .into_response();
+    }
+
+    match state.lookup_tokens(request.addresses).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => {
+            warn!(error = %error, "Broadcaster token lookup failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn handle_session(
