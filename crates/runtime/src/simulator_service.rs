@@ -8,7 +8,6 @@ use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
     Bytes,
 };
-use tycho_simulation::utils::load_all_tokens;
 
 use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
@@ -19,7 +18,7 @@ use crate::models::state::{
     AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
-use crate::models::tokens::TokenStore;
+use crate::models::tokens::{derive_broadcaster_token_lookup_url, TokenStore};
 use crate::services::broadcaster_subscription::{
     supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
     NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
@@ -73,7 +72,6 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     init_logging();
     let config = load_config();
     let chain = config.chain_profile.chain;
-    let tycho_url = config.tycho_url.clone();
     let effective_rfq_enabled =
         config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
@@ -81,7 +79,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
 
-    let tokens = load_token_store(&config, &tycho_url).await?;
+    let tokens = load_token_store(&config)?;
     let bebop_tokens: Arc<TokenStore>;
     let hashflow_tokens: Arc<TokenStore>;
     let liquorice_tokens: Arc<TokenStore>;
@@ -89,29 +87,29 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     if effective_rfq_enabled {
         // RFQ enabled means RFQ bootstrap must succeed.
         bebop_tokens = if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:bebop") {
-            load_bebop_token_store(&config, &tycho_url, &config.bebop_url, chain).await?
+            load_bebop_token_store(&config, &config.bebop_url, chain).await?
         } else {
-            new_token_store(HashMap::new(), &tycho_url, &config)
+            new_local_token_store(HashMap::new(), &config)
         };
         hashflow_tokens =
             if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:hashflow") {
-                load_hashflow_token_store(&config, &tycho_url, &config.hashflow_filename, chain)?
+                load_hashflow_token_store(&config, &config.hashflow_filename, chain)?
             } else {
-                new_token_store(HashMap::new(), &tycho_url, &config)
+                new_local_token_store(HashMap::new(), &config)
             };
         liquorice_tokens =
             if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:liquorice") {
                 let liquorice_url = config.liquorice_url.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("Liquorice RFQ enabled for {chain} without liquorice_url")
                 })?;
-                load_liquorice_token_store(&config, &tycho_url, liquorice_url, chain).await?
+                load_liquorice_token_store(&config, liquorice_url, chain).await?
             } else {
-                new_token_store(HashMap::new(), &tycho_url, &config)
+                new_local_token_store(HashMap::new(), &config)
             };
     } else {
-        bebop_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
-        hashflow_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
-        liquorice_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
+        bebop_tokens = new_local_token_store(HashMap::new(), &config);
+        hashflow_tokens = new_local_token_store(HashMap::new(), &config);
+        liquorice_tokens = new_local_token_store(HashMap::new(), &config);
     }
 
     let stream_resources = create_stream_resources(Arc::clone(&tokens));
@@ -189,24 +187,15 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
     });
 }
 
-async fn load_token_store(config: &AppConfig, tycho_url: &str) -> anyhow::Result<Arc<TokenStore>> {
+fn load_token_store(config: &AppConfig) -> anyhow::Result<Arc<TokenStore>> {
     let chain = config.chain_profile.chain;
-    let all_tokens = load_all_tokens(
-        tycho_url,
-        false,
-        Some(&config.api_key),
-        true,
-        chain,
-        Some(10),
-        None,
-    )
-    .await?;
-    info!("Loaded {} tokens", all_tokens.len());
+    let lookup_url = derive_broadcaster_token_lookup_url(&config.tycho_broadcaster_ws_url)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    info!(%lookup_url, "Initialized broadcaster-backed token metadata mirror");
 
-    Ok(Arc::new(TokenStore::new(
-        all_tokens,
-        tycho_url.to_string(),
-        config.api_key.clone(),
+    Ok(Arc::new(TokenStore::broadcaster_backed(
+        HashMap::new(),
+        lookup_url,
         chain,
         Duration::from_millis(config.token_refresh_timeout_ms),
     )))
@@ -214,14 +203,13 @@ async fn load_token_store(config: &AppConfig, tycho_url: &str) -> anyhow::Result
 
 async fn load_bebop_token_store(
     config: &AppConfig,
-    tycho_url: &str,
     bebop_url: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
     let client = Client::new();
     let bebop_tokens = load_bebop_tokens(&client, bebop_url, chain).await?;
     info!("all bebop tokens: {:?}", bebop_tokens);
-    Ok(new_token_store(bebop_tokens, tycho_url, config))
+    Ok(new_local_token_store(bebop_tokens, config))
 }
 
 async fn load_bebop_tokens(
@@ -256,19 +244,17 @@ async fn load_bebop_tokens(
 
 fn load_hashflow_token_store(
     config: &AppConfig,
-    tycho_url: &str,
     hashflow_filename: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
     let hashflow_tokens = read_hashflow_csv(hashflow_filename, chain)
         .map_err(|error| anyhow::anyhow!("Failed to read hashflow CSV: {}", error))?;
     info!("all_hashflow_tokens: {:?}", hashflow_tokens);
-    Ok(new_token_store(hashflow_tokens, tycho_url, config))
+    Ok(new_local_token_store(hashflow_tokens, config))
 }
 
 async fn load_liquorice_token_store(
     config: &AppConfig,
-    tycho_url: &str,
     liquorice_url: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
@@ -282,7 +268,7 @@ async fn load_liquorice_token_store(
     )
     .await?;
     info!("all_liquorice_tokens: {:?}", liquorice_tokens);
-    Ok(new_token_store(liquorice_tokens, tycho_url, config))
+    Ok(new_local_token_store(liquorice_tokens, config))
 }
 
 async fn load_liquorice_tokens(
@@ -320,15 +306,9 @@ fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
     protocols.iter().any(|configured| configured == protocol)
 }
 
-fn new_token_store(
-    tokens: HashMap<Bytes, Token>,
-    tycho_url: &str,
-    config: &AppConfig,
-) -> Arc<TokenStore> {
-    Arc::new(TokenStore::new(
+fn new_local_token_store(tokens: HashMap<Bytes, Token>, config: &AppConfig) -> Arc<TokenStore> {
+    Arc::new(TokenStore::local_only(
         tokens,
-        tycho_url.to_string(),
-        config.api_key.clone(),
         config.chain_profile.chain,
         Duration::from_millis(config.token_refresh_timeout_ms),
     ))
@@ -581,14 +561,116 @@ fn spawn_rfq_stream_task(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use crate::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
     use crate::models::tokens::TokenStore;
-    use tycho_simulation::tycho_common::{models::Chain, Bytes};
+    use anyhow::{anyhow, Result};
+    use simulator_core::broadcaster::{BroadcasterTokenDto, BroadcasterTokenLookupResponse};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+    use tycho_simulation::tycho_common::{models::token::Token, models::Chain, Bytes};
 
-    use super::{build_app_state, create_stream_resources};
+    use super::{build_app_state, create_stream_resources, load_token_store};
+
+    struct TokenAuthority {
+        ws_url: String,
+        broadcaster_hits: Arc<AtomicUsize>,
+        tycho_hits: Arc<AtomicUsize>,
+        task: JoinHandle<Result<()>>,
+    }
+
+    impl Drop for TokenAuthority {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl TokenAuthority {
+        async fn spawn(tokens: Vec<Token>) -> Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let ws_url = format!("ws://{}/ws", listener.local_addr()?);
+            let broadcaster_hits = Arc::new(AtomicUsize::new(0));
+            let tycho_hits = Arc::new(AtomicUsize::new(0));
+            let tokens = Arc::new(tokens);
+            let broadcaster_hits_for_task = Arc::clone(&broadcaster_hits);
+            let tycho_hits_for_task = Arc::clone(&tycho_hits);
+            let task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    let tokens = Arc::clone(&tokens);
+                    let broadcaster_hits = Arc::clone(&broadcaster_hits_for_task);
+                    let tycho_hits = Arc::clone(&tycho_hits_for_task);
+                    tokio::spawn(async move {
+                        let _ = handle_token_authority_request(
+                            stream,
+                            tokens,
+                            broadcaster_hits,
+                            tycho_hits,
+                        )
+                        .await;
+                    });
+                }
+            });
+
+            Ok(Self {
+                ws_url,
+                broadcaster_hits,
+                tycho_hits,
+                task,
+            })
+        }
+    }
+
+    async fn handle_token_authority_request(
+        mut stream: TcpStream,
+        tokens: Arc<Vec<Token>>,
+        broadcaster_hits: Arc<AtomicUsize>,
+        tycho_hits: Arc<AtomicUsize>,
+    ) -> Result<()> {
+        let mut buffer = vec![0_u8; 4096];
+        let read = stream.read(&mut buffer).await?;
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or_else(|| anyhow!("token authority request line missing path"))?;
+
+        let (status, body) = match path {
+            "/tokens/lookup" => {
+                broadcaster_hits.fetch_add(1, Ordering::SeqCst);
+                let response = BroadcasterTokenLookupResponse {
+                    tokens: tokens
+                        .iter()
+                        .cloned()
+                        .map(BroadcasterTokenDto::from)
+                        .collect(),
+                    missing: Vec::new(),
+                };
+                ("200 OK", serde_json::to_vec(&response)?)
+            }
+            "/v1/tokens" => {
+                tycho_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    "500 Internal Server Error",
+                    b"tycho fetch forbidden".to_vec(),
+                )
+            }
+            _ => ("404 Not Found", b"not found".to_vec()),
+        };
+
+        let headers = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(&body).await?;
+        Ok(())
+    }
 
     fn build_test_config(
         chain_profile: ChainProfile,
@@ -655,6 +737,10 @@ mod tests {
         ))
     }
 
+    fn test_token(address: &Bytes, chain: Chain) -> Token {
+        Token::new(address, "LOOKUP", 18, 0, &[], chain, 100)
+    }
+
     fn base_chain_profile() -> ChainProfile {
         ChainProfile {
             chain: Chain::Base,
@@ -689,6 +775,36 @@ mod tests {
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn load_token_store_uses_broadcaster_lookup_url() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority =
+            TokenAuthority::spawn(vec![test_token(&token_address, Chain::Ethereum)]).await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_url = authority
+            .ws_url
+            .replace("ws://", "http://")
+            .trim_end_matches("/ws")
+            .to_string();
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+
+        let store = load_token_store(&config)?;
+        let resolved = store.ensure(&token_address).await?;
+
+        assert!(resolved.is_some());
+        assert_eq!(
+            authority.broadcaster_hits.load(Ordering::SeqCst),
+            1,
+            "production simulator token store should use broadcaster lookup"
+        );
+        assert_eq!(
+            authority.tycho_hits.load(Ordering::SeqCst),
+            0,
+            "production simulator token store must not fetch token metadata from Tycho"
+        );
+        Ok(())
     }
 
     #[test]

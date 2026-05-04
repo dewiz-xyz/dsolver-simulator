@@ -10,6 +10,7 @@ mod logging;
 mod manifest;
 mod memory;
 use crate::models::erc4626::Erc4626PairPolicy;
+use crate::models::tokens::derive_broadcaster_token_lookup_url;
 pub use logging::init_logging;
 pub(crate) use manifest::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
 pub use memory::MemoryConfig;
@@ -81,10 +82,13 @@ pub fn load_config() -> AppConfig {
     let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
         load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
+    let tycho_broadcaster_ws_url = require_trimmed_env("TYCHO_BROADCASTER_WS_URL");
+    require_broadcaster_token_lookup_url(&tycho_broadcaster_ws_url);
+
     AppConfig {
         chain_profile,
         tycho_url: resolved_chain.tycho_url,
-        tycho_broadcaster_ws_url: require_trimmed_env("TYCHO_BROADCASTER_WS_URL"),
+        tycho_broadcaster_ws_url,
         bebop_url: resolved_chain.bebop_url,
         hashflow_filename: resolved_chain.hashflow_filename,
         liquorice_url: resolved_chain.liquorice_url,
@@ -188,6 +192,16 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
 
 fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile) -> bool {
     enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
+}
+
+#[expect(
+    clippy::panic,
+    reason = "startup config remains fail-fast on invalid broadcaster URL"
+)]
+fn require_broadcaster_token_lookup_url(ws_url: &str) {
+    if let Err(error) = derive_broadcaster_token_lookup_url(ws_url) {
+        panic!("{error}");
+    }
 }
 
 fn load_rfq_credentials(
@@ -1240,5 +1254,12 @@ route_policy = " default "
         let message = load_config_panic_message(Some("   "));
 
         assert!(message.contains("TYCHO_BROADCASTER_WS_URL must not be empty"));
+    }
+
+    #[test]
+    fn load_config_fails_fast_when_tycho_broadcaster_ws_url_does_not_end_with_ws() {
+        let message = load_config_panic_message(Some("ws://127.0.0.1:3001/not-ws"));
+
+        assert!(message.contains("TYCHO_BROADCASTER_WS_URL must end with /ws"));
     }
 }
