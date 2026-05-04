@@ -8,7 +8,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
-use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -25,6 +24,8 @@ use crate::models::messages::{
 };
 use crate::models::state::AppState;
 use crate::models::tokens::TokenStoreError;
+
+use super::blocking_simulation_executor::{BlockingSimulationError, BlockingSimulationExecutor};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
@@ -1954,53 +1955,54 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
     } = input;
     let failure_descriptor = descriptor.clone();
     let blocking_cancel_token = cancel_token.clone();
-    let sleep_duration = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or(Duration::from_millis(0));
-    let handle = spawn_blocking(move || {
-        let _permit = permit;
-        BlockingPoolRunner {
-            descriptor,
-            pool_state,
-            token_in,
-            token_out,
-            amounts,
-            slippage,
-            expected_len,
-            deadline,
-            cancel_token: blocking_cancel_token,
-        }
-        .run()
-    });
-    tokio::pin!(handle);
-
-    tokio::select! {
-        res = handle.as_mut() => {
-            match res {
-                Ok(result) => Ok(result),
-                Err(join_err) => {
-                    let context = failure_context(&failure_descriptor);
-                    let descriptor = format_pool_descriptor(&context);
-                    let message = format!("{}: Quote computation panicked: {}", descriptor, join_err);
-                    Err(make_failure(QuoteFailureKind::Internal, message, Some(context)))
-                }
+    let result = BlockingSimulationExecutor::new()
+        .run_until(deadline, cancel_token, permit, move || {
+            BlockingPoolRunner {
+                descriptor,
+                pool_state,
+                token_in,
+                token_out,
+                amounts,
+                slippage,
+                expected_len,
+                deadline,
+                cancel_token: blocking_cancel_token,
             }
+            .run()
+        })
+        .await;
+
+    match result {
+        Ok(result) => Ok(result),
+        Err(BlockingSimulationError::Join(join_err)) => {
+            let context = failure_context(&failure_descriptor);
+            let descriptor = format_pool_descriptor(&context);
+            let message = format!("{}: Quote computation panicked: {}", descriptor, join_err);
+            Err(make_failure(
+                QuoteFailureKind::Internal,
+                message,
+                Some(context),
+            ))
         }
-        _ = cancel_token.cancelled() => {
-            cancel_token.cancel();
-            handle.as_mut().abort();
+        Err(BlockingSimulationError::Cancelled) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation cancelled", descriptor);
-            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+            Err(make_failure(
+                QuoteFailureKind::Timeout,
+                message,
+                Some(context),
+            ))
         }
-        _ = sleep(sleep_duration) => {
-            cancel_token.cancel();
-            handle.as_mut().abort();
+        Err(BlockingSimulationError::TimedOut) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
             let message = format!("{}: Quote computation timed out", descriptor);
-            Err(make_failure(QuoteFailureKind::Timeout, message, Some(context)))
+            Err(make_failure(
+                QuoteFailureKind::Timeout,
+                message,
+                Some(context),
+            ))
         }
     }
 }
@@ -3702,6 +3704,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_amounts_out_preserves_request_amount_order() {
+        let fixture = BasicQuoteFixture::new();
+        let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig::default(),
+        );
+
+        let computation = get_amounts_out(
+            app_state,
+            fixture.request("req-preserve-amount-order", &["30", "10", "20"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(
+            computation.responses[0].amounts_out,
+            vec!["30".to_string(), "10".to_string(), "20".to_string()]
+        );
+        assert_eq!(
+            computation.responses[0].gas_used,
+            vec![21_000, 21_000, 21_000]
+        );
+        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::Complete
+        );
+        assert!(computation.meta.failures.is_empty());
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
     async fn get_amounts_out_native_only_ignores_vm_rebuild_permits() {
         let fixture = BasicQuoteFixture::new();
         let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
@@ -4778,6 +4817,38 @@ mod tests {
         let computation = get_amounts_out(app_state, request, None).await;
         assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert!(computation.meta.vm_unavailable);
+    }
+
+    #[tokio::test]
+    async fn vm_and_rfq_unavailable_are_true_when_enabled_backends_are_not_ready() {
+        let fixture = BasicQuoteFixture::new();
+        prime_ready_native_store(&fixture.native_state_store).await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                enable_rfq_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+
+        let computation = get_amounts_out(
+            app_state,
+            fixture.request("req-enabled-backends-not-ready", &["1"]),
+            None,
+        )
+        .await;
+
+        assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
+        assert!(computation.meta.vm_unavailable);
+        assert!(computation.meta.rfq_unavailable);
+        assert!(computation.metrics.skipped_vm_unavailable);
+        assert!(computation.metrics.skipped_rfq_unavailable);
+        assert_eq!(computation.metrics.scheduled_vm_pools, 0);
+        assert_eq!(computation.metrics.scheduled_rfq_pools, 0);
     }
 
     #[tokio::test]

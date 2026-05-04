@@ -1,5 +1,6 @@
 pub mod broadcaster;
 
+use axum::extract::FromRef;
 use axum::{
     error_handling::HandleErrorLayer,
     http::StatusCode,
@@ -14,6 +15,8 @@ use tower::{
 };
 use tracing::warn;
 
+use runtime::{services::QuoteService, simulator_service::SimulatorRuntime};
+
 use crate::handlers::{encode::encode, quote::simulate, readiness::status};
 use crate::metrics::{
     emit_simulate_completion, emit_simulate_result_quality, emit_simulate_timeout, TimeoutKind,
@@ -22,12 +25,35 @@ use crate::models::factories::{encode_router_timeout_result, router_timeout_resu
 use crate::models::messages::{QuoteResultQuality, QuoteStatus};
 use crate::models::state::AppState;
 
-pub fn create_router(app_state: AppState) -> Router {
-    let request_timeout = app_state.request_timeout();
+#[derive(Clone)]
+struct SimulatorRouterState {
+    runtime: SimulatorRuntime,
+}
+
+impl SimulatorRouterState {
+    fn new(runtime: SimulatorRuntime) -> Self {
+        Self { runtime }
+    }
+}
+
+impl FromRef<SimulatorRouterState> for AppState {
+    fn from_ref(state: &SimulatorRouterState) -> Self {
+        state.runtime.app_state()
+    }
+}
+
+impl FromRef<SimulatorRouterState> for QuoteService {
+    fn from_ref(state: &SimulatorRouterState) -> Self {
+        state.runtime.quote_service()
+    }
+}
+
+pub fn create_router(runtime: SimulatorRuntime) -> Router {
+    let request_timeout = runtime.request_timeout();
     let router_timeout = request_timeout + Duration::from_millis(250);
     let router_timeout_ms = router_timeout.as_millis() as u64;
 
-    Router::new()
+    Router::<SimulatorRouterState>::new()
         .route(
             "/simulate",
             post(simulate)
@@ -47,7 +73,7 @@ pub fn create_router(app_state: AppState) -> Router {
                 })),
         )
         .route("/status", get(status))
-        .with_state(app_state)
+        .with_state(SimulatorRouterState::new(runtime))
 }
 
 fn handle_timeout_error(err: BoxError, timeout_ms: u64) -> Response {

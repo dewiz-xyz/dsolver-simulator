@@ -26,6 +26,7 @@ use crate::services::broadcaster_subscription::{
     NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
 };
 use crate::services::stream_builder::{build_rfq_stream, RFQConfig, RFQTokenStores};
+use crate::services::QuoteService;
 use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
 
 struct RfqStreamDeps<'a> {
@@ -38,7 +39,35 @@ struct RfqStreamDeps<'a> {
 
 pub struct SimulatorServiceParts {
     pub config: AppConfig,
-    pub app_state: AppState,
+    pub runtime: SimulatorRuntime,
+}
+
+/// Runtime-owned simulator services exposed to the RPC shell.
+#[derive(Clone)]
+pub struct SimulatorRuntime {
+    app_state: AppState,
+    quote_service: QuoteService,
+}
+
+impl SimulatorRuntime {
+    pub fn new(app_state: AppState) -> Self {
+        Self {
+            quote_service: QuoteService::new(app_state.clone()),
+            app_state,
+        }
+    }
+
+    pub fn app_state(&self) -> AppState {
+        self.app_state.clone()
+    }
+
+    pub fn quote_service(&self) -> QuoteService {
+        self.quote_service.clone()
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.app_state.request_timeout()
+    }
 }
 
 pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> {
@@ -114,7 +143,10 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
         rfq_config,
     );
 
-    Ok(SimulatorServiceParts { config, app_state })
+    Ok(SimulatorServiceParts {
+        config,
+        runtime: SimulatorRuntime::new(app_state),
+    })
 }
 
 struct StreamResources {

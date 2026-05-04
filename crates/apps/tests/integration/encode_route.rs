@@ -20,6 +20,7 @@ use runtime::models::state::{
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
+use runtime::simulator_service::SimulatorRuntime;
 use simulator_core::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
@@ -633,7 +634,7 @@ async fn setup_app_state_and_request(
     config: EncodeFixtureConfig<'_>,
 ) -> Result<(axum::Router, RouteEncodeRequest)> {
     let (state, request) = build_app_state_and_request(config).await?;
-    Ok((create_router(state), request))
+    Ok((create_router(SimulatorRuntime::new(state)), request))
 }
 
 async fn post_encode(
@@ -732,7 +733,7 @@ async fn setup_timeout_app(
     };
 
     Ok((
-        create_router(state),
+        create_router(SimulatorRuntime::new(state)),
         build_route_encode_request(&config, pool_id, settlement, router),
         native_sim_semaphore,
     ))
@@ -915,7 +916,7 @@ async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
     let (mut state, request) = build_app_state_and_request(config).await?;
     state.readiness_stale = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
-    let app = create_router(state);
+    let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -956,7 +957,7 @@ async fn encode_route_native_only_succeeds_while_vm_rebuilding_permits_are_held(
     };
     let (state, request) = build_app_state_and_request(config).await?;
     let vm_permit = Arc::clone(&state.vm_sim_semaphore).acquire_owned().await?;
-    let app = create_router(state);
+    let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
     drop(vm_permit);
@@ -1057,7 +1058,7 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
     state.readiness_stale = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
     state.native_stream_health.record_update(42).await;
-    let app = create_router(state);
+    let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1084,7 +1085,7 @@ async fn encode_route_rejects_misclassified_vm_route_when_vm_is_stale() -> Resul
     state.readiness_stale = Duration::from_millis(1);
     tokio::time::advance(Duration::from_millis(2)).await;
     state.native_stream_health.record_update(42).await;
-    let app = create_router(state);
+    let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1523,7 +1524,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         vm_sim_concurrency: 1,
         rfq_sim_concurrency: 1,
     };
-    let app = create_router(state);
+    let app = create_router(SimulatorRuntime::new(state));
     let request = RouteEncodeRequest {
         chain_id: 1,
         token_in: token_a.to_string(),
