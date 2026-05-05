@@ -250,21 +250,12 @@ mod tests {
             enable_vm_pools,
             enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(100),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            rfq_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
             reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-            rfq_sim_concurrency: 1,
         }
     }
 

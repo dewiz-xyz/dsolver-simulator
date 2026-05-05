@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
 use tracing::{debug, info};
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
@@ -119,7 +118,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     let app_state = build_app_state(&config, Arc::clone(&tokens), &stream_resources);
     let supervisor_cfg = build_supervisor_config(&config);
 
-    log_concurrency_config(&config);
+    log_rebuild_config(&config);
     spawn_broadcaster_subscription_task(&config, &supervisor_cfg, &stream_resources, &app_state);
     let rfq_config = RFQConfig {
         bebop_user: config.bebop_user.clone(),
@@ -364,14 +363,7 @@ fn build_app_state(
     resources: &StreamResources,
 ) -> AppState {
     let chain = config.chain_profile.chain;
-    let native_sim_concurrency = config.global_native_sim_concurrency;
-    let vm_sim_concurrency = config.global_vm_sim_concurrency;
-    let rfq_sim_concurrency = config.global_rfq_sim_concurrency;
     let readiness_stale = Duration::from_secs(config.readiness_stale_secs);
-    let quote_timeout = Duration::from_millis(config.quote_timeout_ms);
-    let pool_timeout_native = Duration::from_millis(config.pool_timeout_native_ms);
-    let pool_timeout_vm = Duration::from_millis(config.pool_timeout_vm_ms);
-    let pool_timeout_rfq = Duration::from_millis(config.pool_timeout_rfq_ms);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
     let configured_vm_pools = !config.chain_profile.vm_protocols.is_empty();
     let configured_rfq_pools = !config.chain_profile.rfq_protocols.is_empty();
@@ -403,21 +395,12 @@ fn build_app_state(
         enable_vm_pools: effective_vm_enabled,
         enable_rfq_pools: effective_rfq_enabled,
         readiness_stale,
-        quote_timeout,
-        pool_timeout_native,
-        pool_timeout_vm,
-        pool_timeout_rfq,
         request_timeout,
-        native_sim_semaphore: Arc::new(Semaphore::new(native_sim_concurrency)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(vm_sim_concurrency)),
-        rfq_sim_semaphore: Arc::new(Semaphore::new(rfq_sim_concurrency)),
+        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: config.slippage,
         erc4626_deposits_enabled: config.rpc_url.is_some(),
         erc4626_pair_policies: Arc::clone(&config.erc4626_pair_policies),
         reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
-        native_sim_concurrency,
-        vm_sim_concurrency,
-        rfq_sim_concurrency,
     }
 }
 
@@ -444,20 +427,17 @@ fn build_supervisor_config(config: &AppConfig) -> StreamSupervisorConfig {
         memory: config.memory,
     }
 }
-fn log_concurrency_config(config: &AppConfig) {
+fn log_rebuild_config(config: &AppConfig) {
     let effective_vm_enabled =
         config.enable_vm_pools && !config.chain_profile.vm_protocols.is_empty();
     let effective_rfq_enabled =
         config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(
-        native_sim_concurrency = config.global_native_sim_concurrency,
-        vm_sim_concurrency = config.global_vm_sim_concurrency,
         enable_vm_pools = effective_vm_enabled,
         requested_vm_pools = config.enable_vm_pools,
-        rfq_sim_concurrency = config.global_rfq_sim_concurrency,
         enable_rfq_pools = effective_rfq_enabled,
         requested_rfq_pools = config.enable_rfq_pools,
-        "Initialized simulation concurrency limits"
+        "Initialized backend rebuild gate"
     );
 }
 
@@ -504,8 +484,7 @@ fn spawn_vm_broadcaster_subscription_task(
         state_store: Arc::clone(&resources.vm_state_store),
         stream_health: Arc::clone(&resources.vm_stream_health),
         vm_stream: Arc::clone(&resources.vm_stream),
-        vm_sim_semaphore: app_state.vm_sim_semaphore(),
-        vm_sim_concurrency: vm_sim_concurrency_u32(app_state.vm_sim_concurrency),
+        simulation_rebuild_gate: app_state.simulation_rebuild_gate(),
     });
     spawn_backend_broadcaster_subscription_task(
         "vm",
@@ -561,11 +540,9 @@ fn spawn_rfq_stream_task(
     let state_store_bg = Arc::clone(&deps.resources.rfq_state_store);
     let health_bg = Arc::clone(&deps.resources.rfq_stream_health);
     let rfq_stream_bg = Arc::clone(&deps.resources.rfq_stream);
-    let rfq_semaphore_bg = deps.app_state.rfq_sim_semaphore();
+    let simulation_rebuild_gate = deps.app_state.simulation_rebuild_gate();
     let tvl_threshold = config.tvl_threshold;
     let rfq_protocols = config.chain_profile.rfq_protocols.clone();
-    let rfq_sim_concurrency = rfq_sim_concurrency_u32(config.global_rfq_sim_concurrency);
-
     tokio::spawn(async move {
         info!("Starting RFQ protocol stream supervisor...");
         supervise_rfq_stream(
@@ -592,35 +569,12 @@ fn spawn_rfq_stream_task(
             rfq_supervisor_cfg,
             RfqStreamControls {
                 rfq_stream: rfq_stream_bg,
-                rfq_sim_semaphore: rfq_semaphore_bg,
-                rfq_sim_concurrency,
+                simulation_rebuild_gate,
             },
         )
         .await;
     });
     debug!("RFQ stream supervisor task spawned");
-}
-
-#[expect(
-    clippy::panic,
-    reason = "invalid startup concurrency is a hard configuration invariant"
-)]
-fn vm_sim_concurrency_u32(value: usize) -> u32 {
-    match u32::try_from(value) {
-        Ok(concurrency) => concurrency,
-        Err(_) => panic!("VM simulation concurrency exceeds u32 range"),
-    }
-}
-
-#[expect(
-    clippy::panic,
-    reason = "invalid startup concurrency is a hard configuration invariant"
-)]
-fn rfq_sim_concurrency_u32(value: usize) -> u32 {
-    match u32::try_from(value) {
-        Ok(concurrency) => concurrency,
-        Err(_) => panic!("RFQ simulation concurrency exceeds u32 range"),
-    }
 }
 
 #[cfg(test)]
@@ -658,17 +612,10 @@ mod tests {
             tvl_keep_threshold: 20.0,
             port: 3000,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            quote_timeout_ms: 150,
-            pool_timeout_native_ms: 20,
-            pool_timeout_vm_ms: 150,
-            pool_timeout_rfq_ms: 150,
-            request_timeout_ms: 4_000,
+            request_timeout_ms: 4_500,
             token_refresh_timeout_ms: 1_000,
             enable_vm_pools,
             enable_rfq_pools,
-            global_native_sim_concurrency: 8,
-            global_vm_sim_concurrency: 4,
-            global_rfq_sim_concurrency: 4,
             reset_allowance_tokens,
             erc4626_pair_policies,
             stream_stale_secs: 120,

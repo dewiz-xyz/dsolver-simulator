@@ -121,7 +121,7 @@ In this example, the smallest requested amount failed for that pool, so `amounts
 ### Interpreting `meta.failures` and `meta.pool_results`
 
 - `meta.failures` is the request-level explanation layer. It includes timeouts, token coverage failures, no-pools reasons, and other failures that matter to the overall request outcome.
-- `meta.pool_results` is the per-pool anomaly layer. It includes degraded pool-local outcomes such as `partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `timed_out`, `simulator_error`, and `internal_error`.
+- `meta.pool_results` is the per-pool anomaly layer. It includes degraded pool-local outcomes such as `partial_output`, `zero_output`, `timed_out`, `simulator_error`, and `internal_error`.
 - A partial ready response can include both usable data in `data[]` and request-visible issues in `meta.failures` or `meta.pool_results`.
 
 ### Timeout behavior

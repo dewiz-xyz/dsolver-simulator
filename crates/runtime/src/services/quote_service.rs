@@ -213,13 +213,6 @@ macro_rules! log_completion_event {
                 simulation_runs = $simulation_runs,
                 skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
                 skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
-                skipped_native_concurrency =
-                    $event.computation.metrics.skipped_native_concurrency,
-                skipped_vm_concurrency = $event.computation.metrics.skipped_vm_concurrency,
-                skipped_rfq_concurrency = $event.computation.metrics.skipped_rfq_concurrency,
-                skipped_native_deadline = $event.computation.metrics.skipped_native_deadline,
-                skipped_vm_deadline = $event.computation.metrics.skipped_vm_deadline,
-                skipped_rfq_deadline = $event.computation.metrics.skipped_rfq_deadline,
                 vm_completed_pools = $event.computation.metrics.vm_completed_pools,
                 rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
                 vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
@@ -274,13 +267,6 @@ macro_rules! log_completion_event {
                 simulation_runs = $simulation_runs,
                 skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
                 skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
-                skipped_native_concurrency =
-                    $event.computation.metrics.skipped_native_concurrency,
-                skipped_vm_concurrency = $event.computation.metrics.skipped_vm_concurrency,
-                skipped_rfq_concurrency = $event.computation.metrics.skipped_rfq_concurrency,
-                skipped_native_deadline = $event.computation.metrics.skipped_native_deadline,
-                skipped_vm_deadline = $event.computation.metrics.skipped_vm_deadline,
-                skipped_rfq_deadline = $event.computation.metrics.skipped_rfq_deadline,
                 vm_completed_pools = $event.computation.metrics.vm_completed_pools,
                 rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
                 vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
@@ -508,8 +494,6 @@ fn pool_outcome_kind_label(kind: PoolOutcomeKind) -> &'static str {
     match kind {
         PoolOutcomeKind::PartialOutput => "partial_output",
         PoolOutcomeKind::ZeroOutput => "zero_output",
-        PoolOutcomeKind::SkippedConcurrency => "skipped_concurrency",
-        PoolOutcomeKind::SkippedDeadline => "skipped_deadline",
         PoolOutcomeKind::TimedOut => "timed_out",
         PoolOutcomeKind::SimulatorError => "simulator_error",
         PoolOutcomeKind::InternalError => "internal_error",
@@ -565,7 +549,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::{RwLock, Semaphore};
+    use tokio::sync::RwLock;
     use tycho_simulation::tycho_common::models::Chain;
 
     use crate::config::SlippageConfig;
@@ -634,21 +618,12 @@ mod tests {
             enable_vm_pools: false,
             enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_secs(1),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout,
-            native_sim_semaphore: Arc::new(Semaphore::new(1)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-            rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+            simulation_rebuild_gate: Arc::new(RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
             reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: 1,
-            vm_sim_concurrency: 1,
-            rfq_sim_concurrency: 1,
         }
     }
 
@@ -741,10 +716,10 @@ mod tests {
                 pool_name: "pool one".to_string(),
                 pool_address: "0x1".to_string(),
                 protocol: "vm:curve".to_string(),
-                outcome: PoolOutcomeKind::SkippedDeadline,
+                outcome: PoolOutcomeKind::TimedOut,
                 reported_steps: 0,
                 expected_steps: 2,
-                reason: Some("deadline reached".to_string()),
+                reason: Some("timed out".to_string()),
             },
             PoolSimulationOutcome {
                 pool: "pool-2".to_string(),
@@ -763,7 +738,7 @@ mod tests {
             summary.kind_counts,
             vec![
                 ("partial_output".to_string(), 1),
-                ("skipped_deadline".to_string(), 1),
+                ("timed_out".to_string(), 1),
             ]
         );
         assert_eq!(

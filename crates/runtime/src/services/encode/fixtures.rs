@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::NaiveDateTime;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::RwLock;
 use tycho_simulation::protocol::models::ProtocolComponent;
 use tycho_simulation::tycho_common::models::token::Token;
 use tycho_simulation::tycho_common::models::Chain;
@@ -131,10 +131,6 @@ pub(super) struct TestAppStateConfig {
     pub(super) enable_vm_pools: bool,
     pub(super) enable_rfq_pools: bool,
     pub(super) erc4626_deposits_enabled: bool,
-    pub(super) quote_timeout: Duration,
-    pub(super) pool_timeout_native: Duration,
-    pub(super) pool_timeout_vm: Duration,
-    pub(super) pool_timeout_rfq: Duration,
     pub(super) request_timeout: Duration,
 }
 
@@ -144,10 +140,6 @@ impl Default for TestAppStateConfig {
             enable_vm_pools: false,
             enable_rfq_pools: false,
             erc4626_deposits_enabled: false,
-            quote_timeout: Duration::from_millis(10),
-            pool_timeout_native: Duration::from_millis(10),
-            pool_timeout_vm: Duration::from_millis(10),
-            pool_timeout_rfq: Duration::from_millis(10),
             request_timeout: Duration::from_millis(10),
         }
     }
@@ -181,20 +173,11 @@ pub(super) fn test_app_state(
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
-        quote_timeout: config.quote_timeout,
-        pool_timeout_native: config.pool_timeout_native,
-        pool_timeout_vm: config.pool_timeout_vm,
-        pool_timeout_rfq: config.pool_timeout_rfq,
         request_timeout: config.request_timeout,
-        native_sim_semaphore: Arc::new(Semaphore::new(1)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+        simulation_rebuild_gate: Arc::new(RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
-        native_sim_concurrency: 1,
-        vm_sim_concurrency: 1,
-        rfq_sim_concurrency: 1,
     }
 }

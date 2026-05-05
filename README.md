@@ -91,7 +91,7 @@ Common optional inputs:
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds (defaults to `false`)
 - `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY` only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
 - `HOST` and `PORT` to change the bind address
-- timeout, concurrency, and stream-health knobs from `crates/runtime/src/config/mod.rs`
+- timeout and stream-health knobs from `crates/runtime/src/config/mod.rs`
 
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
@@ -152,7 +152,7 @@ Summary matrix:
 
 `meta.failures` is the request-level failure summary. It captures timeouts, cancellations, token coverage problems, no-pools reasons, and request-relevant simulation failures.
 
-`meta.pool_results` is the per-pool outcome summary. It captures pool-local outcomes such as `partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `timed_out`, `simulator_error`, and `internal_error`.
+`meta.pool_results` is the per-pool outcome summary. It captures pool-local outcomes such as `partial_output`, `zero_output`, `timed_out`, `simulator_error`, and `internal_error`.
 
 For partial results, emitted pool rows keep the original request order and request length in `amounts_out`. Requested amounts that fail are serialized in place as `"0"`, and the matching `gas_used` entries are `0`.
 

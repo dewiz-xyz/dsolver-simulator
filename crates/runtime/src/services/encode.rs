@@ -64,9 +64,25 @@ pub async fn encode_route(
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
-    let resimulated =
-        resimulate::resimulate_route(&state, &normalized, chain, &token_in, &token_out, allowlist)
-            .await?;
+    let rebuild_guard = state
+        .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
+        .await;
+    let availability = state
+        .encode_availability(uses_native, uses_vm, uses_rfq)
+        .await;
+    if let Some(message) = availability.availability_message() {
+        return Err(EncodeError::unavailable(message));
+    }
+    let resimulated = resimulate::resimulate_route(
+        &state,
+        &normalized,
+        chain,
+        &token_in,
+        &token_out,
+        allowlist,
+        rebuild_guard,
+    )
+    .await?;
     response::log_resimulation_amounts(request.request_id.as_deref(), &resimulated);
     let expected_total = response::compute_expected_total(&resimulated);
     if expected_total < min_amount_out {

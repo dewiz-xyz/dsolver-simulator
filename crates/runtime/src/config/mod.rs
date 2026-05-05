@@ -59,7 +59,6 @@ pub fn load_config() -> AppConfig {
         }
     };
     let timeouts = load_timeout_config();
-    let concurrency = load_concurrency_config();
     let stream = load_stream_config();
     let slippage = load_slippage_config();
     // Keep the rest of the runtime on the same AppConfig shape. The manifest is just the new
@@ -95,17 +94,10 @@ pub fn load_config() -> AppConfig {
         tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
         host: network.host,
-        quote_timeout_ms: timeouts.quote_timeout_ms,
-        pool_timeout_native_ms: timeouts.pool_timeout_native_ms,
-        pool_timeout_vm_ms: timeouts.pool_timeout_vm_ms,
-        pool_timeout_rfq_ms: timeouts.pool_timeout_rfq_ms,
         request_timeout_ms: timeouts.request_timeout_ms,
         token_refresh_timeout_ms: timeouts.token_refresh_timeout_ms,
         enable_vm_pools: network.enable_vm_pools,
         enable_rfq_pools: network.enable_rfq_pools,
-        global_native_sim_concurrency: concurrency.global_native_sim_concurrency,
-        global_vm_sim_concurrency: concurrency.global_vm_sim_concurrency,
-        global_rfq_sim_concurrency: concurrency.global_rfq_sim_concurrency,
         reset_allowance_tokens,
         erc4626_pair_policies,
         stream_stale_secs: stream.stream_stale_secs,
@@ -283,18 +275,8 @@ struct NetworkConfig {
 }
 
 struct TimeoutConfig {
-    quote_timeout_ms: u64,
-    pool_timeout_native_ms: u64,
-    pool_timeout_vm_ms: u64,
-    pool_timeout_rfq_ms: u64,
     request_timeout_ms: u64,
     token_refresh_timeout_ms: u64,
-}
-
-struct ConcurrencyConfig {
-    global_native_sim_concurrency: usize,
-    global_vm_sim_concurrency: usize,
-    global_rfq_sim_concurrency: usize,
 }
 
 struct StreamConfig {
@@ -373,53 +355,18 @@ fn load_network_config() -> NetworkConfig {
 }
 
 fn load_timeout_config() -> TimeoutConfig {
-    let quote_timeout_ms = parse_env_or_default("QUOTE_TIMEOUT_MS", "150");
-    let pool_timeout_native_ms = parse_env_or_default("POOL_TIMEOUT_NATIVE_MS", "20");
-    let pool_timeout_vm_ms = parse_env_or_default("POOL_TIMEOUT_VM_MS", "150");
-    let pool_timeout_rfq_ms = parse_env_or_default("POOL_TIMEOUT_RFQ_MS", "150");
-    let request_timeout_ms = parse_env_or_default("REQUEST_TIMEOUT_MS", "4000");
+    let request_timeout_ms = parse_env_or_default("REQUEST_TIMEOUT_MS", "4500");
     let token_refresh_timeout_ms = parse_env_or_default("TOKEN_REFRESH_TIMEOUT_MS", "1000");
 
-    assert!(quote_timeout_ms > 0, "QUOTE_TIMEOUT_MS must be > 0");
-    assert!(
-        pool_timeout_native_ms > 0,
-        "POOL_TIMEOUT_NATIVE_MS must be > 0"
-    );
-    assert!(pool_timeout_vm_ms > 0, "POOL_TIMEOUT_VM_MS must be > 0");
-    assert!(pool_timeout_rfq_ms > 0, "POOL_TIMEOUT_RFQ_MS must be > 0");
+    assert!(request_timeout_ms > 0, "REQUEST_TIMEOUT_MS must be > 0");
     assert!(
         token_refresh_timeout_ms > 0,
         "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
     );
 
     TimeoutConfig {
-        quote_timeout_ms,
-        pool_timeout_native_ms,
-        pool_timeout_vm_ms,
-        pool_timeout_rfq_ms,
         request_timeout_ms,
         token_refresh_timeout_ms,
-    }
-}
-
-fn load_concurrency_config() -> ConcurrencyConfig {
-    let cpu_count = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let default_native = (cpu_count.saturating_mul(4)).max(1);
-    let default_vm = cpu_count.max(1);
-    let default_rfq = cpu_count.max(1);
-
-    ConcurrencyConfig {
-        global_native_sim_concurrency: optional_parsed_env("GLOBAL_NATIVE_SIM_CONCURRENCY")
-            .unwrap_or(default_native)
-            .max(1),
-        global_vm_sim_concurrency: optional_parsed_env("GLOBAL_VM_SIM_CONCURRENCY")
-            .unwrap_or(default_vm)
-            .max(1),
-        global_rfq_sim_concurrency: optional_parsed_env("GLOBAL_RFQ_SIM_CONCURRENCY")
-            .unwrap_or(default_rfq)
-            .max(1),
     }
 }
 
@@ -559,17 +506,10 @@ pub struct AppConfig {
     pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: IpAddr,
-    pub quote_timeout_ms: u64,
-    pub pool_timeout_native_ms: u64,
-    pub pool_timeout_vm_ms: u64,
-    pub pool_timeout_rfq_ms: u64,
     pub request_timeout_ms: u64,
     pub token_refresh_timeout_ms: u64,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
-    pub global_native_sim_concurrency: usize,
-    pub global_vm_sim_concurrency: usize,
-    pub global_rfq_sim_concurrency: usize,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
     pub stream_stale_secs: u64,

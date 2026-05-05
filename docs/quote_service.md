@@ -43,7 +43,7 @@ Live enum values:
 - `QuoteStatus`: `ready`, `warming_up`, `token_missing`, `no_liquidity`, `invalid_request`, `internal_error`
 - `QuoteResultQuality`: `complete`, `partial`, `no_results`, `request_level_failure`
 - `QuotePartialKind`: `amount_ladders`, `pool_coverage`, `mixed`
-- `PoolOutcomeKind`: `partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `timed_out`, `simulator_error`, `internal_error`
+- `PoolOutcomeKind`: `partial_output`, `zero_output`, `timed_out`, `simulator_error`, `internal_error`
 
 Contract invariants:
 
@@ -69,7 +69,7 @@ Contract invariants:
 4. Token metadata is loaded for both sides. Missing or timed-out token coverage exits as `token_missing + request_level_failure`.
 5. Candidate pools are loaded from native state and, when available, VM state.
 6. Unsupported ERC4626 candidates are filtered before execution.
-7. Pool tasks are scheduled under quote deadlines and global concurrency limits.
+7. Pool tasks run until they complete or the request-level timeout guard ends the computation.
 8. Per-pool execution results are aggregated into `data`, `meta.failures`, and `meta.pool_results`.
 9. The runner classifies the final exit as `complete`, `partial`, `no_results`, or `request_level_failure`.
 
@@ -87,7 +87,7 @@ The current classification logic is:
 | --- | --- | --- | --- | --- |
 | Complete quote, all relevant requested amounts returned | `ready` | `complete` | omitted | `meta.failures` and `meta.pool_results` stay empty or omitted |
 | Usable quotes returned, but at least one returned pool has partial requested-amount coverage | `ready` | `partial` | `amount_ladders` | emitted pool rows stay full-length and zero-fill failed amount positions; only positive outputs are usable quotes; `meta.pool_results` includes `partial_output` |
-| Usable quotes returned, but some matching pools failed, timed out, or were skipped | `ready` | `partial` | `pool_coverage` | scheduling and simulator anomalies remain visible |
+| Usable quotes returned, but some matching pools failed or timed out | `ready` | `partial` | `pool_coverage` | simulator anomalies remain visible |
 | Both partial requested-amount coverage and incomplete pool coverage occurred | `ready` | `partial` | `mixed` | both partiality sources are present |
 | Matching pools exist, but none produce a usable quote because liquidity is absent or exhausted | `no_liquidity` | `no_results` | omitted | includes cases where candidate rows would otherwise be fully zero; `meta.failures` explains the no-liquidity reason |
 | No matching pools exist | `no_liquidity` | `no_results` | omitted | `meta.failures` includes `no_pools` |
@@ -130,15 +130,13 @@ Candidate discovery:
 
 Execution rules:
 
-- native and VM tasks share separate global concurrency caps
-- per-request quote execution uses a request deadline and per-pool deadlines
-- pools that cannot be scheduled before the deadline or under concurrency limits are skipped instead of queued indefinitely
+- per-request quote execution uses the request deadline
 - usable outputs are preserved even when some pools degrade
 
 Partiality sources:
 
 - `amount_ladders`: a returned pool produced at least one usable quote, but one or more requested amounts failed or timed out
-- `pool_coverage`: one or more matching pools were skipped, timed out, or failed before returning a usable quote
+- `pool_coverage`: one or more matching pools timed out or failed before returning a usable quote
 - `mixed`: both conditions happened in one response
 
 Advisory `get_limits` signals do not define success on their own. `get_amount_out` remains the source of truth for quote success or failure.
@@ -160,7 +158,6 @@ Important failure kinds include:
 - `token_validation`
 - `token_coverage`
 - `timeout`
-- `concurrency_limit`
 - `overflow`
 - `simulator`
 - `no_pools`
@@ -174,7 +171,6 @@ Use it to understand:
 
 - which pools returned partial requested-amount coverage while still yielding at least one usable quote
 - which pools returned zero output across all requested amounts and were therefore filtered out of `data[]`
-- which pools were skipped because of concurrency or deadlines
 - which pools timed out or failed inside the simulator
 
 The two layers are intentionally redundant in some degraded cases. Material request-visible failures should not be visible only through per-pool anomaly rows.

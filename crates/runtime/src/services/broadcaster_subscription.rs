@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use rand::Rng;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{timeout, Instant};
 use tokio_tungstenite::{
     connect_async,
@@ -47,8 +47,7 @@ pub struct VmBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
-    pub vm_sim_semaphore: Arc<Semaphore>,
-    pub vm_sim_concurrency: u32,
+    pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
 impl BroadcasterSubscriptionControls {
@@ -381,7 +380,6 @@ async fn handle_subscription_reset(
         .broadcaster_subscription()
         .mark_disconnected(last_error.clone())
         .await;
-    controls.state_store().reset().await;
     controls.stream_health().increment_restart().await;
     controls.stream_health().reset_bursts().await;
     controls
@@ -390,25 +388,26 @@ async fn handle_subscription_reset(
         .await;
 
     match controls {
-        BroadcasterSubscriptionControls::Native(_) => None,
+        BroadcasterSubscriptionControls::Native(_) => {
+            controls.state_store().reset().await;
+            None
+        }
         BroadcasterSubscriptionControls::Vm(vm_controls) => {
             {
                 let mut vm_stream = vm_controls.vm_stream.write().await;
                 vm_stream.last_error = last_error;
             }
-            Some(begin_or_continue_vm_rebuild(vm_controls, vm_rebuild).await)
+            let vm_rebuild = begin_or_continue_vm_rebuild(vm_controls, vm_rebuild).await;
+            controls.state_store().reset().await;
+            Some(vm_rebuild)
         }
     }
 }
 
 struct VmSubscriptionRebuildState {
-    guard: OwnedSemaphorePermit,
+    guard: OwnedRwLockWriteGuard<()>,
 }
 
-#[expect(
-    clippy::panic,
-    reason = "the VM rebuild semaphore should remain available for the process lifetime"
-)]
 async fn begin_or_continue_vm_rebuild(
     controls: &VmBroadcasterSubscriptionControls,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
@@ -426,14 +425,7 @@ async fn begin_or_continue_vm_rebuild(
         return vm_rebuild;
     }
 
-    let Ok(guard) = controls
-        .vm_sim_semaphore
-        .clone()
-        .acquire_many_owned(controls.vm_sim_concurrency)
-        .await
-    else {
-        panic!("vm semaphore closed during broadcaster rebuild");
-    };
+    let guard = controls.simulation_rebuild_gate.clone().write_owned().await;
 
     if let Err(err) = SHARED_TYCHO_DB.clear() {
         warn!(
@@ -618,7 +610,7 @@ mod tests {
         native_stream_health: Arc<StreamHealth>,
         vm_stream_health: Arc<StreamHealth>,
         vm_stream: Arc<RwLock<VmStreamStatus>>,
-        vm_sim_semaphore: Arc<tokio::sync::Semaphore>,
+        simulation_rebuild_gate: Arc<RwLock<()>>,
     }
 
     impl TestControls {
@@ -639,7 +631,7 @@ mod tests {
                 native_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-                vm_sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                simulation_rebuild_gate: Arc::new(RwLock::new(())),
             }
         }
 
@@ -657,8 +649,7 @@ mod tests {
                 state_store: Arc::clone(&self.vm_state_store),
                 stream_health: Arc::clone(&self.vm_stream_health),
                 vm_stream: Arc::clone(&self.vm_stream),
-                vm_sim_semaphore: Arc::clone(&self.vm_sim_semaphore),
-                vm_sim_concurrency: 1,
+                simulation_rebuild_gate: Arc::clone(&self.simulation_rebuild_gate),
             })
         }
     }
@@ -928,9 +919,9 @@ mod tests {
 
         bootstrap(&mut native_processor).await?;
         bootstrap(&mut vm_processor).await?;
-        let vm_permit = Arc::clone(&controls.vm_sim_semaphore)
-            .acquire_owned()
-            .await?;
+        let vm_rebuild_read_guard = Arc::clone(&controls.simulation_rebuild_gate)
+            .read_owned()
+            .await;
 
         let native_controls = controls.native();
         let reset = tokio::time::timeout(
@@ -942,7 +933,7 @@ mod tests {
             ),
         )
         .await?;
-        drop(vm_permit);
+        drop(vm_rebuild_read_guard);
 
         assert!(reset.is_none());
         let broadcaster_snapshot = controls.native_subscription.snapshot().await;

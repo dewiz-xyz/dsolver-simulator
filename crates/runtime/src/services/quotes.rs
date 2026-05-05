@@ -2,13 +2,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
-use tokio::time::sleep;
+use rayon::prelude::*;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tycho_simulation::{
@@ -22,10 +21,10 @@ use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
     QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus,
 };
-use crate::models::state::AppState;
+use crate::models::state::{AppState, SimulationRebuildGuard};
 use crate::models::tokens::TokenStoreError;
 
-use super::blocking_simulation_executor::{BlockingSimulationError, BlockingSimulationExecutor};
+use super::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 
 const VM_LOW_FIRST_GAS_THRESHOLD: u64 = 600_000;
 const VM_LOW_FIRST_GAS_SAMPLE_CAP: usize = 3;
@@ -51,12 +50,6 @@ pub struct QuoteMetrics {
     pub scheduled_rfq_pools: usize,
     pub skipped_vm_unavailable: bool,
     pub skipped_rfq_unavailable: bool,
-    pub skipped_native_concurrency: usize,
-    pub skipped_vm_concurrency: usize,
-    pub skipped_rfq_concurrency: usize,
-    pub skipped_native_deadline: usize,
-    pub skipped_vm_deadline: usize,
-    pub skipped_rfq_deadline: usize,
     pub vm_completed_pools: usize,
     pub rfq_completed_pools: usize,
     pub vm_median_first_gas: Option<u64>,
@@ -108,38 +101,8 @@ enum ScheduledPoolKind {
 }
 
 impl ScheduledPoolKind {
-    fn concurrency_exhausted_message(self) -> &'static str {
-        match self {
-            Self::Native => {
-                "Pool scheduling skipped because native concurrency permits were exhausted"
-            }
-            Self::Vm => "Pool scheduling skipped because VM concurrency permits were exhausted",
-            Self::Rfq => "Pool scheduling skipped because RFQ concurrency permits were exhausted",
-        }
-    }
-
-    fn semaphore_closed_message(self) -> &'static str {
-        match self {
-            Self::Native => "Native pool semaphore closed",
-            Self::Vm => "VM pool semaphore closed",
-            Self::Rfq => "RFQ pool semaphore closed",
-        }
-    }
-
-    fn mark_deadline_skip(self, metrics: &mut QuoteMetrics) {
-        match self {
-            Self::Native => metrics.skipped_native_deadline += 1,
-            Self::Vm => metrics.skipped_vm_deadline += 1,
-            Self::Rfq => metrics.skipped_rfq_deadline += 1,
-        }
-    }
-
-    fn mark_concurrency_skip(self, metrics: &mut QuoteMetrics) {
-        match self {
-            Self::Native => metrics.skipped_native_concurrency += 1,
-            Self::Vm => metrics.skipped_vm_concurrency += 1,
-            Self::Rfq => metrics.skipped_rfq_concurrency += 1,
-        }
+    const fn uses_rebuild_guard(self) -> bool {
+        matches!(self, Self::Vm | Self::Rfq)
     }
 
     fn mark_scheduled(self, metrics: &mut QuoteMetrics) {
@@ -156,15 +119,18 @@ struct PreparedPoolSimulation {
     pool_state: Arc<dyn ProtocolSim>,
     sim_token_in: Arc<Token>,
     sim_token_out: Arc<Token>,
-    pool_deadline: Instant,
     pool_cancel: CancellationToken,
-    permit: OwnedSemaphorePermit,
 }
 
-enum PoolScheduleOutcome {
-    Scheduled(PreparedPoolSimulation),
-    Skip,
-    Abort,
+struct PreparePoolSimulationInput<'a> {
+    kind: ScheduledPoolKind,
+    pool_state: Arc<dyn ProtocolSim>,
+    component: Arc<ProtocolComponent>,
+    descriptor: PoolDescriptor,
+    cancel_token: &'a CancellationToken,
+    token_in: &'a Token,
+    token_out: &'a Token,
+    metrics: &'a mut QuoteMetrics,
 }
 
 #[derive(Clone)]
@@ -181,32 +147,16 @@ enum LadderStressQuote {
     Missing,
 }
 
-struct PoolSchedulingContext<'a> {
-    quote_deadline: Instant,
-    pool_timeout: Duration,
-    semaphore: Arc<Semaphore>,
-    cancel_token: &'a CancellationToken,
-    token_in: &'a Token,
-    token_out: &'a Token,
-    expected_len: usize,
-    metrics: &'a mut QuoteMetrics,
-    pool_results: &'a mut Vec<PoolSimulationOutcome>,
-    failures: &'a mut Vec<QuoteFailure>,
-    meta: &'a mut QuoteMeta,
-    classification: &'a mut QuoteClassification,
-}
-
 struct SimulatePoolInput {
     descriptor: PoolDescriptor,
     pool_state: Arc<dyn ProtocolSim>,
+    rebuild_guard: Option<Arc<SimulationRebuildGuard>>,
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts: Arc<Vec<BigUint>>,
     slippage: SlippageConfig,
     expected_len: usize,
-    deadline: Instant,
     cancel_token: CancellationToken,
-    permit: OwnedSemaphorePermit,
 }
 
 struct PoolOutcomeInput {
@@ -343,8 +293,6 @@ impl QuoteClassification {
         match outcome {
             PoolOutcomeKind::PartialOutput => self.partial.note_partial_amount_coverage(),
             PoolOutcomeKind::ZeroOutput
-            | PoolOutcomeKind::SkippedConcurrency
-            | PoolOutcomeKind::SkippedDeadline
             | PoolOutcomeKind::TimedOut
             | PoolOutcomeKind::SimulatorError
             | PoolOutcomeKind::InternalError => self.partial.note_pool_coverage_gap(),
@@ -372,11 +320,11 @@ struct CandidateSets {
 }
 
 struct PreparedQuoteExecution {
+    rebuild_guard: Arc<SimulationRebuildGuard>,
     token_in: Arc<Token>,
     token_out: Arc<Token>,
     amounts_in: Arc<Vec<BigUint>>,
     expected_len: usize,
-    quote_deadline: Instant,
     native_candidates: Vec<CandidatePool>,
     vm_candidates: Vec<CandidatePool>,
     rfq_candidates: Vec<CandidatePool>,
@@ -389,7 +337,6 @@ struct QuoteRequestRunner {
     run: QuoteRunState,
     cancel: Option<CancellationToken>,
     readiness_wait: Duration,
-    quote_timeout: Duration,
 }
 
 fn pool_descriptor(id: String, component: &ProtocolComponent) -> PoolDescriptor {
@@ -401,81 +348,23 @@ fn pool_descriptor(id: String, component: &ProtocolComponent) -> PoolDescriptor 
     }
 }
 
-fn prepare_pool_simulation(
-    kind: ScheduledPoolKind,
-    pool_state: Arc<dyn ProtocolSim>,
-    component: Arc<ProtocolComponent>,
-    descriptor: PoolDescriptor,
-    context: &mut PoolSchedulingContext<'_>,
-) -> PoolScheduleOutcome {
-    let now = Instant::now();
-    let pool_deadline = (now + context.pool_timeout).min(context.quote_deadline);
-    if pool_deadline <= now {
-        kind.mark_deadline_skip(context.metrics);
-        context
-            .classification
-            .note_pool_outcome(PoolOutcomeKind::SkippedDeadline);
-        context
-            .pool_results
-            .push(make_pool_outcome(PoolOutcomeInput {
-                descriptor,
-                outcome: PoolOutcomeKind::SkippedDeadline,
-                reported_steps: 0,
-                expected_steps: context.expected_len,
-                reason: Some(
-                    "Pool scheduling skipped because request deadline was reached".to_string(),
-                ),
-            }));
-        return PoolScheduleOutcome::Skip;
-    }
-
-    let permit = match Arc::clone(&context.semaphore).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(TryAcquireError::NoPermits) => {
-            kind.mark_concurrency_skip(context.metrics);
-            context
-                .classification
-                .note_pool_outcome(PoolOutcomeKind::SkippedConcurrency);
-            context
-                .pool_results
-                .push(make_pool_outcome(PoolOutcomeInput {
-                    descriptor,
-                    outcome: PoolOutcomeKind::SkippedConcurrency,
-                    reported_steps: 0,
-                    expected_steps: context.expected_len,
-                    reason: Some(kind.concurrency_exhausted_message().to_string()),
-                }));
-            return PoolScheduleOutcome::Skip;
-        }
-        Err(TryAcquireError::Closed) => {
-            context.failures.push(make_failure(
-                QuoteFailureKind::Internal,
-                kind.semaphore_closed_message().to_string(),
-                None,
-            ));
-            context.meta.status = QuoteStatus::InternalError;
-            return PoolScheduleOutcome::Abort;
-        }
-    };
-
-    kind.mark_scheduled(context.metrics);
+fn prepare_pool_simulation(input: PreparePoolSimulationInput<'_>) -> PreparedPoolSimulation {
+    input.kind.mark_scheduled(input.metrics);
     let (sim_token_in, sim_token_out) = simulation_tokens_for_pool_with_remap_log(
-        context.token_in,
-        context.token_out,
-        component.as_ref(),
-        descriptor.id.as_str(),
-        descriptor.protocol.as_str(),
+        input.token_in,
+        input.token_out,
+        input.component.as_ref(),
+        input.descriptor.id.as_str(),
+        input.descriptor.protocol.as_str(),
     );
 
-    PoolScheduleOutcome::Scheduled(PreparedPoolSimulation {
-        descriptor,
-        pool_state,
+    PreparedPoolSimulation {
+        descriptor: input.descriptor,
+        pool_state: Arc::from(input.pool_state.as_ref().clone_box()),
         sim_token_in,
         sim_token_out,
-        pool_deadline,
-        pool_cancel: context.cancel_token.child_token(),
-        permit,
-    })
+        pool_cancel: input.cancel_token.child_token(),
+    }
 }
 
 pub async fn get_amounts_out(
@@ -499,7 +388,6 @@ impl QuoteRequestRunner {
         let current_vm_block = state.current_vm_block().await;
         let current_rfq_block = state.current_rfq_block().await;
         let total_pools = state.total_pools().await;
-        let quote_timeout = state.quote_timeout();
         let meta = QuoteMeta {
             status: QuoteStatus::Ready,
             result_quality: QuoteResultQuality::RequestLevelFailure,
@@ -529,7 +417,6 @@ impl QuoteRequestRunner {
             },
             cancel,
             readiness_wait: Duration::from_secs(2),
-            quote_timeout,
         }
     }
 
@@ -707,11 +594,15 @@ impl QuoteRequestRunner {
                 QuoteResultQuality::RequestLevelFailure,
             ));
         }
+        self.refresh_meta_snapshot().await;
+        Ok(())
+    }
+
+    async fn refresh_meta_snapshot(&mut self) {
         self.run.meta.block_number = self.state.current_block().await;
         self.run.meta.vm_block_number = self.state.current_vm_block().await;
         self.run.meta.rfq_block_number = self.state.current_rfq_block().await;
         self.run.meta.total_pools = Some(self.state.total_pools().await);
-        Ok(())
     }
 
     async fn load_tokens(&mut self, pair: &RequestPair) -> Result<(Token, Token), RequestExit> {
@@ -823,9 +714,23 @@ impl QuoteRequestRunner {
             token_out_ref.symbol,
             pair.token_out_address
         );
-        let quote_deadline = Instant::now() + self.quote_timeout;
         let expected_len = amounts_in.len();
-        let mut candidates = self.load_candidate_sets(pair).await;
+        let initial_vm_ready = self.state.vm_ready().await;
+        let initial_rfq_ready = self.state.rfq_ready().await;
+        let rebuild_guard = self
+            .state
+            .acquire_simulation_rebuild_guard(initial_vm_ready, initial_rfq_ready)
+            .await;
+        let vm_ready = initial_vm_ready && self.state.vm_ready().await;
+        let rfq_ready = initial_rfq_ready && self.state.rfq_ready().await;
+        if self.state.enable_vm_pools && !vm_ready {
+            self.run.metrics.skipped_vm_unavailable = true;
+        }
+        if self.state.enable_rfq_pools && !rfq_ready {
+            self.run.metrics.skipped_rfq_unavailable = true;
+        }
+        self.refresh_meta_snapshot().await;
+        let mut candidates = self.load_candidate_sets(pair, vm_ready, rfq_ready).await;
         candidates.rfq_candidates = filter_directional_rfq_candidates(
             candidates.rfq_candidates,
             &token_in_ref,
@@ -844,10 +749,10 @@ impl QuoteRequestRunner {
             token_out: Arc::new(token_out_ref),
             amounts_in,
             expected_len,
-            quote_deadline,
             native_candidates: candidates.native_candidates,
             vm_candidates: candidates.vm_candidates,
             rfq_candidates: candidates.rfq_candidates,
+            rebuild_guard,
             cancel_token: self
                 .cancel
                 .as_ref()
@@ -856,7 +761,12 @@ impl QuoteRequestRunner {
         })
     }
 
-    async fn load_candidate_sets(&mut self, pair: &RequestPair) -> CandidateSets {
+    async fn load_candidate_sets(
+        &mut self,
+        pair: &RequestPair,
+        vm_ready: bool,
+        rfq_ready: bool,
+    ) -> CandidateSets {
         let native_candidates = self
             .state
             .native_state_store
@@ -872,10 +782,6 @@ impl QuoteRequestRunner {
             self.state.erc4626_deposits_enabled,
             &self.state.erc4626_pair_policies,
         );
-        let vm_ready = self.state.vm_ready().await;
-        if self.state.enable_vm_pools && !vm_ready {
-            self.run.metrics.skipped_vm_unavailable = true;
-        }
         let vm_candidates = if vm_ready {
             self.state
                 .vm_state_store
@@ -887,10 +793,6 @@ impl QuoteRequestRunner {
         } else {
             Vec::new()
         };
-        let rfq_ready = self.state.rfq_ready().await;
-        if self.state.enable_rfq_pools && !rfq_ready {
-            self.run.metrics.skipped_rfq_unavailable = true;
-        }
         let rfq_candidates = if rfq_ready {
             self.state
                 .rfq_state_store
@@ -969,7 +871,6 @@ impl QuoteRequestRunner {
         drop(tasks);
         finalize_vm_first_gas_metrics(&mut self.run.metrics, &mut vm_first_gases);
         finalize_rfq_first_gas_metrics(&mut self.run.metrics, &mut rfq_first_gases);
-        self.apply_scheduling_failures();
         self.apply_empty_response_state();
     }
 
@@ -978,37 +879,12 @@ impl QuoteRequestRunner {
         prepared: &PreparedQuoteExecution,
     ) -> FuturesUnordered<PoolTask> {
         let mut tasks = FuturesUnordered::new();
-        let native_semaphore = self.state.native_sim_semaphore();
-        let vm_semaphore = self.state.vm_sim_semaphore();
-        let rfq_semaphore = self.state.rfq_sim_semaphore();
-        for (kind, candidates, pool_timeout, semaphore) in [
-            (
-                ScheduledPoolKind::Native,
-                &prepared.native_candidates,
-                self.state.pool_timeout_native(),
-                native_semaphore,
-            ),
-            (
-                ScheduledPoolKind::Vm,
-                &prepared.vm_candidates,
-                self.state.pool_timeout_vm(),
-                vm_semaphore,
-            ),
-            (
-                ScheduledPoolKind::Rfq,
-                &prepared.rfq_candidates,
-                self.state.pool_timeout_rfq(),
-                rfq_semaphore,
-            ),
+        for (kind, candidates) in [
+            (ScheduledPoolKind::Native, &prepared.native_candidates),
+            (ScheduledPoolKind::Vm, &prepared.vm_candidates),
+            (ScheduledPoolKind::Rfq, &prepared.rfq_candidates),
         ] {
-            self.schedule_pool_group(
-                kind,
-                candidates,
-                pool_timeout,
-                semaphore,
-                prepared,
-                &mut tasks,
-            );
+            self.schedule_pool_group(kind, candidates, prepared, &mut tasks);
         }
         tasks
     }
@@ -1017,8 +893,6 @@ impl QuoteRequestRunner {
         &mut self,
         kind: ScheduledPoolKind,
         candidates: &[CandidatePool],
-        pool_timeout: Duration,
-        semaphore: Arc<Semaphore>,
         prepared: &PreparedQuoteExecution,
         tasks: &mut FuturesUnordered<PoolTask>,
     ) {
@@ -1027,42 +901,28 @@ impl QuoteRequestRunner {
                 break;
             }
             let descriptor = pool_descriptor(id.clone(), component.as_ref());
-            let mut scheduling_context = PoolSchedulingContext {
-                quote_deadline: prepared.quote_deadline,
-                pool_timeout,
-                semaphore: Arc::clone(&semaphore),
+            let scheduled = prepare_pool_simulation(PreparePoolSimulationInput {
+                kind,
+                pool_state: Arc::clone(pool_state),
+                component: Arc::clone(component),
+                descriptor,
                 cancel_token: &prepared.cancel_token,
                 token_in: prepared.token_in.as_ref(),
                 token_out: prepared.token_out.as_ref(),
-                expected_len: prepared.expected_len,
                 metrics: &mut self.run.metrics,
-                pool_results: &mut self.run.pool_results,
-                failures: &mut self.run.failures,
-                meta: &mut self.run.meta,
-                classification: &mut self.run.classification,
-            };
-            let scheduled = match prepare_pool_simulation(
-                kind,
-                Arc::clone(pool_state),
-                Arc::clone(component),
-                descriptor,
-                &mut scheduling_context,
-            ) {
-                PoolScheduleOutcome::Scheduled(scheduled) => scheduled,
-                PoolScheduleOutcome::Skip => continue,
-                PoolScheduleOutcome::Abort => break,
-            };
+            });
             tasks.push(Box::pin(simulate_pool(SimulatePoolInput {
                 descriptor: scheduled.descriptor,
                 pool_state: scheduled.pool_state,
+                rebuild_guard: kind
+                    .uses_rebuild_guard()
+                    .then(|| Arc::clone(&prepared.rebuild_guard)),
                 token_in: scheduled.sim_token_in,
                 token_out: scheduled.sim_token_out,
                 amounts: Arc::clone(&prepared.amounts_in),
                 slippage: self.state.slippage,
                 expected_len: prepared.expected_len,
-                deadline: scheduled.pool_deadline,
                 cancel_token: scheduled.pool_cancel,
-                permit: scheduled.permit,
             })));
         }
     }
@@ -1074,27 +934,8 @@ impl QuoteRequestRunner {
         vm_first_gases: &mut Vec<u64>,
         rfq_first_gases: &mut Vec<u64>,
     ) {
-        let remaining = prepared
-            .quote_deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::from_millis(0));
-        let quote_timeout_sleep = sleep(remaining);
-        tokio::pin!(quote_timeout_sleep);
         while !tasks.is_empty() {
             tokio::select! {
-                _ = &mut quote_timeout_sleep => {
-                    prepared.cancel_token.cancel();
-                    self.run.classification.mark_request_degradation();
-                    self.run
-                        .classification
-                        .note_pool_outcome(PoolOutcomeKind::TimedOut);
-                    self.push_failure(make_failure(
-                        QuoteFailureKind::Timeout,
-                        format!("Quote computation timed out after {}ms", self.quote_timeout.as_millis()),
-                        None,
-                    ));
-                    break;
-                }
                 _ = prepared.cancel_token.cancelled() => {
                     self.run.classification.mark_request_degradation();
                     self.run
@@ -1227,7 +1068,7 @@ impl QuoteRequestRunner {
         let descriptor = format_pool_descriptor(&context);
         let message = if had_timeout {
             format!(
-                "{}: Quote computation timed out after {} of {} requested amounts produced usable quotes",
+                "{}: Pool quote stopped after {} of {} requested amounts produced usable quotes",
                 descriptor, result.successful_steps, expected_len
             )
         } else if result.successful_steps == 0 {
@@ -1266,32 +1107,6 @@ impl QuoteRequestRunner {
             self.run.pool_results.push(pool_outcome);
         }
         self.push_failure(failure);
-    }
-
-    fn apply_scheduling_failures(&mut self) {
-        if self.run.metrics.skipped_native_concurrency == 0
-            && self.run.metrics.skipped_vm_concurrency == 0
-            && self.run.metrics.skipped_rfq_concurrency == 0
-            && self.run.metrics.skipped_native_deadline == 0
-            && self.run.metrics.skipped_vm_deadline == 0
-            && self.run.metrics.skipped_rfq_deadline == 0
-        {
-            return;
-        }
-        self.run.classification.mark_request_degradation();
-        self.push_failure(make_failure(
-            QuoteFailureKind::ConcurrencyLimit,
-            format!(
-                "Skipped pools due to scheduling limits: native_concurrency={} vm_concurrency={} rfq_concurrency={} native_deadline={} vm_deadline={} rfq_deadline={}",
-                self.run.metrics.skipped_native_concurrency,
-                self.run.metrics.skipped_vm_concurrency,
-                self.run.metrics.skipped_rfq_concurrency,
-                self.run.metrics.skipped_native_deadline,
-                self.run.metrics.skipped_vm_deadline,
-                self.run.metrics.skipped_rfq_deadline
-            ),
-            None,
-        ));
     }
 
     fn apply_empty_response_state(&mut self) {
@@ -1579,7 +1394,7 @@ struct FailureContext<'a> {
     protocol: Option<&'a str>,
 }
 
-struct BlockingPoolRunner {
+struct PoolSimulationRunner {
     descriptor: PoolDescriptor,
     pool_state: Arc<dyn ProtocolSim>,
     token_in: Arc<Token>,
@@ -1587,11 +1402,22 @@ struct BlockingPoolRunner {
     amounts: Arc<Vec<BigUint>>,
     slippage: SlippageConfig,
     expected_len: usize,
-    deadline: Instant,
     cancel_token: CancellationToken,
 }
 
-impl BlockingPoolRunner {
+struct AmountQuote {
+    amount_in: BigUint,
+    outcome: AmountQuoteOutcome,
+}
+
+enum AmountQuoteOutcome {
+    Quoted { amount_out: BigUint, gas_used: u64 },
+    Error(String),
+    MissingGas,
+    Cancelled,
+}
+
+impl PoolSimulationRunner {
     fn run(self) -> PoolSimOutcome {
         if let Some(outcome) = self.preflight_outcome() {
             return outcome;
@@ -1607,18 +1433,11 @@ impl BlockingPoolRunner {
                 "Pool quote cancelled before completion",
             ));
         }
-        if Instant::now() >= self.deadline {
-            return Some(self.immediate_outcome(
-                "Timed out",
-                true,
-                "Pool quote exceeded deadline before completion",
-            ));
-        }
         None
     }
 
     fn immediate_outcome(&self, error: &str, timed_out: bool, log_message: &str) -> PoolSimOutcome {
-        self.log_pool_debug("pool_timeout", log_message);
+        self.log_pool_debug("pool_simulation", log_message);
         PoolSimOutcome::Simulated(PoolQuoteResult {
             pool: self.descriptor.id.clone(),
             pool_name: self.descriptor.name.clone(),
@@ -1638,70 +1457,125 @@ impl BlockingPoolRunner {
     fn quote_amounts(&self) -> PoolSimOutcome {
         let mut run = PoolQuoteAccumulator::new(self.expected_len);
         let (limit_max_in, limit_max_out) = self.pool_limits();
-        for amount_in in self.amounts.iter() {
-            if self.record_cancellation_or_timeout(&mut run.errors, &mut run.timed_out) {
+        let quotes = self.quote_requested_amounts();
+        for quote in quotes {
+            if self.record_amount_quote(quote, limit_max_in.as_ref(), &mut run) {
                 break;
             }
-            if let Some(max_in) = limit_max_in.as_ref() {
-                if amount_in > max_in {
-                    self.log_soft_limit_context(
-                        amount_in,
-                        max_in,
-                        "Attempting quote above reported soft limit",
-                    );
-                }
-            }
+        }
+        self.finish_quote_amounts(run, limit_max_in, limit_max_out)
+    }
+
+    fn quote_requested_amounts(&self) -> Vec<AmountQuote> {
+        if self.amounts.len() <= 1 {
+            return self
+                .amounts
+                .iter()
+                .map(|amount_in| self.quote_requested_amount(amount_in))
+                .collect();
+        }
+
+        self.amounts
+            .par_iter()
+            .map(|amount_in| self.quote_requested_amount(amount_in))
+            .collect()
+    }
+
+    fn quote_requested_amount(&self, amount_in: &BigUint) -> AmountQuote {
+        if self.cancel_token.is_cancelled() {
+            return AmountQuote {
+                amount_in: amount_in.clone(),
+                outcome: AmountQuoteOutcome::Cancelled,
+            };
+        }
+
+        let outcome =
             match self
                 .pool_state
                 .get_amount_out(amount_in.clone(), &self.token_in, &self.token_out)
             {
                 Ok(result) => {
-                    let Some(gas_u64) = result.gas.to_u64() else {
-                        let message = "no gas reported".to_string();
-                        self.log_pool_error(&message);
-                        run.errors.push(message);
-                        run.amounts_out.clear();
-                        run.gas_used.clear();
-                        run.successful_steps = 0;
-                        run.first_successful_gas_used = None;
-                        break;
+                    let Some(gas_used) = result.gas.to_u64() else {
+                        return AmountQuote {
+                            amount_in: amount_in.clone(),
+                            outcome: AmountQuoteOutcome::MissingGas,
+                        };
                     };
-                    if result.amount.is_zero() {
-                        // Zero outputs mean this requested amount did not produce a usable quote,
-                        // even when the simulator returned Ok(...).
-                        run.amounts_out.push("0".to_string());
-                        run.gas_used.push(0);
-                    } else {
-                        run.amounts_out.push(result.amount.to_string());
-                        run.gas_used.push(gas_u64);
-                        run.successful_steps += 1;
-                        run.first_successful_gas_used.get_or_insert(gas_u64);
+                    AmountQuoteOutcome::Quoted {
+                        amount_out: result.amount,
+                        gas_used,
                     }
                 }
-                Err(error) => {
-                    let message = error.to_string();
-                    if let Some(max_in) = limit_max_in.as_ref() {
-                        self.log_soft_limit_failure(amount_in, max_in, &message);
-                    }
-                    self.log_pool_error(&message);
-                    run.amounts_out.push("0".to_string());
-                    run.gas_used.push(0);
-                    run.errors.push(message);
-                }
-            }
-            if Instant::now() >= self.deadline {
-                self.log_pool_debug(
-                    "pool_timeout",
-                    "Pool quote deadline reached while evaluating requested amounts",
+                Err(error) => AmountQuoteOutcome::Error(error.to_string()),
+            };
+
+        AmountQuote {
+            amount_in: amount_in.clone(),
+            outcome,
+        }
+    }
+
+    fn record_amount_quote(
+        &self,
+        quote: AmountQuote,
+        limit_max_in: Option<&BigUint>,
+        run: &mut PoolQuoteAccumulator,
+    ) -> bool {
+        if let Some(max_in) = limit_max_in {
+            if quote.amount_in > *max_in {
+                self.log_soft_limit_context(
+                    &quote.amount_in,
+                    max_in,
+                    "Attempting quote above reported soft limit",
                 );
-                if run.errors.is_empty() {
-                    run.errors.push("Timed out".to_string());
-                }
-                run.timed_out = true;
-                break;
             }
         }
-        self.finish_quote_amounts(run, limit_max_in, limit_max_out)
+
+        match quote.outcome {
+            AmountQuoteOutcome::Quoted {
+                amount_out,
+                gas_used,
+            } => {
+                if amount_out.is_zero() {
+                    // Zero outputs mean this requested amount did not produce a usable quote,
+                    // even when the simulator returned Ok(...).
+                    run.amounts_out.push("0".to_string());
+                    run.gas_used.push(0);
+                } else {
+                    run.amounts_out.push(amount_out.to_string());
+                    run.gas_used.push(gas_used);
+                    run.successful_steps += 1;
+                    run.first_successful_gas_used.get_or_insert(gas_used);
+                }
+                false
+            }
+            AmountQuoteOutcome::Error(message) => {
+                if let Some(max_in) = limit_max_in {
+                    self.log_soft_limit_failure(&quote.amount_in, max_in, &message);
+                }
+                self.log_pool_error(&message);
+                run.amounts_out.push("0".to_string());
+                run.gas_used.push(0);
+                run.errors.push(message);
+                false
+            }
+            AmountQuoteOutcome::MissingGas => {
+                let message = "no gas reported".to_string();
+                self.log_pool_error(&message);
+                run.errors.push(message);
+                run.amounts_out.clear();
+                run.gas_used.clear();
+                run.successful_steps = 0;
+                run.first_successful_gas_used = None;
+                true
+            }
+            AmountQuoteOutcome::Cancelled => {
+                self.log_pool_debug("pool_simulation", "Pool quote cancelled before completion");
+                run.errors.push("Cancelled".to_string());
+                run.timed_out = true;
+                true
+            }
+        }
     }
 
     fn pool_limits(&self) -> (Option<BigUint>, Option<BigUint>) {
@@ -1851,7 +1725,7 @@ impl BlockingPoolRunner {
     }
 
     fn compute_local_stress_quote(&self, amount_in: &BigUint) -> Option<(BigUint, BigUint)> {
-        if self.cancel_token.is_cancelled() || Instant::now() >= self.deadline {
+        if self.cancel_token.is_cancelled() {
             return None;
         }
 
@@ -1869,30 +1743,8 @@ impl BlockingPoolRunner {
         Some((stressed_amount_in, stressed_amount_out))
     }
 
-    fn record_cancellation_or_timeout(
-        &self,
-        errors: &mut Vec<String>,
-        timed_out: &mut bool,
-    ) -> bool {
-        if self.cancel_token.is_cancelled() {
-            self.log_pool_debug("pool_timeout", "Pool quote cancelled before completion");
-            errors.push("Cancelled".to_string());
-            return true;
-        }
-        if Instant::now() >= self.deadline {
-            self.log_pool_debug(
-                "pool_timeout",
-                "Pool quote exceeded deadline before completion",
-            );
-            errors.push("Timed out".to_string());
-            *timed_out = true;
-            return true;
-        }
-        false
-    }
-
     fn log_pool_error(&self, message: &str) {
-        self.log_pool_debug("pool_timeout", &format!("Pool quote error: {}", message));
+        self.log_pool_debug("pool_simulation", &format!("Pool quote error: {}", message));
     }
 
     fn log_soft_limit_context(&self, amount_in: &BigUint, max_in: &BigUint, message: &str) {
@@ -1944,20 +1796,19 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
     let SimulatePoolInput {
         descriptor,
         pool_state,
+        rebuild_guard,
         token_in,
         token_out,
         amounts,
         slippage,
         expected_len,
-        deadline,
         cancel_token,
-        permit,
     } = input;
     let failure_descriptor = descriptor.clone();
-    let blocking_cancel_token = cancel_token.clone();
-    let result = BlockingSimulationExecutor::new()
-        .run_until(deadline, cancel_token, permit, move || {
-            BlockingPoolRunner {
+    let result = SimulationExecutor::new()
+        .run(move || {
+            let _rebuild_guard = rebuild_guard;
+            PoolSimulationRunner {
                 descriptor,
                 pool_state,
                 token_in,
@@ -1965,8 +1816,7 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
                 amounts,
                 slippage,
                 expected_len,
-                deadline,
-                cancel_token: blocking_cancel_token,
+                cancel_token,
             }
             .run()
         })
@@ -1974,37 +1824,41 @@ async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, Quote
 
     match result {
         Ok(result) => Ok(result),
-        Err(BlockingSimulationError::Join(join_err)) => {
+        Err(SimulationExecutionError::WorkerPanicked(panic)) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
-            let message = format!("{}: Quote computation panicked: {}", descriptor, join_err);
+            let panic_message = panic_payload_message(&panic);
+            let message = format!(
+                "{}: Quote computation panicked: {}",
+                descriptor, panic_message
+            );
             Err(make_failure(
                 QuoteFailureKind::Internal,
                 message,
                 Some(context),
             ))
         }
-        Err(BlockingSimulationError::Cancelled) => {
+        Err(SimulationExecutionError::ResultDropped) => {
             let context = failure_context(&failure_descriptor);
             let descriptor = format_pool_descriptor(&context);
-            let message = format!("{}: Quote computation cancelled", descriptor);
+            let message = format!("{}: Quote computation result dropped", descriptor);
             Err(make_failure(
-                QuoteFailureKind::Timeout,
-                message,
-                Some(context),
-            ))
-        }
-        Err(BlockingSimulationError::TimedOut) => {
-            let context = failure_context(&failure_descriptor);
-            let descriptor = format_pool_descriptor(&context);
-            let message = format!("{}: Quote computation timed out", descriptor);
-            Err(make_failure(
-                QuoteFailureKind::Timeout,
+                QuoteFailureKind::Internal,
                 message,
                 Some(context),
             ))
         }
     }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send + 'static)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 fn failure_context(descriptor: &PoolDescriptor) -> FailureContext<'_> {
@@ -2051,8 +1905,6 @@ fn outcome_kind_label(kind: PoolOutcomeKind) -> &'static str {
     match kind {
         PoolOutcomeKind::PartialOutput => "partial_output",
         PoolOutcomeKind::ZeroOutput => "zero_output",
-        PoolOutcomeKind::SkippedConcurrency => "skipped_concurrency",
-        PoolOutcomeKind::SkippedDeadline => "skipped_deadline",
         PoolOutcomeKind::TimedOut => "timed_out",
         PoolOutcomeKind::SimulatorError => "simulator_error",
         PoolOutcomeKind::InternalError => "internal_error",
@@ -2482,7 +2334,6 @@ fn is_liquidity_like_failure(failure: &QuoteFailure) -> bool {
         | QuoteFailureKind::TokenValidation
         | QuoteFailureKind::TokenCoverage
         | QuoteFailureKind::Timeout
-        | QuoteFailureKind::ConcurrencyLimit
         | QuoteFailureKind::Overflow
         | QuoteFailureKind::InconsistentResult
         | QuoteFailureKind::Internal
@@ -2699,7 +2550,8 @@ mod tests {
 
     use chrono::NaiveDateTime;
     use num_traits::Zero;
-    use tokio::sync::{RwLock, Semaphore};
+    use tokio::sync::RwLock;
+    use tokio::time::sleep;
     use tycho_simulation::protocol::models::Update;
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::models::{token::Token, Chain};
@@ -3050,6 +2902,68 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct LinearAmountSim {
+        multiplier: u32,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for LinearAmountSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(f64::from(self.multiplier))
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            Ok(GetAmountOutResult::new(
+                amount_in * BigUint::from(self.multiplier),
+                BigUint::zero(),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
     fn make_token(address: &Bytes, symbol: &str) -> Token {
         Token::new(address, symbol, 18, 0, &[], Chain::Ethereum, 100)
     }
@@ -3135,13 +3049,6 @@ mod tests {
         enable_vm_pools: bool,
         enable_rfq_pools: bool,
         erc4626_deposits_enabled: bool,
-        native_sim_concurrency: usize,
-        vm_sim_concurrency: usize,
-        rfq_sim_concurrency: usize,
-        quote_timeout: Duration,
-        pool_timeout_native: Duration,
-        pool_timeout_vm: Duration,
-        pool_timeout_rfq: Duration,
         request_timeout: Duration,
     }
 
@@ -3151,13 +3058,6 @@ mod tests {
                 enable_vm_pools: false,
                 enable_rfq_pools: false,
                 erc4626_deposits_enabled: false,
-                native_sim_concurrency: 1,
-                vm_sim_concurrency: 1,
-                rfq_sim_concurrency: 1,
-                quote_timeout: Duration::from_secs(1),
-                pool_timeout_native: Duration::from_millis(50),
-                pool_timeout_vm: Duration::from_millis(50),
-                pool_timeout_rfq: Duration::from_millis(50),
                 request_timeout: Duration::from_secs(2),
             }
         }
@@ -3191,21 +3091,12 @@ mod tests {
             enable_vm_pools: config.enable_vm_pools,
             enable_rfq_pools: config.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
-            quote_timeout: config.quote_timeout,
-            pool_timeout_native: config.pool_timeout_native,
-            pool_timeout_vm: config.pool_timeout_vm,
-            pool_timeout_rfq: config.pool_timeout_rfq,
             request_timeout: config.request_timeout,
-            native_sim_semaphore: Arc::new(Semaphore::new(config.native_sim_concurrency)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(config.vm_sim_concurrency)),
-            rfq_sim_semaphore: Arc::new(Semaphore::new(config.rfq_sim_concurrency)),
+            simulation_rebuild_gate: Arc::new(RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
             reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: config.native_sim_concurrency,
-            vm_sim_concurrency: config.vm_sim_concurrency,
-            rfq_sim_concurrency: config.rfq_sim_concurrency,
         }
     }
 
@@ -3432,38 +3323,6 @@ mod tests {
         fixture
             .native_state_store
             .apply_update(Update::new(1, states, new_pairs))
-            .await;
-
-        (limit_calls, quote_calls)
-    }
-
-    async fn install_basic_vm_quote_pool(
-        fixture: &BasicQuoteFixture,
-    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let token_in = Bytes::from_str(fixture.token_in_hex).expect("valid address");
-        let token_out = Bytes::from_str(fixture.token_out_hex).expect("valid address");
-        let limit_calls = Arc::new(AtomicUsize::new(0));
-        let quote_calls = Arc::new(AtomicUsize::new(0));
-        let mut states = HashMap::new();
-        let mut new_pairs = HashMap::new();
-        insert_pool_state(
-            &mut states,
-            &mut new_pairs,
-            "pool-basic-vm-ready",
-            "0x0000000000000000000000000000000000000021",
-            "vm:curve",
-            "curve_pool",
-            fixture.pair_tokens(),
-            Box::new(StrictPairTokenSim {
-                expected_sell: token_in,
-                expected_buy: token_out,
-                limit_calls: Arc::clone(&limit_calls),
-                quote_calls: Arc::clone(&quote_calls),
-            }),
-        );
-        fixture
-            .vm_state_store
-            .apply_update(Update::new(2, states, new_pairs))
             .await;
 
         (limit_calls, quote_calls)
@@ -3738,55 +3597,6 @@ mod tests {
         );
         assert!(computation.meta.failures.is_empty());
         assert_eq!(quote_calls.load(Ordering::SeqCst), 4);
-    }
-
-    #[tokio::test]
-    async fn get_amounts_out_native_only_ignores_vm_rebuild_permits() {
-        let fixture = BasicQuoteFixture::new();
-        let (_limit_calls, quote_calls) = install_basic_native_quote_pool(&fixture).await;
-        let (vm_limit_calls, vm_quote_calls) = install_basic_vm_quote_pool(&fixture).await;
-        let app_state = make_test_app_state(
-            Arc::clone(&fixture.token_store),
-            Arc::clone(&fixture.native_state_store),
-            Arc::clone(&fixture.vm_state_store),
-            Arc::clone(&fixture.rfq_state_store),
-            TestAppStateConfig {
-                enable_vm_pools: true,
-                vm_sim_concurrency: 1,
-                ..TestAppStateConfig::default()
-            },
-        );
-        {
-            let mut vm_status = app_state.vm_stream.write().await;
-            vm_status.rebuilding = true;
-        }
-        let vm_permit = Arc::clone(&app_state.vm_sim_semaphore)
-            .acquire_owned()
-            .await
-            .expect("vm permit should be available");
-
-        let computation = tokio::time::timeout(
-            Duration::from_millis(100),
-            get_amounts_out(
-                app_state,
-                fixture.request("req-native-ignores-vm-rebuild", &["2"]),
-                None,
-            ),
-        )
-        .await
-        .expect("native quote should not wait on held VM permits");
-
-        drop(vm_permit);
-        assert_eq!(computation.responses.len(), 1);
-        assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
-        assert!(matches!(computation.meta.status, QuoteStatus::Ready));
-        assert!(computation.metrics.skipped_vm_unavailable);
-        assert_eq!(computation.metrics.scheduled_native_pools, 1);
-        assert_eq!(computation.metrics.scheduled_vm_pools, 0);
-        assert_eq!(computation.metrics.skipped_vm_concurrency, 0);
-        assert_eq!(quote_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(vm_limit_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(vm_quote_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4224,7 +4034,6 @@ mod tests {
 
         assert_eq!(computation.meta.matching_pools, 1);
         assert_eq!(computation.meta.candidate_pools, 1);
-        assert_eq!(computation.metrics.skipped_native_concurrency, 0);
         assert_eq!(wrapped_quote_calls.load(Ordering::SeqCst), 2);
         assert!(wrapped_limit_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(native_quote_calls.load(Ordering::SeqCst), 0);
@@ -4313,7 +4122,6 @@ mod tests {
 
         assert_eq!(computation.meta.matching_pools, 1);
         assert_eq!(computation.meta.candidate_pools, 1);
-        assert_eq!(computation.metrics.skipped_native_concurrency, 0);
         assert_eq!(native_quote_calls.load(Ordering::SeqCst), 2);
         assert!(native_limit_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(wrapped_quote_calls.load(Ordering::SeqCst), 0);
@@ -4484,6 +4292,69 @@ mod tests {
         assert_eq!(computation.responses[0].amounts_out, vec!["2".to_string()]);
         assert!(computation.meta.failures.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_loads_vm_candidates_after_waiting_for_rebuild_guard() {
+        let fixture = BasicQuoteFixture::new();
+        prime_ready_native_store(&fixture.native_state_store).await;
+        let mut states = HashMap::new();
+        let mut new_pairs = HashMap::new();
+        insert_pool_state(
+            &mut states,
+            &mut new_pairs,
+            "pool-vm",
+            "0x0000000000000000000000000000000000000015",
+            "vm:curve",
+            "curve_pool",
+            fixture.pair_tokens(),
+            Box::new(LinearAmountSim { multiplier: 1 }),
+        );
+        fixture
+            .vm_state_store
+            .apply_update(Update::new(1, states, new_pairs))
+            .await;
+        let app_state = make_test_app_state(
+            Arc::clone(&fixture.token_store),
+            Arc::clone(&fixture.native_state_store),
+            Arc::clone(&fixture.vm_state_store),
+            Arc::clone(&fixture.rfq_state_store),
+            TestAppStateConfig {
+                enable_vm_pools: true,
+                ..TestAppStateConfig::default()
+            },
+        );
+        let request_guard = app_state.simulation_rebuild_gate().write_owned().await;
+        let request = fixture.request("req-vm-rebuild-guard", &["10"]);
+        let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
+
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !quote_task.is_finished(),
+            "quote should wait before reading VM candidates"
+        );
+
+        let mut replacement_states = HashMap::new();
+        replacement_states.insert(
+            "pool-vm".to_string(),
+            Box::new(LinearAmountSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
+        );
+        fixture
+            .vm_state_store
+            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .await;
+
+        drop(request_guard);
+        let computation = tokio::time::timeout(Duration::from_millis(500), quote_task)
+            .await
+            .expect("quote should finish after guard is released")
+            .expect("quote task should not panic");
+
+        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses[0].amounts_out, vec!["20".to_string()]);
+        assert_eq!(computation.meta.vm_block_number, Some(2));
+        assert_eq!(computation.meta.total_pools, Some(2));
+        assert!(computation.meta.failures.is_empty());
     }
 
     #[tokio::test]
@@ -4887,7 +4758,7 @@ mod tests {
         let request = fixture.request("req-1", &["1", "5", "11"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
         assert!(computation.responses.is_empty());
         assert!(matches!(computation.meta.status, QuoteStatus::NoLiquidity));
         assert_eq!(
@@ -4920,11 +4791,6 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("permit");
-
         let outcome = simulate_pool(SimulatePoolInput {
             descriptor: PoolDescriptor {
                 id: "pool-1".to_string(),
@@ -4933,14 +4799,13 @@ mod tests {
                 protocol: "uniswap_v2".to_string(),
             },
             pool_state: Arc::new(sim),
+            rebuild_guard: None,
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(1u8), BigUint::from(11u8)]),
             slippage: SlippageConfig::default(),
             expected_len: 2,
-            deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
-            permit,
         })
         .await
         .expect("simulate_pool should return outcome");
@@ -4973,11 +4838,6 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let permit = Arc::new(Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .expect("permit");
-
         let outcome = simulate_pool(SimulatePoolInput {
             descriptor: PoolDescriptor {
                 id: "pool-1".to_string(),
@@ -4986,14 +4846,13 @@ mod tests {
                 protocol: "uniswap_v2".to_string(),
             },
             pool_state: Arc::new(sim),
+            rebuild_guard: None,
             token_in: Arc::new(make_token(&token_in, "TK1")),
             token_out: Arc::new(make_token(&token_out, "TK2")),
             amounts: Arc::new(vec![BigUint::from(11u8), BigUint::from(20u8)]),
             slippage: SlippageConfig::default(),
             expected_len: 2,
-            deadline: Instant::now() + Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
-            permit,
         })
         .await
         .expect("simulate_pool should return outcome");
@@ -5142,6 +5001,124 @@ mod tests {
         fn eq(&self, other: &dyn ProtocolSim) -> bool {
             other.as_any().is::<Self>()
         }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct DelayedAmountOrderSim {
+        #[serde(skip, default = "default_calls")]
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[typetag::serde]
+    impl ProtocolSim for DelayedAmountOrderSim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let sleep_for = if amount_in == BigUint::from(10u8) {
+                Duration::from_millis(30)
+            } else if amount_in == BigUint::from(20u8) {
+                Duration::from_millis(15)
+            } else {
+                Duration::from_millis(1)
+            };
+            std::thread::sleep(sleep_for);
+            Ok(GetAmountOutResult::new(
+                &amount_in * BigUint::from(10u8),
+                &amount_in + BigUint::from(1000u16),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(1_000_000u64), BigUint::zero()))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_pool_preserves_request_amount_order_when_amounts_finish_out_of_order() {
+        let fixture = BasicQuoteFixture::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let outcome = simulate_pool(SimulatePoolInput {
+            descriptor: PoolDescriptor {
+                id: "pool-delayed-amounts".to_string(),
+                name: "Pool Delayed Amounts".to_string(),
+                address: "0x0000000000000000000000000000000000000025".to_string(),
+                protocol: "uniswap_v2".to_string(),
+            },
+            pool_state: Arc::new(DelayedAmountOrderSim {
+                calls: Arc::clone(&calls),
+            }),
+            rebuild_guard: None,
+            token_in: Arc::new(fixture.token_in_meta.clone()),
+            token_out: Arc::new(fixture.token_out_meta.clone()),
+            amounts: Arc::new(vec![
+                BigUint::from(30u8),
+                BigUint::from(10u8),
+                BigUint::from(20u8),
+            ]),
+            slippage: SlippageConfig::default(),
+            expected_len: 3,
+            cancel_token: CancellationToken::new(),
+        })
+        .await
+        .expect("simulate_pool should return outcome");
+
+        match outcome {
+            PoolSimOutcome::Simulated(result) => {
+                assert_eq!(
+                    result.amounts_out,
+                    vec!["300".to_string(), "100".to_string(), "200".to_string()]
+                );
+                assert_eq!(result.gas_used, vec![1030, 1010, 1020]);
+                assert_eq!(result.successful_steps, 3);
+            }
+        }
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "requested amount quotes should run before any slippage probes"
+        );
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5913,10 +5890,7 @@ mod tests {
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
             Arc::clone(&fixture.rfq_state_store),
-            TestAppStateConfig {
-                native_sim_concurrency: 2,
-                ..TestAppStateConfig::default()
-            },
+            TestAppStateConfig::default(),
         );
         let request = fixture.request("req-partial-and-zero-only", &["1", "2"]);
 
@@ -5955,7 +5929,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn skipped_concurrency_with_surviving_quotes_stays_ready_partial() {
+    async fn candidate_pools_all_run_without_capacity_skip_outcomes() {
         let fixture = BasicQuoteFixture::new();
 
         let mut states = HashMap::new();
@@ -5997,33 +5971,24 @@ mod tests {
             Arc::clone(&fixture.native_state_store),
             Arc::clone(&fixture.vm_state_store),
             Arc::clone(&fixture.rfq_state_store),
-            TestAppStateConfig {
-                native_sim_concurrency: 1,
-                ..TestAppStateConfig::default()
-            },
+            TestAppStateConfig::default(),
         );
-        let request = fixture.request("req-skip-concurrency-with-survivor", &["1"]);
+        let request = fixture.request("req-candidate-pools-all-run", &["1"]);
 
         let computation = get_amounts_out(app_state, request, None).await;
 
-        assert_eq!(computation.responses.len(), 1);
+        assert_eq!(computation.responses.len(), 2);
         assert!(matches!(computation.meta.status, QuoteStatus::Ready));
-        assert_eq!(computation.meta.result_quality, QuoteResultQuality::Partial);
         assert_eq!(
-            computation.meta.partial_kind,
-            Some(QuotePartialKind::PoolCoverage)
+            computation.meta.result_quality,
+            QuoteResultQuality::Complete
         );
-        assert!(computation
-            .meta
-            .failures
-            .iter()
-            .any(|failure| matches!(failure.kind, QuoteFailureKind::ConcurrencyLimit)));
-        assert!(computation
-            .meta
-            .pool_results
-            .iter()
-            .any(|outcome| outcome.outcome == PoolOutcomeKind::SkippedConcurrency));
-        assert_eq!(computation.metrics.skipped_native_concurrency, 1);
+        assert_eq!(computation.meta.partial_kind, None);
+        assert!(computation.meta.failures.is_empty());
+        assert!(computation.meta.pool_results.is_empty());
+        assert_eq!(computation.meta.matching_pools, 2);
+        assert_eq!(computation.meta.candidate_pools, 2);
+        assert_eq!(computation.metrics.scheduled_native_pools, 2);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{watch, RwLock, Semaphore};
+use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
@@ -48,21 +48,12 @@ pub struct AppState {
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
     pub readiness_stale: Duration,
-    pub quote_timeout: Duration,
-    pub pool_timeout_native: Duration,
-    pub pool_timeout_vm: Duration,
-    pub pool_timeout_rfq: Duration,
     pub request_timeout: Duration,
-    pub native_sim_semaphore: Arc<Semaphore>,
-    pub vm_sim_semaphore: Arc<Semaphore>,
-    pub rfq_sim_semaphore: Arc<Semaphore>,
+    pub simulation_rebuild_gate: Arc<RwLock<()>>,
     pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
-    pub native_sim_concurrency: usize,
-    pub vm_sim_concurrency: usize,
-    pub rfq_sim_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,6 +61,17 @@ pub struct ConfiguredBackends {
     // Native is always configured; only optional manifest-backed backends live here.
     pub vm: bool,
     pub rfq: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SimulationRebuildGuard {
+    _read_guard: Option<OwnedRwLockReadGuard<()>>,
+}
+
+impl SimulationRebuildGuard {
+    pub(crate) const fn blocks_rebuilds(&self) -> bool {
+        self._read_guard.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -701,35 +703,62 @@ impl AppState {
         }
     }
 
-    pub fn quote_timeout(&self) -> Duration {
-        self.quote_timeout
-    }
-
-    pub fn pool_timeout_native(&self) -> Duration {
-        self.pool_timeout_native
-    }
-
-    pub fn pool_timeout_vm(&self) -> Duration {
-        self.pool_timeout_vm
-    }
-
-    pub fn pool_timeout_rfq(&self) -> Duration {
-        self.pool_timeout_rfq
-    }
-
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
-    pub fn native_sim_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.native_sim_semaphore)
+
+    pub fn simulation_rebuild_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.simulation_rebuild_gate)
     }
 
-    pub fn vm_sim_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.vm_sim_semaphore)
+    pub(crate) async fn acquire_simulation_rebuild_guard(
+        &self,
+        uses_vm: bool,
+        uses_rfq: bool,
+    ) -> Arc<SimulationRebuildGuard> {
+        let read_guard = if uses_vm || uses_rfq {
+            Some(self.simulation_rebuild_gate.clone().read_owned().await)
+        } else {
+            None
+        };
+        Arc::new(SimulationRebuildGuard {
+            _read_guard: read_guard,
+        })
     }
 
-    pub fn rfq_sim_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.rfq_sim_semaphore)
+    pub(crate) async fn pool_rebuild_guard_requirements(
+        &self,
+        id: &str,
+    ) -> Result<Option<(bool, bool)>, EncodeAvailability> {
+        if self.native_state_store.has_pool(id).await {
+            return match self.native_readiness().await {
+                NativeReadiness::Ready => Ok(Some((false, false))),
+                NativeReadiness::WarmingUp => Err(EncodeAvailability::NativeWarmingUp),
+                NativeReadiness::Stale => Err(EncodeAvailability::NativeStale),
+            };
+        }
+
+        if self.vm_state_store.has_pool(id).await {
+            return match self.vm_readiness().await {
+                VmReadiness::Disabled => Err(EncodeAvailability::VmDisabled),
+                VmReadiness::WarmingUp => Err(EncodeAvailability::VmWarmingUp),
+                VmReadiness::Rebuilding => Err(EncodeAvailability::VmRebuilding),
+                VmReadiness::Ready => Ok(Some((true, false))),
+                VmReadiness::Stale => Err(EncodeAvailability::VmStale),
+            };
+        }
+
+        if self.rfq_state_store.has_pool(id).await {
+            return match self.rfq_readiness().await {
+                RfqReadiness::Disabled => Err(EncodeAvailability::RfqDisabled),
+                RfqReadiness::WarmingUp => Err(EncodeAvailability::RfqWarmingUp),
+                RfqReadiness::Rebuilding => Err(EncodeAvailability::RfqRebuilding),
+                RfqReadiness::Ready => Ok(Some((false, true))),
+                RfqReadiness::Stale => Err(EncodeAvailability::RfqStale),
+            };
+        }
+
+        Ok(None)
     }
 
     pub async fn pool_by_id(&self, id: &str) -> Result<Option<PoolEntry>, EncodeAvailability> {
@@ -1569,17 +1598,7 @@ mod tests {
         enable_rfq_pools: bool,
     }
 
-    struct SimConcurrency {
-        native: usize,
-        vm: usize,
-        rfq: usize,
-    }
-
-    fn build_test_app_state(
-        stores: TestAppStateStores,
-        flags: PoolFlags,
-        concurrency: SimConcurrency,
-    ) -> AppState {
+    fn build_test_app_state(stores: TestAppStateStores, flags: PoolFlags) -> AppState {
         AppState {
             chain: Chain::Ethereum,
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -1601,21 +1620,12 @@ mod tests {
             enable_vm_pools: flags.enable_vm_pools,
             enable_rfq_pools: flags.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
-            quote_timeout: Duration::from_millis(100),
-            pool_timeout_native: Duration::from_millis(50),
-            pool_timeout_vm: Duration::from_millis(50),
-            pool_timeout_rfq: Duration::from_millis(50),
             request_timeout: Duration::from_millis(1000),
-            native_sim_semaphore: Arc::new(Semaphore::new(concurrency.native)),
-            vm_sim_semaphore: Arc::new(Semaphore::new(concurrency.vm)),
-            rfq_sim_semaphore: Arc::new(Semaphore::new(concurrency.rfq)),
+            simulation_rebuild_gate: Arc::new(RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
             reset_allowance_tokens: Arc::new(HashMap::new()),
-            native_sim_concurrency: concurrency.native,
-            vm_sim_concurrency: concurrency.vm,
-            rfq_sim_concurrency: concurrency.rfq,
         }
     }
 
@@ -1655,12 +1665,62 @@ mod tests {
                 enable_vm_pools,
                 enable_rfq_pools,
             },
-            SimConcurrency {
-                native: 1,
-                vm: 1,
-                rfq: 1,
-            },
         )
+    }
+
+    #[tokio::test]
+    async fn simulation_rebuild_guard_holds_and_releases_read_guard() {
+        let state = build_readiness_test_state(true, true).await;
+
+        let guard = state.acquire_simulation_rebuild_guard(true, false).await;
+        let gate = state.simulation_rebuild_gate();
+
+        assert!(
+            gate.try_write().is_err(),
+            "VM guard should block rebuild writers"
+        );
+
+        drop(guard);
+
+        assert!(
+            gate.try_write().is_ok(),
+            "rebuild writer should acquire after guard drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_rebuild_guard_uses_shared_gate_for_rfq_only_reads() {
+        let state = build_readiness_test_state(true, true).await;
+
+        let guard = state.acquire_simulation_rebuild_guard(false, true).await;
+        let gate = state.simulation_rebuild_gate();
+
+        assert!(
+            gate.try_write().is_err(),
+            "RFQ-only guard should block shared rebuild writers"
+        );
+
+        drop(guard);
+
+        assert!(
+            gate.try_write().is_ok(),
+            "shared rebuild writer should acquire after RFQ guard drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_rebuild_guard_is_noop_for_native_only_reads() {
+        let state = build_readiness_test_state(true, true).await;
+
+        let guard = state.acquire_simulation_rebuild_guard(false, false).await;
+        let gate = state.simulation_rebuild_gate();
+
+        assert!(
+            gate.try_write().is_ok(),
+            "native-only guard should not block rebuild writers"
+        );
+
+        drop(guard);
     }
 
     fn backend_snapshot(
@@ -1697,11 +1757,6 @@ mod tests {
                 PoolFlags {
                     enable_vm_pools: false,
                     enable_rfq_pools: false,
-                },
-                SimConcurrency {
-                    native: 1,
-                    vm: 1,
-                    rfq: 1,
                 },
             )
         };
@@ -1965,11 +2020,6 @@ mod tests {
             PoolFlags {
                 enable_vm_pools: true,
                 enable_rfq_pools: true,
-            },
-            SimConcurrency {
-                native: 1,
-                vm: 1,
-                rfq: 1,
             },
         );
         vm_state_store
@@ -2451,11 +2501,6 @@ mod tests {
                 enable_vm_pools: true,
                 enable_rfq_pools: true,
             },
-            SimConcurrency {
-                native: 1,
-                vm: 1,
-                rfq: 1,
-            },
         );
 
         assert_eq!(app_state.total_pools().await, 2);
@@ -2510,11 +2555,6 @@ mod tests {
             PoolFlags {
                 enable_vm_pools: true,
                 enable_rfq_pools: true,
-            },
-            SimConcurrency {
-                native: 1,
-                vm: 1,
-                rfq: 1,
             },
         );
 

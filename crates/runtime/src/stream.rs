@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{info, warn};
 use tycho_simulation::{
@@ -85,14 +85,12 @@ pub struct StreamSupervisorConfig {
 
 pub struct VmStreamControls {
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
-    pub vm_sim_semaphore: Arc<Semaphore>,
-    pub vm_sim_concurrency: u32,
+    pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
 pub struct RfqStreamControls {
     pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
-    pub rfq_sim_semaphore: Arc<Semaphore>,
-    pub rfq_sim_concurrency: u32,
+    pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -773,13 +771,13 @@ pub async fn supervise_rfq_stream<F, Fut, S>(
 }
 
 struct VmRebuildState {
-    guard: tokio::sync::OwnedSemaphorePermit,
+    guard: OwnedRwLockWriteGuard<()>,
     rebuild_id: u64,
     started_at: Instant,
 }
 
 struct RfqRebuildState {
-    guard: tokio::sync::OwnedSemaphorePermit,
+    guard: OwnedRwLockWriteGuard<()>,
     rebuild_id: u64,
     started_at: Instant,
 }
@@ -808,9 +806,9 @@ async fn begin_vm_rebuild(
     );
     maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_start", None, memory_cfg, true);
 
-    state_store.reset().await;
-
     let guard = acquire_vm_rebuild_guard(controls).await;
+
+    state_store.reset().await;
 
     if let Err(err) = SHARED_TYCHO_DB.clear() {
         warn!(error = %err, "Failed clearing TychoDB during VM rebuild");
@@ -855,9 +853,9 @@ async fn begin_rfq_rebuild(
     );
     maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_start", None, memory_cfg, true);
 
-    state_store.reset().await;
-
     let guard = acquire_rfq_rebuild_guard(controls).await;
+
+    state_store.reset().await;
 
     if let Err(err) = SHARED_TYCHO_DB.clear() {
         warn!(error = %err, "Failed clearing TychoDB during RFQ rebuild");
@@ -878,40 +876,12 @@ async fn begin_rfq_rebuild(
     }
 }
 
-#[expect(
-    clippy::panic,
-    reason = "the VM rebuild semaphore should remain available for the process lifetime"
-)]
-async fn acquire_vm_rebuild_guard(
-    controls: &VmStreamControls,
-) -> tokio::sync::OwnedSemaphorePermit {
-    match controls
-        .vm_sim_semaphore
-        .clone()
-        .acquire_many_owned(controls.vm_sim_concurrency)
-        .await
-    {
-        Ok(guard) => guard,
-        Err(_) => panic!("vm semaphore closed during rebuild"),
-    }
+async fn acquire_vm_rebuild_guard(controls: &VmStreamControls) -> OwnedRwLockWriteGuard<()> {
+    controls.simulation_rebuild_gate.clone().write_owned().await
 }
 
-#[expect(
-    clippy::panic,
-    reason = "the RFQ rebuild semaphore should remain available for the process lifetime"
-)]
-async fn acquire_rfq_rebuild_guard(
-    controls: &RfqStreamControls,
-) -> tokio::sync::OwnedSemaphorePermit {
-    match controls
-        .rfq_sim_semaphore
-        .clone()
-        .acquire_many_owned(controls.rfq_sim_concurrency)
-        .await
-    {
-        Ok(guard) => guard,
-        Err(_) => panic!("rfq semaphore closed during rebuild"),
-    }
+async fn acquire_rfq_rebuild_guard(controls: &RfqStreamControls) -> OwnedRwLockWriteGuard<()> {
+    controls.simulation_rebuild_gate.clone().write_owned().await
 }
 
 async fn finish_vm_rebuild(
@@ -998,7 +968,18 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_stream_error;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::RwLock;
+    use tycho_simulation::protocol::models::Update;
+
+    use super::{begin_vm_rebuild, classify_stream_error, StreamRestartReason, VmStreamControls};
+    use crate::config::MemoryConfig;
+    use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::tokens::TokenStore;
+    use tycho_simulation::tycho_common::models::Chain;
 
     #[test]
     fn classifies_state_decoding_failure_messages() {
@@ -1022,5 +1003,65 @@ mod tests {
     fn classifies_other_messages() {
         let kind = classify_stream_error("stream closed by peer");
         assert_eq!(kind, "other");
+    }
+
+    #[tokio::test]
+    async fn vm_rebuild_marks_rebuilding_but_waits_for_guard_before_resetting_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let token_store = Arc::new(TokenStore::new(
+            HashMap::new(),
+            "http://localhost".to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            Duration::from_millis(10),
+        ));
+        let state_store = Arc::new(StateStore::new(token_store));
+        state_store
+            .apply_update(Update::new(7, HashMap::new(), HashMap::new()))
+            .await;
+
+        let vm_stream = Arc::new(RwLock::new(VmStreamStatus::default()));
+        let simulation_rebuild_gate = Arc::new(RwLock::new(()));
+        let request_guard = Arc::clone(&simulation_rebuild_gate).read_owned().await;
+        let controls = VmStreamControls {
+            vm_stream: Arc::clone(&vm_stream),
+            simulation_rebuild_gate,
+        };
+        let state_store_for_task = Arc::clone(&state_store);
+
+        let task = tokio::spawn(async move {
+            begin_vm_rebuild(
+                &controls,
+                state_store_for_task,
+                StreamRestartReason::Error,
+                Some("test reset".to_string()),
+                MemoryConfig {
+                    purge_enabled: false,
+                    snapshots_enabled: false,
+                    snapshots_min_interval_secs: 60,
+                    snapshots_min_new_pairs: 1000,
+                    snapshots_emit_emf: false,
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if vm_stream.read().await.rebuilding {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+
+        assert_eq!(state_store.current_block().await, 7);
+
+        drop(request_guard);
+        let rebuild = tokio::time::timeout(Duration::from_millis(100), task).await??;
+        assert_eq!(state_store.current_block().await, 0);
+        drop(rebuild);
+        Ok(())
     }
 }

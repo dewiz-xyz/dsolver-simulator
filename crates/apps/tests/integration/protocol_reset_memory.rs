@@ -19,7 +19,6 @@ use runtime::models::tokens::TokenStore;
 use runtime::services::quotes::get_amounts_out;
 use runtime::stream::{process_stream, StreamKind, StreamRestartReason, StreamSupervisorConfig};
 use simulator_core::models::messages::AmountOutRequest;
-use tokio::sync::Semaphore;
 use tokio::task::yield_now;
 use tokio::time::advance;
 use tycho_simulation::evm::engine_db::SHARED_TYCHO_DB;
@@ -629,21 +628,12 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         enable_vm_pools: true,
         enable_rfq_pools: true,
         readiness_stale: Duration::from_secs(120),
-        quote_timeout: Duration::from_millis(100),
-        pool_timeout_native: Duration::from_millis(50),
-        pool_timeout_vm: Duration::from_millis(50),
-        pool_timeout_rfq: Duration::from_millis(50),
         request_timeout: Duration::from_millis(1000),
-        native_sim_semaphore: Arc::new(Semaphore::new(4)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(4)),
-        rfq_sim_semaphore: Arc::new(Semaphore::new(4)),
+        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(Vec::new()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
-        native_sim_concurrency: 4,
-        vm_sim_concurrency: 4,
-        rfq_sim_concurrency: 4,
     };
 
     assert!(app_state.vm_ready().await);

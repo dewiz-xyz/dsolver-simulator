@@ -25,7 +25,6 @@ use simulator_core::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
 };
-use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
 use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
@@ -607,21 +606,12 @@ async fn build_app_state_and_request(
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
-        quote_timeout: Duration::from_secs(1),
-        pool_timeout_native: Duration::from_secs(1),
-        pool_timeout_vm: Duration::from_secs(1),
-        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
-        native_sim_semaphore: Arc::new(Semaphore::new(4)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(reset_allowance_tokens),
-        native_sim_concurrency: 4,
-        vm_sim_concurrency: 1,
-        rfq_sim_concurrency: 1,
     };
 
     Ok((
@@ -658,8 +648,7 @@ async fn post_encode(
 async fn setup_timeout_app(
     sim: Box<dyn ProtocolSim>,
     request_timeout: Duration,
-    pool_timeout_native: Duration,
-) -> Result<(axum::Router, RouteEncodeRequest, Arc<Semaphore>)> {
+) -> Result<(axum::Router, RouteEncodeRequest)> {
     let config = EncodeFixtureConfig::default();
     let fixture_tokens = build_fixture_tokens(&config)?;
     let settlement = "0x0000000000000000000000000000000000000003".to_string();
@@ -692,7 +681,6 @@ async fn setup_timeout_app(
     native_stream_health.record_update(42).await;
     let vm_stream_health = Arc::new(StreamHealth::new());
     let rfq_stream_health = Arc::new(StreamHealth::new());
-    let native_sim_semaphore = Arc::new(Semaphore::new(1));
 
     let state = AppState {
         chain: config.chain,
@@ -715,27 +703,17 @@ async fn setup_timeout_app(
         enable_vm_pools: false,
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
-        quote_timeout: Duration::from_secs(1),
-        pool_timeout_native,
-        pool_timeout_vm: Duration::from_secs(1),
-        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout,
-        native_sim_semaphore: Arc::clone(&native_sim_semaphore),
-        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
-        native_sim_concurrency: 1,
-        vm_sim_concurrency: 1,
-        rfq_sim_concurrency: 1,
     };
 
     Ok((
         create_router(SimulatorRuntime::new(state)),
         build_route_encode_request(&config, pool_id, settlement, router),
-        native_sim_semaphore,
     ))
 }
 
@@ -948,31 +926,6 @@ async fn encode_route_native_only_succeeds_when_vm_is_unavailable() -> Result<()
 }
 
 #[tokio::test]
-async fn encode_route_native_only_succeeds_while_vm_rebuilding_permits_are_held() -> Result<()> {
-    let config = EncodeFixtureConfig {
-        enable_vm_pools: true,
-        vm_rebuilding: true,
-        request_id: "req-native-ignores-vm-rebuild",
-        ..EncodeFixtureConfig::default()
-    };
-    let (state, request) = build_app_state_and_request(config).await?;
-    let vm_permit = Arc::clone(&state.vm_sim_semaphore).acquire_owned().await?;
-    let app = create_router(SimulatorRuntime::new(state));
-
-    let (status, body) = post_encode(app, &request).await?;
-    drop(vm_permit);
-
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "unexpected status {}: {}",
-        status,
-        String::from_utf8_lossy(&body)
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn encode_route_rejects_vm_route_when_vm_is_disabled() -> Result<()> {
     let config = EncodeFixtureConfig {
         request_pool_protocol: "vm:maverick_v2",
@@ -1052,33 +1005,6 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
         vm_pool: true,
         enable_vm_pools: true,
         request_id: "req-vm-stale",
-        ..EncodeFixtureConfig::default()
-    };
-    let (mut state, request) = build_app_state_and_request(config).await?;
-    state.readiness_stale = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
-    state.native_stream_health.record_update(42).await;
-    let app = create_router(SimulatorRuntime::new(state));
-
-    let (status, body) = post_encode(app, &request).await?;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
-    assert_eq!(
-        response.error,
-        "Encode unavailable: VM state stale for requested route"
-    );
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn encode_route_rejects_misclassified_vm_route_when_vm_is_stale() -> Result<()> {
-    let config = EncodeFixtureConfig {
-        request_pool_protocol: "maverick_v2",
-        component_protocol_system: "vm:maverick_v2",
-        component_protocol_type_name: "maverick_v2",
-        vm_pool: true,
-        enable_vm_pools: true,
-        request_id: "req-vm-stale-misclassified",
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
@@ -1508,21 +1434,12 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         enable_vm_pools: false,
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
-        quote_timeout: Duration::from_secs(1),
-        pool_timeout_native: Duration::from_secs(1),
-        pool_timeout_vm: Duration::from_secs(1),
-        pool_timeout_rfq: Duration::from_secs(1),
         request_timeout: Duration::from_secs(2),
-        native_sim_semaphore: Arc::new(Semaphore::new(4)),
-        vm_sim_semaphore: Arc::new(Semaphore::new(1)),
-        rfq_sim_semaphore: Arc::new(Semaphore::new(1)),
+        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
         reset_allowance_tokens: Arc::new(HashMap::new()),
-        native_sim_concurrency: 4,
-        vm_sim_concurrency: 1,
-        rfq_sim_concurrency: 1,
     };
     let app = create_router(SimulatorRuntime::new(state));
     let request = RouteEncodeRequest {
@@ -1603,33 +1520,12 @@ async fn encode_route_rejects_when_pool_is_missing() -> Result<()> {
 }
 
 #[tokio::test]
-async fn encode_route_times_out_while_waiting_for_native_sim_permit() -> Result<()> {
-    let (app, request, native_sim_semaphore) = setup_timeout_app(
-        Box::new(EchoAmountSim),
-        Duration::from_millis(20),
-        Duration::from_secs(1),
-    )
-    .await?;
-    let permit = native_sim_semaphore.acquire().await?;
-
-    let (status, body) = post_encode(app, &request).await?;
-    drop(permit);
-
-    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
-    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
-    assert_eq!(response.error, "Encode request timed out after 20ms");
-    assert_eq!(response.request_id.as_deref(), Some("req-1"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn encode_route_times_out_during_slow_resimulation() -> Result<()> {
-    let (app, request, _native_sim_semaphore) = setup_timeout_app(
+    let (app, request) = setup_timeout_app(
         Box::new(SlowAmountSim {
             sleep_for: Duration::from_millis(100),
         }),
         Duration::from_millis(20),
-        Duration::from_secs(1),
     )
     .await?;
 

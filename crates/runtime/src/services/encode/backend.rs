@@ -41,6 +41,10 @@ impl PoolBackend {
     pub(super) const fn is_rfq(self) -> bool {
         matches!(self, Self::Rfq)
     }
+
+    pub(super) const fn uses_rebuild_guard(self) -> bool {
+        matches!(self, Self::Vm | Self::Rfq)
+    }
 }
 
 #[cfg(test)]
