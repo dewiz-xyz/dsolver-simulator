@@ -5,12 +5,13 @@ use axum::{
 
 use runtime::broadcaster_service::BroadcasterAppState;
 
-use crate::handlers::broadcaster::{status, token_lookup, ws};
+use crate::handlers::broadcaster::{status, token_lookup, token_snapshot, ws};
 
 pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/ws", get(ws))
+        .route("/tokens/snapshot", get(token_snapshot))
         .route("/tokens/lookup", post(token_lookup))
         .with_state(app_state)
 }
@@ -239,6 +240,30 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
         assert_eq!(body["tokens"][0]["symbol"], "CACHED");
         assert_eq!(body["missing"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_serves_broadcaster_token_cache() -> Result<()> {
+        let cached = token(0x40, "SNAP", Chain::Ethereum);
+        let (tycho_url, request_count, server_task) =
+            spawn_tycho_token_server(None, Duration::ZERO).await?;
+        let app = create_broadcaster_router(
+            build_state_with_tokens(
+                SeedMode::Disconnected,
+                token_store(vec![cached.clone()], tycho_url, Chain::Ethereum),
+                Chain::Ethereum,
+            )
+            .await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+        server_task.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(body["chainId"], Chain::Ethereum.id());
+        assert_eq!(body["tokens"][0]["symbol"], "SNAP");
         Ok(())
     }
 

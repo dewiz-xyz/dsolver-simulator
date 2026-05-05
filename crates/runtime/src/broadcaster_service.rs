@@ -15,7 +15,9 @@ use crate::services::stream_builder::{build_broadcaster_stream, BroadcasterProto
 use crate::stream::{
     supervise_broadcaster_stream, BroadcasterStreamControls, StreamSupervisorConfig,
 };
-use simulator_core::broadcaster::{BroadcasterTokenDto, BroadcasterTokenLookupResponse};
+use simulator_core::broadcaster::{
+    BroadcasterTokenDto, BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
+};
 use tycho_simulation::tycho_common::Bytes;
 
 #[derive(Clone)]
@@ -67,6 +69,21 @@ impl BroadcasterAppState {
         }
 
         Ok(BroadcasterTokenLookupResponse { tokens, missing })
+    }
+
+    pub async fn token_snapshot(&self) -> BroadcasterTokenSnapshotResponse {
+        let tokens = self
+            .tokens
+            .snapshot()
+            .await
+            .into_values()
+            .map(BroadcasterTokenDto::from)
+            .collect();
+
+        BroadcasterTokenSnapshotResponse {
+            chain_id: self.chain_id,
+            tokens,
+        }
     }
 }
 

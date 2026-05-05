@@ -36,6 +36,13 @@ pub struct BroadcasterTokenLookupResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BroadcasterTokenSnapshotResponse {
+    pub chain_id: u64,
+    pub tokens: Vec<BroadcasterTokenDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BroadcasterTokenDto {
     pub address: Bytes,
     pub symbol: String,
@@ -1651,8 +1658,8 @@ mod tests {
         BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
         BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterSubscriptionEvent,
         BroadcasterSubscriptionState, BroadcasterSubscriptionTracker, BroadcasterTokenDto,
-        BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse, BroadcasterUpdateMessage,
-        BroadcasterUpdatePartition,
+        BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
+        BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1756,6 +1763,29 @@ mod tests {
             "0x2222222222222222222222222222222222222222"
         );
         assert_eq!(json["tokens"][0]["chainId"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn token_snapshot_contract_uses_camel_case_shape() -> Result<()> {
+        let address = Bytes::from([0x12_u8; 20]);
+        let response = BroadcasterTokenSnapshotResponse {
+            chain_id: 1,
+            tokens: vec![BroadcasterTokenDto::from(Token::new(
+                &address,
+                "TKN",
+                18,
+                7,
+                &[Some(21_000)],
+                Chain::Ethereum,
+                75,
+            ))],
+        };
+        let json = serde_json::to_value(&response)?;
+
+        assert_eq!(json["chainId"], 1);
+        assert_eq!(json["tokens"][0]["symbol"], "TKN");
+        assert!(json.get("chain_id").is_none());
         Ok(())
     }
 

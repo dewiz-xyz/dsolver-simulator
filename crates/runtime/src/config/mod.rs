@@ -95,6 +95,7 @@ pub fn load_config() -> AppConfig {
         port: network.port,
         host: network.host,
         request_timeout_ms: timeouts.request_timeout_ms,
+        token_snapshot_timeout_ms: timeouts.token_snapshot_timeout_ms,
         token_refresh_timeout_ms: timeouts.token_refresh_timeout_ms,
         enable_vm_pools: network.enable_vm_pools,
         enable_rfq_pools: network.enable_rfq_pools,
@@ -276,6 +277,7 @@ struct NetworkConfig {
 
 struct TimeoutConfig {
     request_timeout_ms: u64,
+    token_snapshot_timeout_ms: u64,
     token_refresh_timeout_ms: u64,
 }
 
@@ -356,9 +358,14 @@ fn load_network_config() -> NetworkConfig {
 
 fn load_timeout_config() -> TimeoutConfig {
     let request_timeout_ms = parse_env_or_default("REQUEST_TIMEOUT_MS", "4500");
+    let token_snapshot_timeout_ms = parse_env_or_default("TOKEN_SNAPSHOT_TIMEOUT_MS", "125000");
     let token_refresh_timeout_ms = parse_env_or_default("TOKEN_REFRESH_TIMEOUT_MS", "1000");
 
     assert!(request_timeout_ms > 0, "REQUEST_TIMEOUT_MS must be > 0");
+    assert!(
+        token_snapshot_timeout_ms > 0,
+        "TOKEN_SNAPSHOT_TIMEOUT_MS must be > 0"
+    );
     assert!(
         token_refresh_timeout_ms > 0,
         "TOKEN_REFRESH_TIMEOUT_MS must be > 0"
@@ -366,6 +373,7 @@ fn load_timeout_config() -> TimeoutConfig {
 
     TimeoutConfig {
         request_timeout_ms,
+        token_snapshot_timeout_ms,
         token_refresh_timeout_ms,
     }
 }
@@ -507,6 +515,7 @@ pub struct AppConfig {
     pub port: u16,
     pub host: IpAddr,
     pub request_timeout_ms: u64,
+    pub token_snapshot_timeout_ms: u64,
     pub token_refresh_timeout_ms: u64,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
@@ -673,9 +682,10 @@ mod tests {
         }
     }
 
-    const CONFIG_TEST_ENV_KEYS: [&str; 4] = [
+    const CONFIG_TEST_ENV_KEYS: [&str; 5] = [
         "CHAIN_ID",
         "ENABLE_RFQ_POOLS",
+        "TOKEN_SNAPSHOT_TIMEOUT_MS",
         "TYCHO_API_KEY",
         "TYCHO_BROADCASTER_WS_URL",
     ];
@@ -729,6 +739,7 @@ mod tests {
         std::env::set_var("CHAIN_ID", "1");
         std::env::set_var("ENABLE_RFQ_POOLS", "false");
         std::env::set_var("TYCHO_API_KEY", "test-api-key");
+        std::env::remove_var("TOKEN_SNAPSHOT_TIMEOUT_MS");
         match broadcaster_ws_url {
             Some(value) => std::env::set_var("TYCHO_BROADCASTER_WS_URL", value),
             None => std::env::remove_var("TYCHO_BROADCASTER_WS_URL"),
@@ -1240,5 +1251,37 @@ route_policy = " default "
         let message = load_config_panic_message(Some("   "));
 
         assert!(message.contains("TYCHO_BROADCASTER_WS_URL must not be empty"));
+    }
+
+    #[test]
+    fn load_config_uses_token_snapshot_timeout_default() {
+        let config = with_isolated_config_env(Some("ws://127.0.0.1:3001/ws"), load_config);
+
+        assert_eq!(config.token_snapshot_timeout_ms, 125_000);
+    }
+
+    #[test]
+    fn load_config_reads_token_snapshot_timeout_override() {
+        let config = with_isolated_config_env(Some("ws://127.0.0.1:3001/ws"), || {
+            std::env::set_var("TOKEN_SNAPSHOT_TIMEOUT_MS", "60000");
+            load_config()
+        });
+
+        assert_eq!(config.token_snapshot_timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn load_config_rejects_zero_token_snapshot_timeout() {
+        let message = with_isolated_config_env(Some("ws://127.0.0.1:3001/ws"), || {
+            std::env::set_var("TOKEN_SNAPSHOT_TIMEOUT_MS", "0");
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = load_config();
+            })) {
+                Ok(_) => unreachable!("load_config should reject zero snapshot timeout"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("TOKEN_SNAPSHOT_TIMEOUT_MS must be > 0"));
     }
 }

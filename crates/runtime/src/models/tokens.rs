@@ -453,6 +453,14 @@ fn map_fetch_error(
 }
 
 pub fn derive_broadcaster_token_lookup_url(ws_url: &str) -> Result<String, TokenStoreError> {
+    derive_broadcaster_token_url(ws_url, "lookup")
+}
+
+pub fn derive_broadcaster_token_snapshot_url(ws_url: &str) -> Result<String, TokenStoreError> {
+    derive_broadcaster_token_url(ws_url, "snapshot")
+}
+
+fn derive_broadcaster_token_url(ws_url: &str, endpoint: &str) -> Result<String, TokenStoreError> {
     let mut url = reqwest::Url::parse(ws_url).map_err(|err| {
         TokenStoreError::RequestFailed(format!("invalid TYCHO_BROADCASTER_WS_URL: {err}"))
     })?;
@@ -470,7 +478,7 @@ pub fn derive_broadcaster_token_lookup_url(ws_url: &str) -> Result<String, Token
             "TYCHO_BROADCASTER_WS_URL must end with /ws".to_string(),
         ));
     };
-    let lookup_path = format!("{prefix}/tokens/lookup");
+    let lookup_path = format!("{prefix}/tokens/{endpoint}");
     url.set_scheme(scheme).map_err(|_| {
         TokenStoreError::RequestFailed("invalid broadcaster URL scheme".to_string())
     })?;
@@ -695,6 +703,19 @@ mod tests {
         assert_eq!(
             derive_broadcaster_token_lookup_url("wss://broadcaster.example/prod/base/ws")?,
             "https://broadcaster.example/prod/base/tokens/lookup"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derives_token_snapshot_url_from_broadcaster_websocket_url() -> Result<()> {
+        assert_eq!(
+            derive_broadcaster_token_snapshot_url("ws://127.0.0.1:3001/ws")?,
+            "http://127.0.0.1:3001/tokens/snapshot"
+        );
+        assert_eq!(
+            derive_broadcaster_token_snapshot_url("wss://broadcaster.example/prod/base/ws")?,
+            "https://broadcaster.example/prod/base/tokens/snapshot"
         );
         Ok(())
     }

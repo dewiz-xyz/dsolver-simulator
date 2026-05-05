@@ -122,6 +122,10 @@ pub async fn token_lookup(
     }
 }
 
+pub async fn token_snapshot(State(state): State<BroadcasterAppState>) -> Response {
+    (StatusCode::OK, Json(state.token_snapshot().await)).into_response()
+}
+
 async fn handle_session(
     socket: WebSocket,
     state: BroadcasterAppState,
