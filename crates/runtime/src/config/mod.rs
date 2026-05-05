@@ -299,6 +299,7 @@ pub struct BroadcasterTuning {
     pub snapshot_chunk_size: usize,
     pub subscriber_buffer_capacity: usize,
     pub heartbeat_interval_secs: u64,
+    pub token_min_quality: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +447,7 @@ fn load_broadcaster_tuning() -> BroadcasterTuning {
     let subscriber_buffer_capacity =
         parse_env_or_default("BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY", "128");
     let heartbeat_interval_secs = parse_env_or_default("BROADCASTER_HEARTBEAT_INTERVAL_SECS", "5");
+    let token_min_quality = parse_env_or_default("BROADCASTER_TOKEN_MIN_QUALITY", "0");
 
     assert!(
         snapshot_chunk_size > 0,
@@ -459,11 +461,16 @@ fn load_broadcaster_tuning() -> BroadcasterTuning {
         heartbeat_interval_secs > 0,
         "BROADCASTER_HEARTBEAT_INTERVAL_SECS must be > 0"
     );
+    assert!(
+        token_min_quality >= 0,
+        "BROADCASTER_TOKEN_MIN_QUALITY must be >= 0"
+    );
 
     BroadcasterTuning {
         snapshot_chunk_size,
         subscriber_buffer_capacity,
         heartbeat_interval_secs,
+        token_min_quality,
     }
 }
 
@@ -650,10 +657,11 @@ mod tests {
         "CUMULATIVE_DEGRADATION_COEFFICIENT_BPS",
         "SATURATION_RAMP_START_SLIPPAGE_BPS",
     ];
-    const BROADCASTER_TUNING_ENV_KEYS: [&str; 3] = [
+    const BROADCASTER_TUNING_ENV_KEYS: [&str; 4] = [
         "BROADCASTER_SNAPSHOT_CHUNK_SIZE",
         "BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY",
         "BROADCASTER_HEARTBEAT_INTERVAL_SECS",
+        "BROADCASTER_TOKEN_MIN_QUALITY",
     ];
     const RFQ_CREDENTIAL_ENV_KEYS: [&str; 6] = [
         "BEBOP_USER",
@@ -1218,6 +1226,7 @@ route_policy = " default "
         assert_eq!(tuning.snapshot_chunk_size, 500);
         assert_eq!(tuning.subscriber_buffer_capacity, 128);
         assert_eq!(tuning.heartbeat_interval_secs, 5);
+        assert_eq!(tuning.token_min_quality, 0);
     }
 
     #[test]
@@ -1229,12 +1238,32 @@ route_policy = " default "
         std::env::set_var("BROADCASTER_SNAPSHOT_CHUNK_SIZE", "64");
         std::env::set_var("BROADCASTER_SUBSCRIBER_BUFFER_CAPACITY", "32");
         std::env::set_var("BROADCASTER_HEARTBEAT_INTERVAL_SECS", "9");
+        std::env::set_var("BROADCASTER_TOKEN_MIN_QUALITY", "7");
 
         let tuning = load_broadcaster_tuning();
 
         assert_eq!(tuning.snapshot_chunk_size, 64);
         assert_eq!(tuning.subscriber_buffer_capacity, 32);
         assert_eq!(tuning.heartbeat_interval_secs, 9);
+        assert_eq!(tuning.token_min_quality, 7);
+
+        clear_broadcaster_tuning_env();
+    }
+
+    #[test]
+    fn load_broadcaster_tuning_rejects_negative_token_min_quality() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_broadcaster_tuning_env();
+        std::env::set_var("BROADCASTER_TOKEN_MIN_QUALITY", "-1");
+
+        let message = match std::panic::catch_unwind(load_broadcaster_tuning) {
+            Ok(_) => unreachable!("load_broadcaster_tuning should reject negative token quality"),
+            Err(panic) => panic_message(panic),
+        };
+
+        assert!(message.contains("BROADCASTER_TOKEN_MIN_QUALITY must be >= 0"));
 
         clear_broadcaster_tuning_env();
     }

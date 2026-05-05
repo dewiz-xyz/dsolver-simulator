@@ -152,7 +152,7 @@ async fn load_token_store(config: &BroadcasterConfig) -> Result<Arc<TokenStore>>
         Some(&config.api_key),
         true,
         chain,
-        Some(10),
+        Some(config.tuning.token_min_quality),
         None,
     )
     .await?;
