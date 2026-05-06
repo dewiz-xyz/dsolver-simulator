@@ -25,7 +25,8 @@ use simulator_core::models::messages::{
 };
 
 use self::presets::{
-    balanced_profile, chain_label, resolve_token, BalancedProfilePreset, SimulateScenarioPreset,
+    balanced_profile, chain_label, resolve_token, BalancedProfilePreset, EncodeRouteKind,
+    EncodeRoutePreset, EncodeSegmentPreset, SimulateScenarioPreset,
 };
 use self::report::{
     build_findings, relative_path, render_summary, AnalysisReport, BaselineComparison,
@@ -40,7 +41,7 @@ const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
-const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 4;
+const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 5;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
@@ -177,6 +178,29 @@ struct EncodePrepOutcome {
 struct SelectedPool {
     quote: AmountOutResponse,
     protocol: String,
+}
+
+struct PreparedEncodeRoute {
+    token_in: String,
+    token_out: String,
+    amount_in: String,
+    min_amount_out: String,
+    segments: Vec<PreparedEncodeSegment>,
+    protocols: BTreeMap<String, usize>,
+    notes: Vec<String>,
+}
+
+struct PreparedEncodeSegment {
+    kind: SwapKind,
+    share_bps: u32,
+    hops: Vec<PreparedEncodeHop>,
+    final_amount_out: String,
+}
+
+struct PreparedEncodeHop {
+    token_in: String,
+    token_out: String,
+    pool: SelectedPool,
 }
 
 impl CliArgs {
@@ -528,10 +552,6 @@ async fn run_simulate_scenario(
     Ok(report)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "The encode probe is easier to audit as one linear workflow."
-)]
 async fn run_encode_scenarios(
     client: &Client,
     repo: &Path,
@@ -539,141 +559,262 @@ async fn run_encode_scenarios(
     args: &CliArgs,
     profile: &BalancedProfilePreset,
 ) -> Result<Vec<ScenarioReport>> {
-    let preset = &profile.encode;
-    let token_in = resolve_token(args.chain_id, preset.token_in_symbol)?;
-    let mid_token = resolve_token(args.chain_id, preset.mid_symbol)?;
-    let token_out = resolve_token(args.chain_id, preset.token_out_symbol)?;
+    let mut reports = Vec::new();
+    for preset in &profile.encode_routes {
+        reports.extend(run_encode_route_scenario(client, repo, evidence_dir, args, preset).await?);
+    }
+    Ok(reports)
+}
+
+async fn run_encode_route_scenario(
+    client: &Client,
+    repo: &Path,
+    evidence_dir: &Path,
+    args: &CliArgs,
+    preset: &EncodeRoutePreset,
+) -> Result<Vec<ScenarioReport>> {
     let simulate_endpoint = simulate_url(&args.base_url);
-    let mut reports = Vec::with_capacity(3);
-    let mut notes = Vec::new();
+    let mut reports = Vec::new();
+    let mut prep_evidence_files = Vec::new();
     let mut protocols = BTreeMap::new();
 
-    let first_request = AmountOutRequest {
-        request_id: format!("encode-hop-1-{}", epoch_now_s()?),
-        auction_id: None,
-        token_in: token_in.to_string(),
-        token_out: mid_token.to_string(),
-        amounts: preset
-            .amounts
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-    };
-    let first_hop = run_encode_prep_hop(
+    let Some(prepared) = prepare_encode_route(
         client,
         repo,
         evidence_dir,
+        args,
+        preset,
         &simulate_endpoint,
-        &first_request,
-        "encode-hop-1",
-        "encode prep hop 1",
+        &mut reports,
+        &mut prep_evidence_files,
+        &mut protocols,
     )
-    .await?;
-    let mut prep_evidence_files = first_hop.report.evidence_files.clone();
-    let Some(first_pool) = first_hop.selected_pool.as_ref() else {
-        reports.push(first_hop.report);
+    .await?
+    else {
         reports.push(build_skipped_encode_report(
-            "Skipping /encode because prep hop 1 did not produce a usable pool.",
+            preset,
+            "Skipping /encode because at least one prep hop did not produce a usable pool.",
             &prep_evidence_files,
             &protocols,
         ));
         return Ok(reports);
     };
-    reports.push(first_hop.report);
 
-    *protocols
-        .entry(first_pool.protocol.clone())
-        .or_insert(0usize) += 1;
-
-    let hop_amounts = first_pool
-        .quote
-        .amounts_out
-        .iter()
-        .map(|amount| apply_slippage(amount, DEFAULT_SLIPPAGE_BPS))
-        .collect::<Vec<_>>();
-    let second_request = AmountOutRequest {
-        request_id: format!("encode-hop-2-{}", epoch_now_s()?),
-        auction_id: None,
-        token_in: mid_token.to_string(),
-        token_out: token_out.to_string(),
-        amounts: hop_amounts,
-    };
-    let second_hop = run_encode_prep_hop(
+    let encode_request = build_encode_route_request(repo, args.chain_id, preset, &prepared)?;
+    let encode_observation = execute_encode_request(
         client,
-        repo,
-        evidence_dir,
-        &simulate_endpoint,
-        &second_request,
-        "encode-hop-2",
-        "encode prep hop 2",
+        &encode_url(&args.base_url),
+        &encode_request,
+        &prepared.protocols,
+        &prepared.notes,
     )
     .await?;
-    prep_evidence_files.extend(second_hop.report.evidence_files.clone());
-    let Some(second_pool) = second_hop.selected_pool.as_ref() else {
-        reports.push(second_hop.report);
-        reports.push(build_skipped_encode_report(
-            "Skipping /encode because prep hop 2 did not produce a usable pool.",
-            &prep_evidence_files,
-            &protocols,
-        ));
-        return Ok(reports);
-    };
-    reports.push(second_hop.report);
+    let encode_artifact = save_observation_artifact(
+        repo,
+        evidence_dir,
+        &format!("encode-route-{}", preset.label),
+        &encode_observation,
+    )?;
 
-    *protocols
-        .entry(second_pool.protocol.clone())
-        .or_insert(0usize) += 1;
-
-    let min_amount_out = apply_slippage(
-        second_pool
-            .quote
-            .amounts_out
-            .first()
-            .map(String::as_str)
-            .unwrap_or("0"),
-        DEFAULT_SLIPPAGE_BPS,
+    let mut report = build_scenario_report(
+        encode_route_report_kind(preset.kind),
+        preset.label,
+        "/encode",
+        &[encode_observation],
+        &[encode_artifact],
     );
+    for (protocol, count) in prepared.protocols {
+        report.protocols_seen.insert(protocol, count);
+    }
+    report.notes.extend(prepared.notes);
+    reports.push(report);
+    Ok(reports)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The route prep workflow threads report and protocol state through each hop."
+)]
+async fn prepare_encode_route(
+    client: &Client,
+    repo: &Path,
+    evidence_dir: &Path,
+    args: &CliArgs,
+    preset: &EncodeRoutePreset,
+    simulate_endpoint: &str,
+    reports: &mut Vec<ScenarioReport>,
+    prep_evidence_files: &mut Vec<String>,
+    protocols: &mut BTreeMap<String, usize>,
+) -> Result<Option<PreparedEncodeRoute>> {
+    let route_amounts = preset
+        .amounts
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(preset.segments.len());
+
+    for (segment_index, segment_preset) in preset.segments.iter().enumerate() {
+        let Some(segment_amounts) =
+            allocate_segment_amounts(&route_amounts, preset.segments, segment_index)?
+        else {
+            return Ok(None);
+        };
+        let prepared_segment = prepare_encode_segment(
+            client,
+            repo,
+            evidence_dir,
+            args,
+            preset,
+            segment_preset,
+            segment_index,
+            segment_amounts,
+            simulate_endpoint,
+            reports,
+            prep_evidence_files,
+            protocols,
+        )
+        .await?;
+        let Some(prepared_segment) = prepared_segment else {
+            return Ok(None);
+        };
+        segments.push(prepared_segment);
+    }
+
+    let token_in_symbol = preset
+        .segments
+        .first()
+        .and_then(|segment| segment.path.first())
+        .ok_or_else(|| anyhow!("encode preset {} has no tokenIn", preset.label))?;
+    let token_out_symbol = preset
+        .segments
+        .first()
+        .and_then(|segment| segment.path.last())
+        .ok_or_else(|| anyhow!("encode preset {} has no tokenOut", preset.label))?;
+    let min_amount_out = route_min_amount_out(&segments);
+    let mut notes = Vec::new();
     if min_amount_out == "0" {
         notes.push(
             "Computed route minAmountOut was zero, so encode is marked degraded.".to_string(),
         );
     }
 
-    let encode_request = build_encode_route_request(
-        repo,
-        args.chain_id,
-        preset,
-        token_in,
-        mid_token,
-        token_out,
-        first_pool,
-        second_pool,
-        &min_amount_out,
-    )?;
-    let encode_observation = execute_encode_request(
-        client,
-        &encode_url(&args.base_url),
-        &encode_request,
-        &protocols,
-        &notes,
-    )
-    .await?;
-    let encode_artifact =
-        save_observation_artifact(repo, evidence_dir, "encode-route", &encode_observation)?;
+    Ok(Some(PreparedEncodeRoute {
+        token_in: resolve_token(args.chain_id, token_in_symbol)?.to_string(),
+        token_out: resolve_token(args.chain_id, token_out_symbol)?.to_string(),
+        amount_in: route_amounts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "0".to_string()),
+        min_amount_out,
+        segments,
+        protocols: protocols.clone(),
+        notes,
+    }))
+}
 
-    let mut report = build_scenario_report(
-        "encode",
-        "encode route probe",
-        "/encode",
-        &[encode_observation],
-        &[encode_artifact],
-    );
-    for (protocol, count) in protocols {
-        report.protocols_seen.insert(protocol, count);
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit hop prep inputs keep scenario evidence naming deterministic."
+)]
+async fn prepare_encode_segment(
+    client: &Client,
+    repo: &Path,
+    evidence_dir: &Path,
+    args: &CliArgs,
+    route_preset: &EncodeRoutePreset,
+    segment_preset: &EncodeSegmentPreset,
+    segment_index: usize,
+    mut hop_amounts: Vec<String>,
+    simulate_endpoint: &str,
+    reports: &mut Vec<ScenarioReport>,
+    prep_evidence_files: &mut Vec<String>,
+    protocols: &mut BTreeMap<String, usize>,
+) -> Result<Option<PreparedEncodeSegment>> {
+    if segment_preset.path.len() < 2 {
+        bail!(
+            "encode preset {} segment {} must contain at least two tokens",
+            route_preset.label,
+            segment_index + 1
+        );
     }
-    report.notes.extend(notes);
-    reports.push(report);
-    Ok(reports)
+
+    let mut hops = Vec::with_capacity(segment_preset.path.len().saturating_sub(1));
+    let mut final_amount_out = "0".to_string();
+    for (hop_index, pair) in segment_preset.path.windows(2).enumerate() {
+        let token_in = resolve_token(args.chain_id, pair[0])?.to_string();
+        let token_out = resolve_token(args.chain_id, pair[1])?.to_string();
+        let request = AmountOutRequest {
+            request_id: format!(
+                "encode-{}-segment-{}-hop-{}-{}",
+                route_preset.label,
+                segment_index + 1,
+                hop_index + 1,
+                epoch_now_s()?
+            ),
+            auction_id: None,
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+            amounts: hop_amounts,
+        };
+        let artifact_stem = format!(
+            "encode-{}-segment-{}-hop-{}",
+            route_preset.label,
+            segment_index + 1,
+            hop_index + 1
+        );
+        let scenario_label = format!(
+            "{} prep segment {} hop {}",
+            route_preset.label,
+            segment_index + 1,
+            hop_index + 1
+        );
+        let hop = run_encode_prep_hop(
+            client,
+            repo,
+            evidence_dir,
+            simulate_endpoint,
+            &request,
+            &artifact_stem,
+            &scenario_label,
+        )
+        .await?;
+        prep_evidence_files.extend(hop.report.evidence_files.clone());
+        let Some(pool) = hop.selected_pool.clone() else {
+            reports.push(hop.report);
+            return Ok(None);
+        };
+        reports.push(hop.report);
+
+        *protocols.entry(pool.protocol.clone()).or_insert(0usize) += 1;
+        final_amount_out = pool
+            .quote
+            .amounts_out
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        hop_amounts = pool
+            .quote
+            .amounts_out
+            .iter()
+            .map(|amount| apply_slippage(amount, DEFAULT_SLIPPAGE_BPS))
+            .collect::<Vec<_>>();
+        hops.push(PreparedEncodeHop {
+            token_in,
+            token_out,
+            pool,
+        });
+    }
+
+    Ok(Some(PreparedEncodeSegment {
+        kind: if hops.len() > 1 {
+            SwapKind::MultiSwap
+        } else {
+            SwapKind::SimpleSwap
+        },
+        share_bps: segment_preset.share_bps,
+        hops,
+        final_amount_out,
+    }))
 }
 
 async fn run_encode_prep_hop(
@@ -723,13 +864,14 @@ async fn run_encode_prep_hop(
 }
 
 fn build_skipped_encode_report(
+    preset: &EncodeRoutePreset,
     reason: &str,
     evidence_files: &[String],
     protocols: &BTreeMap<String, usize>,
 ) -> ScenarioReport {
     let mut report = build_scenario_report(
-        "encode",
-        "encode route probe",
+        encode_route_report_kind(preset.kind),
+        preset.label,
         "/encode",
         &[],
         evidence_files,
@@ -742,27 +884,18 @@ fn build_skipped_encode_report(
     report
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Explicit route parts keep the encode request assembly obvious."
-)]
 fn build_encode_route_request(
     repo: &Path,
     chain_id: u64,
-    preset: &crate::sim_analysis::presets::EncodePreset,
-    token_in: &str,
-    mid_token: &str,
-    token_out: &str,
-    first_pool: &SelectedPool,
-    second_pool: &SelectedPool,
-    min_amount_out: &str,
+    preset: &EncodeRoutePreset,
+    prepared: &PreparedEncodeRoute,
 ) -> Result<RouteEncodeRequest> {
     Ok(RouteEncodeRequest {
         chain_id,
-        token_in: token_in.to_string(),
-        token_out: token_out.to_string(),
-        amount_in: preset.amounts.first().copied().unwrap_or("0").to_string(),
-        min_amount_out: min_amount_out.to_string(),
+        token_in: prepared.token_in.clone(),
+        token_out: prepared.token_out.clone(),
+        amount_in: prepared.amount_in.clone(),
+        min_amount_out: prepared.min_amount_out.clone(),
         settlement_address: resolve_env_or_default(
             repo,
             "COW_SETTLEMENT_CONTRACT",
@@ -773,26 +906,91 @@ fn build_encode_route_request(
             "TYCHO_ROUTER_ADDRESS",
             preset.tycho_router_address,
         )?,
-        swap_kind: SwapKind::MultiSwap,
-        segments: vec![SegmentDraft {
-            kind: SwapKind::MultiSwap,
-            share_bps: 0,
-            hops: vec![
-                HopDraft {
-                    token_in: token_in.to_string(),
-                    token_out: mid_token.to_string(),
-                    swaps: vec![encode_pool_swap(first_pool, token_in, mid_token)],
-                },
-                HopDraft {
-                    token_in: mid_token.to_string(),
-                    token_out: token_out.to_string(),
-                    swaps: vec![encode_pool_swap(second_pool, mid_token, token_out)],
-                },
-            ],
-        }],
-        request_id: Some(format!("encode-probe-{}", epoch_now_s()?)),
+        swap_kind: encode_route_swap_kind(preset.kind),
+        segments: prepared
+            .segments
+            .iter()
+            .map(|segment| SegmentDraft {
+                kind: segment.kind,
+                share_bps: segment.share_bps,
+                hops: segment
+                    .hops
+                    .iter()
+                    .map(|hop| HopDraft {
+                        token_in: hop.token_in.clone(),
+                        token_out: hop.token_out.clone(),
+                        swaps: vec![encode_pool_swap(&hop.pool, &hop.token_in, &hop.token_out)],
+                    })
+                    .collect(),
+            })
+            .collect(),
+        request_id: Some(format!("encode-probe-{}-{}", preset.label, epoch_now_s()?)),
         estimated_amount_in: None,
     })
+}
+
+fn allocate_segment_amounts(
+    route_amounts: &[String],
+    segments: &[EncodeSegmentPreset],
+    segment_index: usize,
+) -> Result<Option<Vec<String>>> {
+    let Some(segment) = segments.get(segment_index) else {
+        return Ok(None);
+    };
+    if segments.len() == 1 {
+        return Ok(Some(route_amounts.to_vec()));
+    }
+
+    let mut allocated = Vec::with_capacity(route_amounts.len());
+    for amount in route_amounts {
+        let route_amount = BigUint::from_str(amount)
+            .with_context(|| format!("invalid route amount for encode matrix: {amount}"))?;
+        let segment_amount = if segment.share_bps == 0 {
+            let prior_sum = segments
+                .iter()
+                .take(segment_index)
+                .map(|prior| route_amount.clone() * BigUint::from(prior.share_bps) / 10_000u32)
+                .sum::<BigUint>();
+            if prior_sum >= route_amount {
+                BigUint::from(0u8)
+            } else {
+                route_amount - prior_sum
+            }
+        } else {
+            route_amount * BigUint::from(segment.share_bps) / 10_000u32
+        };
+        if segment_amount == BigUint::from(0u8) {
+            return Ok(None);
+        }
+        allocated.push(segment_amount.to_string());
+    }
+    Ok(Some(allocated))
+}
+
+fn route_min_amount_out(segments: &[PreparedEncodeSegment]) -> String {
+    let total = segments
+        .iter()
+        .map(|segment| {
+            BigUint::from_str(&segment.final_amount_out).unwrap_or_else(|_| BigUint::from(0u8))
+        })
+        .sum::<BigUint>();
+    apply_slippage(&total.to_string(), DEFAULT_SLIPPAGE_BPS)
+}
+
+const fn encode_route_swap_kind(kind: EncodeRouteKind) -> SwapKind {
+    match kind {
+        EncodeRouteKind::Simple => SwapKind::SimpleSwap,
+        EncodeRouteKind::Multi => SwapKind::MultiSwap,
+        EncodeRouteKind::Mega => SwapKind::MegaSwap,
+    }
+}
+
+const fn encode_route_report_kind(kind: EncodeRouteKind) -> &'static str {
+    match kind {
+        EncodeRouteKind::Simple => "encode-simple",
+        EncodeRouteKind::Multi => "encode-multi",
+        EncodeRouteKind::Mega => "encode-mega",
+    }
 }
 
 fn encode_pool_swap(pool: &SelectedPool, token_in: &str, token_out: &str) -> PoolSwapDraft {
@@ -1911,19 +2109,22 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_wait_ready_args, capture_log_boundary, classify_simulate_response, collect_logs,
-        discover_latest_baseline, ensure_server_ready, maybe_load_baseline, percentile,
-        protocol_from_pool_name, sanitize_filename, select_best_pool, startup_bind_config,
-        BaselineMode, CliArgs, HttpJsonResponse, ObservationClass, ScriptPaths,
+        build_encode_route_request, build_wait_ready_args, capture_log_boundary,
+        classify_simulate_response, collect_logs, discover_latest_baseline, encode_route_swap_kind,
+        ensure_server_ready, maybe_load_baseline, percentile, protocol_from_pool_name,
+        sanitize_filename, select_best_pool, startup_bind_config, BaselineMode, CliArgs,
+        HttpJsonResponse, ObservationClass, PreparedEncodeHop, PreparedEncodeRoute,
+        PreparedEncodeSegment, ScriptPaths, SelectedPool,
     };
-    use crate::sim_analysis::presets::balanced_profile;
+    use crate::sim_analysis::presets::{balanced_profile, EncodeRouteKind};
     use reqwest::Client;
     use reqwest::StatusCode;
     use serde_json::json;
     use simulator_core::models::messages::{
         AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
-        QuoteResultQuality, QuoteStatus,
+        QuoteResultQuality, QuoteStatus, SwapKind,
     };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -2003,6 +2204,113 @@ mod tests {
         assert!(vm_and_rfq_args
             .iter()
             .any(|arg| arg == "--require-rfq-ready"));
+    }
+
+    #[test]
+    fn build_encode_route_request_preserves_route_shapes() -> anyhow::Result<()> {
+        let root = temp_test_dir("encode-route-shapes");
+        assert!(fs::create_dir_all(&root).is_ok());
+
+        let simple = route_request_for_kind(&root, EncodeRouteKind::Simple)?;
+        assert_eq!(simple.swap_kind, SwapKind::SimpleSwap);
+        assert_eq!(simple.segments.len(), 1);
+        assert_eq!(simple.segments[0].kind, SwapKind::SimpleSwap);
+        assert_eq!(simple.segments[0].hops.len(), 1);
+
+        let multi = route_request_for_kind(&root, EncodeRouteKind::Multi)?;
+        assert_eq!(multi.swap_kind, SwapKind::MultiSwap);
+        assert_eq!(multi.segments.len(), 1);
+        assert_eq!(multi.segments[0].kind, SwapKind::MultiSwap);
+        assert_eq!(multi.segments[0].hops.len(), 2);
+
+        let mega = route_request_for_kind(&root, EncodeRouteKind::Mega)?;
+        assert_eq!(mega.swap_kind, SwapKind::MegaSwap);
+        assert_eq!(mega.segments.len(), 2);
+        assert_eq!(mega.segments[0].share_bps, 5000);
+        assert_eq!(mega.segments[1].share_bps, 0);
+
+        assert!(fs::remove_dir_all(&root).is_ok());
+        Ok(())
+    }
+
+    fn route_request_for_kind(
+        root: &std::path::Path,
+        kind: EncodeRouteKind,
+    ) -> anyhow::Result<simulator_core::models::messages::RouteEncodeRequest> {
+        let preset = crate::sim_analysis::presets::EncodeRoutePreset {
+            label: "shape-test",
+            kind,
+            segments: &[],
+            amounts: &["100"],
+            settlement_address: "0x0000000000000000000000000000000000000003",
+            tycho_router_address: "0x0000000000000000000000000000000000000004",
+        };
+        let prepared = PreparedEncodeRoute {
+            token_in: "0x0000000000000000000000000000000000000001".to_string(),
+            token_out: "0x0000000000000000000000000000000000000002".to_string(),
+            amount_in: "100".to_string(),
+            min_amount_out: "90".to_string(),
+            segments: match kind {
+                EncodeRouteKind::Simple => vec![prepared_segment(SwapKind::SimpleSwap, 0, 1)],
+                EncodeRouteKind::Multi => vec![prepared_segment(SwapKind::MultiSwap, 0, 2)],
+                EncodeRouteKind::Mega => vec![
+                    prepared_segment(SwapKind::SimpleSwap, 5000, 1),
+                    prepared_segment(SwapKind::SimpleSwap, 0, 1),
+                ],
+            },
+            protocols: BTreeMap::new(),
+            notes: Vec::new(),
+        };
+        build_encode_route_request(root, 1, &preset, &prepared)
+    }
+
+    fn prepared_segment(kind: SwapKind, share_bps: u32, hop_count: usize) -> PreparedEncodeSegment {
+        let mut hops = Vec::with_capacity(hop_count);
+        for index in 0..hop_count {
+            hops.push(PreparedEncodeHop {
+                token_in: format!("0x{:040x}", index + 1),
+                token_out: format!("0x{:040x}", index + 2),
+                pool: selected_pool(&format!("pool-{index}")),
+            });
+        }
+        PreparedEncodeSegment {
+            kind,
+            share_bps,
+            hops,
+            final_amount_out: "100".to_string(),
+        }
+    }
+
+    fn selected_pool(pool_id: &str) -> SelectedPool {
+        SelectedPool {
+            quote: AmountOutResponse {
+                pool: pool_id.to_string(),
+                pool_name: pool_id.to_string(),
+                pool_address: "0x0000000000000000000000000000000000000009".to_string(),
+                amounts_out: vec!["100".to_string()],
+                slippage: Vec::new(),
+                limit_max_in: None,
+                gas_used: vec![0],
+                block_number: 1,
+            },
+            protocol: "uniswap_v2".to_string(),
+        }
+    }
+
+    #[test]
+    fn encode_route_swap_kind_matches_route_kind() {
+        assert_eq!(
+            encode_route_swap_kind(EncodeRouteKind::Simple),
+            SwapKind::SimpleSwap
+        );
+        assert_eq!(
+            encode_route_swap_kind(EncodeRouteKind::Multi),
+            SwapKind::MultiSwap
+        );
+        assert_eq!(
+            encode_route_swap_kind(EncodeRouteKind::Mega),
+            SwapKind::MegaSwap
+        );
     }
 
     #[tokio::test]

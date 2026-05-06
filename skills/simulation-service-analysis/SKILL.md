@@ -27,7 +27,7 @@ metadata:
 - Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
-- Builds a narrow 2-hop `/encode` probe from live `/simulate` results.
+- Builds a `/encode` route matrix from live `/simulate` results, covering SimpleSwap, MultiSwap, and MegaSwap shapes.
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
