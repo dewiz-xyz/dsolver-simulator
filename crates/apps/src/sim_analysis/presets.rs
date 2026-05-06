@@ -11,13 +11,26 @@ pub struct SimulateScenarioPreset {
 }
 
 #[derive(Clone, Debug)]
-pub struct EncodePreset {
-    pub token_in_symbol: &'static str,
-    pub mid_symbol: &'static str,
-    pub token_out_symbol: &'static str,
+pub struct EncodeRoutePreset {
+    pub label: &'static str,
+    pub kind: EncodeRouteKind,
+    pub segments: &'static [EncodeSegmentPreset],
     pub amounts: &'static [&'static str],
     pub settlement_address: &'static str,
     pub tycho_router_address: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeRouteKind {
+    Simple,
+    Multi,
+    Mega,
+}
+
+#[derive(Clone, Debug)]
+pub struct EncodeSegmentPreset {
+    pub share_bps: u32,
+    pub path: &'static [&'static str],
 }
 
 #[derive(Clone, Debug)]
@@ -25,7 +38,7 @@ pub struct BalancedProfilePreset {
     pub simulate_scenarios: Vec<SimulateScenarioPreset>,
     pub latency_scenarios: Vec<SimulateScenarioPreset>,
     pub stress_scenarios: Vec<SimulateScenarioPreset>,
-    pub encode: EncodePreset,
+    pub encode_routes: Vec<EncodeRoutePreset>,
     pub latency_requests: usize,
     pub latency_concurrency: usize,
     pub stress_requests: usize,
@@ -110,7 +123,7 @@ fn ethereum_balanced_profile(vm_enabled: bool) -> BalancedProfilePreset {
         simulate_scenarios: ethereum_simulate_scenarios(),
         latency_scenarios: ethereum_latency_scenarios(),
         stress_scenarios: ethereum_stress_scenarios(),
-        encode: ethereum_encode_preset(),
+        encode_routes: ethereum_encode_presets(),
         latency_requests: 36,
         latency_concurrency: if vm_enabled { 4 } else { 6 },
         stress_requests: 72,
@@ -123,7 +136,7 @@ fn base_balanced_profile() -> BalancedProfilePreset {
         simulate_scenarios: base_simulate_scenarios(),
         latency_scenarios: base_latency_scenarios(),
         stress_scenarios: base_stress_scenarios(),
-        encode: base_encode_preset(),
+        encode_routes: base_encode_presets(),
         latency_requests: 36,
         latency_concurrency: 6,
         stress_requests: 72,
@@ -230,20 +243,129 @@ fn ethereum_stress_scenarios() -> Vec<SimulateScenarioPreset> {
     ]
 }
 
-fn ethereum_encode_preset() -> EncodePreset {
-    EncodePreset {
-        token_in_symbol: "DAI",
-        mid_symbol: "USDC",
-        token_out_symbol: "USDT",
-        amounts: &[
-            "1000000000000000000",
-            "5000000000000000000",
-            "10000000000000000000",
-            "50000000000000000000",
-        ],
-        settlement_address: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
-        tycho_router_address: "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
-    }
+const ETHEREUM_ENCODE_STABLE_AMOUNTS: &[&str] = &[
+    "1000000000000000000",
+    "5000000000000000000",
+    "10000000000000000000",
+    "50000000000000000000",
+];
+
+const ETHEREUM_ENCODE_USDC_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
+
+const ETH_SIMPLE_DAI_USDC: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["DAI", "USDC"],
+}];
+const ETH_SIMPLE_USDC_USDT: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["USDC", "USDT"],
+}];
+const ETH_SIMPLE_USDC_WETH: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["USDC", "WETH"],
+}];
+const ETH_MULTI_DAI_USDC_USDT: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["DAI", "USDC", "USDT"],
+}];
+const ETH_MULTI_WETH_USDC_USDT: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["WETH", "USDC", "USDT"],
+}];
+const ETH_MULTI_DAI_USDC_WETH: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["DAI", "USDC", "WETH"],
+}];
+const ETH_MEGA_DAI_USDC: &[EncodeSegmentPreset] = &[
+    EncodeSegmentPreset {
+        share_bps: 5000,
+        path: &["DAI", "USDC"],
+    },
+    EncodeSegmentPreset {
+        share_bps: 0,
+        path: &["DAI", "USDC"],
+    },
+];
+const ETH_MEGA_USDC_WETH: &[EncodeSegmentPreset] = &[
+    EncodeSegmentPreset {
+        share_bps: 5000,
+        path: &["USDC", "WETH"],
+    },
+    EncodeSegmentPreset {
+        share_bps: 0,
+        path: &["USDC", "WETH"],
+    },
+];
+
+fn ethereum_encode_presets() -> Vec<EncodeRoutePreset> {
+    let settlement_address = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41";
+    let tycho_router_address = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35";
+    vec![
+        encode_route(
+            "simple-dai-usdc",
+            EncodeRouteKind::Simple,
+            ETH_SIMPLE_DAI_USDC,
+            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "simple-usdc-usdt",
+            EncodeRouteKind::Simple,
+            ETH_SIMPLE_USDC_USDT,
+            ETHEREUM_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "simple-usdc-weth",
+            EncodeRouteKind::Simple,
+            ETH_SIMPLE_USDC_WETH,
+            ETHEREUM_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "multi-dai-usdc-usdt",
+            EncodeRouteKind::Multi,
+            ETH_MULTI_DAI_USDC_USDT,
+            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "multi-weth-usdc-usdt",
+            EncodeRouteKind::Multi,
+            ETH_MULTI_WETH_USDC_USDT,
+            ETH_LARGE_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "multi-dai-usdc-weth",
+            EncodeRouteKind::Multi,
+            ETH_MULTI_DAI_USDC_WETH,
+            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "mega-dai-usdc",
+            EncodeRouteKind::Mega,
+            ETH_MEGA_DAI_USDC,
+            ETHEREUM_ENCODE_STABLE_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "mega-usdc-weth",
+            EncodeRouteKind::Mega,
+            ETH_MEGA_USDC_WETH,
+            ETHEREUM_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+    ]
 }
 
 fn base_simulate_scenarios() -> Vec<SimulateScenarioPreset> {
@@ -331,14 +453,139 @@ fn base_stress_scenarios() -> Vec<SimulateScenarioPreset> {
     ]
 }
 
-fn base_encode_preset() -> EncodePreset {
-    EncodePreset {
-        token_in_symbol: "USDC",
-        mid_symbol: "WETH",
-        token_out_symbol: "USDC",
-        amounts: &["1000000", "5000000", "10000000", "50000000"],
-        settlement_address: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
-        tycho_router_address: "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369",
+const BASE_ENCODE_USDC_AMOUNTS: &[&str] = &["1000000", "5000000", "10000000", "50000000"];
+
+const BASE_SIMPLE_USDC_WETH: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["USDC", "WETH"],
+}];
+const BASE_SIMPLE_WETH_USDC: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["WETH", "USDC"],
+}];
+const BASE_SIMPLE_USDC_AERO: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["USDC", "AERO"],
+}];
+const BASE_MULTI_USDC_WETH_USDC: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["USDC", "WETH", "USDC"],
+}];
+const BASE_MULTI_WETH_USDC_AERO: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["WETH", "USDC", "AERO"],
+}];
+const BASE_MULTI_AERO_USDC_WETH: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["AERO", "USDC", "WETH"],
+}];
+const BASE_MEGA_USDC_WETH: &[EncodeSegmentPreset] = &[
+    EncodeSegmentPreset {
+        share_bps: 5000,
+        path: &["USDC", "WETH"],
+    },
+    EncodeSegmentPreset {
+        share_bps: 0,
+        path: &["USDC", "WETH"],
+    },
+];
+const BASE_MEGA_USDC_AERO: &[EncodeSegmentPreset] = &[
+    EncodeSegmentPreset {
+        share_bps: 5000,
+        path: &["USDC", "AERO"],
+    },
+    EncodeSegmentPreset {
+        share_bps: 0,
+        path: &["USDC", "AERO"],
+    },
+];
+
+fn base_encode_presets() -> Vec<EncodeRoutePreset> {
+    let settlement_address = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41";
+    let tycho_router_address = "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369";
+    vec![
+        encode_route(
+            "simple-usdc-weth",
+            EncodeRouteKind::Simple,
+            BASE_SIMPLE_USDC_WETH,
+            BASE_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "simple-weth-usdc",
+            EncodeRouteKind::Simple,
+            BASE_SIMPLE_WETH_USDC,
+            BASE_ETH_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "simple-usdc-aero",
+            EncodeRouteKind::Simple,
+            BASE_SIMPLE_USDC_AERO,
+            BASE_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "multi-usdc-weth-usdc",
+            EncodeRouteKind::Multi,
+            BASE_MULTI_USDC_WETH_USDC,
+            BASE_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "multi-weth-usdc-aero",
+            EncodeRouteKind::Multi,
+            BASE_MULTI_WETH_USDC_AERO,
+            BASE_ETH_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "multi-aero-usdc-weth",
+            EncodeRouteKind::Multi,
+            BASE_MULTI_AERO_USDC_WETH,
+            LINK_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "mega-usdc-weth",
+            EncodeRouteKind::Mega,
+            BASE_MEGA_USDC_WETH,
+            BASE_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "mega-usdc-aero",
+            EncodeRouteKind::Mega,
+            BASE_MEGA_USDC_AERO,
+            BASE_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+    ]
+}
+
+fn encode_route(
+    label: &'static str,
+    kind: EncodeRouteKind,
+    segments: &'static [EncodeSegmentPreset],
+    amounts: &'static [&'static str],
+    settlement_address: &'static str,
+    tycho_router_address: &'static str,
+) -> EncodeRoutePreset {
+    EncodeRoutePreset {
+        label,
+        kind,
+        segments,
+        amounts,
+        settlement_address,
+        tycho_router_address,
     }
 }
 
@@ -395,7 +642,7 @@ fn rfq_tags(tags: &'static [&'static str]) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_profile, LINK_AMOUNTS, STABLE_AMOUNTS};
+    use super::{balanced_profile, EncodeRouteKind, LINK_AMOUNTS, STABLE_AMOUNTS};
 
     #[test]
     fn ethereum_balanced_profile_includes_rfq_targeted_scenarios() {
@@ -480,5 +727,35 @@ mod tests {
                 ) || scenario.token_in_symbol == "DAI"
                     || scenario.token_out_symbol == "DAI"
             }));
+    }
+
+    #[test]
+    fn balanced_profiles_include_encode_route_matrix() {
+        for chain_id in [1, 8453] {
+            let profile_result = balanced_profile(chain_id, false);
+            assert!(profile_result.is_ok());
+            let Some(profile) = profile_result.ok() else {
+                return;
+            };
+
+            assert!(profile
+                .encode_routes
+                .iter()
+                .any(|route| route.kind == EncodeRouteKind::Simple));
+            assert!(profile
+                .encode_routes
+                .iter()
+                .any(|route| route.kind == EncodeRouteKind::Multi));
+            assert!(profile
+                .encode_routes
+                .iter()
+                .any(|route| route.kind == EncodeRouteKind::Mega));
+            assert!(profile.encode_routes.iter().all(|route| {
+                route
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.share_bps == 0)
+            }));
+        }
     }
 }

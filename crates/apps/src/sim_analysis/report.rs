@@ -595,7 +595,7 @@ mod tests {
 
     fn report(findings: Vec<Finding>, scenarios: Vec<ScenarioReport>) -> AnalysisReport {
         AnalysisReport {
-            schema_version: 4,
+            schema_version: 5,
             run: RunMetadata {
                 started_at_epoch_s: 1,
                 finished_at_epoch_s: 2,
