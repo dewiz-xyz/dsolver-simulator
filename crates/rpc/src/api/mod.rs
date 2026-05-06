@@ -15,7 +15,10 @@ use tower::{
 };
 use tracing::warn;
 
-use runtime::{services::QuoteService, simulator_service::SimulatorRuntime};
+use runtime::{
+    services::{EncodeService, QuoteService},
+    simulator_service::SimulatorRuntime,
+};
 
 use crate::handlers::{encode::encode, quote::simulate, readiness::status};
 use crate::metrics::{
@@ -45,6 +48,12 @@ impl FromRef<SimulatorRouterState> for AppState {
 impl FromRef<SimulatorRouterState> for QuoteService {
     fn from_ref(state: &SimulatorRouterState) -> Self {
         state.runtime.quote_service()
+    }
+}
+
+impl FromRef<SimulatorRouterState> for EncodeService {
+    fn from_ref(state: &SimulatorRouterState) -> Self {
+        state.runtime.encode_service()
     }
 }
 

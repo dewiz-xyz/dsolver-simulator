@@ -18,8 +18,60 @@ mod mocks;
 pub use error::{EncodeError, EncodeErrorKind};
 pub use response::{log_failure, log_handler_timeout, log_received, log_success};
 
+use std::time::Instant;
+
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::AppState;
+
+/// Transport-free runtime wrapper for `/encode` route encoding.
+#[derive(Clone)]
+pub struct EncodeService {
+    state: AppState,
+}
+
+pub struct EncodeServiceSuccess {
+    pub computation: EncodeComputation,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug)]
+pub enum EncodeServiceError {
+    Timeout { timeout_ms: u64, latency_ms: u64 },
+    Failed { error: EncodeError, latency_ms: u64 },
+}
+
+impl EncodeService {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+
+    pub async fn encode(
+        &self,
+        request: RouteEncodeRequest,
+    ) -> Result<EncodeServiceSuccess, EncodeServiceError> {
+        let started_at = Instant::now();
+        response::log_received(&request);
+
+        let request_timeout = self.state.request_timeout();
+        let computation_future = encode_route(self.state.clone(), request);
+
+        let Ok(computation) = tokio::time::timeout(request_timeout, computation_future).await
+        else {
+            return Err(EncodeServiceError::Timeout {
+                timeout_ms: request_timeout.as_millis() as u64,
+                latency_ms: started_at.elapsed().as_millis() as u64,
+            });
+        };
+
+        let latency_ms = started_at.elapsed().as_millis() as u64;
+        computation
+            .map(|computation| EncodeServiceSuccess {
+                computation,
+                latency_ms,
+            })
+            .map_err(|error| EncodeServiceError::Failed { error, latency_ms })
+    }
+}
 
 pub struct EncodeComputation {
     pub response: RouteEncodeResponse,
@@ -28,7 +80,7 @@ pub struct EncodeComputation {
     pub reset_approval: bool,
 }
 
-pub async fn encode_route(
+async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
 ) -> Result<EncodeComputation, EncodeError> {

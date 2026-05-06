@@ -1,4 +1,3 @@
-use axum::http::StatusCode;
 use tycho_execution::encoding::errors::EncodingError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,18 +59,6 @@ impl EncodeError {
         }
     }
 
-    pub fn status_code(&self) -> StatusCode {
-        match self.kind {
-            EncodeErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
-            EncodeErrorKind::NotFound => StatusCode::NOT_FOUND,
-            EncodeErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            EncodeErrorKind::Simulation => StatusCode::UNPROCESSABLE_ENTITY,
-            EncodeErrorKind::Encoding | EncodeErrorKind::Internal => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        }
-    }
-
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -93,13 +80,15 @@ pub(super) fn map_encoding_error(err: EncodingError) -> EncodeError {
 #[cfg(test)]
 mod tests {
     use super::{EncodeError, EncodeErrorKind};
-    use axum::http::StatusCode;
 
     #[test]
-    fn unavailable_errors_map_to_service_unavailable() {
+    fn unavailable_errors_keep_kind_and_message() {
         let error = EncodeError::unavailable("Encode unavailable: native state warming up");
 
         assert_eq!(error.kind(), EncodeErrorKind::Unavailable);
-        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.message(),
+            "Encode unavailable: native state warming up"
+        );
     }
 }
