@@ -1,60 +1,95 @@
-use std::time::Instant;
-
 use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use runtime::services::encode::{EncodeErrorKind, EncodeService, EncodeServiceError};
 
 use crate::models::messages::{EncodeErrorResponse, RouteEncodeRequest, RouteEncodeResponse};
-use crate::models::state::AppState;
-use crate::services::encode::{
-    encode_route, log_failure, log_handler_timeout, log_received, log_success,
-};
+use crate::services::encode::{log_failure, log_handler_timeout, log_success};
 
 pub async fn encode(
-    State(state): State<AppState>,
+    State(encode_service): State<EncodeService>,
     Json(request): Json<RouteEncodeRequest>,
 ) -> Response {
-    let started_at = Instant::now();
-    log_received(&request);
-
-    let request_timeout = state.request_timeout();
-    let state_for_computation = state.clone();
-    let request_for_computation = request.clone();
-
-    let computation_future = encode_route(state_for_computation, request_for_computation);
-
-    let Ok(computation) = tokio::time::timeout(request_timeout, computation_future).await else {
-        let timeout_ms = request_timeout.as_millis() as u64;
-        log_handler_timeout(
-            &request,
-            timeout_ms,
-            started_at.elapsed().as_millis() as u64,
-        );
-
-        let body = Json(EncodeErrorResponse {
-            error: format!("Encode request timed out after {timeout_ms}ms"),
-            request_id: request.request_id.clone(),
-        });
-        return (StatusCode::REQUEST_TIMEOUT, body).into_response();
-    };
-
-    let latency_ms = started_at.elapsed().as_millis() as u64;
-    match computation {
-        Ok(computation) => {
-            log_success(&request, &computation, latency_ms);
-            Json::<RouteEncodeResponse>(computation.response).into_response()
+    let request_for_logging = request.clone();
+    match encode_service.encode(request).await {
+        Ok(success) => {
+            log_success(
+                &request_for_logging,
+                &success.computation,
+                success.latency_ms,
+            );
+            Json::<RouteEncodeResponse>(success.computation.response).into_response()
         }
-        Err(err) => {
-            let status = err.status_code();
+        Err(EncodeServiceError::Timeout {
+            timeout_ms,
+            latency_ms,
+        }) => {
+            log_handler_timeout(&request_for_logging, timeout_ms, latency_ms);
             let body = Json(EncodeErrorResponse {
-                error: err.message().to_string(),
-                request_id: request.request_id.clone(),
+                error: format!("Encode request timed out after {timeout_ms}ms"),
+                request_id: request_for_logging.request_id.clone(),
             });
-            log_failure(&request, status, err.kind(), err.message(), latency_ms);
+            (StatusCode::REQUEST_TIMEOUT, body).into_response()
+        }
+        Err(EncodeServiceError::Failed { error, latency_ms }) => {
+            let status = encode_status_code(error.kind());
+            let body = Json(EncodeErrorResponse {
+                error: error.message().to_string(),
+                request_id: request_for_logging.request_id.clone(),
+            });
+            log_failure(
+                &request_for_logging,
+                error.kind(),
+                error.message(),
+                latency_ms,
+            );
             (status, body).into_response()
         }
+    }
+}
+
+fn encode_status_code(kind: EncodeErrorKind) -> StatusCode {
+    match kind {
+        EncodeErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        EncodeErrorKind::NotFound => StatusCode::NOT_FOUND,
+        EncodeErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        EncodeErrorKind::Simulation => StatusCode::UNPROCESSABLE_ENTITY,
+        EncodeErrorKind::Encoding | EncodeErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_status_code, EncodeErrorKind, StatusCode};
+
+    #[test]
+    fn encode_status_mapping_stays_in_rpc_adapter() {
+        assert_eq!(
+            encode_status_code(EncodeErrorKind::InvalidRequest),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            encode_status_code(EncodeErrorKind::NotFound),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            encode_status_code(EncodeErrorKind::Unavailable),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            encode_status_code(EncodeErrorKind::Simulation),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            encode_status_code(EncodeErrorKind::Encoding),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            encode_status_code(EncodeErrorKind::Internal),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

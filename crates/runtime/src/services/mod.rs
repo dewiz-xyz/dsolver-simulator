@@ -7,4 +7,5 @@ pub mod quotes;
 pub(crate) mod simulation_executor;
 pub mod stream_builder;
 
+pub use encode::EncodeService;
 pub use quote_service::QuoteService;

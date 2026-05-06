@@ -27,7 +27,7 @@ use crate::services::broadcaster_subscription::{
     NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
 };
 use crate::services::stream_builder::{build_rfq_stream, RFQConfig, RFQTokenStores};
-use crate::services::QuoteService;
+use crate::services::{EncodeService, QuoteService};
 use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
 
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -51,12 +51,14 @@ pub struct SimulatorServiceParts {
 pub struct SimulatorRuntime {
     app_state: AppState,
     quote_service: QuoteService,
+    encode_service: EncodeService,
 }
 
 impl SimulatorRuntime {
     pub fn new(app_state: AppState) -> Self {
         Self {
             quote_service: QuoteService::new(app_state.clone()),
+            encode_service: EncodeService::new(app_state.clone()),
             app_state,
         }
     }
@@ -67,6 +69,10 @@ impl SimulatorRuntime {
 
     pub fn quote_service(&self) -> QuoteService {
         self.quote_service.clone()
+    }
+
+    pub fn encode_service(&self) -> EncodeService {
+        self.encode_service.clone()
     }
 
     pub fn request_timeout(&self) -> Duration {

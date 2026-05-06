@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use axum::http::StatusCode;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use tracing::{debug, info, warn};
@@ -122,7 +121,6 @@ pub fn log_success(request: &RouteEncodeRequest, computation: &EncodeComputation
         scope = "handler_complete",
         request_id = summary.request_id.as_deref(),
         latency_ms,
-        status_code = StatusCode::OK.as_u16(),
         chain_id = summary.chain_id,
         swap_kind = summary.swap_kind,
         segments = summary.segments,
@@ -163,7 +161,6 @@ pub fn log_received(request: &RouteEncodeRequest) {
 
 pub fn log_failure(
     request: &RouteEncodeRequest,
-    status_code: StatusCode,
     kind: EncodeErrorKind,
     message: &str,
     latency_ms: u64,
@@ -174,7 +171,6 @@ pub fn log_failure(
         scope = "handler_complete",
         request_id = summary.request_id.as_deref(),
         latency_ms,
-        status_code = status_code.as_u16(),
         encode_error_kind = encode_error_kind_label(kind),
         failure_stage = stage.label(),
         error = message,
@@ -203,7 +199,6 @@ pub fn log_handler_timeout(request: &RouteEncodeRequest, timeout_ms: u64, latenc
         request_id = summary.request_id.as_deref(),
         latency_ms,
         timeout_ms,
-        status_code = StatusCode::REQUEST_TIMEOUT.as_u16(),
         encode_error_kind = "timeout",
         failure_stage = EncodeFailureStage::HandlerTimeout.label(),
         error,

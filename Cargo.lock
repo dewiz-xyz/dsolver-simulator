@@ -5382,7 +5382,6 @@ dependencies = [
  "alloy-primitives 1.5.7",
  "alloy-sol-types",
  "anyhow",
- "axum 0.7.9",
  "chrono",
  "csv",
  "dotenv",
