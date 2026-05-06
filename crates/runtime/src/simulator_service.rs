@@ -1,14 +1,14 @@
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use simulator_core::broadcaster::BroadcasterTokenSnapshotResponse;
+use tracing::{debug, info, warn};
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
     Bytes,
 };
-use tycho_simulation::utils::load_all_tokens;
 
 use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
@@ -19,7 +19,9 @@ use crate::models::state::{
     AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
-use crate::models::tokens::TokenStore;
+use crate::models::tokens::{
+    derive_broadcaster_token_lookup_url, derive_broadcaster_token_snapshot_url, TokenStore,
+};
 use crate::services::broadcaster_subscription::{
     supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
     NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
@@ -27,6 +29,9 @@ use crate::services::broadcaster_subscription::{
 use crate::services::stream_builder::{build_rfq_stream, RFQConfig, RFQTokenStores};
 use crate::services::QuoteService;
 use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
+
+const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const TOKEN_SNAPSHOT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 struct RfqStreamDeps<'a> {
     resources: &'a StreamResources,
@@ -73,7 +78,6 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     init_logging();
     let config = load_config();
     let chain = config.chain_profile.chain;
-    let tycho_url = config.tycho_url.clone();
     let effective_rfq_enabled =
         config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
@@ -81,7 +85,7 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
 
-    let tokens = load_token_store(&config, &tycho_url).await?;
+    let tokens = load_token_store(&config).await?;
     let bebop_tokens: Arc<TokenStore>;
     let hashflow_tokens: Arc<TokenStore>;
     let liquorice_tokens: Arc<TokenStore>;
@@ -89,29 +93,29 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     if effective_rfq_enabled {
         // RFQ enabled means RFQ bootstrap must succeed.
         bebop_tokens = if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:bebop") {
-            load_bebop_token_store(&config, &tycho_url, &config.bebop_url, chain).await?
+            load_bebop_token_store(&config, &config.bebop_url, chain).await?
         } else {
-            new_token_store(HashMap::new(), &tycho_url, &config)
+            new_local_token_store(HashMap::new(), &config)
         };
         hashflow_tokens =
             if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:hashflow") {
-                load_hashflow_token_store(&config, &tycho_url, &config.hashflow_filename, chain)?
+                load_hashflow_token_store(&config, &config.hashflow_filename, chain)?
             } else {
-                new_token_store(HashMap::new(), &tycho_url, &config)
+                new_local_token_store(HashMap::new(), &config)
             };
         liquorice_tokens =
             if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:liquorice") {
                 let liquorice_url = config.liquorice_url.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("Liquorice RFQ enabled for {chain} without liquorice_url")
                 })?;
-                load_liquorice_token_store(&config, &tycho_url, liquorice_url, chain).await?
+                load_liquorice_token_store(&config, liquorice_url, chain).await?
             } else {
-                new_token_store(HashMap::new(), &tycho_url, &config)
+                new_local_token_store(HashMap::new(), &config)
             };
     } else {
-        bebop_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
-        hashflow_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
-        liquorice_tokens = new_token_store(HashMap::new(), &tycho_url, &config);
+        bebop_tokens = new_local_token_store(HashMap::new(), &config);
+        hashflow_tokens = new_local_token_store(HashMap::new(), &config);
+        liquorice_tokens = new_local_token_store(HashMap::new(), &config);
     }
 
     let stream_resources = create_stream_resources(Arc::clone(&tokens));
@@ -189,39 +193,187 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
     });
 }
 
-async fn load_token_store(config: &AppConfig, tycho_url: &str) -> anyhow::Result<Arc<TokenStore>> {
+async fn load_token_store(config: &AppConfig) -> anyhow::Result<Arc<TokenStore>> {
     let chain = config.chain_profile.chain;
-    let all_tokens = load_all_tokens(
-        tycho_url,
-        false,
-        Some(&config.api_key),
-        true,
+    let lookup_url = derive_broadcaster_token_lookup_url(&config.tycho_broadcaster_ws_url)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let snapshot_url = derive_broadcaster_token_snapshot_url(&config.tycho_broadcaster_ws_url)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let fetch_timeout = Duration::from_millis(config.token_refresh_timeout_ms);
+    let snapshot_timeout = Duration::from_millis(config.token_snapshot_timeout_ms);
+    let initial_tokens = load_broadcaster_token_snapshot_with_retry(
+        &Client::new(),
+        &snapshot_url,
         chain,
-        Some(10),
-        None,
+        snapshot_timeout,
     )
     .await?;
-    info!("Loaded {} tokens", all_tokens.len());
+    info!(
+        %lookup_url,
+        token_count = initial_tokens.len(),
+        "Initialized broadcaster-backed token metadata mirror"
+    );
 
-    Ok(Arc::new(TokenStore::new(
-        all_tokens,
-        tycho_url.to_string(),
-        config.api_key.clone(),
+    Ok(Arc::new(TokenStore::broadcaster_backed(
+        initial_tokens,
+        lookup_url,
         chain,
-        Duration::from_millis(config.token_refresh_timeout_ms),
+        fetch_timeout,
     )))
+}
+
+async fn load_broadcaster_token_snapshot_with_retry(
+    client: &Client,
+    snapshot_url: &str,
+    chain: Chain,
+    deadline: Duration,
+) -> anyhow::Result<HashMap<Bytes, Token>> {
+    let started_at = Instant::now();
+    let mut attempt = 1;
+    let mut next_delay = TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY;
+
+    loop {
+        let elapsed = started_at.elapsed();
+        let remaining = deadline
+            .checked_sub(elapsed)
+            .ok_or_else(|| anyhow::anyhow!("Timed out loading broadcaster token snapshot"))?;
+
+        match load_broadcaster_token_snapshot(client, snapshot_url, chain, remaining).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(error) if error.is_retryable() => {
+                let elapsed = started_at.elapsed();
+                let Some(remaining) = deadline.checked_sub(elapsed) else {
+                    return Err(error.into_anyhow(snapshot_url));
+                };
+                let delay = next_delay.min(remaining);
+                warn!(
+                    %snapshot_url,
+                    attempt,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    next_delay_ms = delay.as_millis() as u64,
+                    error = %error,
+                    "Retrying broadcaster token snapshot load"
+                );
+                tokio::time::sleep(delay).await;
+                next_delay = (next_delay * 2).min(TOKEN_SNAPSHOT_RETRY_MAX_DELAY);
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into_anyhow(snapshot_url)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TokenSnapshotLoadError {
+    Request(reqwest::Error),
+    Body(reqwest::Error),
+    Json(serde_json::Error),
+    Status(StatusCode),
+    InvalidChain { actual: u64, expected: u64 },
+    InvalidToken(anyhow::Error),
+}
+
+impl TokenSnapshotLoadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Request(_) | Self::Body(_) => true,
+            Self::Status(status) => {
+                status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS
+            }
+            Self::Json(_) | Self::InvalidChain { .. } | Self::InvalidToken(_) => false,
+        }
+    }
+
+    fn into_anyhow(self, snapshot_url: &str) -> anyhow::Error {
+        match self {
+            Self::Request(error) => anyhow::anyhow!(
+                "Failed to fetch broadcaster token snapshot from {snapshot_url}: {error}"
+            ),
+            Self::Body(error) => anyhow::anyhow!(
+                "Failed to read broadcaster token snapshot from {snapshot_url}: {error}"
+            ),
+            Self::Json(error) => anyhow::anyhow!(
+                "Failed to decode broadcaster token snapshot from {snapshot_url}: {error}"
+            ),
+            Self::Status(status) => anyhow::anyhow!(
+                "Failed to fetch broadcaster token snapshot from {snapshot_url}: HTTP {status}"
+            ),
+            Self::InvalidChain { actual, expected } => anyhow::anyhow!(
+                "broadcaster token snapshot chain_id {actual} does not match simulator chain_id {expected}"
+            ),
+            Self::InvalidToken(error) => {
+                anyhow::anyhow!("Failed to parse broadcaster token snapshot: {error}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TokenSnapshotLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) | Self::Body(error) => write!(formatter, "{error}"),
+            Self::Json(error) => write!(formatter, "{error}"),
+            Self::Status(status) => write!(formatter, "HTTP {status}"),
+            Self::InvalidChain { actual, expected } => write!(
+                formatter,
+                "chain_id {actual} does not match simulator chain_id {expected}"
+            ),
+            Self::InvalidToken(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+async fn load_broadcaster_token_snapshot(
+    client: &Client,
+    snapshot_url: &str,
+    chain: Chain,
+    fetch_timeout: Duration,
+) -> Result<HashMap<Bytes, Token>, TokenSnapshotLoadError> {
+    let response = client
+        .get(snapshot_url)
+        .timeout(fetch_timeout)
+        .send()
+        .await
+        .map_err(TokenSnapshotLoadError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(TokenSnapshotLoadError::Status(status));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(TokenSnapshotLoadError::Body)?;
+    let response = serde_json::from_slice::<BroadcasterTokenSnapshotResponse>(&body)
+        .map_err(TokenSnapshotLoadError::Json)?;
+
+    if response.chain_id != chain.id() {
+        return Err(TokenSnapshotLoadError::InvalidChain {
+            actual: response.chain_id,
+            expected: chain.id(),
+        });
+    }
+
+    response
+        .tokens
+        .into_iter()
+        .map(|token| {
+            token
+                .into_token(chain)
+                .map(|token| (token.address.clone(), token))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|error| TokenSnapshotLoadError::InvalidToken(anyhow::anyhow!("{error}")))
 }
 
 async fn load_bebop_token_store(
     config: &AppConfig,
-    tycho_url: &str,
     bebop_url: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
     let client = Client::new();
     let bebop_tokens = load_bebop_tokens(&client, bebop_url, chain).await?;
     info!("all bebop tokens: {:?}", bebop_tokens);
-    Ok(new_token_store(bebop_tokens, tycho_url, config))
+    Ok(new_local_token_store(bebop_tokens, config))
 }
 
 async fn load_bebop_tokens(
@@ -244,8 +396,8 @@ async fn load_bebop_tokens(
 
     response
         .tokens
-        .into_iter()
-        .filter_map(|(_ticker, token)| match token.to_tycho_token(chain) {
+        .into_values()
+        .filter_map(|token| match token.to_tycho_token(chain) {
             Ok(Some(new)) => Some(Ok((new.address.clone(), new))),
             Ok(None) => None,
             Err(err) => Some(Err(err)),
@@ -256,19 +408,17 @@ async fn load_bebop_tokens(
 
 fn load_hashflow_token_store(
     config: &AppConfig,
-    tycho_url: &str,
     hashflow_filename: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
     let hashflow_tokens = read_hashflow_csv(hashflow_filename, chain)
         .map_err(|error| anyhow::anyhow!("Failed to read hashflow CSV: {}", error))?;
     info!("all_hashflow_tokens: {:?}", hashflow_tokens);
-    Ok(new_token_store(hashflow_tokens, tycho_url, config))
+    Ok(new_local_token_store(hashflow_tokens, config))
 }
 
 async fn load_liquorice_token_store(
     config: &AppConfig,
-    tycho_url: &str,
     liquorice_url: &str,
     chain: Chain,
 ) -> anyhow::Result<Arc<TokenStore>> {
@@ -282,7 +432,7 @@ async fn load_liquorice_token_store(
     )
     .await?;
     info!("all_liquorice_tokens: {:?}", liquorice_tokens);
-    Ok(new_token_store(liquorice_tokens, tycho_url, config))
+    Ok(new_local_token_store(liquorice_tokens, config))
 }
 
 async fn load_liquorice_tokens(
@@ -320,15 +470,9 @@ fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
     protocols.iter().any(|configured| configured == protocol)
 }
 
-fn new_token_store(
-    tokens: HashMap<Bytes, Token>,
-    tycho_url: &str,
-    config: &AppConfig,
-) -> Arc<TokenStore> {
-    Arc::new(TokenStore::new(
+fn new_local_token_store(tokens: HashMap<Bytes, Token>, config: &AppConfig) -> Arc<TokenStore> {
+    Arc::new(TokenStore::local_only(
         tokens,
-        tycho_url.to_string(),
-        config.api_key.clone(),
         config.chain_profile.chain,
         Duration::from_millis(config.token_refresh_timeout_ms),
     ))
@@ -581,14 +725,208 @@ fn spawn_rfq_stream_task(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use crate::config::{AppConfig, ChainProfile, MemoryConfig, SlippageConfig};
     use crate::models::tokens::TokenStore;
-    use tycho_simulation::tycho_common::{models::Chain, Bytes};
+    use anyhow::{anyhow, Result};
+    use simulator_core::broadcaster::{
+        BroadcasterTokenDto, BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+    use tycho_simulation::tycho_common::{models::token::Token, models::Chain, Bytes};
 
-    use super::{build_app_state, create_stream_resources};
+    use super::{build_app_state, create_stream_resources, load_token_store};
+
+    struct TokenAuthority {
+        ws_url: String,
+        lookup_hits: Arc<AtomicUsize>,
+        snapshot_hits: Arc<AtomicUsize>,
+        tycho_hits: Arc<AtomicUsize>,
+        task: JoinHandle<Result<()>>,
+    }
+
+    #[derive(Default)]
+    struct TokenAuthorityOptions {
+        snapshot_delay: Duration,
+        snapshot_failures: usize,
+        truncated_snapshot_responses: usize,
+        snapshot_chain: Option<Chain>,
+    }
+
+    struct TokenAuthorityState {
+        tokens: Arc<Vec<Token>>,
+        lookup_hits: Arc<AtomicUsize>,
+        snapshot_hits: Arc<AtomicUsize>,
+        tycho_hits: Arc<AtomicUsize>,
+        snapshot_failures: Arc<AtomicUsize>,
+        truncated_snapshot_responses: Arc<AtomicUsize>,
+        snapshot_delay: Duration,
+        snapshot_chain: Option<Chain>,
+    }
+
+    impl Drop for TokenAuthority {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl TokenAuthority {
+        async fn spawn(tokens: Vec<Token>) -> Result<Self> {
+            Self::spawn_with_options(tokens, TokenAuthorityOptions::default()).await
+        }
+
+        async fn spawn_with_options(
+            tokens: Vec<Token>,
+            options: TokenAuthorityOptions,
+        ) -> Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let ws_url = format!("ws://{}/ws", listener.local_addr()?);
+            let lookup_hits = Arc::new(AtomicUsize::new(0));
+            let snapshot_hits = Arc::new(AtomicUsize::new(0));
+            let tycho_hits = Arc::new(AtomicUsize::new(0));
+            let state = Arc::new(TokenAuthorityState {
+                tokens: Arc::new(tokens),
+                lookup_hits: Arc::clone(&lookup_hits),
+                snapshot_hits: Arc::clone(&snapshot_hits),
+                tycho_hits: Arc::clone(&tycho_hits),
+                snapshot_failures: Arc::new(AtomicUsize::new(options.snapshot_failures)),
+                truncated_snapshot_responses: Arc::new(AtomicUsize::new(
+                    options.truncated_snapshot_responses,
+                )),
+                snapshot_delay: options.snapshot_delay,
+                snapshot_chain: options.snapshot_chain,
+            });
+            let task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        let _ = handle_token_authority_request(stream, state).await;
+                    });
+                }
+            });
+
+            Ok(Self {
+                ws_url,
+                lookup_hits,
+                snapshot_hits,
+                tycho_hits,
+                task,
+            })
+        }
+    }
+
+    async fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> Result<()> {
+        write_http_response_with_content_length(stream, status, body, body.len()).await
+    }
+
+    async fn write_http_response_with_content_length(
+        stream: &mut TcpStream,
+        status: &str,
+        body: &[u8],
+        content_length: usize,
+    ) -> Result<()> {
+        let headers = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body).await?;
+        Ok(())
+    }
+
+    async fn handle_token_authority_request(
+        mut stream: TcpStream,
+        state: Arc<TokenAuthorityState>,
+    ) -> Result<()> {
+        let mut buffer = vec![0_u8; 4096];
+        let read = stream.read(&mut buffer).await?;
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or_else(|| anyhow!("token authority request line missing path"))?;
+
+        let (status, body) = match path {
+            "/tokens/lookup" => {
+                state.lookup_hits.fetch_add(1, Ordering::SeqCst);
+                let response = BroadcasterTokenLookupResponse {
+                    tokens: state
+                        .tokens
+                        .iter()
+                        .cloned()
+                        .map(BroadcasterTokenDto::from)
+                        .collect(),
+                    missing: Vec::new(),
+                };
+                ("200 OK", serde_json::to_vec(&response)?)
+            }
+            "/tokens/snapshot" => {
+                state.snapshot_hits.fetch_add(1, Ordering::SeqCst);
+                if !state.snapshot_delay.is_zero() {
+                    tokio::time::sleep(state.snapshot_delay).await;
+                }
+                if state
+                    .snapshot_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return write_http_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        b"snapshot unavailable",
+                    )
+                    .await;
+                }
+                if state
+                    .truncated_snapshot_responses
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return write_http_response_with_content_length(
+                        &mut stream,
+                        "200 OK",
+                        b"{\"chainId\":1,\"tokens\":[",
+                        1024,
+                    )
+                    .await;
+                }
+                let response = BroadcasterTokenSnapshotResponse {
+                    chain_id: state
+                        .snapshot_chain
+                        .or_else(|| state.tokens.first().map(|token| token.chain))
+                        .unwrap_or(Chain::Ethereum)
+                        .id(),
+                    tokens: state
+                        .tokens
+                        .iter()
+                        .cloned()
+                        .map(BroadcasterTokenDto::from)
+                        .collect(),
+                };
+                ("200 OK", serde_json::to_vec(&response)?)
+            }
+            "/v1/tokens" => {
+                state.tycho_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    "500 Internal Server Error",
+                    b"tycho fetch forbidden".to_vec(),
+                )
+            }
+            _ => ("404 Not Found", b"not found".to_vec()),
+        };
+
+        write_http_response(&mut stream, status, &body).await
+    }
 
     fn build_test_config(
         chain_profile: ChainProfile,
@@ -613,6 +951,7 @@ mod tests {
             port: 3000,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             request_timeout_ms: 4_500,
+            token_snapshot_timeout_ms: 125_000,
             token_refresh_timeout_ms: 1_000,
             enable_vm_pools,
             enable_rfq_pools,
@@ -655,6 +994,10 @@ mod tests {
         ))
     }
 
+    fn test_token(address: &Bytes, chain: Chain) -> Token {
+        Token::new(address, "LOOKUP", 18, 0, &[], chain, 100)
+    }
+
     fn base_chain_profile() -> ChainProfile {
         ChainProfile {
             chain: Chain::Base,
@@ -689,6 +1032,203 @@ mod tests {
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn load_token_store_preloads_broadcaster_token_snapshot() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority =
+            TokenAuthority::spawn(vec![test_token(&token_address, Chain::Ethereum)]).await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_url = authority
+            .ws_url
+            .replace("ws://", "http://")
+            .trim_end_matches("/ws")
+            .to_string();
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+
+        let store = load_token_store(&config).await?;
+        let resolved = store.ensure(&token_address).await?;
+
+        assert!(resolved.is_some());
+        assert_eq!(
+            authority.snapshot_hits.load(Ordering::SeqCst),
+            1,
+            "production simulator token store should preload the broadcaster snapshot"
+        );
+        assert_eq!(
+            authority.lookup_hits.load(Ordering::SeqCst),
+            0,
+            "snapshot-seeded token lookups should hit the local mirror"
+        );
+        assert_eq!(
+            authority.tycho_hits.load(Ordering::SeqCst),
+            0,
+            "production simulator token store must not fetch token metadata from Tycho"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_token_store_uses_broadcaster_lookup_for_snapshot_misses() -> Result<()> {
+        let cached_address = Bytes::from([9_u8; 20]);
+        let missed_address = Bytes::from([10_u8; 20]);
+        let authority =
+            TokenAuthority::spawn(vec![test_token(&cached_address, Chain::Ethereum)]).await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_url = authority
+            .ws_url
+            .replace("ws://", "http://")
+            .trim_end_matches("/ws")
+            .to_string();
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+
+        let store = load_token_store(&config).await?;
+        let resolved = store.ensure(&missed_address).await?;
+
+        assert!(resolved.is_none());
+        assert_eq!(authority.snapshot_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            authority.lookup_hits.load(Ordering::SeqCst),
+            1,
+            "tokens absent from the startup snapshot should use broadcaster lookup"
+        );
+        assert_eq!(
+            authority.tycho_hits.load(Ordering::SeqCst),
+            0,
+            "production simulator token store must not fetch token metadata from Tycho"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_token_store_uses_snapshot_timeout_for_startup_snapshot() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority = TokenAuthority::spawn_with_options(
+            vec![test_token(&token_address, Chain::Ethereum)],
+            TokenAuthorityOptions {
+                snapshot_delay: Duration::from_millis(20),
+                ..TokenAuthorityOptions::default()
+            },
+        )
+        .await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.token_refresh_timeout_ms = 1;
+        config.token_snapshot_timeout_ms = 500;
+
+        let store = load_token_store(&config).await?;
+        let resolved = store.ensure(&token_address).await?;
+
+        assert!(resolved.is_some());
+        assert_eq!(authority.snapshot_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            authority.lookup_hits.load(Ordering::SeqCst),
+            0,
+            "startup snapshot must not inherit the single-token refresh timeout"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_token_store_retries_retryable_snapshot_failures() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority = TokenAuthority::spawn_with_options(
+            vec![test_token(&token_address, Chain::Ethereum)],
+            TokenAuthorityOptions {
+                snapshot_failures: 1,
+                ..TokenAuthorityOptions::default()
+            },
+        )
+        .await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.token_snapshot_timeout_ms = 1_000;
+
+        let store = load_token_store(&config).await?;
+        let resolved = store.ensure(&token_address).await?;
+
+        assert!(resolved.is_some());
+        assert_eq!(
+            authority.snapshot_hits.load(Ordering::SeqCst),
+            2,
+            "a transient broadcaster snapshot failure should be retried"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_token_store_retries_truncated_snapshot_bodies() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority = TokenAuthority::spawn_with_options(
+            vec![test_token(&token_address, Chain::Ethereum)],
+            TokenAuthorityOptions {
+                truncated_snapshot_responses: 1,
+                ..TokenAuthorityOptions::default()
+            },
+        )
+        .await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.token_snapshot_timeout_ms = 1_000;
+
+        let store = load_token_store(&config).await?;
+        let resolved = store.ensure(&token_address).await?;
+
+        assert!(resolved.is_some());
+        assert_eq!(
+            authority.snapshot_hits.load(Ordering::SeqCst),
+            2,
+            "a truncated snapshot body should be retried before startup fails"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_token_store_does_not_retry_snapshot_chain_mismatch() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority = TokenAuthority::spawn_with_options(
+            vec![test_token(&token_address, Chain::Ethereum)],
+            TokenAuthorityOptions {
+                snapshot_chain: Some(Chain::Base),
+                ..TokenAuthorityOptions::default()
+            },
+        )
+        .await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+
+        let Err(error) = load_token_store(&config).await else {
+            anyhow::bail!("chain mismatch should fail startup");
+        };
+
+        assert!(error.to_string().contains("chain_id"));
+        assert_eq!(authority.snapshot_hits.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_token_store_enforces_snapshot_startup_deadline() -> Result<()> {
+        let token_address = Bytes::from([9_u8; 20]);
+        let authority = TokenAuthority::spawn_with_options(
+            vec![test_token(&token_address, Chain::Ethereum)],
+            TokenAuthorityOptions {
+                snapshot_failures: usize::MAX,
+                ..TokenAuthorityOptions::default()
+            },
+        )
+        .await?;
+        let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
+        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.token_snapshot_timeout_ms = 20;
+
+        let Err(error) = load_token_store(&config).await else {
+            anyhow::bail!("snapshot startup deadline should fail when retries never succeed");
+        };
+
+        assert!(error.to_string().contains("Timed out"));
+        assert!(authority.snapshot_hits.load(Ordering::SeqCst) >= 1);
+        Ok(())
     }
 
     #[test]

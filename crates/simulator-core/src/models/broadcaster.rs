@@ -8,7 +8,7 @@ use serde::{
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update as TychoUpdate},
     tycho_client::feed::{BlockHeader, SynchronizerState},
-    tycho_common::{simulation::protocol_sim::ProtocolSim, Bytes},
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::protocol::ProtocolKind;
@@ -18,6 +18,77 @@ use crate::models::protocol::ProtocolKind;
 pub enum BroadcasterBackend {
     Native,
     Vm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterTokenLookupRequest {
+    pub chain_id: u64,
+    pub addresses: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterTokenLookupResponse {
+    pub tokens: Vec<BroadcasterTokenDto>,
+    pub missing: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterTokenSnapshotResponse {
+    pub chain_id: u64,
+    pub tokens: Vec<BroadcasterTokenDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterTokenDto {
+    pub address: Bytes,
+    pub symbol: String,
+    pub decimals: u32,
+    pub tax: u64,
+    pub gas: Vec<Option<u64>>,
+    pub chain_id: u64,
+    pub quality: u32,
+}
+
+impl BroadcasterTokenDto {
+    pub fn into_token(
+        self,
+        chain: tycho_simulation::tycho_common::models::Chain,
+    ) -> Result<Token, BroadcasterContractError> {
+        if self.chain_id != chain.id() {
+            return Err(BroadcasterContractError::TokenChainMismatch {
+                expected: chain.id(),
+                actual: self.chain_id,
+            });
+        }
+
+        Ok(Token::new(
+            &self.address,
+            &self.symbol,
+            self.decimals,
+            self.tax,
+            &self.gas,
+            chain,
+            self.quality,
+        ))
+    }
+}
+
+impl From<Token> for BroadcasterTokenDto {
+    fn from(token: Token) -> Self {
+        Self {
+            address: token.address,
+            symbol: token.symbol,
+            decimals: token.decimals,
+            tax: token.tax,
+            gas: token.gas,
+            chain_id: token.chain.id(),
+            quality: token.quality,
+        }
+    }
 }
 
 impl BroadcasterBackend {
@@ -923,6 +994,10 @@ pub enum BroadcasterContractError {
         partition_backend: BroadcasterBackend,
         entry_backend: BroadcasterBackend,
     },
+    TokenChainMismatch {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 fn fmt_unexpected_message_seq(
@@ -1149,6 +1224,12 @@ impl fmt::Display for BroadcasterContractError {
                 *partition_backend,
                 *entry_backend,
             ),
+            Self::TokenChainMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "token chain id mismatch: expected {expected}, got {actual}"
+                )
+            }
         }
     }
 }
@@ -1576,8 +1657,9 @@ mod tests {
         BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair, BroadcasterSnapshotChunk,
         BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
         BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterSubscriptionEvent,
-        BroadcasterSubscriptionState, BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
-        BroadcasterUpdatePartition,
+        BroadcasterSubscriptionState, BroadcasterSubscriptionTracker, BroadcasterTokenDto,
+        BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
+        BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1643,6 +1725,87 @@ mod tests {
                 .downcast_ref::<Self>()
                 .is_some_and(|state| state == self)
         }
+    }
+
+    #[test]
+    fn token_lookup_contract_uses_camel_case_shape() -> Result<()> {
+        let address = Bytes::from([0x11_u8; 20]);
+        let request = BroadcasterTokenLookupRequest {
+            chain_id: 1,
+            addresses: vec![address.clone()],
+        };
+        let json = serde_json::to_value(&request)?;
+
+        assert_eq!(json["chainId"], 1);
+        assert_eq!(
+            json["addresses"][0],
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert!(json.get("chain_id").is_none());
+
+        let response = BroadcasterTokenLookupResponse {
+            tokens: vec![BroadcasterTokenDto::from(Token::new(
+                &address,
+                "TKN",
+                18,
+                7,
+                &[Some(21_000)],
+                Chain::Ethereum,
+                75,
+            ))],
+            missing: vec![Bytes::from([0x22_u8; 20])],
+        };
+        let json = serde_json::to_value(&response)?;
+
+        assert!(json["tokens"].is_array());
+        assert_eq!(
+            json["missing"][0],
+            "0x2222222222222222222222222222222222222222"
+        );
+        assert_eq!(json["tokens"][0]["chainId"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn token_snapshot_contract_uses_camel_case_shape() -> Result<()> {
+        let address = Bytes::from([0x12_u8; 20]);
+        let response = BroadcasterTokenSnapshotResponse {
+            chain_id: 1,
+            tokens: vec![BroadcasterTokenDto::from(Token::new(
+                &address,
+                "TKN",
+                18,
+                7,
+                &[Some(21_000)],
+                Chain::Ethereum,
+                75,
+            ))],
+        };
+        let json = serde_json::to_value(&response)?;
+
+        assert_eq!(json["chainId"], 1);
+        assert_eq!(json["tokens"][0]["symbol"], "TKN");
+        assert!(json.get("chain_id").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn token_dto_round_trips_tycho_token_fields() -> Result<()> {
+        let address = Bytes::from([0x33_u8; 20]);
+        let token = Token::new(
+            &address,
+            "ROUND",
+            6,
+            15,
+            &[Some(45_000), None],
+            Chain::Ethereum,
+            50,
+        );
+
+        let round_tripped = BroadcasterTokenDto::from(token.clone()).into_token(Chain::Ethereum)?;
+
+        assert_eq!(round_tripped, token);
+        Ok(())
     }
 
     #[test]
