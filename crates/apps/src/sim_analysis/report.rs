@@ -155,10 +155,19 @@ pub struct LatencySummary {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogSummary {
-    pub log_file: String,
+    pub sources: Vec<LogSourceSummary>,
     pub matched_lines: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt_file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LogSourceSummary {
+    pub source: String,
+    pub log_file: String,
+    pub matched_lines: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub highlights: Vec<String>,
 }
@@ -319,13 +328,23 @@ fn add_scenario_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
 }
 
 fn add_log_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
-    if report.logs.matched_lines > 0 {
+    for source in &report.logs.sources {
+        if source.matched_lines == 0 {
+            continue;
+        }
+
+        let title = if source.source == "broadcaster" {
+            "Broadcaster log warnings or failures were captured"
+        } else {
+            "Simulator log warnings or failures were captured"
+        };
+
         findings.push(Finding {
             severity: "attention".to_string(),
-            title: "Interesting log lines were captured".to_string(),
+            title: title.to_string(),
             detail: format!(
                 "The analyzer matched {} warning/error-like log line(s) in {}.",
-                report.logs.matched_lines, report.logs.log_file
+                source.matched_lines, source.log_file
             ),
         });
     }
@@ -489,10 +508,16 @@ fn append_readiness_snapshot(lines: &mut Vec<String>, label: &str, snapshot: &Re
 fn append_evidence_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push(String::new());
     lines.push("## Evidence".to_string());
-    lines.push(format!("- Log file: {}", report.logs.log_file));
+    for source in &report.logs.sources {
+        lines.push(format!(
+            "- Log file ({}): {} matched={}",
+            source.source, source.log_file, source.matched_lines
+        ));
+    }
     if let Some(excerpt) = &report.logs.excerpt_file {
         lines.push(format!("- Log excerpts: {}", excerpt));
     }
+    append_log_highlights(lines, report);
     if let Some(baseline) = &report.baseline {
         lines.push(format!(
             "- Compared against: {}",
@@ -502,6 +527,31 @@ fn append_evidence_section(lines: &mut Vec<String>, report: &AnalysisReport) {
     lines.push("- Primary artifact: report.json".to_string());
     lines.push("- Human summary: summary.md".to_string());
     lines.push(String::new());
+}
+
+fn append_log_highlights(lines: &mut Vec<String>, report: &AnalysisReport) {
+    if report.logs.highlights.is_empty() {
+        return;
+    }
+
+    lines.push("- Log highlights:".to_string());
+    for highlight in report.logs.highlights.iter().take(6) {
+        lines.push(format!("  {}", truncate_log_line(highlight)));
+    }
+}
+
+fn truncate_log_line(line: &str) -> String {
+    const MAX_LOG_HIGHLIGHT_CHARS: usize = 240;
+    let mut chars = line.chars();
+    let truncated = chars
+        .by_ref()
+        .take(MAX_LOG_HIGHLIGHT_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 pub fn relative_path(root: &Path, path: &Path) -> String {
@@ -549,8 +599,8 @@ fn readiness_component_status(enabled: bool, status: Option<&str>) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSummary,
-        ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
+        build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSourceSummary,
+        LogSummary, ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
     use super::{ReadinessBackendSnapshot, ReadinessSnapshot, RunMetadata, ScenarioReport};
     use std::collections::BTreeMap;
@@ -595,7 +645,7 @@ mod tests {
 
     fn report(findings: Vec<Finding>, scenarios: Vec<ScenarioReport>) -> AnalysisReport {
         AnalysisReport {
-            schema_version: 5,
+            schema_version: 6,
             run: RunMetadata {
                 started_at_epoch_s: 1,
                 finished_at_epoch_s: 2,
@@ -621,7 +671,20 @@ mod tests {
             },
             scenarios,
             logs: LogSummary {
-                log_file: "logs/tycho-sim-server.log".to_string(),
+                sources: vec![
+                    LogSourceSummary {
+                        source: "simulator".to_string(),
+                        log_file: "logs/tycho-sim-server.log".to_string(),
+                        matched_lines: 0,
+                        highlights: Vec::new(),
+                    },
+                    LogSourceSummary {
+                        source: "broadcaster".to_string(),
+                        log_file: "logs/tycho-broadcaster-service.log".to_string(),
+                        matched_lines: 0,
+                        highlights: Vec::new(),
+                    },
+                ],
                 matched_lines: 0,
                 excerpt_file: None,
                 highlights: Vec::new(),
@@ -687,6 +750,37 @@ mod tests {
     }
 
     #[test]
+    fn build_findings_marks_broadcaster_log_matches() {
+        let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+        let broadcaster = analysis
+            .logs
+            .sources
+            .iter_mut()
+            .find(|source| source.source == "broadcaster");
+        assert!(broadcaster.is_some());
+        let Some(broadcaster) = broadcaster else {
+            return;
+        };
+        broadcaster.matched_lines = 2;
+        broadcaster
+            .highlights
+            .push("{\"level\":\"WARN\",\"message\":\"stream build failed\"}".to_string());
+        analysis.logs.matched_lines = 2;
+        analysis.logs.highlights = vec![
+            "broadcaster: {\"level\":\"WARN\",\"message\":\"stream build failed\"}".to_string(),
+        ];
+
+        let findings = build_findings(&analysis);
+
+        assert!(findings.iter().any(|finding| {
+            finding.title == "Broadcaster log warnings or failures were captured"
+                && finding
+                    .detail
+                    .contains("logs/tycho-broadcaster-service.log")
+        }));
+    }
+
+    #[test]
     fn render_summary_includes_rfq_status() {
         let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
         analysis.readiness.initial.backends.insert(
@@ -721,5 +815,39 @@ mod tests {
         assert!(summary.contains("vm=disabled rfq=ready"));
         assert!(summary.contains("native=ready"));
         assert!(summary.contains("vm=disabled rfq=rebuilding"));
+    }
+
+    #[test]
+    fn render_summary_includes_broadcaster_log_source_and_highlight() {
+        let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+        let broadcaster = analysis
+            .logs
+            .sources
+            .iter_mut()
+            .find(|source| source.source == "broadcaster");
+        assert!(broadcaster.is_some());
+        let Some(broadcaster) = broadcaster else {
+            return;
+        };
+        broadcaster.matched_lines = 1;
+        broadcaster
+            .highlights
+            .push("{\"level\":\"ERROR\",\"message\":\"snapshot failed\"}".to_string());
+        analysis.logs.matched_lines = 1;
+        analysis.logs.excerpt_file =
+            Some("logs/simulation-reports/1/balanced/1/evidence/log-excerpts.txt".to_string());
+        analysis.logs.highlights =
+            vec!["broadcaster: {\"level\":\"ERROR\",\"message\":\"snapshot failed\"}".to_string()];
+
+        let summary = render_summary(&analysis);
+
+        assert!(summary
+            .contains("- Log file (broadcaster): logs/tycho-broadcaster-service.log matched=1"));
+        assert!(summary.contains(
+            "- Log excerpts: logs/simulation-reports/1/balanced/1/evidence/log-excerpts.txt"
+        ));
+        assert!(
+            summary.contains("broadcaster: {\"level\":\"ERROR\",\"message\":\"snapshot failed\"}")
+        );
     }
 }

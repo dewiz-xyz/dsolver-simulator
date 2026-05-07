@@ -71,12 +71,15 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 
 ```bash
 cp .env.example .env
-PORT=3001 cargo run -p apps --bin dsolver-tycho-broadcaster-service --release
-cargo run -p apps --bin dsolver-simulator-service --release
+scripts/start_server.sh --repo . --chain-id 1
+scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1
 ```
 
 Use the explicit `-p ... --bin ...` form for local runs and builds so it's always clear which
 workspace binary you're targeting.
+
+For manual service runs, start `dsolver-tycho-broadcaster-service` first on the port used by
+`TYCHO_BROADCASTER_WS_URL`, then start `dsolver-simulator-service`.
 
 Required runtime inputs:
 
@@ -213,6 +216,10 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
 cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
+When `TYCHO_BROADCASTER_WS_URL` points at local loopback, the analyzer uses the repo lifecycle
+helper to start the broadcaster before the simulator. Non-local broadcaster URLs are treated as
+externally managed.
+
 Container builds:
 
 ```bash
@@ -222,12 +229,12 @@ docker build -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-serv
 
 Useful helpers:
 
-- `scripts/start_server.sh` to start the server with repo-local PID and log files
+- `scripts/start_server.sh` to start the local broadcaster plus simulator stack with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
-- `scripts/stop_server.sh` to stop a server started by the repo helper
+- `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
-The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/` so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
 
 ## Docs Map
 
