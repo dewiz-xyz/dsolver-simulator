@@ -408,12 +408,24 @@ if [[ -n "$chain_id_arg" ]]; then
   export CHAIN_ID="$chain_id_arg"
 fi
 
-if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" && "$simulator_already_running" == "false" ]]; then
+if [[ "$simulator_already_running" == "true" ]]; then
+  if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
+    echo "TYCHO_BROADCASTER_WS_URL not set; skipping broadcaster startup for running simulator."
+  elif [[ -z "${CHAIN_ID:-}" ]]; then
+    echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
+    exit 2
+  else
+    start_broadcaster_if_local
+  fi
+  exit 0
+fi
+
+if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
   echo "Error: TYCHO_BROADCASTER_WS_URL is required for simulator startup." >&2
   exit 2
 fi
 
-if [[ -z "${CHAIN_ID:-}" && "$simulator_already_running" == "false" ]]; then
+if [[ -z "${CHAIN_ID:-}" ]]; then
   echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
   exit 2
 fi
@@ -425,12 +437,6 @@ fi
 
 if [[ -n "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
   start_broadcaster_if_local
-elif [[ "$simulator_already_running" == "true" ]]; then
-  echo "TYCHO_BROADCASTER_WS_URL not set; skipping broadcaster startup for running simulator."
-fi
-
-if [[ "$simulator_already_running" == "true" ]]; then
-  exit 0
 fi
 
 (
