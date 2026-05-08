@@ -13,7 +13,8 @@ The local analyzer uses a default route matrix:
 
 - resolves chain from `--chain-id` (or `CHAIN_ID`)
 - calls `/simulate` for each route hop to pick a representative candidate pool
-- builds SimpleSwap, MultiSwap, and MegaSwap requests and posts them to `/encode`
+- builds 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain, then posts each assembled route to `/encode`
+- maps one-segment/one-hop routes to SimpleSwap, one-segment/sequential-hop routes to MultiSwap, and multi-segment split routes to MegaSwap
 - records prep `/simulate` hops as separate `encode-prep` scenarios
 - records each `/encode` interaction shape, router-call presence, latency, and oddities without mixing in prep-hop metrics
 - uses chain-specific default routes and amounts, but treats the result as analytical evidence rather than a strict gate

@@ -23,6 +23,8 @@ skills/**/*.skill
 logs/
 *.log
 .tycho-sim-server.pid
+.tycho-broadcaster-service.pid
+.tycho-broadcaster-service.meta
 .cursorrules
 AGENTS.md
 CLAUDE.md

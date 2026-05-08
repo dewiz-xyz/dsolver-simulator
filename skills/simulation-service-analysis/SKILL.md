@@ -1,6 +1,6 @@
 ---
 name: simulation-service-analysis
-description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the server, wait for /status health and native readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
+description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the local broadcaster plus simulator stack, wait for /status health and native readiness, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
   short-description: DSolver Simulator local analysis
 ---
@@ -10,8 +10,9 @@ metadata:
 ## Quick start
 
 1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
-2. Ensure `.env` exists and contains `TYCHO_API_KEY`.
-   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum runs need `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`. Base runs need the Bebop and Hashflow pairs.
+2. Ensure `.env` exists and contains `TYCHO_API_KEY` plus `TYCHO_BROADCASTER_WS_URL`.
+   The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator.
+   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently need the Bebop and Hashflow credential pairs; Liquorice credentials are only needed after `rfq:liquorice` is added to an active chain profile.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash
@@ -23,13 +24,14 @@ metadata:
 
 ## What the analyzer does
 
-- Reuses the existing local server if it is already responding, otherwise starts it with the repo lifecycle scripts.
+- Reuses the existing local simulator if it is already responding, otherwise starts the local broadcaster plus simulator stack with the repo lifecycle scripts.
+- Starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_WS_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed.
 - Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
-- Builds a `/encode` route matrix from live `/simulate` results, covering SimpleSwap, MultiSwap, and MegaSwap shapes.
+- Builds the balanced `/encode` route matrix from live `/simulate` prep hops, covering 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain.
 - Runs latency and light stress sweeps.
-- Saves sampled request/response artifacts plus log excerpts.
+- Saves sampled request/response artifacts plus simulator and broadcaster log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
 - Top-level `/status.status` is service health; nested `backends.*.status` carries backend readiness.
 
@@ -46,7 +48,7 @@ Base run:
 cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
-Keep the server running:
+Keep the helper-managed local services running:
 ```bash
 cargo run -p apps --bin sim-analysis -- --chain-id 1
 ```
@@ -89,7 +91,7 @@ After the analyzer runs:
 
 1. Read `summary.md` first for the high-level picture.
 2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, and any RFQ readiness or RFQ-visibility findings.
-3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and log excerpts.
+3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts.
 4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
 5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.
 

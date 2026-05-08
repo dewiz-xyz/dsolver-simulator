@@ -4,6 +4,7 @@ mod report;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,8 +31,8 @@ use self::presets::{
 };
 use self::report::{
     build_findings, relative_path, render_summary, AnalysisReport, BaselineComparison,
-    LatencySummary, LogSummary, ReadinessReport, ReadinessSnapshot, RunMetadata, ScenarioDiff,
-    ScenarioReport,
+    LatencySummary, LogSourceSummary, LogSummary, ReadinessReport, ReadinessSnapshot, RunMetadata,
+    ScenarioDiff, ScenarioReport,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000";
@@ -41,10 +42,13 @@ const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
-const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 5;
+const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 6;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
+const LOG_BOUNDARY_TAIL_BYTES: u64 = 64;
+const SIMULATOR_LOG_FILE: &str = "logs/tycho-sim-server.log";
+const BROADCASTER_LOG_FILE: &str = "logs/tycho-broadcaster-service.log";
 const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
 
 pub async fn run() -> Result<()> {
@@ -62,8 +66,8 @@ pub async fn run() -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
     let scripts = ScriptPaths::new(&repo);
+    let log_boundary = capture_log_boundaries(&repo);
     let lifecycle = ensure_server_ready(&client, &scripts, &repo, &args).await?;
-    let log_boundary = capture_log_boundary(&repo);
 
     let analysis_result = analyze_run(
         &client,
@@ -86,7 +90,9 @@ pub async fn run() -> Result<()> {
     match (analysis_result, stop_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
-        (Err(err), Err(stop_err)) => Err(anyhow!("{err}; failed to stop server: {stop_err}")),
+        (Err(err), Err(stop_err)) => {
+            Err(anyhow!("{err}; failed to stop local services: {stop_err}"))
+        }
     }
 }
 
@@ -122,8 +128,18 @@ struct StartupBindConfig {
     port: u16,
 }
 
+struct LogSourceConfig {
+    source: &'static str,
+    log_file: &'static str,
+}
+
 struct LogBoundary {
+    checkpoints: BTreeMap<&'static str, LogBoundaryCheckpoint>,
+}
+
+struct LogBoundaryCheckpoint {
     byte_offset: u64,
+    tail: Vec<u8>,
 }
 
 struct LoadProbePlan<'a> {
@@ -466,7 +482,7 @@ async fn ensure_server_ready(
             return match stop_server(scripts, repo) {
                 Ok(()) => Err(err),
                 Err(stop_err) => Err(anyhow!(
-                    "{err}; failed to stop server after readiness failure: {stop_err}"
+                    "{err}; failed to stop local services after readiness failure: {stop_err}"
                 )),
             };
         }
@@ -1871,26 +1887,126 @@ fn compare_with_baseline(
     })
 }
 
-fn capture_log_boundary(repo: &Path) -> LogBoundary {
-    let log_path = repo.join("logs/tycho-sim-server.log");
-    let byte_offset = fs::metadata(&log_path).map_or(0, |metadata| metadata.len());
-    LogBoundary { byte_offset }
+fn capture_log_boundaries(repo: &Path) -> LogBoundary {
+    let checkpoints = log_sources()
+        .iter()
+        .map(|source| {
+            let log_path = repo.join(source.log_file);
+            (source.source, capture_log_checkpoint(&log_path))
+        })
+        .collect();
+
+    LogBoundary { checkpoints }
+}
+
+fn capture_log_checkpoint(log_path: &Path) -> LogBoundaryCheckpoint {
+    let byte_offset = fs::metadata(log_path).map_or(0, |metadata| metadata.len());
+    let tail_len = byte_offset.min(LOG_BOUNDARY_TAIL_BYTES);
+    if tail_len == 0 {
+        return LogBoundaryCheckpoint {
+            byte_offset,
+            tail: Vec::new(),
+        };
+    }
+
+    let mut tail = vec![0; tail_len as usize];
+    let read_tail = fs::File::open(log_path)
+        .and_then(|mut file| {
+            file.seek(SeekFrom::Start(byte_offset - tail_len))?;
+            file.read_exact(&mut tail)
+        })
+        .is_ok();
+
+    LogBoundaryCheckpoint {
+        byte_offset,
+        tail: if read_tail { tail } else { Vec::new() },
+    }
 }
 
 fn collect_logs(repo: &Path, report_dir: &Path, log_boundary: &LogBoundary) -> Result<LogSummary> {
-    let log_path = repo.join("logs/tycho-sim-server.log");
+    let mut sources = Vec::new();
+    let mut excerpt_sections = Vec::new();
+    let mut highlights = Vec::new();
+    let mut total_matched_lines = 0;
+
+    for source in log_sources() {
+        let log_path = repo.join(source.log_file);
+        let matched_lines = collect_log_source(&log_path, log_boundary.checkpoint(source.source))?;
+        let source_summary = LogSourceSummary {
+            source: source.source.to_string(),
+            log_file: relative_path(repo, &log_path),
+            matched_lines: matched_lines.len(),
+            highlights: matched_lines.iter().take(6).cloned().collect(),
+        };
+
+        if !matched_lines.is_empty() {
+            let excerpt = matched_lines
+                .iter()
+                .rev()
+                .take(LOG_EXCERPT_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            excerpt_sections.push(format!(
+                "# {} ({})\n{}",
+                source.source, source_summary.log_file, excerpt
+            ));
+            highlights.extend(
+                source_summary
+                    .highlights
+                    .iter()
+                    .map(|line| format!("{}: {}", source.source, line)),
+            );
+        }
+
+        total_matched_lines += source_summary.matched_lines;
+        sources.push(source_summary);
+    }
+
+    let excerpt_file = if excerpt_sections.is_empty() {
+        None
+    } else {
+        let excerpt_path = report_dir.join("evidence/log-excerpts.txt");
+        fs::write(
+            &excerpt_path,
+            format!("{}\n", excerpt_sections.join("\n\n")),
+        )
+        .with_context(|| format!("failed to write {}", excerpt_path.display()))?;
+        Some(relative_path(repo, &excerpt_path))
+    };
+
+    Ok(LogSummary {
+        sources,
+        matched_lines: total_matched_lines,
+        excerpt_file,
+        highlights: highlights.into_iter().take(6).collect(),
+    })
+}
+
+fn log_sources() -> [LogSourceConfig; 2] {
+    [
+        LogSourceConfig {
+            source: "simulator",
+            log_file: SIMULATOR_LOG_FILE,
+        },
+        LogSourceConfig {
+            source: "broadcaster",
+            log_file: BROADCASTER_LOG_FILE,
+        },
+    ]
+}
+
+fn collect_log_source(
+    log_path: &Path,
+    checkpoint: Option<&LogBoundaryCheckpoint>,
+) -> Result<Vec<String>> {
     if !log_path.exists() {
-        return Ok(LogSummary {
-            log_file: log_path.display().to_string(),
-            matched_lines: 0,
-            excerpt_file: None,
-            highlights: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
     let contents =
-        fs::read(&log_path).with_context(|| format!("failed to read {}", log_path.display()))?;
-    let start = usize::try_from(log_boundary.byte_offset).unwrap_or(usize::MAX);
+        fs::read(log_path).with_context(|| format!("failed to read {}", log_path.display()))?;
+    let start = log_scan_start(&contents, checkpoint);
     let scoped_contents = if start >= contents.len() {
         String::new()
     } else {
@@ -1910,28 +2026,41 @@ fn collect_logs(repo: &Path, report_dir: &Path, log_boundary: &LogBoundary) -> R
         .map(|line| (*line).to_string())
         .collect::<Vec<_>>();
 
-    let excerpt_file = if matched_lines.is_empty() {
-        None
-    } else {
-        let excerpt_path = report_dir.join("evidence/log-excerpts.txt");
-        let excerpt = matched_lines
-            .iter()
-            .rev()
-            .take(LOG_EXCERPT_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&excerpt_path, format!("{excerpt}\n"))
-            .with_context(|| format!("failed to write {}", excerpt_path.display()))?;
-        Some(relative_path(repo, &excerpt_path))
-    };
+    Ok(matched_lines)
+}
 
-    Ok(LogSummary {
-        log_file: log_path.display().to_string(),
-        matched_lines: matched_lines.len(),
-        excerpt_file,
-        highlights: matched_lines.into_iter().take(6).collect(),
-    })
+impl LogBoundary {
+    fn checkpoint(&self, source: &str) -> Option<&LogBoundaryCheckpoint> {
+        self.checkpoints.get(source)
+    }
+}
+
+fn log_scan_start(contents: &[u8], checkpoint: Option<&LogBoundaryCheckpoint>) -> usize {
+    let Some(checkpoint) = checkpoint else {
+        return 0;
+    };
+    let Ok(byte_offset) = usize::try_from(checkpoint.byte_offset) else {
+        return 0;
+    };
+    if byte_offset == 0 {
+        return 0;
+    }
+    if byte_offset > contents.len() {
+        return 0;
+    }
+    if checkpoint.tail.is_empty() {
+        return 0;
+    }
+
+    let tail_len = checkpoint.tail.len();
+    let Some(tail_start) = byte_offset.checked_sub(tail_len) else {
+        return 0;
+    };
+    if &contents[tail_start..byte_offset] == checkpoint.tail.as_slice() {
+        byte_offset
+    } else {
+        0
+    }
 }
 
 fn is_interesting_log_line(line: &str) -> bool {
@@ -2045,7 +2174,7 @@ fn print_help() {
            --base-url <url>     Base URL for the local service (default: http://localhost:3000)\n\
            --out <path>         Custom report output directory\n\
            --baseline <mode>    latest, none, or a report directory path (default: latest)\n\
-           --stop               Stop the server after the run if the analyzer started it\n"
+           --stop               Stop helper-managed local services after the run if the analyzer started them\n"
     );
 }
 
@@ -2109,7 +2238,7 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_encode_route_request, build_wait_ready_args, capture_log_boundary,
+        build_encode_route_request, build_wait_ready_args, capture_log_boundaries,
         classify_simulate_response, collect_logs, discover_latest_baseline, encode_route_swap_kind,
         ensure_server_ready, maybe_load_baseline, percentile, protocol_from_pool_name,
         sanitize_filename, select_best_pool, startup_bind_config, BaselineMode, CliArgs,
@@ -2423,7 +2552,7 @@ mod tests {
         };
         let message = error.to_string();
         assert!(message.contains("wait_ready.sh failed: wait-ready failed"));
-        assert!(message.contains("failed to stop server after readiness failure"));
+        assert!(message.contains("failed to stop local services after readiness failure"));
         assert!(message.contains("stop_server.sh failed: stop failed"));
         assert!(start_marker.exists());
         assert!(stop_marker.exists());
@@ -2482,11 +2611,15 @@ mod tests {
         assert!(fs::create_dir_all(report_dir.join("evidence")).is_ok());
         assert!(fs::create_dir_all(&log_dir).is_ok());
 
-        let log_path = log_dir.join("tycho-sim-server.log");
-        assert!(fs::write(&log_path, "{\"level\":\"warn\",\"msg\":\"old warning\"}\n").is_ok());
-        let boundary = capture_log_boundary(&root);
+        let simulator_log_path = log_dir.join("tycho-sim-server.log");
         assert!(fs::write(
-            &log_path,
+            &simulator_log_path,
+            "{\"level\":\"warn\",\"msg\":\"old warning\"}\n"
+        )
+        .is_ok());
+        let boundary = capture_log_boundaries(&root);
+        assert!(fs::write(
+            &simulator_log_path,
             concat!(
                 "{\"level\":\"warn\",\"msg\":\"old warning\"}\n",
                 "{\"level\":\"info\",\"msg\":\"new info\"}\n",
@@ -2503,6 +2636,125 @@ mod tests {
         assert_eq!(summary.matched_lines, 1);
         assert_eq!(summary.highlights.len(), 1);
         assert!(summary.highlights[0].contains("new error"));
+        let simulator_source = summary
+            .sources
+            .iter()
+            .find(|source| source.source == "simulator");
+        assert!(simulator_source.is_some());
+        let Some(simulator_source) = simulator_source else {
+            return;
+        };
+        assert_eq!(simulator_source.matched_lines, 1);
+        let broadcaster_source = summary
+            .sources
+            .iter()
+            .find(|source| source.source == "broadcaster");
+        assert!(broadcaster_source.is_some());
+        let Some(broadcaster_source) = broadcaster_source else {
+            return;
+        };
+        assert_eq!(broadcaster_source.matched_lines, 0);
+
+        assert!(fs::remove_dir_all(&root).is_ok());
+    }
+
+    #[test]
+    fn collect_logs_includes_broadcaster_log_excerpts() {
+        let root = temp_test_dir("broadcaster-log-excerpts");
+        let log_dir = root.join("logs");
+        let report_dir = root.join("reports/run-1");
+        assert!(fs::create_dir_all(report_dir.join("evidence")).is_ok());
+        assert!(fs::create_dir_all(&log_dir).is_ok());
+
+        let boundary = capture_log_boundaries(&root);
+        let simulator_log_path = log_dir.join("tycho-sim-server.log");
+        let broadcaster_log_path = log_dir.join("tycho-broadcaster-service.log");
+        assert!(fs::write(
+            &simulator_log_path,
+            "{\"level\":\"info\",\"msg\":\"simulator ready\"}\n"
+        )
+        .is_ok());
+        assert!(fs::write(
+            &broadcaster_log_path,
+            concat!(
+                "{\"level\":\"info\",\"msg\":\"broadcaster warming\"}\n",
+                "{\"level\":\"warn\",\"msg\":\"snapshot failed once\"}\n"
+            ),
+        )
+        .is_ok());
+
+        let summary_result = collect_logs(&root, &report_dir, &boundary);
+        assert!(summary_result.is_ok());
+        let Some(summary) = summary_result.ok() else {
+            return;
+        };
+
+        let broadcaster_source = summary
+            .sources
+            .iter()
+            .find(|source| source.source == "broadcaster");
+        assert!(broadcaster_source.is_some());
+        let Some(broadcaster_source) = broadcaster_source else {
+            return;
+        };
+        assert_eq!(summary.matched_lines, 1);
+        assert_eq!(broadcaster_source.matched_lines, 1);
+        assert!(summary.highlights[0].contains("broadcaster:"));
+        assert!(summary.highlights[0].contains("snapshot failed once"));
+        assert!(summary.excerpt_file.is_some());
+        let Some(excerpt_file) = summary.excerpt_file else {
+            return;
+        };
+        let excerpt_path = root.join(excerpt_file);
+        let excerpt = fs::read_to_string(excerpt_path);
+        assert!(excerpt.is_ok());
+        let Some(excerpt) = excerpt.ok() else {
+            return;
+        };
+        assert!(excerpt.contains("# broadcaster (logs/tycho-broadcaster-service.log)"));
+        assert!(excerpt.contains("snapshot failed once"));
+
+        assert!(fs::remove_dir_all(&root).is_ok());
+    }
+
+    #[test]
+    fn collect_logs_scans_from_start_when_log_was_rewritten_after_boundary() {
+        let root = temp_test_dir("log-rewritten-after-boundary");
+        let log_dir = root.join("logs");
+        let report_dir = root.join("reports/run-1");
+        assert!(fs::create_dir_all(report_dir.join("evidence")).is_ok());
+        assert!(fs::create_dir_all(&log_dir).is_ok());
+
+        let log_path = log_dir.join("tycho-broadcaster-service.log");
+        assert!(fs::write(
+            &log_path,
+            concat!(
+                "{\"level\":\"info\",\"msg\":\"old startup line\"}\n",
+                "{\"level\":\"info\",\"msg\":\"another old line\"}\n"
+            ),
+        )
+        .is_ok());
+        let boundary = capture_log_boundaries(&root);
+        assert!(fs::write(
+            &log_path,
+            concat!(
+                "{\"level\":\"error\",\"msg\":\"fresh broadcaster failure\"}\n",
+                "{\"level\":\"info\",\"msg\":\"padding after rewrite so the new file is longer than the old boundary offset\"}\n"
+            )
+        )
+        .is_ok());
+
+        let summary_result = collect_logs(&root, &report_dir, &boundary);
+        assert!(summary_result.is_ok());
+        let Some(summary) = summary_result.ok() else {
+            return;
+        };
+
+        assert_eq!(summary.matched_lines, 1);
+        assert!(summary
+            .highlights
+            .iter()
+            .any(|line| line.contains("fresh broadcaster failure")));
 
         assert!(fs::remove_dir_all(&root).is_ok());
     }
