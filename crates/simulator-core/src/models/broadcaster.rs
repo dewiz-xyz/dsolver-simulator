@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use serde::{
@@ -7,7 +7,9 @@ use serde::{
 };
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update as TychoUpdate},
-    tycho_client::feed::{BlockHeader, SynchronizerState},
+    tycho_client::feed::{
+        synchronizer::StateSyncMessage, BlockHeader, FeedMessage, HeaderLike, SynchronizerState,
+    },
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
@@ -39,6 +41,18 @@ pub struct BroadcasterTokenLookupResponse {
 pub struct BroadcasterTokenSnapshotResponse {
     pub chain_id: u64,
     pub tokens: Vec<BroadcasterTokenDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterSnapshotSessionResponse {
+    pub chain_id: u64,
+    pub session_id: u64,
+    pub stream_id: String,
+    pub snapshot_id: String,
+    pub payload_count: u32,
+    pub snapshot_chunk_count: u32,
+    pub expires_in_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +258,8 @@ pub struct BroadcasterSnapshotPartition {
     pub backend: BroadcasterBackend,
     pub block_number: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<BroadcasterProtocolMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub states: Vec<BroadcasterStateEntry>,
     // BTreeMap keeps the wire output deterministic for snapshots, deltas, and golden tests.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -261,7 +277,23 @@ impl BroadcasterSnapshotPartition {
         Self {
             backend,
             block_number,
+            messages: Vec::new(),
             states,
+            sync_statuses,
+        }
+    }
+
+    pub fn with_messages(
+        backend: BroadcasterBackend,
+        block_number: u64,
+        messages: Vec<BroadcasterProtocolMessage>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Self {
+        Self {
+            backend,
+            block_number,
+            messages,
+            states: Vec::new(),
             sync_statuses,
         }
     }
@@ -383,6 +415,86 @@ impl BroadcasterUpdateMessage {
 
         Self::new(partitions)
     }
+
+    pub fn from_tycho_feed_message(
+        feed: &FeedMessage<BlockHeader>,
+    ) -> Result<Self, BroadcasterContractError> {
+        let mut partitions = BTreeMap::<BroadcasterBackend, Vec<BroadcasterProtocolMessage>>::new();
+        let mut sync_statuses =
+            BTreeMap::<BroadcasterBackend, BTreeMap<String, BroadcasterProtocolSyncStatus>>::new();
+        let mut block_numbers = BTreeMap::<BroadcasterBackend, u64>::new();
+
+        for (protocol, status) in &feed.sync_states {
+            let backend = backend_for_sync_state(protocol)?;
+            if let Some(block_number) = sync_state_block_number(status) {
+                block_numbers
+                    .entry(backend)
+                    .and_modify(|current| *current = (*current).max(block_number))
+                    .or_insert(block_number);
+            }
+            sync_statuses.entry(backend).or_default().insert(
+                protocol.clone(),
+                BroadcasterProtocolSyncStatus::from_synchronizer_state(status),
+            );
+        }
+
+        for (protocol, message) in &feed.state_msgs {
+            let backend = backend_for_sync_state(protocol)?;
+            let sync_state = feed
+                .sync_states
+                .get(protocol)
+                .cloned()
+                .unwrap_or(SynchronizerState::Started);
+            partitions
+                .entry(backend)
+                .or_default()
+                .push(BroadcasterProtocolMessage::new(
+                    protocol.clone(),
+                    sync_state,
+                    message.clone(),
+                ));
+        }
+
+        let partition_backends = partitions
+            .keys()
+            .chain(sync_statuses.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let partitions = partition_backends
+            .into_iter()
+            .filter_map(|backend| {
+                let messages = partitions.remove(&backend).unwrap_or_default();
+                let statuses = sync_statuses.remove(&backend).unwrap_or_default();
+                if messages.is_empty() && statuses.is_empty() {
+                    return None;
+                }
+                let block_number = messages
+                    .iter()
+                    .map(|message| message.message.header.clone().block_number_or_timestamp())
+                    .max()
+                    .or_else(|| block_numbers.get(&backend).copied())
+                    .unwrap_or_default();
+                Some(BroadcasterUpdatePartition::with_messages(
+                    backend,
+                    block_number,
+                    messages,
+                    statuses,
+                ))
+            })
+            .collect();
+
+        Self::new(partitions)
+    }
+}
+
+fn sync_state_block_number(state: &SynchronizerState) -> Option<u64> {
+    match state {
+        SynchronizerState::Ready(header)
+        | SynchronizerState::Delayed(header)
+        | SynchronizerState::Stale(header)
+        | SynchronizerState::Advanced(header) => Some(header.clone().block_number_or_timestamp()),
+        SynchronizerState::Started | SynchronizerState::Ended(_) => None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +502,8 @@ impl BroadcasterUpdateMessage {
 pub struct BroadcasterUpdatePartition {
     pub backend: BroadcasterBackend,
     pub block_number: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<BroadcasterProtocolMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_pairs: Vec<BroadcasterStateEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -416,6 +530,7 @@ impl BroadcasterUpdatePartition {
         Self {
             backend,
             block_number,
+            messages: Vec::new(),
             new_pairs,
             updated_states,
             removed_pairs,
@@ -423,11 +538,51 @@ impl BroadcasterUpdatePartition {
         }
     }
 
+    pub fn with_messages(
+        backend: BroadcasterBackend,
+        block_number: u64,
+        messages: Vec<BroadcasterProtocolMessage>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Self {
+        Self {
+            backend,
+            block_number,
+            messages,
+            new_pairs: Vec::new(),
+            updated_states: Vec::new(),
+            removed_pairs: Vec::new(),
+            sync_statuses,
+        }
+    }
+
     fn is_empty(&self) -> bool {
-        self.new_pairs.is_empty()
+        self.messages.is_empty()
+            && self.new_pairs.is_empty()
             && self.updated_states.is_empty()
             && self.removed_pairs.is_empty()
             && self.sync_statuses.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterProtocolMessage {
+    pub protocol: String,
+    pub sync_state: SynchronizerState,
+    pub message: StateSyncMessage<BlockHeader>,
+}
+
+impl BroadcasterProtocolMessage {
+    pub fn new(
+        protocol: impl Into<String>,
+        sync_state: SynchronizerState,
+        message: StateSyncMessage<BlockHeader>,
+    ) -> Self {
+        Self {
+            protocol: protocol.into(),
+            sync_state,
+            message,
+        }
     }
 }
 
@@ -1546,6 +1701,15 @@ fn validate_snapshot_partition_contents(
     partitions: &[BroadcasterSnapshotPartition],
 ) -> Result<(), BroadcasterContractError> {
     for partition in partitions {
+        for message in &partition.messages {
+            let backend = backend_for_sync_state(&message.protocol)?;
+            validate_partition_content_backend(
+                "snapshot_chunk.partitions.messages",
+                &message.protocol,
+                partition.backend,
+                backend,
+            )?;
+        }
         for state in &partition.states {
             let backend = backend_for_component(&state.component_id, &state.component)?;
             validate_partition_content_backend(
@@ -1572,6 +1736,15 @@ fn validate_update_partition_contents(
     partitions: &[BroadcasterUpdatePartition],
 ) -> Result<(), BroadcasterContractError> {
     for partition in partitions {
+        for message in &partition.messages {
+            let backend = backend_for_sync_state(&message.protocol)?;
+            validate_partition_content_backend(
+                "update.partitions.messages",
+                &message.protocol,
+                partition.backend,
+                backend,
+            )?;
+        }
         for state in &partition.new_pairs {
             let backend = backend_for_component(&state.component_id, &state.component)?;
             validate_partition_content_backend(
@@ -1639,7 +1812,10 @@ mod tests {
     use num_bigint::BigUint;
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update as TychoUpdate},
-        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, SynchronizerState,
+        },
         tycho_common::{
             dto::ProtocolStateDelta,
             models::{token::Token, Chain},
@@ -1653,13 +1829,14 @@ mod tests {
 
     use super::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolSyncStatus,
-        BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair, BroadcasterSnapshotChunk,
-        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
-        BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterSubscriptionEvent,
-        BroadcasterSubscriptionState, BroadcasterSubscriptionTracker, BroadcasterTokenDto,
-        BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
-        BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
+        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair,
+        BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
+        BroadcasterSnapshotSessionResponse, BroadcasterSnapshotStart, BroadcasterStateDelta,
+        BroadcasterStateEntry, BroadcasterSubscriptionEvent, BroadcasterSubscriptionState,
+        BroadcasterSubscriptionTracker, BroadcasterTokenDto, BroadcasterTokenLookupRequest,
+        BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage,
+        BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1786,6 +1963,30 @@ mod tests {
         assert_eq!(json["chainId"], 1);
         assert_eq!(json["tokens"][0]["symbol"], "TKN");
         assert!(json.get("chain_id").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_session_contract_uses_camel_case_shape() -> Result<()> {
+        let response = BroadcasterSnapshotSessionResponse {
+            chain_id: 1,
+            session_id: 9,
+            stream_id: "stream-1".to_string(),
+            snapshot_id: "snapshot-1".to_string(),
+            payload_count: 4,
+            snapshot_chunk_count: 2,
+            expires_in_ms: 300_000,
+        };
+        let json = serde_json::to_value(&response)?;
+
+        assert_eq!(json["chainId"], 1);
+        assert_eq!(json["sessionId"], 9);
+        assert_eq!(json["streamId"], "stream-1");
+        assert_eq!(json["snapshotId"], "snapshot-1");
+        assert_eq!(json["payloadCount"], 4);
+        assert_eq!(json["snapshotChunkCount"], 2);
+        assert_eq!(json["expiresInMs"], 300_000);
+        assert!(json.get("session_id").is_none());
         Ok(())
     }
 
@@ -2990,6 +3191,56 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn constructors_reject_raw_message_partition_backend_mismatch() -> Result<()> {
+        let Err(error) = BroadcasterSnapshotChunk::new(
+            "snapshot-1",
+            0,
+            vec![BroadcasterSnapshotPartition::with_messages(
+                BroadcasterBackend::Native,
+                123,
+                vec![raw_protocol_message("vm:curve")],
+                BTreeMap::new(),
+            )],
+        ) else {
+            return Err(anyhow!(
+                "snapshot chunk should reject raw messages from the wrong backend"
+            ));
+        };
+        assert_eq!(
+            error,
+            BroadcasterContractError::PartitionContentBackendMismatch {
+                context: "snapshot_chunk.partitions.messages",
+                entry: "vm:curve".to_string(),
+                partition_backend: BroadcasterBackend::Native,
+                entry_backend: BroadcasterBackend::Vm,
+            }
+        );
+
+        let Err(error) =
+            BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                123,
+                vec![raw_protocol_message("vm:curve")],
+                BTreeMap::new(),
+            )])
+        else {
+            return Err(anyhow!(
+                "update should reject raw messages from the wrong backend"
+            ));
+        };
+        assert_eq!(
+            error,
+            BroadcasterContractError::PartitionContentBackendMismatch {
+                context: "update.partitions.messages",
+                entry: "vm:curve".to_string(),
+                partition_backend: BroadcasterBackend::Native,
+                entry_backend: BroadcasterBackend::Vm,
+            }
+        );
+        Ok(())
+    }
+
     fn ready_tracker() -> Result<BroadcasterSubscriptionTracker> {
         let mut tracker = BroadcasterSubscriptionTracker::new();
         tracker.observe(&snapshot_start_envelope(
@@ -3235,6 +3486,22 @@ mod tests {
             timestamp: number * 10,
             partial_block_index: None,
         }
+    }
+
+    fn raw_protocol_message(protocol: &str) -> BroadcasterProtocolMessage {
+        BroadcasterProtocolMessage::new(
+            protocol,
+            SynchronizerState::Ready(block_header(123, 1)),
+            StateSyncMessage {
+                header: block_header(123, 1),
+                snapshots: Snapshot {
+                    states: HashMap::new(),
+                    vm_storage: HashMap::new(),
+                },
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )
     }
 
     fn assert_dummy_state(state: &dyn ProtocolSim, expected_label: &str) {
