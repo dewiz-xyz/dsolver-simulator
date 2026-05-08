@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use rand::Rng;
+use reqwest::{Client, StatusCode};
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{timeout, Instant};
 use tokio_tungstenite::{
@@ -13,20 +14,30 @@ use tokio_tungstenite::{
 };
 use tracing::{info, warn};
 use tycho_simulation::{
+    evm::decoder::TychoStreamDecoder,
     evm::engine_db::SHARED_TYCHO_DB,
     protocol::models::{ProtocolComponent, Update},
+    tycho_client::feed::{BlockHeader, FeedMessage},
     tycho_common::simulation::protocol_sim::ProtocolSim,
 };
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterSnapshotPartition, BroadcasterSubscriptionTracker, BroadcasterUpdatePartition,
+    BroadcasterProtocolMessage, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
+    BroadcasterSubscriptionTracker, BroadcasterUpdatePartition,
 };
 
 use crate::memory::maybe_purge_allocator;
+use crate::models::broadcaster_urls::{
+    derive_broadcaster_http_url, derive_broadcaster_session_ws_url,
+};
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
+use crate::models::tokens::TokenStore;
+use crate::services::stream_builder::build_broadcaster_subscription_decoder;
 use crate::stream::StreamSupervisorConfig;
+
+const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub enum BroadcasterSubscriptionControls {
@@ -39,6 +50,8 @@ pub struct NativeBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
+    pub tokens: Arc<TokenStore>,
+    pub protocols: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -46,6 +59,8 @@ pub struct VmBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
+    pub tokens: Arc<TokenStore>,
+    pub protocols: Vec<String>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
@@ -82,6 +97,20 @@ impl BroadcasterSubscriptionControls {
             Self::Vm(controls) => &controls.stream_health,
         }
     }
+
+    fn tokens(&self) -> Arc<TokenStore> {
+        match self {
+            Self::Native(controls) => Arc::clone(&controls.tokens),
+            Self::Vm(controls) => Arc::clone(&controls.tokens),
+        }
+    }
+
+    fn protocols(&self) -> &[String] {
+        match self {
+            Self::Native(controls) => &controls.protocols,
+            Self::Vm(controls) => &controls.protocols,
+        }
+    }
 }
 
 pub async fn supervise_broadcaster_subscription(
@@ -92,78 +121,253 @@ pub async fn supervise_broadcaster_subscription(
 ) {
     let mut backoff = cfg.restart_backoff_min;
     let mut vm_rebuild = None;
+    let client = Client::new();
 
     loop {
-        let stream = match connect_async(ws_url.as_str()).await {
-            Ok((stream, _response)) => {
-                controls.broadcaster_subscription().mark_connected().await;
-                controls.stream_health().mark_started().await;
-                stream
+        let bootstrap = match prepare_broadcaster_subscription(
+            &client,
+            &ws_url,
+            expected_chain_id,
+            &cfg,
+            &controls,
+            vm_rebuild,
+        )
+        .await
+        {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                (vm_rebuild, backoff) = reset_subscription_after_error(
+                    &controls,
+                    &cfg,
+                    backoff,
+                    error.vm_rebuild,
+                    error.message,
+                    error.event,
+                    error.detail,
+                )
+                .await;
+                continue;
             }
+        };
+
+        let stream = match connect_async(bootstrap.session_ws_url.as_str()).await {
+            Ok((stream, _response)) => stream,
             Err(error) => {
                 let message = format!("Failed to connect to broadcaster websocket: {error}");
-                vm_rebuild =
-                    handle_subscription_reset(&controls, Some(message.clone()), vm_rebuild).await;
-                warn!(
-                    event = "broadcaster_subscription_connect_failed",
-                    backend = controls.backend_label(),
-                    error = %message,
-                    "Failed to connect to broadcaster subscription"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep_backoff(backoff_ms, cfg.memory).await;
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
+                (vm_rebuild, backoff) = reset_subscription_after_error(
+                    &controls,
+                    &cfg,
+                    backoff,
+                    bootstrap.processor.vm_rebuild,
+                    message,
+                    "broadcaster_subscription_connect_failed",
+                    "Failed to connect to broadcaster subscription",
+                )
+                .await;
                 continue;
             }
         };
 
         info!(
-            ws_url,
+            ws_url = bootstrap.session_ws_url,
+            session_id = bootstrap.session.session_id,
             backend = controls.backend_label(),
             "Connected to broadcaster subscription"
         );
-        let (exit, next_vm_rebuild) = process_broadcaster_subscription(
-            stream,
-            expected_chain_id,
-            &controls,
-            &cfg,
-            vm_rebuild,
-        )
-        .await;
-        vm_rebuild =
-            handle_subscription_reset(&controls, exit.last_error.clone(), next_vm_rebuild).await;
-
-        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-        warn!(
-            event = "broadcaster_subscription_restart",
-            backend = controls.backend_label(),
-            reason = exit.reason,
-            backoff_ms,
-            last_error = exit.last_error.as_deref(),
-            "Restarting broadcaster subscription"
-        );
-        sleep_backoff(backoff_ms, cfg.memory).await;
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
+        let (exit, next_vm_rebuild) =
+            process_broadcaster_subscription(stream, bootstrap.processor, &cfg).await;
+        (vm_rebuild, backoff) =
+            restart_after_subscription_exit(&controls, &cfg, backoff, exit, next_vm_rebuild).await;
     }
+}
+
+struct PreparedBroadcasterSubscription {
+    processor: BroadcasterSubscriptionProcessor,
+    session: BroadcasterSnapshotSessionResponse,
+    session_ws_url: String,
+}
+
+struct PrepareBroadcasterSubscriptionError {
+    message: String,
+    event: &'static str,
+    detail: &'static str,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+}
+
+impl PrepareBroadcasterSubscriptionError {
+    fn new(
+        message: String,
+        event: &'static str,
+        detail: &'static str,
+        vm_rebuild: Option<VmSubscriptionRebuildState>,
+    ) -> Self {
+        Self {
+            message,
+            event,
+            detail,
+            vm_rebuild,
+        }
+    }
+}
+
+async fn prepare_broadcaster_subscription(
+    client: &Client,
+    ws_url: &str,
+    expected_chain_id: u64,
+    cfg: &StreamSupervisorConfig,
+    controls: &BroadcasterSubscriptionControls,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+) -> std::result::Result<PreparedBroadcasterSubscription, PrepareBroadcasterSubscriptionError> {
+    let snapshot_sessions_url = match derive_broadcaster_http_url(ws_url, "snapshot-sessions") {
+        Ok(url) => url,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                format!("Invalid broadcaster websocket URL: {error}"),
+                "broadcaster_subscription_url_invalid",
+                "Failed to derive broadcaster snapshot session URL",
+                vm_rebuild,
+            ));
+        }
+    };
+    let decoder = match build_broadcaster_subscription_decoder(
+        controls.tokens(),
+        controls.backend(),
+        controls.protocols(),
+    )
+    .await
+    {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                error.to_string(),
+                "broadcaster_subscription_decoder_failed",
+                "Failed to build broadcaster subscription decoder",
+                vm_rebuild,
+            ));
+        }
+    };
+    let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+        expected_chain_id,
+        controls.clone(),
+        decoder,
+        vm_rebuild,
+    );
+    let session = match bootstrap_broadcaster_snapshot(
+        client,
+        ws_url,
+        &snapshot_sessions_url,
+        &mut processor,
+        controls,
+        cfg,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                error.to_string(),
+                "broadcaster_subscription_bootstrap_failed",
+                "Failed to bootstrap broadcaster subscription from HTTP snapshot",
+                processor.vm_rebuild,
+            ));
+        }
+    };
+    let session_ws_url = match derive_broadcaster_session_ws_url(ws_url, session.session_id) {
+        Ok(url) => url,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                format!("Invalid broadcaster websocket URL: {error}"),
+                "broadcaster_subscription_url_invalid",
+                "Failed to derive broadcaster session websocket URL",
+                processor.vm_rebuild,
+            ));
+        }
+    };
+
+    Ok(PreparedBroadcasterSubscription {
+        processor,
+        session,
+        session_ws_url,
+    })
+}
+
+async fn reset_subscription_after_error(
+    controls: &BroadcasterSubscriptionControls,
+    cfg: &StreamSupervisorConfig,
+    backoff: Duration,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+    message: String,
+    event: &'static str,
+    detail: &'static str,
+) -> (Option<VmSubscriptionRebuildState>, Duration) {
+    let vm_rebuild = handle_subscription_reset(controls, Some(message.clone()), vm_rebuild).await;
+    let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+    warn!(
+        event = event,
+        backend = controls.backend_label(),
+        backoff_ms,
+        error = %message,
+        "{detail}"
+    );
+    sleep_backoff(backoff_ms, cfg.memory).await;
+    (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+}
+
+async fn restart_after_subscription_exit(
+    controls: &BroadcasterSubscriptionControls,
+    cfg: &StreamSupervisorConfig,
+    backoff: Duration,
+    exit: SubscriptionExit,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+) -> (Option<VmSubscriptionRebuildState>, Duration) {
+    let vm_rebuild = handle_subscription_reset(controls, exit.last_error.clone(), vm_rebuild).await;
+    let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+    warn!(
+        event = "broadcaster_subscription_restart",
+        backend = controls.backend_label(),
+        reason = exit.reason,
+        backoff_ms,
+        last_error = exit.last_error.as_deref(),
+        "Restarting broadcaster subscription"
+    );
+    sleep_backoff(backoff_ms, cfg.memory).await;
+    (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
 }
 
 struct BroadcasterSubscriptionProcessor {
     expected_chain_id: u64,
     controls: BroadcasterSubscriptionControls,
+    decoder: Arc<TychoStreamDecoder<BlockHeader>>,
     tracker: BroadcasterSubscriptionTracker,
     bootstrap_block: Option<u64>,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 }
 
 impl BroadcasterSubscriptionProcessor {
+    #[cfg(test)]
     fn new(
         expected_chain_id: u64,
         controls: BroadcasterSubscriptionControls,
         vm_rebuild: Option<VmSubscriptionRebuildState>,
     ) -> Self {
+        Self::with_decoder(
+            expected_chain_id,
+            controls,
+            Arc::new(TychoStreamDecoder::new()),
+            vm_rebuild,
+        )
+    }
+
+    fn with_decoder(
+        expected_chain_id: u64,
+        controls: BroadcasterSubscriptionControls,
+        decoder: Arc<TychoStreamDecoder<BlockHeader>>,
+        vm_rebuild: Option<VmSubscriptionRebuildState>,
+    ) -> Self {
         Self {
             expected_chain_id,
             controls,
+            decoder,
             tracker: BroadcasterSubscriptionTracker::new(),
             bootstrap_block: None,
             vm_rebuild,
@@ -198,7 +402,7 @@ impl BroadcasterSubscriptionProcessor {
                 for partition in chunk.partitions {
                     if partition.backend == self.controls.backend() {
                         self.bootstrap_block = Some(partition.block_number);
-                        self.apply_snapshot_partition(partition).await;
+                        self.apply_snapshot_partition(partition).await?;
                     }
                 }
             }
@@ -213,7 +417,7 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::Update(update) => {
                 for partition in update.partitions {
                     if partition.backend == self.controls.backend() {
-                        self.apply_live_update_partition(partition).await;
+                        self.apply_live_update_partition(partition).await?;
                     }
                 }
             }
@@ -255,19 +459,68 @@ impl BroadcasterSubscriptionProcessor {
         }
     }
 
-    async fn apply_snapshot_partition(&self, partition: BroadcasterSnapshotPartition) {
+    async fn apply_snapshot_partition(
+        &self,
+        partition: BroadcasterSnapshotPartition,
+    ) -> Result<()> {
+        if !partition.messages.is_empty() {
+            return self.apply_protocol_messages(partition.messages).await;
+        }
+
         let update = snapshot_partition_update(partition);
         self.controls.state_store().apply_update(update).await;
+        Ok(())
     }
 
-    async fn apply_live_update_partition(&self, partition: BroadcasterUpdatePartition) {
+    async fn apply_live_update_partition(
+        &self,
+        partition: BroadcasterUpdatePartition,
+    ) -> Result<()> {
         let block_number = partition.block_number;
+        if !partition.messages.is_empty() {
+            self.apply_protocol_messages(partition.messages).await?;
+            self.controls
+                .stream_health()
+                .record_update(block_number)
+                .await;
+            return Ok(());
+        }
+
         let update = live_partition_update(partition);
         self.controls.state_store().apply_update(update).await;
         self.controls
             .stream_health()
             .record_update(block_number)
             .await;
+        Ok(())
+    }
+
+    async fn apply_protocol_messages(
+        &self,
+        messages: Vec<BroadcasterProtocolMessage>,
+    ) -> Result<()> {
+        for message in messages {
+            self.apply_protocol_message(message).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_protocol_message(&self, raw: BroadcasterProtocolMessage) -> Result<()> {
+        let mut state_msgs = HashMap::new();
+        state_msgs.insert(raw.protocol.clone(), raw.message);
+        let mut sync_states = HashMap::new();
+        sync_states.insert(raw.protocol, raw.sync_state);
+        let feed = FeedMessage {
+            state_msgs,
+            sync_states,
+        };
+        let update = self
+            .decoder
+            .decode(&feed)
+            .await
+            .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))?;
+        self.controls.state_store().apply_update(update).await;
+        Ok(())
     }
 
     async fn apply_heartbeat(&self, head: BroadcasterBackendHead) {
@@ -295,16 +548,128 @@ impl BroadcasterSubscriptionProcessor {
     }
 }
 
-async fn process_broadcaster_subscription(
-    mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
-    expected_chain_id: u64,
+async fn bootstrap_broadcaster_snapshot(
+    client: &Client,
+    ws_url: &str,
+    snapshot_sessions_url: &str,
+    processor: &mut BroadcasterSubscriptionProcessor,
     controls: &BroadcasterSubscriptionControls,
     cfg: &StreamSupervisorConfig,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
-) -> (SubscriptionExit, Option<VmSubscriptionRebuildState>) {
-    let mut processor =
-        BroadcasterSubscriptionProcessor::new(expected_chain_id, controls.clone(), vm_rebuild);
+) -> Result<BroadcasterSnapshotSessionResponse> {
+    let session =
+        create_broadcaster_snapshot_session(client, snapshot_sessions_url, cfg.readiness_stale)
+            .await?;
+    controls.stream_health().mark_started().await;
 
+    {
+        let mut payloads = futures::stream::iter(0..session.payload_count)
+            .map(|index| {
+                let session = session.clone();
+                async move {
+                    fetch_broadcaster_snapshot_payload(
+                        client,
+                        ws_url,
+                        &session,
+                        index,
+                        cfg.readiness_stale,
+                    )
+                    .await
+                }
+            })
+            .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY);
+
+        while let Some(envelope) = payloads.next().await {
+            processor.observe(envelope?).await?;
+        }
+    }
+
+    if !processor.bootstrap_complete() {
+        return Err(anyhow!(
+            "broadcaster HTTP snapshot session {} ended before bootstrap completed",
+            session.session_id
+        ));
+    }
+
+    Ok(session)
+}
+
+async fn create_broadcaster_snapshot_session(
+    client: &Client,
+    snapshot_sessions_url: &str,
+    request_timeout: Duration,
+) -> Result<BroadcasterSnapshotSessionResponse> {
+    let response = client
+        .post(snapshot_sessions_url)
+        .timeout(request_timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "failed to create broadcaster snapshot session at {snapshot_sessions_url}: {error}"
+            )
+        })?;
+    decode_success_json(
+        response,
+        snapshot_sessions_url,
+        "create broadcaster snapshot session",
+    )
+    .await
+}
+
+async fn fetch_broadcaster_snapshot_payload(
+    client: &Client,
+    ws_url: &str,
+    session: &BroadcasterSnapshotSessionResponse,
+    index: u32,
+    request_timeout: Duration,
+) -> Result<BroadcasterEnvelope> {
+    let payload_url = derive_broadcaster_http_url(
+        ws_url,
+        &format!("snapshot-sessions/{}/payloads/{index}", session.session_id),
+    )
+    .map_err(|error| anyhow!("failed to derive broadcaster snapshot payload URL: {error}"))?;
+    let response = client
+        .get(&payload_url)
+        .timeout(request_timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "failed to fetch broadcaster snapshot payload {index} from {payload_url}: {error}"
+            )
+        })?;
+    decode_success_json(response, &payload_url, "fetch broadcaster snapshot payload").await
+}
+
+async fn decode_success_json<T>(
+    response: reqwest::Response,
+    url: &str,
+    operation: &str,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let status = response.status();
+    if !status.is_success() {
+        return Err(http_status_error(operation, url, status));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| anyhow!("failed to read {operation} response from {url}: {error}"))?;
+    serde_json::from_slice(&body)
+        .map_err(|error| anyhow!("failed to decode {operation} response from {url}: {error}"))
+}
+
+fn http_status_error(operation: &str, url: &str, status: StatusCode) -> anyhow::Error {
+    anyhow!("{operation} at {url} failed with HTTP {status}")
+}
+
+async fn process_broadcaster_subscription(
+    mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
+    mut processor: BroadcasterSubscriptionProcessor,
+    cfg: &StreamSupervisorConfig,
+) -> (SubscriptionExit, Option<VmSubscriptionRebuildState>) {
     loop {
         let next_timeout = if processor.bootstrap_complete() {
             cfg.stream_stale
@@ -511,7 +876,13 @@ mod tests {
 
     use anyhow::Result;
     use num_bigint::BigUint;
-    use tokio::sync::RwLock;
+    use reqwest::Client;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::RwLock,
+        task::JoinHandle,
+    };
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
@@ -524,13 +895,15 @@ mod tests {
     };
 
     use super::{
-        handle_subscription_reset, BroadcasterSubscriptionControls,
+        bootstrap_broadcaster_snapshot, handle_subscription_reset, BroadcasterSubscriptionControls,
         BroadcasterSubscriptionProcessor, NativeBroadcasterSubscriptionControls,
         VmBroadcasterSubscriptionControls,
     };
+    use crate::config::MemoryConfig;
     use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
+    use crate::stream::StreamSupervisorConfig;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
         BroadcasterPayload, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
@@ -603,6 +976,7 @@ mod tests {
     }
 
     struct TestControls {
+        token_store: Arc<TokenStore>,
         native_subscription: BroadcasterSubscriptionStatus,
         vm_subscription: BroadcasterSubscriptionStatus,
         native_state_store: Arc<StateStore>,
@@ -624,10 +998,11 @@ mod tests {
             ));
 
             Self {
+                token_store: Arc::clone(&token_store),
                 native_subscription: BroadcasterSubscriptionStatus::default(),
                 vm_subscription: BroadcasterSubscriptionStatus::default(),
                 native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
-                vm_state_store: Arc::new(StateStore::new(token_store)),
+                vm_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
                 native_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
@@ -640,6 +1015,8 @@ mod tests {
                 broadcaster_subscription: self.native_subscription.clone(),
                 state_store: Arc::clone(&self.native_state_store),
                 stream_health: Arc::clone(&self.native_stream_health),
+                tokens: Arc::clone(&self.token_store),
+                protocols: vec!["uniswap_v2".to_string()],
             })
         }
 
@@ -648,6 +1025,8 @@ mod tests {
                 broadcaster_subscription: self.vm_subscription.clone(),
                 state_store: Arc::clone(&self.vm_state_store),
                 stream_health: Arc::clone(&self.vm_stream_health),
+                tokens: Arc::clone(&self.token_store),
+                protocols: vec!["vm:curve".to_string()],
                 vm_stream: Arc::clone(&self.vm_stream),
                 simulation_rebuild_gate: Arc::clone(&self.simulation_rebuild_gate),
             })
@@ -748,6 +1127,31 @@ mod tests {
         ))
     }
 
+    fn empty_snapshot_chunk_envelope() -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                0,
+                vec![
+                    BroadcasterSnapshotPartition::new(
+                        BroadcasterBackend::Native,
+                        10,
+                        Vec::new(),
+                        BTreeMap::new(),
+                    ),
+                    BroadcasterSnapshotPartition::new(
+                        BroadcasterBackend::Vm,
+                        11,
+                        Vec::new(),
+                        BTreeMap::new(),
+                    ),
+                ],
+            )?),
+        ))
+    }
+
     fn snapshot_end_envelope() -> BroadcasterEnvelope {
         BroadcasterEnvelope::new(
             "stream-1",
@@ -790,6 +1194,114 @@ mod tests {
                 ],
             )?),
         ))
+    }
+
+    async fn spawn_snapshot_session_server(
+        payloads: Vec<BroadcasterEnvelope>,
+    ) -> Result<(String, String, JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let payloads = Arc::new(
+            payloads
+                .into_iter()
+                .map(|payload| serde_json::to_string(&payload))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let payloads = Arc::clone(&payloads);
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 8192];
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let (status, body) = snapshot_server_response(first_line, &payloads);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Ok((
+            format!("ws://{addr}/ws"),
+            format!("http://{addr}/snapshot-sessions"),
+            server_task,
+        ))
+    }
+
+    fn snapshot_server_response(first_line: &str, payloads: &[String]) -> (&'static str, String) {
+        if first_line == "POST /snapshot-sessions HTTP/1.1" {
+            return (
+                "201 Created",
+                serde_json::json!({
+                    "chainId": Chain::Ethereum.id(),
+                    "sessionId": 7,
+                    "streamId": "stream-1",
+                    "snapshotId": "snapshot-1",
+                    "payloadCount": payloads.len(),
+                    "snapshotChunkCount": payloads
+                        .iter()
+                        .filter(|payload| payload.contains("\"kind\":\"snapshot_chunk\""))
+                        .count(),
+                    "expiresInMs": 300000
+                })
+                .to_string(),
+            );
+        }
+
+        let Some(path) = first_line
+            .strip_prefix("GET /snapshot-sessions/7/payloads/")
+            .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+        else {
+            return (
+                "404 Not Found",
+                serde_json::json!({ "error": "not found" }).to_string(),
+            );
+        };
+        let Ok(index) = path.parse::<usize>() else {
+            return (
+                "416 Range Not Satisfiable",
+                serde_json::json!({ "error": "bad index" }).to_string(),
+            );
+        };
+        match payloads.get(index) {
+            Some(payload) => ("200 OK", payload.clone()),
+            None => (
+                "416 Range Not Satisfiable",
+                serde_json::json!({ "error": "bad index" }).to_string(),
+            ),
+        }
+    }
+
+    fn test_supervisor_config() -> StreamSupervisorConfig {
+        StreamSupervisorConfig {
+            readiness_stale: Duration::from_secs(1),
+            stream_stale: Duration::from_secs(1),
+            missing_block_burst: 3,
+            missing_block_window: Duration::from_secs(60),
+            error_burst: 3,
+            error_window: Duration::from_secs(60),
+            resync_grace: Duration::from_secs(60),
+            restart_backoff_min: Duration::from_millis(10),
+            restart_backoff_max: Duration::from_millis(100),
+            restart_backoff_jitter_pct: 0.0,
+            memory: MemoryConfig {
+                purge_enabled: false,
+                snapshots_enabled: false,
+                snapshots_min_interval_secs: 60,
+                snapshots_min_new_pairs: 1_000,
+                snapshots_emit_emf: false,
+            },
+        }
     }
 
     #[tokio::test]
@@ -839,6 +1351,47 @@ mod tests {
             .last_update_age_ms()
             .await
             .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_snapshot_bootstrap_populates_processor_before_live_attach() -> Result<()> {
+        let controls = TestControls::new();
+        let native_controls = controls.native();
+        let mut processor = BroadcasterSubscriptionProcessor::new(
+            Chain::Ethereum.id(),
+            native_controls.clone(),
+            None,
+        );
+        let payloads = vec![
+            snapshot_start_envelope()?,
+            empty_snapshot_chunk_envelope()?,
+            snapshot_end_envelope(),
+        ];
+        let (ws_url, snapshot_sessions_url, server_task) =
+            spawn_snapshot_session_server(payloads).await?;
+
+        let session = bootstrap_broadcaster_snapshot(
+            &Client::new(),
+            &ws_url,
+            &snapshot_sessions_url,
+            &mut processor,
+            &native_controls,
+            &test_supervisor_config(),
+        )
+        .await?;
+        server_task.abort();
+
+        assert_eq!(session.session_id, 7);
+        assert!(processor.bootstrap_complete());
+        assert_eq!(controls.native_state_store.current_block().await, 10);
+        assert!(!controls.native_state_store.has_pool("pool-native").await);
+        assert!(!controls.native_state_store.has_pool("pool-vm").await);
+        let snapshot = controls.native_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-1"));
+        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-1"));
         Ok(())
     }
 
