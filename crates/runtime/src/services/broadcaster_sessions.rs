@@ -224,11 +224,13 @@ impl BroadcasterSubscriberRegistry {
                 let Some(close_receiver) = session.close_receiver.take() else {
                     return Err(SnapshotSessionError::AlreadyAttached);
                 };
+                let next_message_seq = session.next_message_seq();
+                drop(std::mem::take(&mut session.snapshot_payloads));
                 session.attached = true;
                 return Ok(BroadcasterAttachedSession {
                     session_id,
                     stream_id: session.stream_id.clone(),
-                    next_message_seq: session.next_message_seq(),
+                    next_message_seq,
                     receiver,
                     close_receiver,
                 });
@@ -490,6 +492,29 @@ mod tests {
             unreachable!("attached session should not attach twice");
         };
         assert_eq!(error, SnapshotSessionError::AlreadyAttached);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attached_session_drops_http_snapshot_payloads() -> Result<()> {
+        let registry = BroadcasterSubscriberRegistry::new(2);
+        let session = registry
+            .create_snapshot_session(snapshot_export(), 1, Duration::from_secs(300))
+            .await?;
+
+        let attached = registry
+            .attach_snapshot_session(session.session_id)
+            .await
+            .map_err(|error| anyhow!("attach failed: {error:?}"))?;
+        assert_eq!(attached.next_message_seq, 3);
+
+        let guard = registry.pending_sessions.lock().await;
+        let pending = guard
+            .get(&session.session_id)
+            .ok_or_else(|| anyhow!("attached session should remain registered"))?;
+        assert!(pending.attached);
+        assert_eq!(pending.snapshot_payloads.len(), 0);
+        assert_eq!(pending.snapshot_payloads.capacity(), 0);
         Ok(())
     }
 
