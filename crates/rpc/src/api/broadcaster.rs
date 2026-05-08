@@ -5,11 +5,18 @@ use axum::{
 
 use runtime::broadcaster_service::BroadcasterAppState;
 
-use crate::handlers::broadcaster::{status, token_lookup, token_snapshot, ws};
+use crate::handlers::broadcaster::{
+    create_snapshot_session, snapshot_session_payload, status, token_lookup, token_snapshot, ws,
+};
 
 pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/snapshot-sessions", post(create_snapshot_session))
+        .route(
+            "/snapshot-sessions/:session_id/payloads/:index",
+            get(snapshot_session_payload),
+        )
         .route("/ws", get(ws))
         .route("/tokens/snapshot", get(token_snapshot))
         .route("/tokens/lookup", post(token_lookup))
@@ -26,13 +33,14 @@ mod tests {
     };
     use std::time::Duration;
 
-    use anyhow::{bail, Result};
+    use anyhow::{anyhow, bail, Result};
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
         routing::post,
         Json, Router,
     };
+    use futures::StreamExt;
     use num_bigint::BigUint;
     use num_traits::Zero;
     use runtime::{
@@ -42,7 +50,11 @@ mod tests {
         services::broadcaster::BroadcasterServiceState,
     };
     use simulator_core::broadcaster::BroadcasterBackend;
-    use tokio::{sync::Barrier, task::JoinHandle, time::sleep};
+    use tokio::{
+        sync::Barrier,
+        task::JoinHandle,
+        time::{sleep, timeout},
+    };
     use tokio_tungstenite::{connect_async, tungstenite};
     use tower::ServiceExt;
     use tycho_simulation::{
@@ -174,27 +186,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_upgrade_is_rejected_until_ready() -> Result<()> {
-        let (url, server_task) = spawn_server(
-            create_broadcaster_router(build_state(SeedMode::WarmingUp).await?),
-            "/ws",
-        )
-        .await?;
-        let result = connect_async(url).await;
-        server_task.abort();
+    async fn snapshot_session_create_rejects_until_ready() -> Result<()> {
+        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
 
-        match result {
-            Err(tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            }
-            Err(error) => bail!("unexpected websocket error: {error}"),
-            Ok(_) => bail!("expected websocket handshake rejection"),
-        }
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         Ok(())
     }
 
     #[tokio::test]
-    async fn websocket_upgrade_is_admitted_once_ready() -> Result<()> {
+    async fn snapshot_session_create_serves_payload_metadata_and_payloads() -> Result<()> {
+        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
+        let (status, body) =
+            post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["chainId"], Chain::Ethereum.id());
+        assert_eq!(body["streamId"], "chain-1-stream-1");
+        assert_eq!(body["snapshotId"], "chain-1-snapshot-1");
+        assert_eq!(body["payloadCount"], 3);
+        assert_eq!(body["snapshotChunkCount"], 1);
+        assert_eq!(body["expiresInMs"], 300_000);
+
+        let session_id = body["sessionId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
+        let (status, payload) =
+            get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["stream_id"], "chain-1-stream-1");
+        assert_eq!(payload["message_seq"], 1);
+        assert_eq!(payload["kind"], "snapshot_start");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_session_payload_reports_out_of_range() -> Result<()> {
+        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
+        let (_status, body) =
+            post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
+        let session_id = body["sessionId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
+
+        let (status, body) =
+            get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/99")).await?;
+
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(body["error"], "snapshot payload index out of range");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_requires_session_id() -> Result<()> {
         let (url, server_task) = spawn_server(
             create_broadcaster_router(build_state(SeedMode::Ready).await?),
             "/ws",
@@ -203,11 +249,63 @@ mod tests {
         let result = connect_async(url).await;
         server_task.abort();
 
-        let (_stream, response) = match result {
+        match result {
+            Err(tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            Err(error) => bail!("unexpected websocket error: {error}"),
+            Ok(_) => bail!("expected websocket handshake rejection"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_unknown_session_id() -> Result<()> {
+        let (url, server_task) = spawn_server(
+            create_broadcaster_router(build_state(SeedMode::Ready).await?),
+            "/ws?sessionId=404",
+        )
+        .await?;
+        let result = connect_async(url).await;
+        server_task.abort();
+
+        match result {
+            Err(tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+            Err(error) => bail!("unexpected websocket error: {error}"),
+            Ok(_) => bail!("expected websocket handshake rejection"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_attaches_snapshot_session_without_replaying_snapshot() -> Result<()>
+    {
+        let state = build_state(SeedMode::Ready).await?;
+        let session = state
+            .create_snapshot_session()
+            .await?
+            .ok_or_else(|| anyhow!("expected ready snapshot session"))?;
+        let (url, server_task) = spawn_server(
+            create_broadcaster_router(state),
+            &format!("/ws?sessionId={}", session.session_id),
+        )
+        .await?;
+        let result = connect_async(url).await;
+
+        let (mut stream, response) = match result {
             Ok(result) => result,
             Err(error) => bail!("expected websocket handshake success: {error}"),
         };
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(
+            timeout(Duration::from_millis(25), stream.next())
+                .await
+                .is_err(),
+            "websocket attach should wait for live messages instead of replaying snapshot"
+        );
+        server_task.abort();
         Ok(())
     }
 
@@ -460,7 +558,7 @@ mod tests {
     ) -> Result<BroadcasterAppState> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let upstream = BroadcasterUpstreamState::default();
-        let service = BroadcasterServiceState::new(2, 8, cache, upstream);
+        let service = BroadcasterServiceState::new(8_388_608, 8, cache, upstream);
 
         match mode {
             SeedMode::Disconnected => {}

@@ -1,16 +1,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tycho_simulation::protocol::models::Update as TychoUpdate;
+use tycho_simulation::{
+    protocol::models::Update as TychoUpdate,
+    tycho_client::feed::{BlockHeader, FeedMessage},
+};
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterHeartbeat, BroadcasterPayload,
-    BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-    BroadcasterStateEntry, BroadcasterUpdateMessage,
+    BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk,
+    BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+    BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +59,7 @@ pub struct BroadcasterSnapshotStatus {
     pub snapshot_id: String,
     pub configured_backends: Vec<BroadcasterBackend>,
     pub total_states: usize,
-    pub chunk_size: usize,
+    pub max_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +79,8 @@ pub struct BroadcasterBackendStatus {
 #[derive(Debug, Clone)]
 pub struct BroadcasterSnapshotExport {
     pub stream_id: String,
+    pub snapshot_id: String,
+    pub max_payload_bytes: usize,
     pub payloads: Vec<BroadcasterPayload>,
 }
 
@@ -164,6 +169,7 @@ struct BroadcasterSnapshotCacheData {
 struct BroadcasterPartitionState {
     block_number: Option<u64>,
     sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    messages: Vec<BroadcasterProtocolMessage>,
     states: BTreeMap<String, BroadcasterStateEntry>,
 }
 
@@ -211,12 +217,32 @@ impl BroadcasterSnapshotCache {
         Ok(message)
     }
 
-    pub async fn export_snapshot(&self, chunk_size: usize) -> Result<BroadcasterSnapshotExport> {
+    pub async fn apply_feed_message(
+        &self,
+        feed: &FeedMessage<BlockHeader>,
+    ) -> Result<BroadcasterUpdateMessage> {
+        let message = BroadcasterUpdateMessage::from_tycho_feed_message(feed)?;
+        let mut guard = self.inner.write().await;
+        apply_raw_update_message(&mut guard, &message);
+        Ok(message)
+    }
+
+    pub async fn export_snapshot(
+        &self,
+        max_payload_bytes: usize,
+    ) -> Result<BroadcasterSnapshotExport> {
         let guard = self.inner.read().await;
         let snapshot_id = guard.snapshot_id.clone();
         let stream_id = guard.stream_id.clone();
-        let total_chunks = count_snapshot_chunks(&guard.partitions, chunk_size);
-        let mut payloads = Vec::new();
+        let chunks = build_snapshot_chunks(
+            &stream_id,
+            &snapshot_id,
+            &self.configured_backends,
+            &guard.partitions,
+            max_payload_bytes,
+        )?;
+        let total_chunks = chunks.len() as u32;
+        let mut payloads = Vec::with_capacity(chunks.len().saturating_add(2));
         payloads.push(BroadcasterPayload::SnapshotStart(
             BroadcasterSnapshotStart::new(
                 snapshot_id.clone(),
@@ -226,49 +252,20 @@ impl BroadcasterSnapshotCache {
             )?,
         ));
 
-        let mut chunk_index = 0;
-        let mut backend_emit_state: BTreeMap<BroadcasterBackend, usize> = BTreeMap::new();
-        let mut chunk_payloads = BTreeMap::new();
-
-        loop {
-            chunk_payloads.clear();
-            for backend in &self.configured_backends {
-                let Some(partition) = guard.partitions.get(backend) else {
-                    continue;
-                };
-                let state_offset = backend_emit_state.entry(*backend).or_insert(0);
-                if *state_offset >= partition.states.len() && (*state_offset > 0 || chunk_index > 0)
-                {
-                    continue;
-                }
-
-                let partition_chunk = partition.snapshot_chunk(*backend, *state_offset, chunk_size);
-                if !partition_chunk.states.is_empty() || *state_offset == 0 {
-                    *state_offset = state_offset.saturating_add(partition_chunk.states.len());
-                    chunk_payloads.insert(*backend, partition_chunk);
-                }
-            }
-
-            if chunk_payloads.is_empty() {
-                break;
-            }
-
-            payloads.push(BroadcasterPayload::SnapshotChunk(
-                BroadcasterSnapshotChunk::new(
-                    snapshot_id.clone(),
-                    chunk_index,
-                    chunk_payloads.values().cloned().collect(),
-                )?,
-            ));
-            chunk_index = chunk_index.saturating_add(1);
-        }
+        payloads.extend(chunks.into_iter().map(BroadcasterPayload::SnapshotChunk));
 
         payloads.push(BroadcasterPayload::SnapshotEnd(
             BroadcasterSnapshotEnd::new(snapshot_id),
         ));
+        for (index, payload) in payloads.iter().enumerate() {
+            ensure_payload_fits(&stream_id, index as u64 + 1, payload, max_payload_bytes)
+                .with_context(|| format!("snapshot payload {index} exceeds byte cap"))?;
+        }
 
         Ok(BroadcasterSnapshotExport {
             stream_id,
+            snapshot_id: guard.snapshot_id.clone(),
+            max_payload_bytes,
             payloads,
         })
     }
@@ -306,7 +303,7 @@ impl BroadcasterSnapshotCache {
 
     pub async fn status_snapshot(
         &self,
-        chunk_size: usize,
+        max_payload_bytes: usize,
         upstream: BroadcasterUpstreamSnapshot,
         subscribers: BroadcasterSubscriberSnapshot,
     ) -> BroadcasterStatusSnapshot {
@@ -329,7 +326,7 @@ impl BroadcasterSnapshotCache {
                     *backend,
                     BroadcasterBackendStatus {
                         block_number: status.block_number,
-                        pool_count: status.states.len(),
+                        pool_count: status.entry_count(),
                         sync_statuses: status.sync_statuses,
                     },
                 )
@@ -348,9 +345,9 @@ impl BroadcasterSnapshotCache {
                 total_states: guard
                     .partitions
                     .values()
-                    .map(|partition| partition.states.len())
+                    .map(BroadcasterPartitionState::entry_count)
                     .sum(),
-                chunk_size,
+                max_payload_bytes,
             },
             subscribers,
             backends,
@@ -369,32 +366,46 @@ impl BroadcasterSnapshotCache {
 }
 
 impl BroadcasterPartitionState {
-    fn snapshot_chunk(
-        &self,
-        backend: BroadcasterBackend,
-        offset: usize,
-        chunk_size: usize,
-    ) -> BroadcasterSnapshotPartition {
-        let states = self
-            .states
-            .values()
-            .skip(offset)
-            .take(chunk_size)
-            .cloned()
-            .collect();
-        let sync_statuses = if offset == 0 {
-            self.sync_statuses.clone()
+    fn entry_count(&self) -> usize {
+        if self.messages.is_empty() {
+            self.states.len()
         } else {
-            BTreeMap::new()
-        };
-
-        BroadcasterSnapshotPartition::new(
-            backend,
-            self.block_number.unwrap_or_default(),
-            states,
-            sync_statuses,
-        )
+            self.messages
+                .iter()
+                .map(|message| message.message.snapshots.states.len())
+                .sum()
+        }
     }
+}
+
+fn apply_raw_update_message(
+    guard: &mut BroadcasterSnapshotCacheData,
+    message: &BroadcasterUpdateMessage,
+) {
+    for partition in &message.partitions {
+        let partition_state = guard.partitions.entry(partition.backend).or_default();
+        partition_state.block_number = Some(partition.block_number);
+        partition_state.sync_statuses = partition.sync_statuses.clone();
+        for message in &partition.messages {
+            merge_raw_message(&mut partition_state.messages, message.clone());
+        }
+    }
+}
+
+fn merge_raw_message(
+    messages: &mut Vec<BroadcasterProtocolMessage>,
+    incoming: BroadcasterProtocolMessage,
+) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|message| message.protocol == incoming.protocol)
+    {
+        existing.sync_state = incoming.sync_state;
+        existing.message = existing.message.clone().merge(incoming.message);
+    } else {
+        messages.push(incoming);
+    }
+    messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
 }
 
 fn apply_update_message(
@@ -452,38 +463,377 @@ fn apply_state_delta(
     Ok(())
 }
 
-fn count_snapshot_chunks(
+fn build_snapshot_chunks(
+    stream_id: &str,
+    snapshot_id: &str,
+    configured_backends: &[BroadcasterBackend],
     partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    chunk_size: usize,
-) -> u32 {
-    let mut remaining = partitions
-        .iter()
-        .map(|(backend, partition)| (*backend, partition.states.len()))
-        .collect::<BTreeMap<_, _>>();
-    let mut total_chunks = 0u32;
+    max_payload_bytes: usize,
+) -> Result<Vec<BroadcasterSnapshotChunk>> {
+    let mut chunks = Vec::new();
+    for backend in configured_backends {
+        let Some(partition) = partitions.get(backend) else {
+            continue;
+        };
+        let partitions = build_partition_snapshot_chunks(
+            &SnapshotChunkBuildContext {
+                stream_id,
+                snapshot_id,
+                backend: *backend,
+                block_number: partition.block_number.unwrap_or_default(),
+                max_payload_bytes,
+            },
+            partition,
+            chunks.len(),
+        )?;
+        chunks.extend(partitions);
+    }
+    Ok(chunks)
+}
 
-    loop {
-        let mut emitted = false;
-        for states_remaining in remaining.values_mut() {
-            if *states_remaining == 0 && emitted {
-                continue;
-            }
-            if *states_remaining > 0 {
-                *states_remaining = states_remaining.saturating_sub(chunk_size);
-                emitted = true;
-            } else if total_chunks == 0 {
-                emitted = true;
+fn build_partition_snapshot_chunks(
+    ctx: &SnapshotChunkBuildContext<'_>,
+    partition: &BroadcasterPartitionState,
+    base_chunk_index: usize,
+) -> Result<Vec<BroadcasterSnapshotChunk>> {
+    let mut chunks = Vec::new();
+    let mut sync_statuses = partition.sync_statuses.clone();
+
+    if !partition.messages.is_empty() {
+        let mut messages = Vec::new();
+        for message in &partition.messages {
+            let fragments = split_protocol_message_for_snapshot(ctx, message, &sync_statuses)?;
+            for fragment in fragments {
+                let mut candidate = messages.clone();
+                candidate.push(fragment.clone());
+                if ctx.messages_fit(
+                    base_chunk_index + chunks.len(),
+                    candidate.clone(),
+                    sync_statuses.clone(),
+                )? {
+                    messages = candidate;
+                    continue;
+                }
+
+                if messages.is_empty() {
+                    return Err(anyhow!(
+                        "broadcaster snapshot message for protocol {} exceeds {} bytes",
+                        fragment.protocol,
+                        ctx.max_payload_bytes
+                    ));
+                }
+                chunks.push(ctx.messages_chunk(
+                    base_chunk_index + chunks.len(),
+                    std::mem::take(&mut messages),
+                    std::mem::take(&mut sync_statuses),
+                )?);
+                messages.push(fragment);
             }
         }
-
-        if !emitted {
-            break;
+        if !messages.is_empty() || !sync_statuses.is_empty() {
+            chunks.push(ctx.messages_chunk(
+                base_chunk_index + chunks.len(),
+                messages,
+                sync_statuses,
+            )?);
         }
-
-        total_chunks = total_chunks.saturating_add(1);
+        return Ok(chunks);
     }
 
-    total_chunks
+    let mut states = Vec::new();
+    for state in partition.states.values() {
+        let mut candidate = states.clone();
+        candidate.push(state.clone());
+        if ctx.states_fit(
+            base_chunk_index + chunks.len(),
+            candidate.clone(),
+            sync_statuses.clone(),
+        )? {
+            states = candidate;
+            continue;
+        }
+
+        if states.is_empty() {
+            return Err(anyhow!(
+                "broadcaster snapshot state {} exceeds {} bytes",
+                state.component_id,
+                ctx.max_payload_bytes
+            ));
+        }
+        chunks.push(ctx.states_chunk(
+            base_chunk_index + chunks.len(),
+            std::mem::take(&mut states),
+            std::mem::take(&mut sync_statuses),
+        )?);
+        states.push(state.clone());
+    }
+    if !states.is_empty() || !sync_statuses.is_empty() {
+        chunks.push(ctx.states_chunk(base_chunk_index + chunks.len(), states, sync_statuses)?);
+    }
+    Ok(chunks)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "raw Tycho fragments share one packing state"
+)]
+fn split_protocol_message_for_snapshot(
+    ctx: &SnapshotChunkBuildContext<'_>,
+    message: &BroadcasterProtocolMessage,
+    sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
+) -> Result<Vec<BroadcasterProtocolMessage>> {
+    if ctx.messages_fit(0, vec![message.clone()], sync_statuses.clone())? {
+        return Ok(vec![message.clone()]);
+    }
+
+    let mut states = message
+        .message
+        .snapshots
+        .states
+        .iter()
+        .map(|(component_id, state)| (component_id.clone(), state.clone()))
+        .collect::<Vec<_>>();
+    states.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut vm_storage = message
+        .message
+        .snapshots
+        .vm_storage
+        .iter()
+        .map(|(address, account)| (address.clone(), account.clone()))
+        .collect::<Vec<_>>();
+    vm_storage.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut fragments = Vec::new();
+    let mut current = empty_protocol_fragment(message, false);
+    let mut current_has_payload = false;
+
+    for (component_id, state) in states {
+        let mut candidate = current.clone();
+        candidate
+            .message
+            .snapshots
+            .states
+            .insert(component_id.clone(), state.clone());
+        if ctx.raw_fragment_fits(candidate.clone(), sync_statuses, fragments.is_empty())? {
+            current = candidate;
+            current_has_payload = true;
+            continue;
+        }
+        ensure!(
+            current_has_payload,
+            "broadcaster snapshot state fragment for protocol {} exceeds {} bytes",
+            message.protocol,
+            ctx.max_payload_bytes
+        );
+        fragments.push(current);
+        current = empty_protocol_fragment(message, false);
+        current.message.snapshots.states.insert(component_id, state);
+        ensure!(
+            ctx.raw_fragment_fits(current.clone(), sync_statuses, fragments.is_empty(),)?,
+            "broadcaster snapshot state fragment for protocol {} exceeds {} bytes",
+            message.protocol,
+            ctx.max_payload_bytes
+        );
+        current_has_payload = true;
+    }
+
+    for (address, account) in vm_storage {
+        let mut candidate = current.clone();
+        candidate
+            .message
+            .snapshots
+            .vm_storage
+            .insert(address.clone(), account.clone());
+        if ctx.raw_fragment_fits(candidate.clone(), sync_statuses, fragments.is_empty())? {
+            current = candidate;
+            current_has_payload = true;
+            continue;
+        }
+        ensure!(
+            current_has_payload,
+            "broadcaster snapshot VM storage fragment for protocol {} exceeds {} bytes",
+            message.protocol,
+            ctx.max_payload_bytes
+        );
+        fragments.push(current);
+        current = empty_protocol_fragment(message, false);
+        current
+            .message
+            .snapshots
+            .vm_storage
+            .insert(address, account);
+        ensure!(
+            ctx.raw_fragment_fits(current.clone(), sync_statuses, fragments.is_empty(),)?,
+            "broadcaster snapshot VM storage fragment for protocol {} exceeds {} bytes",
+            message.protocol,
+            ctx.max_payload_bytes
+        );
+        current_has_payload = true;
+    }
+
+    let mut final_fragment = if current_has_payload {
+        current.clone()
+    } else {
+        empty_protocol_fragment(message, false)
+    };
+    final_fragment.message.deltas = message.message.deltas.clone();
+    final_fragment.message.removed_components = message.message.removed_components.clone();
+    if ctx.raw_fragment_fits(final_fragment.clone(), sync_statuses, fragments.is_empty())? {
+        fragments.push(final_fragment);
+    } else {
+        if current_has_payload {
+            fragments.push(current);
+        }
+        let tail = empty_protocol_fragment(message, true);
+        ensure!(
+            ctx.raw_fragment_fits(tail.clone(), sync_statuses, fragments.is_empty(),)?,
+            "broadcaster snapshot delta/removal fragment for protocol {} exceeds {} bytes",
+            message.protocol,
+            ctx.max_payload_bytes
+        );
+        fragments.push(tail);
+    }
+
+    Ok(fragments)
+}
+
+fn empty_protocol_fragment(
+    message: &BroadcasterProtocolMessage,
+    include_tail: bool,
+) -> BroadcasterProtocolMessage {
+    let mut fragment = message.clone();
+    fragment.message.snapshots.states.clear();
+    fragment.message.snapshots.vm_storage.clear();
+    if !include_tail {
+        fragment.message.deltas = None;
+        fragment.message.removed_components.clear();
+    }
+    fragment
+}
+
+struct SnapshotChunkBuildContext<'a> {
+    stream_id: &'a str,
+    snapshot_id: &'a str,
+    backend: BroadcasterBackend,
+    block_number: u64,
+    max_payload_bytes: usize,
+}
+
+impl SnapshotChunkBuildContext<'_> {
+    fn raw_fragment_fits(
+        &self,
+        message: BroadcasterProtocolMessage,
+        sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
+        include_sync_statuses: bool,
+    ) -> Result<bool> {
+        self.messages_fit(
+            0,
+            vec![message],
+            if include_sync_statuses {
+                sync_statuses.clone()
+            } else {
+                BTreeMap::new()
+            },
+        )
+    }
+
+    fn messages_fit(
+        &self,
+        chunk_index: usize,
+        messages: Vec<BroadcasterProtocolMessage>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Result<bool> {
+        self.chunk_fits(self.messages_chunk(chunk_index, messages, sync_statuses)?)
+    }
+
+    fn states_fit(
+        &self,
+        chunk_index: usize,
+        states: Vec<BroadcasterStateEntry>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Result<bool> {
+        self.chunk_fits(self.states_chunk(chunk_index, states, sync_statuses)?)
+    }
+
+    fn messages_chunk(
+        &self,
+        chunk_index: usize,
+        messages: Vec<BroadcasterProtocolMessage>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Result<BroadcasterSnapshotChunk> {
+        self.snapshot_chunk(
+            chunk_index,
+            BroadcasterSnapshotPartition::with_messages(
+                self.backend,
+                self.block_number,
+                messages,
+                sync_statuses,
+            ),
+        )
+    }
+
+    fn states_chunk(
+        &self,
+        chunk_index: usize,
+        states: Vec<BroadcasterStateEntry>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Result<BroadcasterSnapshotChunk> {
+        self.snapshot_chunk(
+            chunk_index,
+            BroadcasterSnapshotPartition::new(
+                self.backend,
+                self.block_number,
+                states,
+                sync_statuses,
+            ),
+        )
+    }
+
+    fn snapshot_chunk(
+        &self,
+        chunk_index: usize,
+        partition: BroadcasterSnapshotPartition,
+    ) -> Result<BroadcasterSnapshotChunk> {
+        BroadcasterSnapshotChunk::new(
+            self.snapshot_id.to_string(),
+            chunk_index as u32,
+            vec![partition],
+        )
+        .map_err(Into::into)
+    }
+
+    fn chunk_fits(&self, chunk: BroadcasterSnapshotChunk) -> Result<bool> {
+        payload_size(self.stream_id, &BroadcasterPayload::SnapshotChunk(chunk))
+            .map(|size| size <= self.max_payload_bytes)
+    }
+}
+
+fn ensure_payload_fits(
+    stream_id: &str,
+    message_seq: u64,
+    payload: &BroadcasterPayload,
+    max_payload_bytes: usize,
+) -> Result<()> {
+    let envelope = simulator_core::broadcaster::BroadcasterEnvelope::new(
+        stream_id.to_string(),
+        message_seq,
+        payload.clone(),
+    );
+    let size = serde_json::to_vec(&envelope)?.len();
+    ensure!(
+        size <= max_payload_bytes,
+        "serialized broadcaster snapshot payload is {size} bytes, above configured max {max_payload_bytes}"
+    );
+    Ok(())
+}
+
+fn payload_size(stream_id: &str, payload: &BroadcasterPayload) -> Result<usize> {
+    let envelope = simulator_core::broadcaster::BroadcasterEnvelope::new(
+        stream_id.to_string(),
+        u64::MAX,
+        payload.clone(),
+    );
+    Ok(serde_json::to_vec(&envelope)?.len())
 }
 
 fn format_stream_id(chain_id: u64, generation: u64) -> String {
@@ -496,24 +846,32 @@ fn format_snapshot_id(chain_id: u64, generation: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
 
     use super::{
-        count_snapshot_chunks, BroadcasterPartitionState, BroadcasterReadiness,
-        BroadcasterSnapshotCache, BroadcasterSubscriberSnapshot, BroadcasterUpstreamState,
+        BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
+        BroadcasterSubscriberSnapshot, BroadcasterUpstreamState,
     };
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolSyncStatus,
-        BroadcasterProtocolSyncStatusKind, BroadcasterStateEntry, BroadcasterSubscriptionEvent,
+        BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk, BroadcasterSubscriptionEvent,
         BroadcasterSubscriptionTracker,
+    };
+    use tycho_common::{
+        dto::{ProtocolComponent as DtoProtocolComponent, ResponseProtocolState},
+        models::Chain as DtoChain,
+        Bytes as DtoBytes,
     };
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
-        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_client::feed::{
+            synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+            BlockHeader, FeedMessage, SynchronizerState,
+        },
         tycho_common::{
             models::{token::Token, Chain},
             simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -596,31 +954,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn count_snapshot_chunks_handles_partition_spread() {
-        let mut partitions = BTreeMap::new();
-        partitions.insert(
-            BroadcasterBackend::Native,
-            BroadcasterPartitionState {
-                block_number: Some(10),
-                sync_statuses: BTreeMap::new(),
-                states: (0..3)
-                    .map(|index| (format!("native-{index}"), dummy_state(index)))
-                    .collect(),
-            },
-        );
-        partitions.insert(
-            BroadcasterBackend::Vm,
-            BroadcasterPartitionState {
-                block_number: Some(11),
-                sync_statuses: BTreeMap::new(),
-                states: (0..1)
-                    .map(|index| (format!("vm-{index}"), dummy_state(index + 10)))
-                    .collect(),
-            },
-        );
+    fn snapshot_chunks(export: &BroadcasterSnapshotExport) -> Vec<&BroadcasterSnapshotChunk> {
+        export
+            .payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .collect()
+    }
 
-        assert_eq!(count_snapshot_chunks(&partitions, 2), 2);
+    fn first_snapshot_chunk_size(export: &BroadcasterSnapshotExport) -> Result<usize> {
+        snapshot_chunks(export)
+            .first()
+            .map(|chunk| {
+                super::payload_size(
+                    &export.stream_id,
+                    &BroadcasterPayload::SnapshotChunk((*chunk).clone()),
+                )
+            })
+            .ok_or_else(|| anyhow!("expected snapshot chunk"))?
+    }
+
+    fn assert_payloads_smaller_than(
+        export: &BroadcasterSnapshotExport,
+        max_size: usize,
+    ) -> Result<()> {
+        for (message_seq, payload) in export.payloads.iter().cloned().enumerate() {
+            let size = serde_json::to_vec(&BroadcasterEnvelope::new(
+                export.stream_id.clone(),
+                message_seq as u64 + 1,
+                payload,
+            ))?
+            .len();
+            assert!(size < max_size);
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -632,7 +1002,7 @@ mod tests {
         let update = mixed_update();
         cache.apply_update(&update).await?;
 
-        let export = cache.export_snapshot(1).await?;
+        let export = cache.export_snapshot(8_388_608).await?;
         assert_eq!(export.stream_id, "chain-1-stream-1");
         assert!(matches!(
             export.payloads.first(),
@@ -648,11 +1018,80 @@ mod tests {
                 .iter()
                 .filter(|payload| matches!(payload, BroadcasterPayload::SnapshotChunk(_)))
                 .count(),
-            1
+            2
         );
 
         let heartbeat = cache.heartbeat().await?;
         assert!(matches!(heartbeat, Some(BroadcasterPayload::Heartbeat(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_exports_decoded_snapshot_by_serialized_payload_bytes() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        cache.apply_update(&multi_native_update()).await?;
+
+        let full_export = cache.export_snapshot(8_388_608).await?;
+        let full_chunk_size = first_snapshot_chunk_size(&full_export)?;
+
+        let export = cache.export_snapshot(full_chunk_size - 1).await?;
+        let chunks = snapshot_chunks(&export);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.partitions[0].states.len())
+                .sum::<usize>(),
+            3
+        );
+        assert_payloads_smaller_than(&export, full_chunk_size)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_splits_raw_snapshot_message_by_serialized_payload_bytes() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let feed = FeedMessage {
+            state_msgs: HashMap::from([(
+                "uniswap_v2".to_string(),
+                StateSyncMessage {
+                    header: block_header(10, 1),
+                    snapshots: Snapshot {
+                        states: HashMap::from([
+                            ("raw-1".to_string(), raw_component_with_state("raw-1", 1)),
+                            ("raw-2".to_string(), raw_component_with_state("raw-2", 2)),
+                        ]),
+                        vm_storage: HashMap::new(),
+                    },
+                    deltas: None,
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "uniswap_v2".to_string(),
+                SynchronizerState::Ready(block_header(10, 1)),
+            )]),
+        };
+        cache.apply_feed_message(&feed).await?;
+
+        let full_export = cache.export_snapshot(8_388_608).await?;
+        let full_chunk_size = first_snapshot_chunk_size(&full_export)?;
+
+        let export = cache.export_snapshot(full_chunk_size - 1).await?;
+        let chunks = snapshot_chunks(&export);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| &chunk.partitions)
+                .flat_map(|partition| &partition.messages)
+                .map(|message| message.message.snapshots.states.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_payloads_smaller_than(&export, full_chunk_size)?;
         Ok(())
     }
 
@@ -665,13 +1104,20 @@ mod tests {
         cache.apply_update(&mixed_update()).await?;
         cache.apply_update(&vm_sync_only_update()).await?;
 
-        let export = cache.export_snapshot(1).await?;
-        let Some(BroadcasterPayload::SnapshotChunk(chunk)) = export
-            .payloads
-            .iter()
-            .find(|payload| matches!(payload, BroadcasterPayload::SnapshotChunk(_)))
+        let export = cache.export_snapshot(8_388_608).await?;
+        let Some(BroadcasterPayload::SnapshotChunk(chunk)) =
+            export.payloads.iter().find(|payload| {
+                matches!(
+                    payload,
+                    BroadcasterPayload::SnapshotChunk(chunk)
+                        if chunk
+                            .partitions
+                            .iter()
+                            .any(|partition| partition.backend == BroadcasterBackend::Vm)
+                )
+            })
         else {
-            return Err(anyhow!("expected snapshot_chunk payload"));
+            return Err(anyhow!("expected vm snapshot_chunk payload"));
         };
 
         let Some(vm_partition) = chunk
@@ -704,6 +1150,10 @@ mod tests {
                 BroadcasterSubscriptionEvent::SnapshotChunkAccepted {
                     snapshot_id: "chain-1-snapshot-1".to_string(),
                     chunk_index: 0,
+                },
+                BroadcasterSubscriptionEvent::SnapshotChunkAccepted {
+                    snapshot_id: "chain-1-snapshot-1".to_string(),
+                    chunk_index: 1,
                 },
                 BroadcasterSubscriptionEvent::SnapshotCompleted {
                     snapshot_id: "chain-1-snapshot-1".to_string(),
@@ -816,6 +1266,27 @@ mod tests {
         )]))
     }
 
+    fn multi_native_update() -> Update {
+        let mut new_pairs = HashMap::new();
+        let mut states = HashMap::new();
+        for index in 0u8..3 {
+            let component_id = format!("native-{index}");
+            new_pairs.insert(
+                component_id.clone(),
+                native_component(&component_id, "uniswap_v2"),
+            );
+            states.insert(
+                component_id,
+                Box::new(DummySim(index)) as Box<dyn ProtocolSim>,
+            );
+        }
+
+        Update::new(10, states, new_pairs).set_sync_states(HashMap::from([(
+            "uniswap_v2".to_string(),
+            SynchronizerState::Ready(block_header(10, 1)),
+        )]))
+    }
+
     fn vm_sync_only_update() -> Update {
         Update::new(11, HashMap::new(), HashMap::new())
             .set_removed_pairs(HashMap::from([(
@@ -860,12 +1331,37 @@ mod tests {
         )
     }
 
-    fn dummy_state(seed: usize) -> BroadcasterStateEntry {
-        BroadcasterStateEntry::new(
-            format!("component-{seed}"),
-            native_component(&format!("component-{seed}"), "uniswap_v2"),
-            Box::new(DummySim(seed as u8)),
-        )
+    fn raw_component_with_state(component_id: &str, seed: u8) -> ComponentWithState {
+        ComponentWithState {
+            state: ResponseProtocolState {
+                component_id: component_id.to_string(),
+                attributes: HashMap::from([(
+                    "large".to_string(),
+                    DtoBytes::from(vec![seed; 1024]),
+                )]),
+                balances: HashMap::new(),
+            },
+            component: raw_component(component_id, "uniswap_v2", seed),
+            component_tvl: Some(seed as f64),
+            entrypoints: Vec::new(),
+        }
+    }
+
+    fn raw_component(component_id: &str, protocol: &str, seed: u8) -> DtoProtocolComponent {
+        DtoProtocolComponent {
+            id: component_id.to_string(),
+            protocol_system: protocol.to_string(),
+            protocol_type_name: protocol.to_string(),
+            chain: DtoChain::Ethereum.into(),
+            tokens: vec![DtoBytes::from([seed; 20]), DtoBytes::from([seed + 1; 20])],
+            contract_ids: Vec::new(),
+            static_attributes: HashMap::new(),
+            change: Default::default(),
+            creation_tx: DtoBytes::from([seed; 32]),
+            created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .unwrap_or_else(|| unreachable!("unix epoch"))
+                .naive_utc(),
+        }
     }
 
     fn dummy_token(seed: u8, symbol: &str) -> Token {

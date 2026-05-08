@@ -11,12 +11,13 @@ use crate::models::broadcaster::{BroadcasterSnapshotCache, BroadcasterUpstreamSt
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{TokenStore, TokenStoreError};
 use crate::services::broadcaster::BroadcasterServiceState;
-use crate::services::stream_builder::{build_broadcaster_stream, BroadcasterProtocols};
+use crate::services::stream_builder::{build_broadcaster_raw_stream, BroadcasterProtocols};
 use crate::stream::{
-    supervise_broadcaster_stream, BroadcasterStreamControls, StreamSupervisorConfig,
+    supervise_broadcaster_raw_stream, BroadcasterStreamControls, StreamSupervisorConfig,
 };
 use simulator_core::broadcaster::{
-    BroadcasterTokenDto, BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
+    BroadcasterEnvelope, BroadcasterSnapshotSessionResponse, BroadcasterTokenDto,
+    BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
 };
 use tycho_simulation::tycho_common::Bytes;
 
@@ -25,21 +26,55 @@ pub struct BroadcasterAppState {
     service: BroadcasterServiceState,
     tokens: Arc<TokenStore>,
     chain_id: u64,
+    snapshot_session_ttl: Duration,
 }
 
 impl BroadcasterAppState {
     pub fn new(service: BroadcasterServiceState, tokens: Arc<TokenStore>, chain_id: u64) -> Self {
+        Self::with_snapshot_session_ttl(service, tokens, chain_id, Duration::from_secs(300))
+    }
+
+    pub fn with_snapshot_session_ttl(
+        service: BroadcasterServiceState,
+        tokens: Arc<TokenStore>,
+        chain_id: u64,
+        snapshot_session_ttl: Duration,
+    ) -> Self {
         Self {
             service,
             tokens,
             chain_id,
+            snapshot_session_ttl,
         }
     }
 
-    pub async fn subscribe(
+    pub async fn create_snapshot_session(
         &self,
-    ) -> Result<Option<crate::services::broadcaster_sessions::BroadcasterSessionRegistration>> {
-        self.service.subscribe().await
+    ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
+        self.service
+            .create_snapshot_session(self.snapshot_session_ttl)
+            .await
+    }
+
+    pub async fn snapshot_session_payload(
+        &self,
+        session_id: u64,
+        index: u32,
+    ) -> Result<BroadcasterEnvelope, crate::services::broadcaster_sessions::SnapshotSessionError>
+    {
+        self.service
+            .snapshot_session_payload(session_id, index)
+            .await
+    }
+
+    pub async fn attach_snapshot_session(
+        &self,
+        session_id: u64,
+    ) -> Result<
+        crate::services::broadcaster_sessions::BroadcasterAttachedSession,
+        crate::services::broadcaster_sessions::SnapshotSessionError,
+    > {
+        self.service.attach_snapshot_session(session_id).await
     }
 
     pub async fn status_snapshot(&self) -> crate::models::broadcaster::BroadcasterStatusSnapshot {
@@ -105,7 +140,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let cache = BroadcasterSnapshotCache::new(chain.id(), configured_backends);
     let upstream_state = BroadcasterUpstreamState::default();
     let service = BroadcasterServiceState::new(
-        config.tuning.snapshot_chunk_size,
+        config.tuning.snapshot_max_payload_bytes,
         config.tuning.subscriber_buffer_capacity,
         cache,
         upstream_state,
@@ -116,7 +151,6 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg,
-        Arc::clone(&tokens),
         Arc::clone(&health),
         service.clone(),
     );
@@ -124,11 +158,14 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         service.clone(),
         Duration::from_secs(config.tuning.heartbeat_interval_secs),
     );
+    let app_state = BroadcasterAppState::with_snapshot_session_ttl(
+        service,
+        tokens,
+        chain.id(),
+        Duration::from_secs(config.tuning.snapshot_session_ttl_secs),
+    );
 
-    Ok(BroadcasterServiceParts {
-        config,
-        app_state: BroadcasterAppState::new(service, tokens, chain.id()),
-    })
+    Ok(BroadcasterServiceParts { config, app_state })
 }
 
 fn log_memory_config(memory: MemoryConfig) {
@@ -199,7 +236,6 @@ fn build_supervisor_config(config: &BroadcasterConfig) -> StreamSupervisorConfig
 fn spawn_broadcaster_stream_task(
     config: &BroadcasterConfig,
     supervisor_cfg: StreamSupervisorConfig,
-    tokens: Arc<TokenStore>,
     health: Arc<StreamHealth>,
     service: BroadcasterServiceState,
 ) {
@@ -215,19 +251,17 @@ fn spawn_broadcaster_stream_task(
 
     tokio::spawn(async move {
         info!("Starting broadcaster upstream supervisor...");
-        supervise_broadcaster_stream(
+        supervise_broadcaster_raw_stream(
             move || {
-                let tokens = Arc::clone(&tokens);
                 let tycho_url = tycho_url.clone();
                 let api_key = api_key.clone();
                 let protocols = protocols.clone();
                 async move {
-                    build_broadcaster_stream(
+                    build_broadcaster_raw_stream(
                         &tycho_url,
                         &api_key,
                         tvl_threshold,
                         tvl_keep_threshold,
-                        tokens,
                         chain,
                         &protocols,
                     )

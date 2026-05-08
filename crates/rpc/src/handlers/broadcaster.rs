@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
 
 use axum::{
     extract::{
         rejection::JsonRejection,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -17,7 +17,9 @@ use futures::{
 use runtime::{
     broadcaster_service::BroadcasterAppState,
     models::broadcaster::BroadcasterReadiness,
-    services::broadcaster_sessions::{BroadcasterSessionRegistration, SessionCloseReason},
+    services::broadcaster_sessions::{
+        BroadcasterAttachedSession, SessionCloseReason, SnapshotSessionError,
+    },
 };
 use serde_json::json;
 use simulator_core::broadcaster::{
@@ -40,30 +42,57 @@ pub async fn status(
     (status_code, Json(BroadcasterStatusPayload::from(snapshot)))
 }
 
-pub async fn ws(ws: WebSocketUpgrade, State(state): State<BroadcasterAppState>) -> Response {
-    let snapshot = state.status_snapshot().await;
-    if snapshot.readiness != BroadcasterReadiness::Ready {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(BroadcasterStatusPayload::from(snapshot)),
-        )
-            .into_response();
-    }
-
-    let registration = match state.subscribe().await {
-        Ok(Some(registration)) => registration,
+pub async fn create_snapshot_session(State(state): State<BroadcasterAppState>) -> Response {
+    match state.create_snapshot_session().await {
+        Ok(Some(session)) => (StatusCode::CREATED, Json(session)).into_response(),
         Ok(None) => {
             let snapshot = state.status_snapshot().await;
-            return (
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(BroadcasterStatusPayload::from(snapshot)),
             )
-                .into_response();
+                .into_response()
         }
         Err(error) => {
-            warn!(error = %error, "Failed to register broadcaster websocket subscriber");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            warn!(error = %error, "Failed to create broadcaster snapshot session");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+pub async fn snapshot_session_payload(
+    State(state): State<BroadcasterAppState>,
+    Path((session_id, index)): Path<(u64, u32)>,
+) -> Response {
+    match state.snapshot_session_payload(session_id, index).await {
+        Ok(envelope) => (StatusCode::OK, Json(envelope)).into_response(),
+        Err(error) => snapshot_session_error_response(error, StatusCode::GONE),
+    }
+}
+
+pub async fn ws(
+    ws: WebSocketUpgrade,
+    State(state): State<BroadcasterAppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(session_id) = query.get("sessionId") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing sessionId" })),
+        )
+            .into_response();
+    };
+    let Ok(session_id) = session_id.parse::<u64>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid sessionId" })),
+        )
+            .into_response();
+    };
+
+    let registration = match state.attach_snapshot_session(session_id).await {
+        Ok(registration) => registration,
+        Err(error) => return snapshot_session_error_response(error, StatusCode::CONFLICT),
     };
 
     ws.on_upgrade(move |socket| handle_session(socket, state, registration))
@@ -129,16 +158,16 @@ pub async fn token_snapshot(State(state): State<BroadcasterAppState>) -> Respons
 async fn handle_session(
     socket: WebSocket,
     state: BroadcasterAppState,
-    registration: BroadcasterSessionRegistration,
+    registration: BroadcasterAttachedSession,
 ) {
-    let BroadcasterSessionRegistration {
+    let BroadcasterAttachedSession {
         session_id,
         stream_id,
-        snapshot_payloads,
+        next_message_seq,
         receiver,
         close_receiver,
     } = registration;
-    let session_stream = BroadcasterSessionStream::new(stream_id, snapshot_payloads, receiver);
+    let session_stream = BroadcasterSessionStream::new(stream_id, next_message_seq, receiver);
     let (sender, receiver) = socket.split();
 
     drive_session(sender, receiver, close_receiver, session_stream).await;
@@ -210,30 +239,23 @@ fn readiness_status_code(readiness: BroadcasterReadiness) -> StatusCode {
 struct BroadcasterSessionStream {
     stream_id: String,
     next_message_seq: u64,
-    snapshot_payloads: VecDeque<BroadcasterPayload>,
     receiver: mpsc::Receiver<BroadcasterPayload>,
 }
 
 impl BroadcasterSessionStream {
     fn new(
         stream_id: String,
-        snapshot_payloads: Vec<BroadcasterPayload>,
+        next_message_seq: u64,
         receiver: mpsc::Receiver<BroadcasterPayload>,
     ) -> Self {
         Self {
             stream_id,
-            next_message_seq: 1,
-            snapshot_payloads: snapshot_payloads.into_iter().collect(),
+            next_message_seq,
             receiver,
         }
     }
 
     async fn next_envelope(&mut self) -> Option<BroadcasterEnvelope> {
-        // New sessions must see the exported snapshot before any live traffic.
-        if let Some(payload) = self.snapshot_payloads.pop_front() {
-            return Some(self.wrap(payload));
-        }
-
         self.receiver.recv().await.map(|payload| self.wrap(payload))
     }
 
@@ -249,6 +271,24 @@ async fn await_join(task: JoinHandle<()>) {
     let _ = task.await;
 }
 
+fn snapshot_session_error_response(
+    error: SnapshotSessionError,
+    already_attached_status: StatusCode,
+) -> Response {
+    let (status, message) = match error {
+        SnapshotSessionError::NotFound => (StatusCode::NOT_FOUND, "snapshot session not found"),
+        SnapshotSessionError::Expired => (StatusCode::GONE, "snapshot session expired"),
+        SnapshotSessionError::AlreadyAttached => {
+            (already_attached_status, "snapshot session already attached")
+        }
+        SnapshotSessionError::PayloadOutOfRange => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "snapshot payload index out of range",
+        ),
+    };
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Result};
@@ -256,26 +296,13 @@ mod tests {
 
     use super::BroadcasterSessionStream;
     use simulator_core::broadcaster::{
-        BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload, BroadcasterSnapshotEnd,
-        BroadcasterSnapshotStart,
+        BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload,
     };
 
     #[tokio::test]
-    async fn session_stream_sends_snapshot_before_live_payloads() -> Result<()> {
+    async fn session_stream_sends_live_payloads_from_next_sequence() -> Result<()> {
         let (sender, receiver) = mpsc::channel(4);
-        let mut session_stream = BroadcasterSessionStream::new(
-            "stream-7".to_string(),
-            vec![
-                BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
-                    "snapshot-7",
-                    1,
-                    vec![],
-                    0,
-                )?),
-                BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-7")),
-            ],
-            receiver,
-        );
+        let mut session_stream = BroadcasterSessionStream::new("stream-7".to_string(), 3, receiver);
 
         sender
             .send(BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
@@ -285,27 +312,6 @@ mod tests {
             )?))
             .await?;
 
-        assert_envelope(
-            session_stream.next_envelope().await,
-            BroadcasterEnvelope::new(
-                "stream-7",
-                1,
-                BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
-                    "snapshot-7",
-                    1,
-                    vec![],
-                    0,
-                )?),
-            ),
-        )?;
-        assert_envelope(
-            session_stream.next_envelope().await,
-            BroadcasterEnvelope::new(
-                "stream-7",
-                2,
-                BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-7")),
-            ),
-        )?;
         assert_envelope(
             session_stream.next_envelope().await,
             BroadcasterEnvelope::new(

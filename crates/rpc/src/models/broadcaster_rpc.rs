@@ -66,7 +66,7 @@ pub struct BroadcasterSnapshotPayload {
     pub snapshot_id: String,
     pub configured_backends: Vec<BroadcasterBackend>,
     pub total_states: usize,
-    pub chunk_size: usize,
+    pub max_payload_bytes: usize,
 }
 
 impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
@@ -77,7 +77,7 @@ impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
             snapshot_id: snapshot.snapshot_id,
             configured_backends: snapshot.configured_backends,
             total_states: snapshot.total_states,
-            chunk_size: snapshot.chunk_size,
+            max_payload_bytes: snapshot.max_payload_bytes,
         }
     }
 }
