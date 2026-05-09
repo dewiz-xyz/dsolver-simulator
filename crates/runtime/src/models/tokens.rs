@@ -12,6 +12,8 @@ use tycho_simulation::tycho_common::{
     Bytes,
 };
 
+use crate::models::broadcaster_urls::derive_broadcaster_http_url;
+
 /// In-memory token metadata cache. The fetch source is explicit so simulator request
 /// paths can be broadcaster-backed while the broadcaster remains the Tycho authority.
 type InflightRx = watch::Receiver<Option<Result<Option<Token>, TokenStoreError>>>;
@@ -461,29 +463,8 @@ pub fn derive_broadcaster_token_snapshot_url(ws_url: &str) -> Result<String, Tok
 }
 
 fn derive_broadcaster_token_url(ws_url: &str, endpoint: &str) -> Result<String, TokenStoreError> {
-    let mut url = reqwest::Url::parse(ws_url).map_err(|err| {
-        TokenStoreError::RequestFailed(format!("invalid TYCHO_BROADCASTER_WS_URL: {err}"))
-    })?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        other => {
-            return Err(TokenStoreError::RequestFailed(format!(
-                "TYCHO_BROADCASTER_WS_URL must use ws or wss, got {other}"
-            )))
-        }
-    };
-    let Some(prefix) = url.path().strip_suffix("/ws") else {
-        return Err(TokenStoreError::RequestFailed(
-            "TYCHO_BROADCASTER_WS_URL must end with /ws".to_string(),
-        ));
-    };
-    let lookup_path = format!("{prefix}/tokens/{endpoint}");
-    url.set_scheme(scheme).map_err(|_| {
-        TokenStoreError::RequestFailed("invalid broadcaster URL scheme".to_string())
-    })?;
-    url.set_path(&lookup_path);
-    Ok(url.to_string())
+    derive_broadcaster_http_url(ws_url, &format!("tokens/{endpoint}"))
+        .map_err(|error| TokenStoreError::RequestFailed(error.to_string()))
 }
 
 #[cfg(test)]

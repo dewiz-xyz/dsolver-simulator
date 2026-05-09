@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{
+    btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, HashMap,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use rand::Rng;
+use reqwest::{Client, StatusCode};
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{timeout, Instant};
 use tokio_tungstenite::{
@@ -13,20 +16,30 @@ use tokio_tungstenite::{
 };
 use tracing::{info, warn};
 use tycho_simulation::{
+    evm::decoder::TychoStreamDecoder,
     evm::engine_db::SHARED_TYCHO_DB,
     protocol::models::{ProtocolComponent, Update},
-    tycho_common::simulation::protocol_sim::ProtocolSim,
+    tycho_client::feed::{BlockHeader, FeedMessage},
+    tycho_common::{dto::ResponseAccount, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterSnapshotPartition, BroadcasterSubscriptionTracker, BroadcasterUpdatePartition,
+    BroadcasterProtocolMessage, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
+    BroadcasterSubscriptionTracker, BroadcasterUpdatePartition,
 };
 
 use crate::memory::maybe_purge_allocator;
+use crate::models::broadcaster_urls::{
+    derive_broadcaster_http_url, derive_broadcaster_session_ws_url,
+};
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
+use crate::models::tokens::TokenStore;
+use crate::services::stream_builder::build_broadcaster_subscription_decoder;
 use crate::stream::StreamSupervisorConfig;
+
+const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub enum BroadcasterSubscriptionControls {
@@ -39,6 +52,8 @@ pub struct NativeBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
+    pub tokens: Arc<TokenStore>,
+    pub protocols: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -46,6 +61,8 @@ pub struct VmBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
+    pub tokens: Arc<TokenStore>,
+    pub protocols: Vec<String>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
@@ -82,6 +99,20 @@ impl BroadcasterSubscriptionControls {
             Self::Vm(controls) => &controls.stream_health,
         }
     }
+
+    fn tokens(&self) -> Arc<TokenStore> {
+        match self {
+            Self::Native(controls) => Arc::clone(&controls.tokens),
+            Self::Vm(controls) => Arc::clone(&controls.tokens),
+        }
+    }
+
+    fn protocols(&self) -> &[String] {
+        match self {
+            Self::Native(controls) => &controls.protocols,
+            Self::Vm(controls) => &controls.protocols,
+        }
+    }
 }
 
 pub async fn supervise_broadcaster_subscription(
@@ -92,79 +123,491 @@ pub async fn supervise_broadcaster_subscription(
 ) {
     let mut backoff = cfg.restart_backoff_min;
     let mut vm_rebuild = None;
+    let client = Client::new();
 
     loop {
-        let stream = match connect_async(ws_url.as_str()).await {
-            Ok((stream, _response)) => {
-                controls.broadcaster_subscription().mark_connected().await;
-                controls.stream_health().mark_started().await;
-                stream
+        let bootstrap = match prepare_broadcaster_subscription(
+            &client,
+            &ws_url,
+            expected_chain_id,
+            &cfg,
+            &controls,
+            vm_rebuild,
+        )
+        .await
+        {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                (vm_rebuild, backoff) = reset_subscription_after_error(
+                    &controls,
+                    &cfg,
+                    backoff,
+                    error.vm_rebuild,
+                    error.message,
+                    error.event,
+                    error.detail,
+                )
+                .await;
+                continue;
             }
+        };
+
+        let stream = match connect_async(bootstrap.session_ws_url.as_str()).await {
+            Ok((stream, _response)) => stream,
             Err(error) => {
                 let message = format!("Failed to connect to broadcaster websocket: {error}");
-                vm_rebuild =
-                    handle_subscription_reset(&controls, Some(message.clone()), vm_rebuild).await;
-                warn!(
-                    event = "broadcaster_subscription_connect_failed",
-                    backend = controls.backend_label(),
-                    error = %message,
-                    "Failed to connect to broadcaster subscription"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep_backoff(backoff_ms, cfg.memory).await;
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
+                (vm_rebuild, backoff) = reset_subscription_after_error(
+                    &controls,
+                    &cfg,
+                    backoff,
+                    bootstrap.processor.vm_rebuild,
+                    message,
+                    "broadcaster_subscription_connect_failed",
+                    "Failed to connect to broadcaster subscription",
+                )
+                .await;
                 continue;
             }
         };
 
         info!(
-            ws_url,
+            ws_url = bootstrap.session_ws_url,
+            session_id = bootstrap.session.session_id,
             backend = controls.backend_label(),
             "Connected to broadcaster subscription"
         );
-        let (exit, next_vm_rebuild) = process_broadcaster_subscription(
-            stream,
-            expected_chain_id,
-            &controls,
-            &cfg,
-            vm_rebuild,
-        )
-        .await;
-        vm_rebuild =
-            handle_subscription_reset(&controls, exit.last_error.clone(), next_vm_rebuild).await;
-
-        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-        warn!(
-            event = "broadcaster_subscription_restart",
-            backend = controls.backend_label(),
-            reason = exit.reason,
-            backoff_ms,
-            last_error = exit.last_error.as_deref(),
-            "Restarting broadcaster subscription"
-        );
-        sleep_backoff(backoff_ms, cfg.memory).await;
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
+        let (exit, next_vm_rebuild) =
+            process_broadcaster_subscription(stream, bootstrap.processor, &cfg).await;
+        (vm_rebuild, backoff) =
+            restart_after_subscription_exit(&controls, &cfg, backoff, exit, next_vm_rebuild).await;
     }
+}
+
+struct PreparedBroadcasterSubscription {
+    processor: BroadcasterSubscriptionProcessor,
+    session: BroadcasterSnapshotSessionResponse,
+    session_ws_url: String,
+}
+
+struct PrepareBroadcasterSubscriptionError {
+    message: String,
+    event: &'static str,
+    detail: &'static str,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+}
+
+impl PrepareBroadcasterSubscriptionError {
+    fn new(
+        message: String,
+        event: &'static str,
+        detail: &'static str,
+        vm_rebuild: Option<VmSubscriptionRebuildState>,
+    ) -> Self {
+        Self {
+            message,
+            event,
+            detail,
+            vm_rebuild,
+        }
+    }
+}
+
+async fn prepare_broadcaster_subscription(
+    client: &Client,
+    ws_url: &str,
+    expected_chain_id: u64,
+    cfg: &StreamSupervisorConfig,
+    controls: &BroadcasterSubscriptionControls,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+) -> std::result::Result<PreparedBroadcasterSubscription, PrepareBroadcasterSubscriptionError> {
+    let snapshot_sessions_url = match derive_broadcaster_http_url(ws_url, "snapshot-sessions") {
+        Ok(url) => url,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                format!("Invalid broadcaster websocket URL: {error}"),
+                "broadcaster_subscription_url_invalid",
+                "Failed to derive broadcaster snapshot session URL",
+                vm_rebuild,
+            ));
+        }
+    };
+    let decoder = match build_broadcaster_subscription_decoder(
+        controls.tokens(),
+        controls.backend(),
+        controls.protocols(),
+    )
+    .await
+    {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                error.to_string(),
+                "broadcaster_subscription_decoder_failed",
+                "Failed to build broadcaster subscription decoder",
+                vm_rebuild,
+            ));
+        }
+    };
+    let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+        expected_chain_id,
+        controls.clone(),
+        decoder,
+        vm_rebuild,
+    );
+    let session = match bootstrap_broadcaster_snapshot(
+        client,
+        ws_url,
+        &snapshot_sessions_url,
+        &mut processor,
+        controls,
+        cfg,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                error.to_string(),
+                "broadcaster_subscription_bootstrap_failed",
+                "Failed to bootstrap broadcaster subscription from HTTP snapshot",
+                processor.vm_rebuild,
+            ));
+        }
+    };
+    let session_ws_url = match derive_broadcaster_session_ws_url(ws_url, session.session_id) {
+        Ok(url) => url,
+        Err(error) => {
+            return Err(PrepareBroadcasterSubscriptionError::new(
+                format!("Invalid broadcaster websocket URL: {error}"),
+                "broadcaster_subscription_url_invalid",
+                "Failed to derive broadcaster session websocket URL",
+                processor.vm_rebuild,
+            ));
+        }
+    };
+
+    Ok(PreparedBroadcasterSubscription {
+        processor,
+        session,
+        session_ws_url,
+    })
+}
+
+async fn reset_subscription_after_error(
+    controls: &BroadcasterSubscriptionControls,
+    cfg: &StreamSupervisorConfig,
+    backoff: Duration,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+    message: String,
+    event: &'static str,
+    detail: &'static str,
+) -> (Option<VmSubscriptionRebuildState>, Duration) {
+    let vm_rebuild = handle_subscription_reset(controls, Some(message.clone()), vm_rebuild).await;
+    let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+    warn!(
+        event = event,
+        backend = controls.backend_label(),
+        backoff_ms,
+        error = %message,
+        "{detail}"
+    );
+    sleep_backoff(backoff_ms, cfg.memory).await;
+    (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+}
+
+async fn restart_after_subscription_exit(
+    controls: &BroadcasterSubscriptionControls,
+    cfg: &StreamSupervisorConfig,
+    backoff: Duration,
+    exit: SubscriptionExit,
+    vm_rebuild: Option<VmSubscriptionRebuildState>,
+) -> (Option<VmSubscriptionRebuildState>, Duration) {
+    let vm_rebuild = handle_subscription_reset(controls, exit.last_error.clone(), vm_rebuild).await;
+    let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
+    warn!(
+        event = "broadcaster_subscription_restart",
+        backend = controls.backend_label(),
+        reason = exit.reason,
+        backoff_ms,
+        last_error = exit.last_error.as_deref(),
+        "Restarting broadcaster subscription"
+    );
+    sleep_backoff(backoff_ms, cfg.memory).await;
+    (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+}
+
+#[derive(Default)]
+struct RawSnapshotReassembly {
+    messages: BTreeMap<String, BroadcasterProtocolMessage>,
+}
+
+impl RawSnapshotReassembly {
+    fn reset(&mut self) {
+        self.messages.clear();
+    }
+
+    fn push(&mut self, message: BroadcasterProtocolMessage) -> Result<()> {
+        match self.messages.entry(message.protocol.clone()) {
+            BTreeEntry::Vacant(entry) => {
+                entry.insert(message);
+            }
+            BTreeEntry::Occupied(mut entry) => {
+                merge_snapshot_protocol_message(entry.get_mut(), message)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn take_messages(&mut self) -> Vec<BroadcasterProtocolMessage> {
+        std::mem::take(&mut self.messages).into_values().collect()
+    }
+}
+
+fn merge_snapshot_protocol_message(
+    existing: &mut BroadcasterProtocolMessage,
+    incoming: BroadcasterProtocolMessage,
+) -> Result<()> {
+    if existing.protocol != incoming.protocol {
+        return Err(anyhow!(
+            "broadcaster snapshot protocol mismatch: expected {}, got {}",
+            existing.protocol,
+            incoming.protocol
+        ));
+    }
+
+    ensure_raw_snapshot_fragment_identity(existing, &incoming)?;
+    ensure_raw_snapshot_fragment_conflicts(existing, &incoming)?;
+
+    let mut merged_vm_storage = std::mem::take(&mut existing.message.snapshots.vm_storage);
+    let mut incoming_message = incoming.message;
+    let incoming_vm_storage = std::mem::take(&mut incoming_message.snapshots.vm_storage);
+    merge_vm_storage(&mut merged_vm_storage, incoming_vm_storage)?;
+
+    let mut merged_message = existing.message.clone().merge(incoming_message);
+    merged_message.snapshots.vm_storage = merged_vm_storage;
+    existing.message = merged_message;
+    Ok(())
+}
+
+fn ensure_raw_snapshot_fragment_identity(
+    existing: &BroadcasterProtocolMessage,
+    incoming: &BroadcasterProtocolMessage,
+) -> Result<()> {
+    if existing.message.header != incoming.message.header {
+        return Err(anyhow!(
+            "broadcaster snapshot raw fragment header mismatch for protocol {}: expected {:?}, got {:?}",
+            existing.protocol,
+            existing.message.header,
+            incoming.message.header
+        ));
+    }
+
+    if existing.sync_state != incoming.sync_state {
+        return Err(anyhow!(
+            "broadcaster snapshot raw fragment sync_state mismatch for protocol {}: expected {:?}, got {:?}",
+            existing.protocol,
+            existing.sync_state,
+            incoming.sync_state
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_raw_snapshot_fragment_conflicts(
+    existing: &BroadcasterProtocolMessage,
+    incoming: &BroadcasterProtocolMessage,
+) -> Result<()> {
+    ensure_no_duplicate_ids(
+        &existing.protocol,
+        &existing.message.snapshots.states,
+        &incoming.message.snapshots.states,
+        "snapshot state",
+    )?;
+    ensure_no_duplicate_ids(
+        &existing.protocol,
+        &existing.message.removed_components,
+        &incoming.message.removed_components,
+        "removed component",
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &existing.message.snapshots.states,
+        &existing.message.removed_components,
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &incoming.message.snapshots.states,
+        &incoming.message.removed_components,
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &existing.message.snapshots.states,
+        &incoming.message.removed_components,
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &incoming.message.snapshots.states,
+        &existing.message.removed_components,
+    )?;
+
+    Ok(())
+}
+
+fn ensure_no_duplicate_ids<Existing, Incoming>(
+    protocol: &str,
+    existing: &HashMap<String, Existing>,
+    incoming: &HashMap<String, Incoming>,
+    kind: &str,
+) -> Result<()> {
+    for component_id in incoming.keys() {
+        if existing.contains_key(component_id) {
+            return Err(anyhow!(
+                "broadcaster snapshot raw fragment duplicate {kind} for protocol {protocol}: {component_id}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_no_snapshot_removal_overlap<State, Removed>(
+    protocol: &str,
+    snapshots: &HashMap<String, State>,
+    removals: &HashMap<String, Removed>,
+) -> Result<()> {
+    for component_id in snapshots.keys() {
+        if removals.contains_key(component_id) {
+            return Err(anyhow!(
+                "broadcaster snapshot raw fragment snapshot/removal overlap for protocol {protocol}: {component_id}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_vm_storage(
+    existing: &mut HashMap<Bytes, ResponseAccount>,
+    incoming: HashMap<Bytes, ResponseAccount>,
+) -> Result<()> {
+    for (address, account) in incoming {
+        match existing.entry(address.clone()) {
+            HashEntry::Vacant(entry) => {
+                entry.insert(account);
+            }
+            HashEntry::Occupied(mut entry) => {
+                merge_vm_storage_account(&address, entry.get_mut(), account)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_vm_storage_account(
+    address: &Bytes,
+    existing: &mut ResponseAccount,
+    incoming: ResponseAccount,
+) -> Result<()> {
+    ensure_vm_account_metadata_matches(address, existing, &incoming)?;
+    for (slot, value) in incoming.slots {
+        match existing.slots.entry(slot.clone()) {
+            HashEntry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            HashEntry::Occupied(entry) if entry.get() == &value => {}
+            HashEntry::Occupied(_) => {
+                return Err(anyhow!(
+                    "broadcaster snapshot VM storage slot mismatch for account {} slot {}",
+                    address,
+                    slot
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    deprecated,
+    reason = "creation_tx is deprecated but still part of the broadcaster wire DTO"
+)]
+fn ensure_vm_account_metadata_matches(
+    address: &Bytes,
+    existing: &ResponseAccount,
+    incoming: &ResponseAccount,
+) -> Result<()> {
+    let mismatch = if existing.chain != incoming.chain {
+        Some("chain")
+    } else if existing.address != incoming.address {
+        Some("address")
+    } else if existing.title != incoming.title {
+        Some("title")
+    } else if existing.native_balance != incoming.native_balance {
+        Some("native_balance")
+    } else if existing.token_balances != incoming.token_balances {
+        Some("token_balances")
+    } else if existing.code != incoming.code {
+        Some("code")
+    } else if existing.code_hash != incoming.code_hash {
+        Some("code_hash")
+    } else if existing.balance_modify_tx != incoming.balance_modify_tx {
+        Some("balance_modify_tx")
+    } else if existing.code_modify_tx != incoming.code_modify_tx {
+        Some("code_modify_tx")
+    } else if existing.creation_tx != incoming.creation_tx {
+        Some("creation_tx")
+    } else {
+        None
+    };
+
+    if let Some(field) = mismatch {
+        return Err(anyhow!(
+            "broadcaster snapshot VM storage metadata mismatch for account {} field {}",
+            address,
+            field
+        ));
+    }
+    Ok(())
 }
 
 struct BroadcasterSubscriptionProcessor {
     expected_chain_id: u64,
     controls: BroadcasterSubscriptionControls,
+    decoder: Arc<TychoStreamDecoder<BlockHeader>>,
     tracker: BroadcasterSubscriptionTracker,
+    raw_snapshot: RawSnapshotReassembly,
     bootstrap_block: Option<u64>,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 }
 
 impl BroadcasterSubscriptionProcessor {
+    #[cfg(test)]
     fn new(
         expected_chain_id: u64,
         controls: BroadcasterSubscriptionControls,
         vm_rebuild: Option<VmSubscriptionRebuildState>,
     ) -> Self {
+        Self::with_decoder(
+            expected_chain_id,
+            controls,
+            Arc::new(TychoStreamDecoder::new()),
+            vm_rebuild,
+        )
+    }
+
+    fn with_decoder(
+        expected_chain_id: u64,
+        controls: BroadcasterSubscriptionControls,
+        decoder: Arc<TychoStreamDecoder<BlockHeader>>,
+        vm_rebuild: Option<VmSubscriptionRebuildState>,
+    ) -> Self {
         Self {
             expected_chain_id,
             controls,
+            decoder,
             tracker: BroadcasterSubscriptionTracker::new(),
+            raw_snapshot: RawSnapshotReassembly::default(),
             bootstrap_block: None,
             vm_rebuild,
         }
@@ -189,6 +632,7 @@ impl BroadcasterSubscriptionProcessor {
         match envelope.payload {
             BroadcasterPayload::SnapshotStart(start) => {
                 self.bootstrap_block = None;
+                self.raw_snapshot.reset();
                 self.controls
                     .broadcaster_subscription()
                     .mark_snapshot_started(envelope.stream_id, start.snapshot_id)
@@ -198,11 +642,12 @@ impl BroadcasterSubscriptionProcessor {
                 for partition in chunk.partitions {
                     if partition.backend == self.controls.backend() {
                         self.bootstrap_block = Some(partition.block_number);
-                        self.apply_snapshot_partition(partition).await;
+                        self.buffer_snapshot_partition(partition).await?;
                     }
                 }
             }
             BroadcasterPayload::SnapshotEnd(_end) => {
+                self.apply_reassembled_snapshot_messages().await?;
                 self.refresh_bootstrap_health().await;
                 self.controls
                     .broadcaster_subscription()
@@ -213,7 +658,7 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::Update(update) => {
                 for partition in update.partitions {
                     if partition.backend == self.controls.backend() {
-                        self.apply_live_update_partition(partition).await;
+                        self.apply_live_update_partition(partition).await?;
                     }
                 }
             }
@@ -255,19 +700,89 @@ impl BroadcasterSubscriptionProcessor {
         }
     }
 
-    async fn apply_snapshot_partition(&self, partition: BroadcasterSnapshotPartition) {
+    async fn apply_snapshot_partition(
+        &self,
+        partition: BroadcasterSnapshotPartition,
+    ) -> Result<()> {
+        if !partition.messages.is_empty() {
+            return Err(anyhow!(
+                "raw broadcaster snapshot messages cannot be applied without reassembly"
+            ));
+        }
+
         let update = snapshot_partition_update(partition);
         self.controls.state_store().apply_update(update).await;
+        Ok(())
     }
 
-    async fn apply_live_update_partition(&self, partition: BroadcasterUpdatePartition) {
+    async fn buffer_snapshot_partition(
+        &mut self,
+        partition: BroadcasterSnapshotPartition,
+    ) -> Result<()> {
+        if partition.messages.is_empty() {
+            return self.apply_snapshot_partition(partition).await;
+        }
+
+        for message in partition.messages {
+            self.raw_snapshot.push(message)?;
+        }
+        Ok(())
+    }
+
+    async fn apply_reassembled_snapshot_messages(&mut self) -> Result<()> {
+        let messages = self.raw_snapshot.take_messages();
+        self.apply_protocol_messages(messages).await
+    }
+
+    async fn apply_live_update_partition(
+        &self,
+        partition: BroadcasterUpdatePartition,
+    ) -> Result<()> {
         let block_number = partition.block_number;
+        if !partition.messages.is_empty() {
+            self.apply_protocol_messages(partition.messages).await?;
+            self.controls
+                .stream_health()
+                .record_update(block_number)
+                .await;
+            return Ok(());
+        }
+
         let update = live_partition_update(partition);
         self.controls.state_store().apply_update(update).await;
         self.controls
             .stream_health()
             .record_update(block_number)
             .await;
+        Ok(())
+    }
+
+    async fn apply_protocol_messages(
+        &self,
+        messages: Vec<BroadcasterProtocolMessage>,
+    ) -> Result<()> {
+        for message in messages {
+            self.apply_protocol_message(message).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_protocol_message(&self, raw: BroadcasterProtocolMessage) -> Result<()> {
+        let mut state_msgs = HashMap::new();
+        state_msgs.insert(raw.protocol.clone(), raw.message);
+        let mut sync_states = HashMap::new();
+        sync_states.insert(raw.protocol, raw.sync_state);
+        let feed = FeedMessage {
+            state_msgs,
+            sync_states,
+        };
+        let update = self
+            .decoder
+            .decode(&feed)
+            .await
+            .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))?;
+        self.controls.state_store().apply_update(update).await;
+        Ok(())
     }
 
     async fn apply_heartbeat(&self, head: BroadcasterBackendHead) {
@@ -295,16 +810,128 @@ impl BroadcasterSubscriptionProcessor {
     }
 }
 
-async fn process_broadcaster_subscription(
-    mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
-    expected_chain_id: u64,
+async fn bootstrap_broadcaster_snapshot(
+    client: &Client,
+    ws_url: &str,
+    snapshot_sessions_url: &str,
+    processor: &mut BroadcasterSubscriptionProcessor,
     controls: &BroadcasterSubscriptionControls,
     cfg: &StreamSupervisorConfig,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
-) -> (SubscriptionExit, Option<VmSubscriptionRebuildState>) {
-    let mut processor =
-        BroadcasterSubscriptionProcessor::new(expected_chain_id, controls.clone(), vm_rebuild);
+) -> Result<BroadcasterSnapshotSessionResponse> {
+    let session =
+        create_broadcaster_snapshot_session(client, snapshot_sessions_url, cfg.readiness_stale)
+            .await?;
+    controls.stream_health().mark_started().await;
 
+    {
+        let mut payloads = futures::stream::iter(0..session.payload_count)
+            .map(|index| {
+                let session = session.clone();
+                async move {
+                    fetch_broadcaster_snapshot_payload(
+                        client,
+                        ws_url,
+                        &session,
+                        index,
+                        cfg.readiness_stale,
+                    )
+                    .await
+                }
+            })
+            .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY);
+
+        while let Some(envelope) = payloads.next().await {
+            processor.observe(envelope?).await?;
+        }
+    }
+
+    if !processor.bootstrap_complete() {
+        return Err(anyhow!(
+            "broadcaster HTTP snapshot session {} ended before bootstrap completed",
+            session.session_id
+        ));
+    }
+
+    Ok(session)
+}
+
+async fn create_broadcaster_snapshot_session(
+    client: &Client,
+    snapshot_sessions_url: &str,
+    request_timeout: Duration,
+) -> Result<BroadcasterSnapshotSessionResponse> {
+    let response = client
+        .post(snapshot_sessions_url)
+        .timeout(request_timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "failed to create broadcaster snapshot session at {snapshot_sessions_url}: {error}"
+            )
+        })?;
+    decode_success_json(
+        response,
+        snapshot_sessions_url,
+        "create broadcaster snapshot session",
+    )
+    .await
+}
+
+async fn fetch_broadcaster_snapshot_payload(
+    client: &Client,
+    ws_url: &str,
+    session: &BroadcasterSnapshotSessionResponse,
+    index: u32,
+    request_timeout: Duration,
+) -> Result<BroadcasterEnvelope> {
+    let payload_url = derive_broadcaster_http_url(
+        ws_url,
+        &format!("snapshot-sessions/{}/payloads/{index}", session.session_id),
+    )
+    .map_err(|error| anyhow!("failed to derive broadcaster snapshot payload URL: {error}"))?;
+    let response = client
+        .get(&payload_url)
+        .timeout(request_timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "failed to fetch broadcaster snapshot payload {index} from {payload_url}: {error}"
+            )
+        })?;
+    decode_success_json(response, &payload_url, "fetch broadcaster snapshot payload").await
+}
+
+async fn decode_success_json<T>(
+    response: reqwest::Response,
+    url: &str,
+    operation: &str,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let status = response.status();
+    if !status.is_success() {
+        return Err(http_status_error(operation, url, status));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| anyhow!("failed to read {operation} response from {url}: {error}"))?;
+    serde_json::from_slice(&body)
+        .map_err(|error| anyhow!("failed to decode {operation} response from {url}: {error}"))
+}
+
+fn http_status_error(operation: &str, url: &str, status: StatusCode) -> anyhow::Error {
+    anyhow!("{operation} at {url} failed with HTTP {status}")
+}
+
+async fn process_broadcaster_subscription(
+    mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
+    mut processor: BroadcasterSubscriptionProcessor,
+    cfg: &StreamSupervisorConfig,
+) -> (SubscriptionExit, Option<VmSubscriptionRebuildState>) {
     loop {
         let next_timeout = if processor.bootstrap_complete() {
             cfg.stream_stale
@@ -509,14 +1136,32 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
-    use tokio::sync::RwLock;
+    use reqwest::Client;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::RwLock,
+        task::JoinHandle,
+    };
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
-        protocol::models::ProtocolComponent,
+        evm::decoder::TychoStreamDecoder,
+        protocol::{
+            errors::InvalidSnapshotError,
+            models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        },
+        tycho_client::feed::{
+            synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+            BlockHeader, SynchronizerState,
+        },
         tycho_common::{
+            dto::{
+                Chain as DtoChain, ProtocolComponent as DtoProtocolComponent, ResponseAccount,
+                ResponseProtocolState,
+            },
             models::{token::Token, Chain},
             simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
             Bytes,
@@ -524,18 +1169,21 @@ mod tests {
     };
 
     use super::{
-        handle_subscription_reset, BroadcasterSubscriptionControls,
+        bootstrap_broadcaster_snapshot, handle_subscription_reset, BroadcasterSubscriptionControls,
         BroadcasterSubscriptionProcessor, NativeBroadcasterSubscriptionControls,
-        VmBroadcasterSubscriptionControls,
+        RawSnapshotReassembly, VmBroadcasterSubscriptionControls,
     };
+    use crate::config::MemoryConfig;
     use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
+    use crate::stream::StreamSupervisorConfig;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
-        BroadcasterPayload, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-        BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-        BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+        BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
+        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+        BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
+        BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -602,7 +1250,22 @@ mod tests {
         }
     }
 
+    impl TryFromWithBlock<ComponentWithState, BlockHeader> for DummySim {
+        type Error = InvalidSnapshotError;
+
+        async fn try_from_with_header(
+            _snapshot: ComponentWithState,
+            _block: BlockHeader,
+            _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
+            _all_tokens: &HashMap<Bytes, Token>,
+            _decoder_context: &DecoderContext,
+        ) -> std::result::Result<Self, Self::Error> {
+            Ok(Self(0))
+        }
+    }
+
     struct TestControls {
+        token_store: Arc<TokenStore>,
         native_subscription: BroadcasterSubscriptionStatus,
         vm_subscription: BroadcasterSubscriptionStatus,
         native_state_store: Arc<StateStore>,
@@ -624,10 +1287,11 @@ mod tests {
             ));
 
             Self {
+                token_store: Arc::clone(&token_store),
                 native_subscription: BroadcasterSubscriptionStatus::default(),
                 vm_subscription: BroadcasterSubscriptionStatus::default(),
                 native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
-                vm_state_store: Arc::new(StateStore::new(token_store)),
+                vm_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
                 native_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
@@ -640,6 +1304,8 @@ mod tests {
                 broadcaster_subscription: self.native_subscription.clone(),
                 state_store: Arc::clone(&self.native_state_store),
                 stream_health: Arc::clone(&self.native_stream_health),
+                tokens: Arc::clone(&self.token_store),
+                protocols: vec!["uniswap_v2".to_string()],
             })
         }
 
@@ -648,6 +1314,8 @@ mod tests {
                 broadcaster_subscription: self.vm_subscription.clone(),
                 state_store: Arc::clone(&self.vm_state_store),
                 stream_health: Arc::clone(&self.vm_stream_health),
+                tokens: Arc::clone(&self.token_store),
+                protocols: vec!["vm:curve".to_string()],
                 vm_stream: Arc::clone(&self.vm_stream),
                 simulation_rebuild_gate: Arc::clone(&self.simulation_rebuild_gate),
             })
@@ -748,6 +1416,31 @@ mod tests {
         ))
     }
 
+    fn empty_snapshot_chunk_envelope() -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                0,
+                vec![
+                    BroadcasterSnapshotPartition::new(
+                        BroadcasterBackend::Native,
+                        10,
+                        Vec::new(),
+                        BTreeMap::new(),
+                    ),
+                    BroadcasterSnapshotPartition::new(
+                        BroadcasterBackend::Vm,
+                        11,
+                        Vec::new(),
+                        BTreeMap::new(),
+                    ),
+                ],
+            )?),
+        ))
+    }
+
     fn snapshot_end_envelope() -> BroadcasterEnvelope {
         BroadcasterEnvelope::new(
             "stream-1",
@@ -790,6 +1483,331 @@ mod tests {
                 ],
             )?),
         ))
+    }
+
+    fn vm_only_snapshot_start_envelope(total_chunks: u32) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            1,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                "snapshot-1",
+                Chain::Ethereum.id(),
+                vec![BroadcasterBackend::Vm],
+                total_chunks,
+            )?),
+        ))
+    }
+
+    fn raw_snapshot_chunk_envelope(
+        message_seq: u64,
+        chunk_index: u32,
+        block_number: u64,
+        messages: Vec<BroadcasterProtocolMessage>,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            message_seq,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                chunk_index,
+                vec![BroadcasterSnapshotPartition::with_messages(
+                    BroadcasterBackend::Vm,
+                    block_number,
+                    messages,
+                    BTreeMap::new(),
+                )],
+            )?),
+        ))
+    }
+
+    fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
+        BroadcasterEnvelope::new(
+            "stream-1",
+            message_seq,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        )
+    }
+
+    async fn spawn_snapshot_session_server(
+        payloads: Vec<BroadcasterEnvelope>,
+    ) -> Result<(String, String, JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let payloads = Arc::new(
+            payloads
+                .into_iter()
+                .map(|payload| serde_json::to_string(&payload))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let payloads = Arc::clone(&payloads);
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 8192];
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let (status, body) = snapshot_server_response(first_line, &payloads);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Ok((
+            format!("ws://{addr}/ws"),
+            format!("http://{addr}/snapshot-sessions"),
+            server_task,
+        ))
+    }
+
+    fn snapshot_server_response(first_line: &str, payloads: &[String]) -> (&'static str, String) {
+        if first_line == "POST /snapshot-sessions HTTP/1.1" {
+            return (
+                "201 Created",
+                serde_json::json!({
+                    "chainId": Chain::Ethereum.id(),
+                    "sessionId": 7,
+                    "streamId": "stream-1",
+                    "snapshotId": "snapshot-1",
+                    "payloadCount": payloads.len(),
+                    "snapshotChunkCount": payloads
+                        .iter()
+                        .filter(|payload| payload.contains("\"kind\":\"snapshot_chunk\""))
+                        .count(),
+                    "expiresInMs": 300000
+                })
+                .to_string(),
+            );
+        }
+
+        let Some(path) = first_line
+            .strip_prefix("GET /snapshot-sessions/7/payloads/")
+            .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+        else {
+            return (
+                "404 Not Found",
+                serde_json::json!({ "error": "not found" }).to_string(),
+            );
+        };
+        let Ok(index) = path.parse::<usize>() else {
+            return (
+                "416 Range Not Satisfiable",
+                serde_json::json!({ "error": "bad index" }).to_string(),
+            );
+        };
+        match payloads.get(index) {
+            Some(payload) => ("200 OK", payload.clone()),
+            None => (
+                "416 Range Not Satisfiable",
+                serde_json::json!({ "error": "bad index" }).to_string(),
+            ),
+        }
+    }
+
+    fn test_supervisor_config() -> StreamSupervisorConfig {
+        StreamSupervisorConfig {
+            readiness_stale: Duration::from_secs(1),
+            stream_stale: Duration::from_secs(1),
+            missing_block_burst: 3,
+            missing_block_window: Duration::from_secs(60),
+            error_burst: 3,
+            error_window: Duration::from_secs(60),
+            resync_grace: Duration::from_secs(60),
+            restart_backoff_min: Duration::from_millis(10),
+            restart_backoff_max: Duration::from_millis(100),
+            restart_backoff_jitter_pct: 0.0,
+            memory: MemoryConfig {
+                purge_enabled: false,
+                snapshots_enabled: false,
+                snapshots_min_interval_secs: 60,
+                snapshots_min_new_pairs: 1_000,
+                snapshots_emit_emf: false,
+            },
+        }
+    }
+
+    fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+        let mut decoder = TychoStreamDecoder::new();
+        decoder.register_decoder::<DummySim>("vm:curve");
+        Arc::new(decoder)
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_merges_split_vm_storage_account() -> Result<()> {
+        let account_address = Bytes::from([42u8; 20]);
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address.clone(), "vm-account", &[(1, 11)]),
+        ))?;
+        reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address.clone(), "vm-account", &[(2, 22), (3, 33)]),
+        ))?;
+
+        let messages = reassembly.take_messages();
+        assert_eq!(messages.len(), 1);
+        let account = messages[0]
+            .message
+            .snapshots
+            .vm_storage
+            .get(&account_address)
+            .ok_or_else(|| anyhow!("expected reassembled VM account"))?;
+        assert_eq!(account.slots.len(), 3);
+        assert_eq!(
+            account.slots[&Bytes::from([1u8; 32])],
+            Bytes::from([11u8; 32])
+        );
+        assert_eq!(
+            account.slots[&Bytes::from([2u8; 32])],
+            Bytes::from([22u8; 32])
+        );
+        assert_eq!(
+            account.slots[&Bytes::from([3u8; 32])],
+            Bytes::from([33u8; 32])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_metadata_mismatch() -> Result<()> {
+        let account_address = Bytes::from([42u8; 20]);
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address.clone(), "vm-account", &[(1, 11)]),
+        ))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address, "changed-title", &[(2, 22)]),
+        )) else {
+            return Err(anyhow!("metadata mismatch should fail"));
+        };
+
+        assert!(error
+            .to_string()
+            .contains("broadcaster snapshot VM storage metadata mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_header_mismatch() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        let sync_header = raw_block_header(10, 1);
+        reassembly.push(raw_protocol_message_with_header(
+            sync_header.clone(),
+            SynchronizerState::Ready(sync_header.clone()),
+        ))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_header(
+            raw_block_header(11, 2),
+            SynchronizerState::Ready(sync_header),
+        )) else {
+            return Err(anyhow!("header mismatch should fail"));
+        };
+
+        assert!(error.to_string().contains("header mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_sync_state_mismatch() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        let header = raw_block_header(10, 1);
+        reassembly.push(raw_protocol_message_with_header(
+            header.clone(),
+            SynchronizerState::Ready(header.clone()),
+        ))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_header(
+            header.clone(),
+            SynchronizerState::Delayed(header),
+        )) else {
+            return Err(anyhow!("sync_state mismatch should fail"));
+        };
+
+        assert!(error.to_string().contains("sync_state mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_duplicate_snapshot_state_conflict() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_ids(&["pool-a"], &[]))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_ids(&["pool-a"], &[])) else {
+            return Err(anyhow!("duplicate snapshot state should fail"));
+        };
+
+        assert!(error.to_string().contains("duplicate snapshot state"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_duplicate_removal_conflict() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_ids(&[], &["pool-a"]))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_ids(&[], &["pool-a"])) else {
+            return Err(anyhow!("duplicate removal should fail"));
+        };
+
+        assert!(error.to_string().contains("duplicate removed component"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_snapshot_removal_overlap() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_ids(&["pool-a"], &[]))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_ids(&[], &["pool-a"])) else {
+            return Err(anyhow!("snapshot/removal overlap should fail"));
+        };
+
+        assert!(error.to_string().contains("snapshot/removal overlap"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_happy_path_preserves_header_and_sync_state() -> Result<()> {
+        let header = raw_block_header(10, 1);
+        let sync_state = SynchronizerState::Ready(header.clone());
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_parts(
+            header.clone(),
+            sync_state.clone(),
+            &["pool-a"],
+            &[],
+            HashMap::new(),
+        ))?;
+        reassembly.push(raw_protocol_message_with_parts(
+            header.clone(),
+            sync_state.clone(),
+            &[],
+            &["pool-b"],
+            HashMap::new(),
+        ))?;
+
+        let messages = reassembly.take_messages();
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.message.header, header);
+        assert_eq!(message.sync_state, sync_state);
+        assert!(message.message.snapshots.states.contains_key("pool-a"));
+        assert!(message.message.removed_components.contains_key("pool-b"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -839,6 +1857,207 @@ mod tests {
             .last_update_age_ms()
             .await
             .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_snapshot_bootstrap_populates_processor_before_live_attach() -> Result<()> {
+        let controls = TestControls::new();
+        let native_controls = controls.native();
+        let mut processor = BroadcasterSubscriptionProcessor::new(
+            Chain::Ethereum.id(),
+            native_controls.clone(),
+            None,
+        );
+        let payloads = vec![
+            snapshot_start_envelope()?,
+            empty_snapshot_chunk_envelope()?,
+            snapshot_end_envelope(),
+        ];
+        let (ws_url, snapshot_sessions_url, server_task) =
+            spawn_snapshot_session_server(payloads).await?;
+
+        let session = bootstrap_broadcaster_snapshot(
+            &Client::new(),
+            &ws_url,
+            &snapshot_sessions_url,
+            &mut processor,
+            &native_controls,
+            &test_supervisor_config(),
+        )
+        .await?;
+        server_task.abort();
+
+        assert_eq!(session.session_id, 7);
+        assert!(processor.bootstrap_complete());
+        assert_eq!(controls.native_state_store.current_block().await, 10);
+        assert!(!controls.native_state_store.has_pool("pool-native").await);
+        assert!(!controls.native_state_store.has_pool("pool-vm").await);
+        let snapshot = controls.native_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-1"));
+        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> Result<()> {
+        let controls = TestControls::new();
+        let vm_controls = controls.vm();
+        let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+            Chain::Ethereum.id(),
+            vm_controls,
+            raw_decoder(),
+            None,
+        );
+        let header = raw_block_header(21, 9);
+        let sync_state = SynchronizerState::Ready(header.clone());
+
+        processor
+            .observe(vm_only_snapshot_start_envelope(2)?)
+            .await?;
+        processor
+            .observe(raw_snapshot_chunk_envelope(
+                2,
+                0,
+                21,
+                vec![raw_protocol_message_with_parts(
+                    header.clone(),
+                    sync_state.clone(),
+                    &["0x1111111111111111111111111111111111111111"],
+                    &[],
+                    HashMap::new(),
+                )],
+            )?)
+            .await?;
+
+        assert!(!processor.bootstrap_complete());
+        assert!(
+            !controls
+                .vm_state_store
+                .has_pool("0x1111111111111111111111111111111111111111")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 0);
+        assert_eq!(controls.vm_stream_health.last_block().await, 0);
+
+        processor
+            .observe(raw_snapshot_chunk_envelope(
+                3,
+                1,
+                21,
+                vec![raw_protocol_message_with_parts(
+                    header,
+                    sync_state,
+                    &["0x2222222222222222222222222222222222222222"],
+                    &[],
+                    HashMap::new(),
+                )],
+            )?)
+            .await?;
+
+        assert!(!processor.bootstrap_complete());
+        assert!(
+            !controls
+                .vm_state_store
+                .has_pool("0x1111111111111111111111111111111111111111")
+                .await
+        );
+        assert!(
+            !controls
+                .vm_state_store
+                .has_pool("0x2222222222222222222222222222222222222222")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 0);
+        assert_eq!(controls.vm_stream_health.last_block().await, 0);
+
+        processor.observe(snapshot_end_envelope_at(4)).await?;
+
+        let snapshot = controls.vm_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert!(processor.bootstrap_complete());
+        assert!(
+            controls
+                .vm_state_store
+                .has_pool("0x1111111111111111111111111111111111111111")
+                .await
+        );
+        assert!(
+            controls
+                .vm_state_store
+                .has_pool("0x2222222222222222222222222222222222222222")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 21);
+        assert_eq!(controls.vm_stream_health.last_block().await, 21);
+        assert!(controls
+            .vm_stream_health
+            .last_update_age_ms()
+            .await
+            .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_snapshot_bootstrap_decodes_unsplit_raw_message() -> Result<()> {
+        let controls = TestControls::new();
+        let vm_controls = controls.vm();
+        let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+            Chain::Ethereum.id(),
+            vm_controls.clone(),
+            raw_decoder(),
+            None,
+        );
+        let header = raw_block_header(30, 10);
+        let payloads = vec![
+            vm_only_snapshot_start_envelope(1)?,
+            raw_snapshot_chunk_envelope(
+                2,
+                0,
+                30,
+                vec![raw_protocol_message_with_parts(
+                    header.clone(),
+                    SynchronizerState::Ready(header),
+                    &["0x3333333333333333333333333333333333333333"],
+                    &[],
+                    HashMap::new(),
+                )],
+            )?,
+            snapshot_end_envelope_at(3),
+        ];
+        let (ws_url, snapshot_sessions_url, server_task) =
+            spawn_snapshot_session_server(payloads).await?;
+
+        let session = bootstrap_broadcaster_snapshot(
+            &Client::new(),
+            &ws_url,
+            &snapshot_sessions_url,
+            &mut processor,
+            &vm_controls,
+            &test_supervisor_config(),
+        )
+        .await?;
+        server_task.abort();
+
+        assert_eq!(session.session_id, 7);
+        assert!(processor.bootstrap_complete());
+        assert!(
+            controls
+                .vm_state_store
+                .has_pool("0x3333333333333333333333333333333333333333")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 30);
+        assert_eq!(controls.vm_stream_health.last_block().await, 30);
+
+        let snapshot = controls.vm_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-1"));
+        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-1"));
         Ok(())
     }
 
@@ -1055,5 +2274,146 @@ mod tests {
             .await
             .is_some());
         Ok(())
+    }
+
+    fn raw_protocol_message(
+        account_address: Bytes,
+        account: ResponseAccount,
+    ) -> BroadcasterProtocolMessage {
+        let header = raw_block_header(10, 1);
+        raw_protocol_message_with_parts(
+            header.clone(),
+            SynchronizerState::Ready(header),
+            &[],
+            &[],
+            HashMap::from([(account_address, account)]),
+        )
+    }
+
+    fn raw_protocol_message_with_ids(
+        state_ids: &[&str],
+        removal_ids: &[&str],
+    ) -> BroadcasterProtocolMessage {
+        let header = raw_block_header(10, 1);
+        raw_protocol_message_with_parts(
+            header.clone(),
+            SynchronizerState::Ready(header),
+            state_ids,
+            removal_ids,
+            HashMap::new(),
+        )
+    }
+
+    fn raw_protocol_message_with_header(
+        header: BlockHeader,
+        sync_state: SynchronizerState,
+    ) -> BroadcasterProtocolMessage {
+        raw_protocol_message_with_parts(header, sync_state, &[], &[], HashMap::new())
+    }
+
+    fn raw_protocol_message_with_parts(
+        header: BlockHeader,
+        sync_state: SynchronizerState,
+        state_ids: &[&str],
+        removal_ids: &[&str],
+        vm_storage: HashMap<Bytes, ResponseAccount>,
+    ) -> BroadcasterProtocolMessage {
+        BroadcasterProtocolMessage::new(
+            "vm:curve",
+            sync_state,
+            StateSyncMessage {
+                header,
+                snapshots: Snapshot {
+                    states: state_ids
+                        .iter()
+                        .map(|component_id| {
+                            (
+                                (*component_id).to_string(),
+                                raw_component_with_state(component_id),
+                            )
+                        })
+                        .collect(),
+                    vm_storage,
+                },
+                deltas: None,
+                removed_components: removal_ids
+                    .iter()
+                    .map(|component_id| {
+                        (
+                            (*component_id).to_string(),
+                            raw_dto_protocol_component(component_id),
+                        )
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    fn raw_component_with_state(component_id: &str) -> ComponentWithState {
+        ComponentWithState {
+            state: ResponseProtocolState {
+                component_id: component_id.to_string(),
+                attributes: HashMap::new(),
+                balances: HashMap::new(),
+            },
+            component: raw_dto_protocol_component(component_id),
+            component_tvl: None,
+            entrypoints: Vec::new(),
+        }
+    }
+
+    fn raw_dto_protocol_component(component_id: &str) -> DtoProtocolComponent {
+        DtoProtocolComponent {
+            id: component_id.to_string(),
+            protocol_system: "vm:curve".to_string(),
+            protocol_type_name: "curve_pool".to_string(),
+            chain: DtoChain::Ethereum,
+            tokens: Vec::new(),
+            contract_ids: Vec::new(),
+            static_attributes: HashMap::new(),
+            change: Default::default(),
+            creation_tx: Bytes::from([0u8; 32]),
+            created_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    fn raw_block_header(number: u64, seed: u8) -> BlockHeader {
+        BlockHeader {
+            hash: Bytes::from(vec![seed; 32]),
+            number,
+            parent_hash: Bytes::from(vec![seed.saturating_add(1); 32]),
+            revert: false,
+            timestamp: number * 10,
+            partial_block_index: None,
+        }
+    }
+
+    fn raw_response_account(
+        address: Bytes,
+        title: &str,
+        slot_values: &[(u8, u8)],
+    ) -> ResponseAccount {
+        let slots = slot_values
+            .iter()
+            .map(|(slot_seed, value_seed)| {
+                (
+                    Bytes::from([*slot_seed; 32]),
+                    Bytes::from([*value_seed; 32]),
+                )
+            })
+            .collect();
+        ResponseAccount::new(
+            DtoChain::Ethereum,
+            address,
+            title.to_string(),
+            slots,
+            Bytes::from([0u8; 32]),
+            HashMap::new(),
+            Bytes::from([7u8; 32]),
+            Bytes::from([8u8; 32]),
+            Bytes::from([9u8; 32]),
+            Bytes::from([10u8; 32]),
+            None,
+        )
     }
 }

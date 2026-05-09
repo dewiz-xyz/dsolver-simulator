@@ -92,6 +92,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build & push broadcaster image
+        if: matrix.target == 'quoter-base'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.broadcaster-service
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/tycho-broadcaster-${{ matrix.target }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-broadcaster-${{ matrix.target }}:latest
+          cache-from: type=gha,scope=broadcaster-service-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=broadcaster-service-${{ matrix.target }}
+
       - name: Force deploy ECS service
         env:
           CLUSTER: ${{ matrix.target }}

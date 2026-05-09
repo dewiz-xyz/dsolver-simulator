@@ -4,14 +4,17 @@ use std::{
     time::Duration,
 };
 
-use crate::models::tokens::TokenStore;
 use anyhow::{bail, Result};
 use futures::StreamExt;
+use simulator_core::broadcaster::BroadcasterBackend;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
+
+use crate::models::tokens::TokenStore;
 use tycho_simulation::{
     evm::{
+        decoder::TychoStreamDecoder,
         engine_db::tycho_db::PreCachedDB,
         protocol::{
             aerodrome_slipstreams::state::AerodromeSlipstreamsState,
@@ -24,6 +27,7 @@ use tycho_simulation::{
             rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
+            uniswap_v4::hooks::hook_handler_creator::initialize_hook_handlers,
             uniswap_v4::state::UniswapV4State,
             vm::state::EVMPoolState,
         },
@@ -39,6 +43,10 @@ use tycho_simulation::{
         stream::RFQStreamBuilder,
     },
     tycho_client::feed::component_tracker::ComponentFilter,
+    tycho_client::{
+        feed::{BlockHeader, FeedMessage},
+        stream::TychoStreamBuilder,
+    },
     tycho_common::{
         models::{token::Token, Chain},
         Bytes,
@@ -206,6 +214,71 @@ pub async fn build_broadcaster_stream(
     }))
 }
 
+pub async fn build_broadcaster_raw_stream(
+    tycho_url: &str,
+    api_key: &str,
+    tvl_add_threshold: f64,
+    tvl_keep_threshold: f64,
+    chain: Chain,
+    protocols: &BroadcasterProtocols,
+) -> Result<
+    impl futures::Stream<
+            Item = Result<
+                FeedMessage<BlockHeader>,
+                Box<dyn std::error::Error + Send + Sync + 'static>,
+            >,
+        > + Unpin
+        + Send,
+> {
+    let (mut builder, tvl_filter) = raw_base_builder(
+        tycho_url,
+        api_key,
+        tvl_add_threshold,
+        tvl_keep_threshold,
+        chain,
+    );
+
+    for protocol in protocols.native.iter().chain(protocols.vm.iter()) {
+        builder = builder.exchange(protocol, tvl_filter.clone());
+    }
+
+    let (_handle, rx) = builder.build().await?;
+    Ok(ReceiverStream::new(rx).map(|item| {
+        item.map_err(|err| -> Box<dyn std::error::Error + Send + Sync + 'static> { Box::new(err) })
+    }))
+}
+
+pub async fn build_broadcaster_subscription_decoder(
+    tokens: Arc<TokenStore>,
+    backend: BroadcasterBackend,
+    protocols: &[String],
+) -> Result<Arc<TychoStreamDecoder<BlockHeader>>> {
+    let mut decoder = TychoStreamDecoder::new();
+    decoder.skip_state_decode_failures(decode_skip_state_failures(match backend {
+        BroadcasterBackend::Native => StreamDecodePolicy::Native,
+        BroadcasterBackend::Vm => StreamDecodePolicy::Vm,
+    }));
+
+    match backend {
+        BroadcasterBackend::Native => {
+            for protocol in protocols {
+                register_native_decoder(&mut decoder, protocol)?;
+            }
+        }
+        BroadcasterBackend::Vm => {
+            for protocol in protocols {
+                register_vm_decoder(&mut decoder, protocol)?;
+            }
+        }
+    }
+
+    initialize_hook_handlers().map_err(|error| {
+        anyhow::anyhow!("failed to initialize Uniswap v4 hook handlers: {error:?}")
+    })?;
+    decoder.set_tokens(tokens.snapshot().await).await;
+    Ok(Arc::new(decoder))
+}
+
 #[derive(Clone)]
 pub struct RFQConfig {
     pub bebop_user: String,
@@ -362,6 +435,49 @@ fn register_vm_protocol(
     }
 }
 
+fn register_native_decoder(
+    decoder: &mut TychoStreamDecoder<BlockHeader>,
+    protocol: &str,
+) -> Result<()> {
+    match protocol {
+        "uniswap_v2" | "sushiswap_v2" => decoder.register_decoder::<UniswapV2State>(protocol),
+        "pancakeswap_v2" => decoder.register_decoder::<PancakeswapV2State>(protocol),
+        "uniswap_v3" | "pancakeswap_v3" => decoder.register_decoder::<UniswapV3State>(protocol),
+        "uniswap_v4" => decoder.register_decoder::<UniswapV4State>(protocol),
+        "ekubo_v2" => decoder.register_decoder::<EkuboState>(protocol),
+        "fluid_v1" => {
+            decoder.register_decoder::<FluidV1>(protocol);
+            decoder.register_filter(protocol, fluid_v1_paused_pools_filter);
+        }
+        "rocketpool" => decoder.register_decoder::<RocketpoolState>(protocol),
+        "ekubo_v3" => decoder.register_decoder::<EkuboV3State>(protocol),
+        "aerodrome_slipstreams" => decoder.register_decoder::<AerodromeSlipstreamsState>(protocol),
+        "erc4626" => {
+            decoder.register_decoder::<ERC4626State>(protocol);
+            decoder.register_filter(protocol, erc4626_filter);
+        }
+        other => bail!("Unknown native protocol in chain profile: {}", other),
+    }
+    Ok(())
+}
+
+fn register_vm_decoder(
+    decoder: &mut TychoStreamDecoder<BlockHeader>,
+    protocol: &str,
+) -> Result<()> {
+    match protocol {
+        "vm:balancer_v2" => {
+            decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol);
+            decoder.register_filter(protocol, balancer_v2_pool_filter);
+        }
+        "vm:curve" | "vm:maverick_v2" => {
+            decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol);
+        }
+        other => bail!("Unknown VM protocol in chain profile: {}", other),
+    }
+    Ok(())
+}
+
 fn base_builder(
     tycho_url: &str,
     api_key: &str,
@@ -382,6 +498,28 @@ fn base_builder(
         .latency_buffer(15)
         .auth_key(Some(api_key.to_string()))
         .skip_state_decode_failures(skip_state_decode_failures);
+
+    (builder, tvl_filter)
+}
+
+fn raw_base_builder(
+    tycho_url: &str,
+    api_key: &str,
+    tvl_add_threshold: f64,
+    tvl_keep_threshold: f64,
+    chain: Chain,
+) -> (TychoStreamBuilder, ComponentFilter) {
+    let add_tvl = tvl_add_threshold;
+    let keep_tvl = tvl_keep_threshold.min(add_tvl);
+    info!(
+        "Using TVL thresholds: remove/keep={} add={}",
+        keep_tvl, add_tvl
+    );
+    let tvl_filter = ComponentFilter::with_tvl_range(keep_tvl, add_tvl);
+
+    let builder = TychoStreamBuilder::new(tycho_url, chain.into())
+        .timeout(15)
+        .auth_key(Some(api_key.to_string()));
 
     (builder, tvl_filter)
 }

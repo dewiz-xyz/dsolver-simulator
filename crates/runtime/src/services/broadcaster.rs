@@ -1,19 +1,27 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use tokio::sync::Mutex;
-use tycho_simulation::protocol::models::Update as TychoUpdate;
+use tycho_simulation::{
+    protocol::models::Update as TychoUpdate,
+    tycho_client::feed::{BlockHeader, FeedMessage},
+};
 
 use crate::models::broadcaster::{
     BroadcasterLiveState, BroadcasterReadiness, BroadcasterSnapshotCache,
     BroadcasterStatusSnapshot, BroadcasterUpstreamState,
 };
 use crate::services::broadcaster_sessions::{
-    BroadcasterSessionRegistration, BroadcasterSubscriberRegistry, SessionCloseReason,
+    BroadcasterAttachedSession, BroadcasterSubscriberRegistry, SessionCloseReason,
+    SnapshotSessionError,
 };
-use simulator_core::broadcaster::BroadcasterPayload;
+use simulator_core::broadcaster::{
+    BroadcasterEnvelope, BroadcasterPayload, BroadcasterSnapshotSessionResponse,
+};
 
 #[derive(Debug, Clone)]
 pub struct BroadcasterServiceState {
-    snapshot_chunk_size: usize,
+    snapshot_max_payload_bytes: usize,
     cache: BroadcasterSnapshotCache,
     upstream: BroadcasterUpstreamState,
     subscribers: BroadcasterSubscriberRegistry,
@@ -24,13 +32,13 @@ pub struct BroadcasterServiceState {
 
 impl BroadcasterServiceState {
     pub fn new(
-        snapshot_chunk_size: usize,
+        snapshot_max_payload_bytes: usize,
         subscriber_buffer_capacity: usize,
         cache: BroadcasterSnapshotCache,
         upstream: BroadcasterUpstreamState,
     ) -> Self {
         Self {
-            snapshot_chunk_size,
+            snapshot_max_payload_bytes,
             cache,
             upstream,
             subscribers: BroadcasterSubscriberRegistry::new(subscriber_buffer_capacity),
@@ -69,23 +77,58 @@ impl BroadcasterServiceState {
         Ok(())
     }
 
+    pub async fn apply_feed_message(&self, feed: &FeedMessage<BlockHeader>) -> Result<()> {
+        let _gate = self.lifecycle_gate.lock().await;
+        let message = self.cache.apply_feed_message(feed).await?;
+        self.upstream.record_update().await;
+        self.subscribers
+            .broadcast(BroadcasterPayload::Update(message))
+            .await;
+        Ok(())
+    }
+
     pub async fn broadcast_heartbeat(&self) -> Result<()> {
         let _gate = self.lifecycle_gate.lock().await;
         if let Some(heartbeat) = self.cache.heartbeat().await? {
             self.subscribers.broadcast(heartbeat).await;
         }
+        self.subscribers.cleanup_expired_snapshot_sessions().await;
         Ok(())
     }
 
-    pub async fn subscribe(&self) -> Result<Option<BroadcasterSessionRegistration>> {
+    pub async fn create_snapshot_session(
+        &self,
+        ttl: Duration,
+    ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
         let _gate = self.lifecycle_gate.lock().await;
         let status = self.status_snapshot().await;
         if status.readiness != BroadcasterReadiness::Ready {
             return Ok(None);
         }
 
-        let snapshot = self.cache.export_snapshot(self.snapshot_chunk_size).await?;
-        Ok(Some(self.subscribers.register(snapshot).await))
+        let snapshot = self
+            .cache
+            .export_snapshot(self.snapshot_max_payload_bytes)
+            .await?;
+        self.subscribers
+            .create_snapshot_session(snapshot, status.chain_id, ttl)
+            .await
+            .map(Some)
+    }
+
+    pub async fn snapshot_session_payload(
+        &self,
+        session_id: u64,
+        index: u32,
+    ) -> Result<BroadcasterEnvelope, SnapshotSessionError> {
+        self.subscribers.snapshot_payload(session_id, index).await
+    }
+
+    pub async fn attach_snapshot_session(
+        &self,
+        session_id: u64,
+    ) -> Result<BroadcasterAttachedSession, SnapshotSessionError> {
+        self.subscribers.attach_snapshot_session(session_id).await
     }
 
     pub async fn remove_subscriber(&self, session_id: u64) {
@@ -101,7 +144,7 @@ impl BroadcasterServiceState {
     pub async fn status_snapshot(&self) -> BroadcasterStatusSnapshot {
         self.cache
             .status_snapshot(
-                self.snapshot_chunk_size,
+                self.snapshot_max_payload_bytes,
                 self.upstream.snapshot().await,
                 self.subscribers.snapshot().await,
             )
@@ -208,7 +251,11 @@ mod tests {
 
         let mut subscribe_task = tokio::spawn({
             let service = service.clone();
-            async move { service.subscribe().await }
+            async move {
+                service
+                    .create_snapshot_session(Duration::from_secs(300))
+                    .await
+            }
         });
         tokio::task::yield_now().await;
 
@@ -226,7 +273,7 @@ mod tests {
             .is_err());
         drop(gate);
 
-        let mut registration = subscribe_task
+        let session = subscribe_task
             .await
             .map_err(|error| anyhow!("subscribe task failed: {error}"))??
             .ok_or_else(|| anyhow!("expected ready broadcaster subscriber"))?;
@@ -234,6 +281,11 @@ mod tests {
         update_task
             .await
             .map_err(|error| anyhow!("update task failed: {error}"))??;
+
+        let mut registration = service
+            .attach_snapshot_session(session.session_id)
+            .await
+            .map_err(|error| anyhow!("failed to attach snapshot session: {error:?}"))?;
 
         let live_payload = registration
             .receiver
@@ -245,16 +297,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_is_disconnected_by_queued_generation_reset() -> Result<()> {
+    async fn attached_session_is_disconnected_by_generation_reset() -> Result<()> {
         let service = ready_service().await?;
         let gate = service.lock_lifecycle_gate_for_test().await;
 
         let mut subscribe_task = tokio::spawn({
             let service = service.clone();
-            async move { service.subscribe().await }
+            async move {
+                service
+                    .create_snapshot_session(Duration::from_secs(300))
+                    .await
+            }
         });
         tokio::task::yield_now().await;
 
+        assert!(timeout(Duration::from_millis(25), &mut subscribe_task)
+            .await
+            .is_err());
+        drop(gate);
+
+        let session = subscribe_task
+            .await
+            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
+            .ok_or_else(|| anyhow!("expected ready broadcaster subscriber"))?;
+
+        let registration = service
+            .attach_snapshot_session(session.session_id)
+            .await
+            .map_err(|error| anyhow!("failed to attach snapshot session: {error:?}"))?;
         let reset_task = tokio::spawn({
             let service = service.clone();
             async move {
@@ -263,16 +333,6 @@ mod tests {
                     .await
             }
         });
-
-        assert!(timeout(Duration::from_millis(25), &mut subscribe_task)
-            .await
-            .is_err());
-        drop(gate);
-
-        let registration = subscribe_task
-            .await
-            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
-            .ok_or_else(|| anyhow!("expected ready broadcaster subscriber"))?;
         let reason = registration
             .close_receiver
             .await
@@ -292,7 +352,7 @@ mod tests {
     async fn ready_service() -> Result<BroadcasterServiceState> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let upstream = BroadcasterUpstreamState::default();
-        let service = BroadcasterServiceState::new(2, 8, cache, upstream);
+        let service = BroadcasterServiceState::new(8_388_608, 8, cache, upstream);
         service.mark_upstream_connected().await;
         service
             .apply_update(&native_only_update(10, "native-1"))

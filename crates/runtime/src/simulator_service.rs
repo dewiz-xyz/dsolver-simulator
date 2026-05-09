@@ -613,6 +613,8 @@ fn spawn_native_broadcaster_subscription_task(
         broadcaster_subscription: app_state.native_broadcaster_subscription.clone(),
         state_store: Arc::clone(&resources.native_state_store),
         stream_health: Arc::clone(&resources.native_stream_health),
+        tokens: Arc::clone(&app_state.tokens),
+        protocols: config.chain_profile.native_protocols.clone(),
     });
     spawn_backend_broadcaster_subscription_task(
         "native",
@@ -633,6 +635,8 @@ fn spawn_vm_broadcaster_subscription_task(
         broadcaster_subscription: app_state.vm_broadcaster_subscription.clone(),
         state_store: Arc::clone(&resources.vm_state_store),
         stream_health: Arc::clone(&resources.vm_stream_health),
+        tokens: Arc::clone(&app_state.tokens),
+        protocols: config.chain_profile.vm_protocols.clone(),
         vm_stream: Arc::clone(&resources.vm_stream),
         simulation_rebuild_gate: app_state.simulation_rebuild_gate(),
     });
