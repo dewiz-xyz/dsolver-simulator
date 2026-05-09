@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{
+    btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, HashMap,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use tycho_simulation::{
     evm::engine_db::SHARED_TYCHO_DB,
     protocol::models::{ProtocolComponent, Update},
     tycho_client::feed::{BlockHeader, FeedMessage},
-    tycho_common::simulation::protocol_sim::ProtocolSim,
+    tycho_common::{dto::ResponseAccount, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use simulator_core::broadcaster::{
@@ -334,11 +336,247 @@ async fn restart_after_subscription_exit(
     (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
 }
 
+#[derive(Default)]
+struct RawSnapshotReassembly {
+    messages: BTreeMap<String, BroadcasterProtocolMessage>,
+}
+
+impl RawSnapshotReassembly {
+    fn reset(&mut self) {
+        self.messages.clear();
+    }
+
+    fn push(&mut self, message: BroadcasterProtocolMessage) -> Result<()> {
+        match self.messages.entry(message.protocol.clone()) {
+            BTreeEntry::Vacant(entry) => {
+                entry.insert(message);
+            }
+            BTreeEntry::Occupied(mut entry) => {
+                merge_snapshot_protocol_message(entry.get_mut(), message)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn take_messages(&mut self) -> Vec<BroadcasterProtocolMessage> {
+        std::mem::take(&mut self.messages).into_values().collect()
+    }
+}
+
+fn merge_snapshot_protocol_message(
+    existing: &mut BroadcasterProtocolMessage,
+    incoming: BroadcasterProtocolMessage,
+) -> Result<()> {
+    if existing.protocol != incoming.protocol {
+        return Err(anyhow!(
+            "broadcaster snapshot protocol mismatch: expected {}, got {}",
+            existing.protocol,
+            incoming.protocol
+        ));
+    }
+
+    ensure_raw_snapshot_fragment_identity(existing, &incoming)?;
+    ensure_raw_snapshot_fragment_conflicts(existing, &incoming)?;
+
+    let mut merged_vm_storage = std::mem::take(&mut existing.message.snapshots.vm_storage);
+    let mut incoming_message = incoming.message;
+    let incoming_vm_storage = std::mem::take(&mut incoming_message.snapshots.vm_storage);
+    merge_vm_storage(&mut merged_vm_storage, incoming_vm_storage)?;
+
+    let mut merged_message = existing.message.clone().merge(incoming_message);
+    merged_message.snapshots.vm_storage = merged_vm_storage;
+    existing.message = merged_message;
+    Ok(())
+}
+
+fn ensure_raw_snapshot_fragment_identity(
+    existing: &BroadcasterProtocolMessage,
+    incoming: &BroadcasterProtocolMessage,
+) -> Result<()> {
+    if existing.message.header != incoming.message.header {
+        return Err(anyhow!(
+            "broadcaster snapshot raw fragment header mismatch for protocol {}: expected {:?}, got {:?}",
+            existing.protocol,
+            existing.message.header,
+            incoming.message.header
+        ));
+    }
+
+    if existing.sync_state != incoming.sync_state {
+        return Err(anyhow!(
+            "broadcaster snapshot raw fragment sync_state mismatch for protocol {}: expected {:?}, got {:?}",
+            existing.protocol,
+            existing.sync_state,
+            incoming.sync_state
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_raw_snapshot_fragment_conflicts(
+    existing: &BroadcasterProtocolMessage,
+    incoming: &BroadcasterProtocolMessage,
+) -> Result<()> {
+    ensure_no_duplicate_ids(
+        &existing.protocol,
+        &existing.message.snapshots.states,
+        &incoming.message.snapshots.states,
+        "snapshot state",
+    )?;
+    ensure_no_duplicate_ids(
+        &existing.protocol,
+        &existing.message.removed_components,
+        &incoming.message.removed_components,
+        "removed component",
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &existing.message.snapshots.states,
+        &existing.message.removed_components,
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &incoming.message.snapshots.states,
+        &incoming.message.removed_components,
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &existing.message.snapshots.states,
+        &incoming.message.removed_components,
+    )?;
+    ensure_no_snapshot_removal_overlap(
+        &existing.protocol,
+        &incoming.message.snapshots.states,
+        &existing.message.removed_components,
+    )?;
+
+    Ok(())
+}
+
+fn ensure_no_duplicate_ids<Existing, Incoming>(
+    protocol: &str,
+    existing: &HashMap<String, Existing>,
+    incoming: &HashMap<String, Incoming>,
+    kind: &str,
+) -> Result<()> {
+    for component_id in incoming.keys() {
+        if existing.contains_key(component_id) {
+            return Err(anyhow!(
+                "broadcaster snapshot raw fragment duplicate {kind} for protocol {protocol}: {component_id}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_no_snapshot_removal_overlap<State, Removed>(
+    protocol: &str,
+    snapshots: &HashMap<String, State>,
+    removals: &HashMap<String, Removed>,
+) -> Result<()> {
+    for component_id in snapshots.keys() {
+        if removals.contains_key(component_id) {
+            return Err(anyhow!(
+                "broadcaster snapshot raw fragment snapshot/removal overlap for protocol {protocol}: {component_id}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_vm_storage(
+    existing: &mut HashMap<Bytes, ResponseAccount>,
+    incoming: HashMap<Bytes, ResponseAccount>,
+) -> Result<()> {
+    for (address, account) in incoming {
+        match existing.entry(address.clone()) {
+            HashEntry::Vacant(entry) => {
+                entry.insert(account);
+            }
+            HashEntry::Occupied(mut entry) => {
+                merge_vm_storage_account(&address, entry.get_mut(), account)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_vm_storage_account(
+    address: &Bytes,
+    existing: &mut ResponseAccount,
+    incoming: ResponseAccount,
+) -> Result<()> {
+    ensure_vm_account_metadata_matches(address, existing, &incoming)?;
+    for (slot, value) in incoming.slots {
+        match existing.slots.entry(slot.clone()) {
+            HashEntry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            HashEntry::Occupied(entry) if entry.get() == &value => {}
+            HashEntry::Occupied(_) => {
+                return Err(anyhow!(
+                    "broadcaster snapshot VM storage slot mismatch for account {} slot {}",
+                    address,
+                    slot
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    deprecated,
+    reason = "creation_tx is deprecated but still part of the broadcaster wire DTO"
+)]
+fn ensure_vm_account_metadata_matches(
+    address: &Bytes,
+    existing: &ResponseAccount,
+    incoming: &ResponseAccount,
+) -> Result<()> {
+    let mismatch = if existing.chain != incoming.chain {
+        Some("chain")
+    } else if existing.address != incoming.address {
+        Some("address")
+    } else if existing.title != incoming.title {
+        Some("title")
+    } else if existing.native_balance != incoming.native_balance {
+        Some("native_balance")
+    } else if existing.token_balances != incoming.token_balances {
+        Some("token_balances")
+    } else if existing.code != incoming.code {
+        Some("code")
+    } else if existing.code_hash != incoming.code_hash {
+        Some("code_hash")
+    } else if existing.balance_modify_tx != incoming.balance_modify_tx {
+        Some("balance_modify_tx")
+    } else if existing.code_modify_tx != incoming.code_modify_tx {
+        Some("code_modify_tx")
+    } else if existing.creation_tx != incoming.creation_tx {
+        Some("creation_tx")
+    } else {
+        None
+    };
+
+    if let Some(field) = mismatch {
+        return Err(anyhow!(
+            "broadcaster snapshot VM storage metadata mismatch for account {} field {}",
+            address,
+            field
+        ));
+    }
+    Ok(())
+}
+
 struct BroadcasterSubscriptionProcessor {
     expected_chain_id: u64,
     controls: BroadcasterSubscriptionControls,
     decoder: Arc<TychoStreamDecoder<BlockHeader>>,
     tracker: BroadcasterSubscriptionTracker,
+    raw_snapshot: RawSnapshotReassembly,
     bootstrap_block: Option<u64>,
     vm_rebuild: Option<VmSubscriptionRebuildState>,
 }
@@ -369,6 +607,7 @@ impl BroadcasterSubscriptionProcessor {
             controls,
             decoder,
             tracker: BroadcasterSubscriptionTracker::new(),
+            raw_snapshot: RawSnapshotReassembly::default(),
             bootstrap_block: None,
             vm_rebuild,
         }
@@ -393,6 +632,7 @@ impl BroadcasterSubscriptionProcessor {
         match envelope.payload {
             BroadcasterPayload::SnapshotStart(start) => {
                 self.bootstrap_block = None;
+                self.raw_snapshot.reset();
                 self.controls
                     .broadcaster_subscription()
                     .mark_snapshot_started(envelope.stream_id, start.snapshot_id)
@@ -402,11 +642,12 @@ impl BroadcasterSubscriptionProcessor {
                 for partition in chunk.partitions {
                     if partition.backend == self.controls.backend() {
                         self.bootstrap_block = Some(partition.block_number);
-                        self.apply_snapshot_partition(partition).await?;
+                        self.buffer_snapshot_partition(partition).await?;
                     }
                 }
             }
             BroadcasterPayload::SnapshotEnd(_end) => {
+                self.apply_reassembled_snapshot_messages().await?;
                 self.refresh_bootstrap_health().await;
                 self.controls
                     .broadcaster_subscription()
@@ -464,12 +705,33 @@ impl BroadcasterSubscriptionProcessor {
         partition: BroadcasterSnapshotPartition,
     ) -> Result<()> {
         if !partition.messages.is_empty() {
-            return self.apply_protocol_messages(partition.messages).await;
+            return Err(anyhow!(
+                "raw broadcaster snapshot messages cannot be applied without reassembly"
+            ));
         }
 
         let update = snapshot_partition_update(partition);
         self.controls.state_store().apply_update(update).await;
         Ok(())
+    }
+
+    async fn buffer_snapshot_partition(
+        &mut self,
+        partition: BroadcasterSnapshotPartition,
+    ) -> Result<()> {
+        if partition.messages.is_empty() {
+            return self.apply_snapshot_partition(partition).await;
+        }
+
+        for message in partition.messages {
+            self.raw_snapshot.push(message)?;
+        }
+        Ok(())
+    }
+
+    async fn apply_reassembled_snapshot_messages(&mut self) -> Result<()> {
+        let messages = self.raw_snapshot.take_messages();
+        self.apply_protocol_messages(messages).await
     }
 
     async fn apply_live_update_partition(
@@ -874,7 +1136,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
     use reqwest::Client;
     use tokio::{
@@ -886,8 +1148,20 @@ mod tests {
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
-        protocol::models::ProtocolComponent,
+        evm::decoder::TychoStreamDecoder,
+        protocol::{
+            errors::InvalidSnapshotError,
+            models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        },
+        tycho_client::feed::{
+            synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+            BlockHeader, SynchronizerState,
+        },
         tycho_common::{
+            dto::{
+                Chain as DtoChain, ProtocolComponent as DtoProtocolComponent, ResponseAccount,
+                ResponseProtocolState,
+            },
             models::{token::Token, Chain},
             simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
             Bytes,
@@ -897,7 +1171,7 @@ mod tests {
     use super::{
         bootstrap_broadcaster_snapshot, handle_subscription_reset, BroadcasterSubscriptionControls,
         BroadcasterSubscriptionProcessor, NativeBroadcasterSubscriptionControls,
-        VmBroadcasterSubscriptionControls,
+        RawSnapshotReassembly, VmBroadcasterSubscriptionControls,
     };
     use crate::config::MemoryConfig;
     use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
@@ -906,9 +1180,10 @@ mod tests {
     use crate::stream::StreamSupervisorConfig;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
-        BroadcasterPayload, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-        BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-        BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+        BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
+        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+        BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
+        BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -972,6 +1247,20 @@ mod tests {
                 .downcast_ref::<DummySim>()
                 .map(|value| value.0 == self.0)
                 .unwrap_or(false)
+        }
+    }
+
+    impl TryFromWithBlock<ComponentWithState, BlockHeader> for DummySim {
+        type Error = InvalidSnapshotError;
+
+        async fn try_from_with_header(
+            _snapshot: ComponentWithState,
+            _block: BlockHeader,
+            _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
+            _all_tokens: &HashMap<Bytes, Token>,
+            _decoder_context: &DecoderContext,
+        ) -> std::result::Result<Self, Self::Error> {
+            Ok(Self(0))
         }
     }
 
@@ -1196,6 +1485,49 @@ mod tests {
         ))
     }
 
+    fn vm_only_snapshot_start_envelope(total_chunks: u32) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            1,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                "snapshot-1",
+                Chain::Ethereum.id(),
+                vec![BroadcasterBackend::Vm],
+                total_chunks,
+            )?),
+        ))
+    }
+
+    fn raw_snapshot_chunk_envelope(
+        message_seq: u64,
+        chunk_index: u32,
+        block_number: u64,
+        messages: Vec<BroadcasterProtocolMessage>,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            message_seq,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                chunk_index,
+                vec![BroadcasterSnapshotPartition::with_messages(
+                    BroadcasterBackend::Vm,
+                    block_number,
+                    messages,
+                    BTreeMap::new(),
+                )],
+            )?),
+        ))
+    }
+
+    fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
+        BroadcasterEnvelope::new(
+            "stream-1",
+            message_seq,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        )
+    }
+
     async fn spawn_snapshot_session_server(
         payloads: Vec<BroadcasterEnvelope>,
     ) -> Result<(String, String, JoinHandle<()>)> {
@@ -1304,6 +1636,180 @@ mod tests {
         }
     }
 
+    fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+        let mut decoder = TychoStreamDecoder::new();
+        decoder.register_decoder::<DummySim>("vm:curve");
+        Arc::new(decoder)
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_merges_split_vm_storage_account() -> Result<()> {
+        let account_address = Bytes::from([42u8; 20]);
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address.clone(), "vm-account", &[(1, 11)]),
+        ))?;
+        reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address.clone(), "vm-account", &[(2, 22), (3, 33)]),
+        ))?;
+
+        let messages = reassembly.take_messages();
+        assert_eq!(messages.len(), 1);
+        let account = messages[0]
+            .message
+            .snapshots
+            .vm_storage
+            .get(&account_address)
+            .ok_or_else(|| anyhow!("expected reassembled VM account"))?;
+        assert_eq!(account.slots.len(), 3);
+        assert_eq!(
+            account.slots[&Bytes::from([1u8; 32])],
+            Bytes::from([11u8; 32])
+        );
+        assert_eq!(
+            account.slots[&Bytes::from([2u8; 32])],
+            Bytes::from([22u8; 32])
+        );
+        assert_eq!(
+            account.slots[&Bytes::from([3u8; 32])],
+            Bytes::from([33u8; 32])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_metadata_mismatch() -> Result<()> {
+        let account_address = Bytes::from([42u8; 20]);
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address.clone(), "vm-account", &[(1, 11)]),
+        ))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address, "changed-title", &[(2, 22)]),
+        )) else {
+            return Err(anyhow!("metadata mismatch should fail"));
+        };
+
+        assert!(error
+            .to_string()
+            .contains("broadcaster snapshot VM storage metadata mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_header_mismatch() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        let sync_header = raw_block_header(10, 1);
+        reassembly.push(raw_protocol_message_with_header(
+            sync_header.clone(),
+            SynchronizerState::Ready(sync_header.clone()),
+        ))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_header(
+            raw_block_header(11, 2),
+            SynchronizerState::Ready(sync_header),
+        )) else {
+            return Err(anyhow!("header mismatch should fail"));
+        };
+
+        assert!(error.to_string().contains("header mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_sync_state_mismatch() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        let header = raw_block_header(10, 1);
+        reassembly.push(raw_protocol_message_with_header(
+            header.clone(),
+            SynchronizerState::Ready(header.clone()),
+        ))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_header(
+            header.clone(),
+            SynchronizerState::Delayed(header),
+        )) else {
+            return Err(anyhow!("sync_state mismatch should fail"));
+        };
+
+        assert!(error.to_string().contains("sync_state mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_duplicate_snapshot_state_conflict() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_ids(&["pool-a"], &[]))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_ids(&["pool-a"], &[])) else {
+            return Err(anyhow!("duplicate snapshot state should fail"));
+        };
+
+        assert!(error.to_string().contains("duplicate snapshot state"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_duplicate_removal_conflict() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_ids(&[], &["pool-a"]))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_ids(&[], &["pool-a"])) else {
+            return Err(anyhow!("duplicate removal should fail"));
+        };
+
+        assert!(error.to_string().contains("duplicate removed component"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_rejects_snapshot_removal_overlap() -> Result<()> {
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_ids(&["pool-a"], &[]))?;
+
+        let Err(error) = reassembly.push(raw_protocol_message_with_ids(&[], &["pool-a"])) else {
+            return Err(anyhow!("snapshot/removal overlap should fail"));
+        };
+
+        assert!(error.to_string().contains("snapshot/removal overlap"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshot_reassembly_happy_path_preserves_header_and_sync_state() -> Result<()> {
+        let header = raw_block_header(10, 1);
+        let sync_state = SynchronizerState::Ready(header.clone());
+        let mut reassembly = RawSnapshotReassembly::default();
+        reassembly.push(raw_protocol_message_with_parts(
+            header.clone(),
+            sync_state.clone(),
+            &["pool-a"],
+            &[],
+            HashMap::new(),
+        ))?;
+        reassembly.push(raw_protocol_message_with_parts(
+            header.clone(),
+            sync_state.clone(),
+            &[],
+            &["pool-b"],
+            HashMap::new(),
+        ))?;
+
+        let messages = reassembly.take_messages();
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.message.header, header);
+        assert_eq!(message.sync_state, sync_state);
+        assert!(message.message.snapshots.states.contains_key("pool-a"));
+        assert!(message.message.removed_components.contains_key("pool-b"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn snapshot_bootstrap_populates_native_and_vm_separately() -> Result<()> {
         let controls = TestControls::new();
@@ -1388,6 +1894,166 @@ mod tests {
         assert!(!controls.native_state_store.has_pool("pool-native").await);
         assert!(!controls.native_state_store.has_pool("pool-vm").await);
         let snapshot = controls.native_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-1"));
+        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> Result<()> {
+        let controls = TestControls::new();
+        let vm_controls = controls.vm();
+        let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+            Chain::Ethereum.id(),
+            vm_controls,
+            raw_decoder(),
+            None,
+        );
+        let header = raw_block_header(21, 9);
+        let sync_state = SynchronizerState::Ready(header.clone());
+
+        processor
+            .observe(vm_only_snapshot_start_envelope(2)?)
+            .await?;
+        processor
+            .observe(raw_snapshot_chunk_envelope(
+                2,
+                0,
+                21,
+                vec![raw_protocol_message_with_parts(
+                    header.clone(),
+                    sync_state.clone(),
+                    &["0x1111111111111111111111111111111111111111"],
+                    &[],
+                    HashMap::new(),
+                )],
+            )?)
+            .await?;
+
+        assert!(!processor.bootstrap_complete());
+        assert!(
+            !controls
+                .vm_state_store
+                .has_pool("0x1111111111111111111111111111111111111111")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 0);
+        assert_eq!(controls.vm_stream_health.last_block().await, 0);
+
+        processor
+            .observe(raw_snapshot_chunk_envelope(
+                3,
+                1,
+                21,
+                vec![raw_protocol_message_with_parts(
+                    header,
+                    sync_state,
+                    &["0x2222222222222222222222222222222222222222"],
+                    &[],
+                    HashMap::new(),
+                )],
+            )?)
+            .await?;
+
+        assert!(!processor.bootstrap_complete());
+        assert!(
+            !controls
+                .vm_state_store
+                .has_pool("0x1111111111111111111111111111111111111111")
+                .await
+        );
+        assert!(
+            !controls
+                .vm_state_store
+                .has_pool("0x2222222222222222222222222222222222222222")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 0);
+        assert_eq!(controls.vm_stream_health.last_block().await, 0);
+
+        processor.observe(snapshot_end_envelope_at(4)).await?;
+
+        let snapshot = controls.vm_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert!(processor.bootstrap_complete());
+        assert!(
+            controls
+                .vm_state_store
+                .has_pool("0x1111111111111111111111111111111111111111")
+                .await
+        );
+        assert!(
+            controls
+                .vm_state_store
+                .has_pool("0x2222222222222222222222222222222222222222")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 21);
+        assert_eq!(controls.vm_stream_health.last_block().await, 21);
+        assert!(controls
+            .vm_stream_health
+            .last_update_age_ms()
+            .await
+            .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_snapshot_bootstrap_decodes_unsplit_raw_message() -> Result<()> {
+        let controls = TestControls::new();
+        let vm_controls = controls.vm();
+        let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+            Chain::Ethereum.id(),
+            vm_controls.clone(),
+            raw_decoder(),
+            None,
+        );
+        let header = raw_block_header(30, 10);
+        let payloads = vec![
+            vm_only_snapshot_start_envelope(1)?,
+            raw_snapshot_chunk_envelope(
+                2,
+                0,
+                30,
+                vec![raw_protocol_message_with_parts(
+                    header.clone(),
+                    SynchronizerState::Ready(header),
+                    &["0x3333333333333333333333333333333333333333"],
+                    &[],
+                    HashMap::new(),
+                )],
+            )?,
+            snapshot_end_envelope_at(3),
+        ];
+        let (ws_url, snapshot_sessions_url, server_task) =
+            spawn_snapshot_session_server(payloads).await?;
+
+        let session = bootstrap_broadcaster_snapshot(
+            &Client::new(),
+            &ws_url,
+            &snapshot_sessions_url,
+            &mut processor,
+            &vm_controls,
+            &test_supervisor_config(),
+        )
+        .await?;
+        server_task.abort();
+
+        assert_eq!(session.session_id, 7);
+        assert!(processor.bootstrap_complete());
+        assert!(
+            controls
+                .vm_state_store
+                .has_pool("0x3333333333333333333333333333333333333333")
+                .await
+        );
+        assert_eq!(controls.vm_state_store.current_block().await, 30);
+        assert_eq!(controls.vm_stream_health.last_block().await, 30);
+
+        let snapshot = controls.vm_subscription.snapshot().await;
         assert!(snapshot.connected);
         assert!(snapshot.bootstrap_complete);
         assert_eq!(snapshot.stream_id.as_deref(), Some("stream-1"));
@@ -1608,5 +2274,146 @@ mod tests {
             .await
             .is_some());
         Ok(())
+    }
+
+    fn raw_protocol_message(
+        account_address: Bytes,
+        account: ResponseAccount,
+    ) -> BroadcasterProtocolMessage {
+        let header = raw_block_header(10, 1);
+        raw_protocol_message_with_parts(
+            header.clone(),
+            SynchronizerState::Ready(header),
+            &[],
+            &[],
+            HashMap::from([(account_address, account)]),
+        )
+    }
+
+    fn raw_protocol_message_with_ids(
+        state_ids: &[&str],
+        removal_ids: &[&str],
+    ) -> BroadcasterProtocolMessage {
+        let header = raw_block_header(10, 1);
+        raw_protocol_message_with_parts(
+            header.clone(),
+            SynchronizerState::Ready(header),
+            state_ids,
+            removal_ids,
+            HashMap::new(),
+        )
+    }
+
+    fn raw_protocol_message_with_header(
+        header: BlockHeader,
+        sync_state: SynchronizerState,
+    ) -> BroadcasterProtocolMessage {
+        raw_protocol_message_with_parts(header, sync_state, &[], &[], HashMap::new())
+    }
+
+    fn raw_protocol_message_with_parts(
+        header: BlockHeader,
+        sync_state: SynchronizerState,
+        state_ids: &[&str],
+        removal_ids: &[&str],
+        vm_storage: HashMap<Bytes, ResponseAccount>,
+    ) -> BroadcasterProtocolMessage {
+        BroadcasterProtocolMessage::new(
+            "vm:curve",
+            sync_state,
+            StateSyncMessage {
+                header,
+                snapshots: Snapshot {
+                    states: state_ids
+                        .iter()
+                        .map(|component_id| {
+                            (
+                                (*component_id).to_string(),
+                                raw_component_with_state(component_id),
+                            )
+                        })
+                        .collect(),
+                    vm_storage,
+                },
+                deltas: None,
+                removed_components: removal_ids
+                    .iter()
+                    .map(|component_id| {
+                        (
+                            (*component_id).to_string(),
+                            raw_dto_protocol_component(component_id),
+                        )
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    fn raw_component_with_state(component_id: &str) -> ComponentWithState {
+        ComponentWithState {
+            state: ResponseProtocolState {
+                component_id: component_id.to_string(),
+                attributes: HashMap::new(),
+                balances: HashMap::new(),
+            },
+            component: raw_dto_protocol_component(component_id),
+            component_tvl: None,
+            entrypoints: Vec::new(),
+        }
+    }
+
+    fn raw_dto_protocol_component(component_id: &str) -> DtoProtocolComponent {
+        DtoProtocolComponent {
+            id: component_id.to_string(),
+            protocol_system: "vm:curve".to_string(),
+            protocol_type_name: "curve_pool".to_string(),
+            chain: DtoChain::Ethereum,
+            tokens: Vec::new(),
+            contract_ids: Vec::new(),
+            static_attributes: HashMap::new(),
+            change: Default::default(),
+            creation_tx: Bytes::from([0u8; 32]),
+            created_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    fn raw_block_header(number: u64, seed: u8) -> BlockHeader {
+        BlockHeader {
+            hash: Bytes::from(vec![seed; 32]),
+            number,
+            parent_hash: Bytes::from(vec![seed.saturating_add(1); 32]),
+            revert: false,
+            timestamp: number * 10,
+            partial_block_index: None,
+        }
+    }
+
+    fn raw_response_account(
+        address: Bytes,
+        title: &str,
+        slot_values: &[(u8, u8)],
+    ) -> ResponseAccount {
+        let slots = slot_values
+            .iter()
+            .map(|(slot_seed, value_seed)| {
+                (
+                    Bytes::from([*slot_seed; 32]),
+                    Bytes::from([*value_seed; 32]),
+                )
+            })
+            .collect();
+        ResponseAccount::new(
+            DtoChain::Ethereum,
+            address,
+            title.to_string(),
+            slots,
+            Bytes::from([0u8; 32]),
+            HashMap::new(),
+            Bytes::from([7u8; 32]),
+            Bytes::from([8u8; 32]),
+            Bytes::from([9u8; 32]),
+            Bytes::from([10u8; 32]),
+            None,
+        )
     }
 }
