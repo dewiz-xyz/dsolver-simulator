@@ -6,7 +6,11 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tycho_simulation::{
     protocol::models::Update as TychoUpdate,
-    tycho_client::feed::{BlockHeader, FeedMessage},
+    tycho_client::feed::{
+        synchronizer::{Snapshot, StateSyncMessage},
+        BlockHeader, FeedMessage,
+    },
+    tycho_common::{dto::ResponseAccount, Bytes},
 };
 
 use simulator_core::broadcaster::{
@@ -573,16 +577,18 @@ fn build_partition_snapshot_chunks(
     Ok(chunks)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "raw Tycho fragments share one packing state"
-)]
 fn split_protocol_message_for_snapshot(
     ctx: &SnapshotChunkBuildContext<'_>,
     message: &BroadcasterProtocolMessage,
     sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
 ) -> Result<Vec<BroadcasterProtocolMessage>> {
-    if ctx.messages_fit(0, vec![message.clone()], sync_statuses.clone())? {
+    if message.message.snapshots.vm_storage.is_empty()
+        && ctx.messages_fit(
+            WORST_CASE_SNAPSHOT_CHUNK_INDEX,
+            vec![message.clone()],
+            sync_statuses.clone(),
+        )?
+    {
         return Ok(vec![message.clone()]);
     }
 
@@ -599,9 +605,8 @@ fn split_protocol_message_for_snapshot(
         .snapshots
         .vm_storage
         .iter()
-        .map(|(address, account)| (address.clone(), account.clone()))
         .collect::<Vec<_>>();
-    vm_storage.sort_by(|left, right| left.0.cmp(&right.0));
+    vm_storage.sort_by(|left, right| left.0.cmp(right.0));
 
     let mut fragments = Vec::new();
     let mut current = empty_protocol_fragment(message, false);
@@ -638,37 +643,26 @@ fn split_protocol_message_for_snapshot(
     }
 
     for (address, account) in vm_storage {
-        let mut candidate = current.clone();
-        candidate
-            .message
-            .snapshots
-            .vm_storage
-            .insert(address.clone(), account.clone());
-        if ctx.raw_fragment_fits(candidate.clone(), sync_statuses, fragments.is_empty())? {
-            current = candidate;
-            current_has_payload = true;
-            continue;
+        if current_has_payload {
+            fragments.push(current);
+            current = empty_protocol_fragment(message, false);
+            current_has_payload = false;
         }
-        ensure!(
-            current_has_payload,
-            "broadcaster snapshot VM storage fragment for protocol {} exceeds {} bytes",
-            message.protocol,
-            ctx.max_payload_bytes
-        );
-        fragments.push(current);
-        current = empty_protocol_fragment(message, false);
-        current
-            .message
-            .snapshots
-            .vm_storage
-            .insert(address, account);
-        ensure!(
-            ctx.raw_fragment_fits(current.clone(), sync_statuses, fragments.is_empty(),)?,
-            "broadcaster snapshot VM storage fragment for protocol {} exceeds {} bytes",
-            message.protocol,
-            ctx.max_payload_bytes
-        );
-        current_has_payload = true;
+        let account_fragments = split_vm_storage_account_for_snapshot(
+            ctx,
+            message,
+            sync_statuses,
+            address.clone(),
+            account,
+            fragments.is_empty(),
+        )?;
+        fragments.extend(account_fragments);
+    }
+
+    let has_tail =
+        message.message.deltas.is_some() || !message.message.removed_components.is_empty();
+    if !current_has_payload && !has_tail {
+        return Ok(fragments);
     }
 
     let mut final_fragment = if current_has_payload {
@@ -701,15 +695,183 @@ fn empty_protocol_fragment(
     message: &BroadcasterProtocolMessage,
     include_tail: bool,
 ) -> BroadcasterProtocolMessage {
-    let mut fragment = message.clone();
-    fragment.message.snapshots.states.clear();
-    fragment.message.snapshots.vm_storage.clear();
-    if !include_tail {
-        fragment.message.deltas = None;
-        fragment.message.removed_components.clear();
+    let (deltas, removed_components) = if include_tail {
+        (
+            message.message.deltas.clone(),
+            message.message.removed_components.clone(),
+        )
+    } else {
+        (None, HashMap::new())
+    };
+
+    // Build this structurally so large raw snapshots are never cloned just to be cleared.
+    BroadcasterProtocolMessage::new(
+        message.protocol.clone(),
+        message.sync_state.clone(),
+        StateSyncMessage {
+            header: message.message.header.clone(),
+            snapshots: Snapshot::default(),
+            deltas,
+            removed_components,
+        },
+    )
+}
+
+fn split_vm_storage_account_for_snapshot(
+    ctx: &SnapshotChunkBuildContext<'_>,
+    message: &BroadcasterProtocolMessage,
+    sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    address: Bytes,
+    account: &ResponseAccount,
+    include_sync_statuses: bool,
+) -> Result<Vec<BroadcasterProtocolMessage>> {
+    let mut slots = account
+        .slots
+        .iter()
+        .map(|(slot, value)| (slot.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    slots.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut fragments = Vec::new();
+    if slots.is_empty() {
+        let fragment =
+            vm_storage_account_fragment_for_slot_range(message, address.clone(), account, &[]);
+        ensure!(
+            ctx.raw_fragment_fits(fragment.clone(), sync_statuses, include_sync_statuses)?,
+            "broadcaster snapshot VM storage account metadata for protocol {} account {} exceeds {} bytes",
+            message.protocol,
+            address,
+            ctx.max_payload_bytes
+        );
+        return Ok(vec![fragment]);
     }
+
+    let mut start = 0usize;
+    let mut include_sync_for_fragment = include_sync_statuses;
+    while start < slots.len() {
+        let metadata_fragment =
+            vm_storage_account_fragment_for_slot_range(message, address.clone(), account, &[]);
+        let metadata_size =
+            ctx.raw_fragment_size(metadata_fragment, sync_statuses, include_sync_for_fragment)?;
+        ensure!(
+            metadata_size < ctx.max_payload_bytes,
+            "broadcaster snapshot VM storage account metadata for protocol {} account {} exceeds {} bytes",
+            message.protocol,
+            address,
+            ctx.max_payload_bytes
+        );
+
+        let mut estimated_size = metadata_size;
+        let mut end = start;
+        while end < slots.len() {
+            let next_size = estimated_size.saturating_add(estimated_slot_entry_size(&slots[end]));
+            if next_size > ctx.max_payload_bytes {
+                break;
+            }
+            estimated_size = next_size;
+            end += 1;
+        }
+
+        if end == start {
+            return Err(anyhow!(
+                "broadcaster snapshot VM storage slot fragment for protocol {} account {} exceeds {} bytes",
+                message.protocol,
+                address,
+                ctx.max_payload_bytes
+            ));
+        }
+
+        let mut fragment = vm_storage_account_fragment_for_slot_range(
+            message,
+            address.clone(),
+            account,
+            &slots[start..end],
+        );
+        while !ctx.raw_fragment_fits(fragment.clone(), sync_statuses, include_sync_for_fragment)? {
+            end = end.saturating_sub(1);
+            if end == start {
+                return Err(anyhow!(
+                    "broadcaster snapshot VM storage slot fragment for protocol {} account {} exceeds {} bytes",
+                    message.protocol,
+                    address,
+                    ctx.max_payload_bytes
+                ));
+            }
+            fragment = vm_storage_account_fragment_for_slot_range(
+                message,
+                address.clone(),
+                account,
+                &slots[start..end],
+            );
+        }
+        fragments.push(fragment);
+        include_sync_for_fragment = false;
+        start = end;
+    }
+
+    Ok(fragments)
+}
+
+fn estimated_slot_entry_size((slot, value): &(Bytes, Bytes)) -> usize {
+    // Pessimistic JSON size for one `"0x...":"0x..."` storage entry plus a comma.
+    hex_json_string_size(slot)
+        .saturating_add(1)
+        .saturating_add(hex_json_string_size(value))
+        .saturating_add(1)
+}
+
+fn hex_json_string_size(bytes: &Bytes) -> usize {
+    4usize.saturating_add(bytes.len().saturating_mul(2))
+}
+
+fn vm_storage_account_fragment_for_slot_range(
+    message: &BroadcasterProtocolMessage,
+    address: Bytes,
+    account: &ResponseAccount,
+    slots: &[(Bytes, Bytes)],
+) -> BroadcasterProtocolMessage {
+    let account = response_account_with_slots(account, slots.iter().cloned().collect());
+    vm_storage_account_fragment(message, address, account)
+}
+
+#[expect(
+    deprecated,
+    reason = "creation_tx is deprecated but still part of the broadcaster wire DTO"
+)]
+fn response_account_with_slots(
+    account: &ResponseAccount,
+    slots: HashMap<Bytes, Bytes>,
+) -> ResponseAccount {
+    ResponseAccount::new(
+        account.chain,
+        account.address.clone(),
+        account.title.clone(),
+        slots,
+        account.native_balance.clone(),
+        account.token_balances.clone(),
+        account.code.clone(),
+        account.code_hash.clone(),
+        account.balance_modify_tx.clone(),
+        account.code_modify_tx.clone(),
+        account.creation_tx.clone(),
+    )
+}
+
+fn vm_storage_account_fragment(
+    message: &BroadcasterProtocolMessage,
+    address: Bytes,
+    account: ResponseAccount,
+) -> BroadcasterProtocolMessage {
+    let mut fragment = empty_protocol_fragment(message, false);
+    fragment
+        .message
+        .snapshots
+        .vm_storage
+        .insert(address, account);
     fragment
 }
+
+const WORST_CASE_SNAPSHOT_CHUNK_INDEX: usize = u32::MAX as usize;
 
 struct SnapshotChunkBuildContext<'a> {
     stream_id: &'a str,
@@ -726,8 +888,18 @@ impl SnapshotChunkBuildContext<'_> {
         sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
         include_sync_statuses: bool,
     ) -> Result<bool> {
-        self.messages_fit(
-            0,
+        self.raw_fragment_size(message, sync_statuses, include_sync_statuses)
+            .map(|size| size <= self.max_payload_bytes)
+    }
+
+    fn raw_fragment_size(
+        &self,
+        message: BroadcasterProtocolMessage,
+        sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
+        include_sync_statuses: bool,
+    ) -> Result<usize> {
+        self.messages_size(
+            WORST_CASE_SNAPSHOT_CHUNK_INDEX,
             vec![message],
             if include_sync_statuses {
                 sync_statuses.clone()
@@ -743,7 +915,17 @@ impl SnapshotChunkBuildContext<'_> {
         messages: Vec<BroadcasterProtocolMessage>,
         sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
     ) -> Result<bool> {
-        self.chunk_fits(self.messages_chunk(chunk_index, messages, sync_statuses)?)
+        self.messages_size(chunk_index, messages, sync_statuses)
+            .map(|size| size <= self.max_payload_bytes)
+    }
+
+    fn messages_size(
+        &self,
+        chunk_index: usize,
+        messages: Vec<BroadcasterProtocolMessage>,
+        sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    ) -> Result<usize> {
+        self.chunk_size(self.messages_chunk(chunk_index, messages, sync_statuses)?)
     }
 
     fn states_fit(
@@ -794,17 +976,19 @@ impl SnapshotChunkBuildContext<'_> {
         chunk_index: usize,
         partition: BroadcasterSnapshotPartition,
     ) -> Result<BroadcasterSnapshotChunk> {
-        BroadcasterSnapshotChunk::new(
-            self.snapshot_id.to_string(),
-            chunk_index as u32,
-            vec![partition],
-        )
-        .map_err(Into::into)
+        let chunk_index =
+            u32::try_from(chunk_index).context("snapshot chunk index exceeds u32 range")?;
+        BroadcasterSnapshotChunk::new(self.snapshot_id.to_string(), chunk_index, vec![partition])
+            .map_err(Into::into)
     }
 
     fn chunk_fits(&self, chunk: BroadcasterSnapshotChunk) -> Result<bool> {
-        payload_size(self.stream_id, &BroadcasterPayload::SnapshotChunk(chunk))
+        self.chunk_size(chunk)
             .map(|size| size <= self.max_payload_bytes)
+    }
+
+    fn chunk_size(&self, chunk: BroadcasterSnapshotChunk) -> Result<usize> {
+        payload_size(self.stream_id, &BroadcasterPayload::SnapshotChunk(chunk))
     }
 }
 
@@ -846,7 +1030,7 @@ fn format_snapshot_id(chain_id: u64, generation: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use super::{
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
@@ -855,12 +1039,12 @@ mod tests {
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
     use simulator_core::broadcaster::{
-        BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolSyncStatus,
-        BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk, BroadcasterSubscriptionEvent,
-        BroadcasterSubscriptionTracker,
+        BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
+        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk,
+        BroadcasterSubscriptionEvent, BroadcasterSubscriptionTracker,
     };
     use tycho_common::{
-        dto::{ProtocolComponent as DtoProtocolComponent, ResponseProtocolState},
+        dto::{ProtocolComponent as DtoProtocolComponent, ResponseAccount, ResponseProtocolState},
         models::Chain as DtoChain,
         Bytes as DtoBytes,
     };
@@ -954,6 +1138,25 @@ mod tests {
         }
     }
 
+    fn snapshot_chunk_build_context(
+        max_payload_bytes: usize,
+    ) -> super::SnapshotChunkBuildContext<'static> {
+        snapshot_chunk_build_context_for_backend(max_payload_bytes, BroadcasterBackend::Native)
+    }
+
+    fn snapshot_chunk_build_context_for_backend(
+        max_payload_bytes: usize,
+        backend: BroadcasterBackend,
+    ) -> super::SnapshotChunkBuildContext<'static> {
+        super::SnapshotChunkBuildContext {
+            stream_id: "chain-1-stream-1",
+            snapshot_id: "chain-1-snapshot-1",
+            backend,
+            block_number: 10,
+            max_payload_bytes,
+        }
+    }
+
     fn snapshot_chunks(export: &BroadcasterSnapshotExport) -> Vec<&BroadcasterSnapshotChunk> {
         export
             .payloads
@@ -991,6 +1194,83 @@ mod tests {
             assert!(size < max_size);
         }
         Ok(())
+    }
+
+    fn assert_payloads_at_most(export: &BroadcasterSnapshotExport, max_size: usize) -> Result<()> {
+        for (message_seq, payload) in export.payloads.iter().cloned().enumerate() {
+            let size = serde_json::to_vec(&BroadcasterEnvelope::new(
+                export.stream_id.clone(),
+                message_seq as u64 + 1,
+                payload,
+            ))?
+            .len();
+            assert!(size <= max_size);
+        }
+        Ok(())
+    }
+
+    fn vm_account_fragments<'a>(
+        export: &'a BroadcasterSnapshotExport,
+        account_address: &DtoBytes,
+    ) -> Vec<&'a ResponseAccount> {
+        snapshot_chunks(export)
+            .into_iter()
+            .flat_map(|chunk| &chunk.partitions)
+            .flat_map(|partition| &partition.messages)
+            .filter_map(|message| message.message.snapshots.vm_storage.get(account_address))
+            .collect()
+    }
+
+    fn vm_account_slot_key_batches(
+        export: &BroadcasterSnapshotExport,
+        account_address: &DtoBytes,
+    ) -> Vec<Vec<DtoBytes>> {
+        vm_account_fragments(export, account_address)
+            .into_iter()
+            .map(|account| {
+                let mut slot_keys = account.slots.keys().cloned().collect::<Vec<_>>();
+                slot_keys.sort();
+                slot_keys
+            })
+            .collect()
+    }
+
+    fn account_metadata_without_slots(account: &ResponseAccount) -> ResponseAccount {
+        let mut metadata = account.clone();
+        metadata.slots.clear();
+        metadata
+    }
+
+    fn assert_vm_storage_account_fragments_match(
+        export: &BroadcasterSnapshotExport,
+        account_address: &DtoBytes,
+        expected_account: &ResponseAccount,
+    ) {
+        let fragments = vm_account_fragments(export, account_address);
+        assert!(fragments.len() > 1);
+
+        let expected_metadata = account_metadata_without_slots(expected_account);
+        let mut observed_slots = HashMap::new();
+        let mut emitted_slot_count = 0usize;
+
+        for fragment in fragments {
+            assert_eq!(
+                account_metadata_without_slots(fragment),
+                expected_metadata,
+                "VM account fragment metadata changed"
+            );
+            emitted_slot_count += fragment.slots.len();
+
+            for (slot, value) in &fragment.slots {
+                assert!(
+                    observed_slots.insert(slot.clone(), value.clone()).is_none(),
+                    "duplicate VM storage slot emitted: {slot:?}"
+                );
+            }
+        }
+
+        assert_eq!(emitted_slot_count, expected_account.slots.len());
+        assert_eq!(observed_slots, expected_account.slots);
     }
 
     #[tokio::test]
@@ -1092,6 +1372,199 @@ mod tests {
             2
         );
         assert_payloads_smaller_than(&export, full_chunk_size)?;
+        Ok(())
+    }
+
+    #[test]
+    fn raw_fragment_sizing_reserves_chunk_index_digit_growth() -> Result<()> {
+        let message = raw_protocol_message_with_states(HashMap::from([(
+            "raw-1".to_string(),
+            raw_component_with_state("raw-1", 1),
+        )]));
+        let sync_statuses = BTreeMap::new();
+        let ctx = snapshot_chunk_build_context(usize::MAX);
+        let size_at_zero = ctx.messages_size(0, vec![message.clone()], sync_statuses.clone())?;
+        let size_at_worst = ctx.messages_size(
+            super::WORST_CASE_SNAPSHOT_CHUNK_INDEX,
+            vec![message.clone()],
+            sync_statuses.clone(),
+        )?;
+        assert!(size_at_worst > size_at_zero);
+
+        let capped_ctx = snapshot_chunk_build_context(size_at_zero);
+        assert!(capped_ctx.messages_fit(0, vec![message.clone()], BTreeMap::new())?);
+        assert!(!capped_ctx.raw_fragment_fits(message, &sync_statuses, false)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_vm_slot_split_handles_chunk_index_digit_boundary() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+        let account_address = DtoBytes::from([44u8; 20]);
+        let account = raw_response_account(account_address.clone(), 12, 256);
+        let message = raw_vm_protocol_message(account_address.clone(), account.clone());
+        let mut slots = account.slots.iter().collect::<Vec<_>>();
+        slots.sort_by(|left, right| left.0.cmp(right.0));
+        let first_slot = vec![((*slots[0].0).clone(), (*slots[0].1).clone())];
+        let ctx = snapshot_chunk_build_context_for_backend(usize::MAX, BroadcasterBackend::Vm);
+        let metadata_fragment = super::vm_storage_account_fragment_for_slot_range(
+            &message,
+            account_address.clone(),
+            &account,
+            &[],
+        );
+        let single_slot_fragment = super::vm_storage_account_fragment_for_slot_range(
+            &message,
+            account_address,
+            &account,
+            &first_slot,
+        );
+        let metadata_size = ctx.raw_fragment_size(metadata_fragment, &BTreeMap::new(), false)?;
+        let max_payload_bytes =
+            metadata_size.saturating_add(super::estimated_slot_entry_size(&first_slot[0]));
+        assert!(
+            ctx.raw_fragment_size(single_slot_fragment, &BTreeMap::new(), false)?
+                <= max_payload_bytes
+        );
+
+        let feed = FeedMessage {
+            state_msgs: HashMap::from([("vm:balancer_v2".to_string(), message.message)]),
+            sync_states: HashMap::new(),
+        };
+        cache.apply_feed_message(&feed).await?;
+
+        let export = cache.export_snapshot(max_payload_bytes).await?;
+        let chunks = snapshot_chunks(&export);
+        assert!(chunks.iter().any(|chunk| chunk.chunk_index == 9));
+        assert!(chunks.iter().any(|chunk| chunk.chunk_index == 10));
+        assert_payloads_at_most(&export, max_payload_bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn empty_protocol_fragment_preserves_metadata_and_tail() {
+        let account_address = DtoBytes::from([42u8; 20]);
+        let message = BroadcasterProtocolMessage::new(
+            "vm:balancer_v2",
+            SynchronizerState::Ready(block_header(20, 2)),
+            StateSyncMessage {
+                header: block_header(20, 2),
+                snapshots: Snapshot {
+                    states: HashMap::from([(
+                        "raw-1".to_string(),
+                        raw_component_with_state("raw-1", 1),
+                    )]),
+                    vm_storage: HashMap::from([(
+                        account_address.clone(),
+                        raw_response_account(account_address, 1, 32),
+                    )]),
+                },
+                deltas: Some(Default::default()),
+                removed_components: HashMap::from([(
+                    "removed-1".to_string(),
+                    raw_component("removed-1", "uniswap_v2", 3),
+                )]),
+            },
+        );
+
+        let without_tail = super::empty_protocol_fragment(&message, false);
+        assert_eq!(without_tail.protocol, message.protocol);
+        assert_eq!(without_tail.sync_state, message.sync_state);
+        assert_eq!(without_tail.message.header, message.message.header);
+        assert!(without_tail.message.snapshots.states.is_empty());
+        assert!(without_tail.message.snapshots.vm_storage.is_empty());
+        assert!(without_tail.message.deltas.is_none());
+        assert!(without_tail.message.removed_components.is_empty());
+
+        let with_tail = super::empty_protocol_fragment(&message, true);
+        assert_eq!(with_tail.protocol, message.protocol);
+        assert_eq!(with_tail.sync_state, message.sync_state);
+        assert_eq!(with_tail.message.header, message.message.header);
+        assert!(with_tail.message.snapshots.states.is_empty());
+        assert!(with_tail.message.snapshots.vm_storage.is_empty());
+        assert_eq!(with_tail.message.deltas, message.message.deltas);
+        assert_eq!(
+            with_tail.message.removed_components,
+            message.message.removed_components
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_splits_oversized_raw_vm_account_by_storage_slots() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+        let account_address = DtoBytes::from([42u8; 20]);
+        let account = raw_response_account(account_address.clone(), 8, 512);
+        let expected_account = account.clone();
+        let feed = FeedMessage {
+            state_msgs: HashMap::from([(
+                "vm:balancer_v2".to_string(),
+                StateSyncMessage {
+                    header: block_header(10, 1),
+                    snapshots: Snapshot {
+                        states: HashMap::new(),
+                        vm_storage: HashMap::from([(account_address.clone(), account)]),
+                    },
+                    deltas: None,
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "vm:balancer_v2".to_string(),
+                SynchronizerState::Ready(block_header(10, 1)),
+            )]),
+        };
+        cache.apply_feed_message(&feed).await?;
+
+        let full_export = cache.export_snapshot(8_388_608).await?;
+        let full_chunk_size = first_snapshot_chunk_size(&full_export)?;
+        let max_payload_bytes = full_chunk_size / 2;
+        let export = cache.export_snapshot(max_payload_bytes).await?;
+        let slot_key_batches = vm_account_slot_key_batches(&export, &account_address);
+        let repeated_export = cache.export_snapshot(max_payload_bytes).await?;
+
+        assert_eq!(
+            slot_key_batches,
+            vm_account_slot_key_batches(&repeated_export, &account_address)
+        );
+        assert_vm_storage_account_fragments_match(&export, &account_address, &expected_account);
+        assert_payloads_at_most(&export, max_payload_bytes)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_splits_raw_vm_account_above_default_payload_cap() -> Result<()> {
+        const MAX_PAYLOAD_BYTES: usize = 8_388_608;
+
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+        let account_address = DtoBytes::from([43u8; 20]);
+        let account = raw_response_account(account_address.clone(), 10_000, 1_000);
+        let expected_account = account.clone();
+        let feed = FeedMessage {
+            state_msgs: HashMap::from([(
+                "vm:balancer_v2".to_string(),
+                StateSyncMessage {
+                    header: block_header(10, 1),
+                    snapshots: Snapshot {
+                        states: HashMap::new(),
+                        vm_storage: HashMap::from([(account_address.clone(), account)]),
+                    },
+                    deltas: None,
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "vm:balancer_v2".to_string(),
+                SynchronizerState::Ready(block_header(10, 1)),
+            )]),
+        };
+        cache.apply_feed_message(&feed).await?;
+
+        let unsplit_export = cache.export_snapshot(usize::MAX).await?;
+        assert!(first_snapshot_chunk_size(&unsplit_export)? > MAX_PAYLOAD_BYTES);
+
+        let export = cache.export_snapshot(MAX_PAYLOAD_BYTES).await?;
+        assert_vm_storage_account_fragments_match(&export, &account_address, &expected_account);
+        assert_payloads_at_most(&export, MAX_PAYLOAD_BYTES)?;
         Ok(())
     }
 
@@ -1299,6 +1772,43 @@ mod tests {
             )]))
     }
 
+    fn raw_protocol_message_with_states(
+        states: HashMap<String, ComponentWithState>,
+    ) -> BroadcasterProtocolMessage {
+        BroadcasterProtocolMessage::new(
+            "uniswap_v2",
+            SynchronizerState::Started,
+            StateSyncMessage {
+                header: block_header(10, 1),
+                snapshots: Snapshot {
+                    states,
+                    vm_storage: HashMap::new(),
+                },
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )
+    }
+
+    fn raw_vm_protocol_message(
+        account_address: DtoBytes,
+        account: ResponseAccount,
+    ) -> BroadcasterProtocolMessage {
+        BroadcasterProtocolMessage::new(
+            "vm:balancer_v2",
+            SynchronizerState::Started,
+            StateSyncMessage {
+                header: block_header(10, 1),
+                snapshots: Snapshot {
+                    states: HashMap::new(),
+                    vm_storage: HashMap::from([(account_address, account)]),
+                },
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )
+    }
+
     fn native_component(_id: &str, protocol: &str) -> ProtocolComponent {
         ProtocolComponent::new(
             Bytes::from([3u8; 20]),
@@ -1362,6 +1872,37 @@ mod tests {
                 .unwrap_or_else(|| unreachable!("unix epoch"))
                 .naive_utc(),
         }
+    }
+
+    fn raw_response_account(
+        address: DtoBytes,
+        slot_count: usize,
+        slot_value_size: usize,
+    ) -> ResponseAccount {
+        let mut slots = HashMap::new();
+        for index in 0..slot_count {
+            let seed = index as u8;
+            let mut slot_key = vec![0u8; 32];
+            slot_key[24..].copy_from_slice(&(index as u64).to_be_bytes());
+            slots.insert(
+                DtoBytes::from(slot_key),
+                DtoBytes::from(vec![seed.saturating_add(1); slot_value_size]),
+            );
+        }
+
+        ResponseAccount::new(
+            DtoChain::Ethereum.into(),
+            address,
+            "vm-account".to_string(),
+            slots,
+            DtoBytes::from([0u8; 32]),
+            HashMap::new(),
+            DtoBytes::from(vec![7u8; 128]),
+            DtoBytes::from([8u8; 32]),
+            DtoBytes::from([9u8; 32]),
+            DtoBytes::from([10u8; 32]),
+            None,
+        )
     }
 
     fn dummy_token(seed: u8, symbol: &str) -> Token {
