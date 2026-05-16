@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM public.ecr.aws/docker/library/rust:1.91.0-bookworm AS builder
 WORKDIR /app
 
@@ -7,7 +8,13 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock ./
 
 COPY . .
-RUN cargo build --release
+RUN --mount=type=secret,id=github_token \
+    GITHUB_TOKEN="$(cat /run/secrets/github_token)" && \
+    test -n "$GITHUB_TOKEN" && \
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/" && \
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/" && \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release && \
+    git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf
 
 
 FROM public.ecr.aws/debian/debian:bookworm-slim AS runner

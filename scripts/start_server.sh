@@ -31,6 +31,7 @@ repo="."
 log_file=""
 chain_id_arg=""
 env_overrides=()
+rpc_url_overridden=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +48,9 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --env)
+      if [[ "$2" == RPC_URL=* ]]; then
+        rpc_url_overridden=true
+      fi
       env_overrides+=("$2")
       shift 2
       ;;
@@ -115,6 +119,10 @@ if [[ -z "${CHAIN_ID:-}" ]]; then
   exit 2
 fi
 validate_chain_id "$CHAIN_ID"
+
+if [[ "$CHAIN_ID" == "8453" && "$rpc_url_overridden" == false && -n "${BASE_RPC_URL:-}" ]]; then
+  export RPC_URL="$BASE_RPC_URL"
+fi
 
 if [[ -z "$log_file" ]]; then
   mkdir -p "$repo/logs"

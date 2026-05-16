@@ -33,13 +33,14 @@
   - `cargo run --bin sim-analysis -- --chain-id 1 --stop`
   - `cargo run --bin sim-analysis -- --chain-id 8453 --stop`
 - The analyzer starts or reuses the local server, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` and `/encode` probes, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
+- On Base with RFQ enabled and ready, the encode probes include a Bebop partial-fill diagnostic that checks router calldata for the packed `originalFilledTakerAmount` token-in invariant.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
 - Main artifacts:
   - `summary.md` for the narrative overview
   - `report.json` for exact metrics and scenario breakdowns
   - `evidence/` for sampled request/response bodies, readiness snapshots, and log excerpts
-- RFQ-enabled Ethereum runs should also surface RFQ readiness and any RFQ-visibility findings in `summary.md` and `report.json`.
+- RFQ-enabled runs should also surface RFQ readiness, RFQ-visibility findings, and any Bebop encode-inspection findings in `summary.md` and `report.json`.
 - Baseline comparison is meant to be flexible. Use the latest saved run when it helps, disable it with `--baseline none` when you want a clean one-off read.
 - The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so the agent can investigate.
 

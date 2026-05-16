@@ -67,3 +67,4 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
   If a protocol disappears unexpectedly, lowering `TVL_THRESHOLD` may be worth testing in a follow-up run.
 - Protocol labels in the analyzer are inferred from returned pool data and `meta.pool_results`. They are useful for comparison and triage, but they are still downstream observations of live state.
 - RFQ-targeted simulate scenarios are meant to make RFQ visibility intentional on Ethereum and Base. If they do not surface any `rfq:*` protocols, treat that as a finding to investigate rather than an automatic failure.
+- On Base, RFQ-enabled analyzer runs include a Bebop partial-fill encode diagnostic. It is required only when RFQ is enabled and ready, and it reports degraded evidence if `rfq:bebop` or the non-RFQ comparison leg is not visible.

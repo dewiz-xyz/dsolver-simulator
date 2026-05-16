@@ -10,8 +10,16 @@ pub struct SimulateScenarioPreset {
     pub expect_rfq_visibility: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeRouteKind {
+    GenericMultihop,
+    BebopPartialFill,
+}
+
 #[derive(Clone, Debug)]
-pub struct EncodePreset {
+pub struct EncodeRoutePreset {
+    pub label: &'static str,
+    pub kind: EncodeRouteKind,
     pub token_in_symbol: &'static str,
     pub mid_symbol: &'static str,
     pub token_out_symbol: &'static str,
@@ -25,7 +33,7 @@ pub struct BalancedProfilePreset {
     pub simulate_scenarios: Vec<SimulateScenarioPreset>,
     pub latency_scenarios: Vec<SimulateScenarioPreset>,
     pub stress_scenarios: Vec<SimulateScenarioPreset>,
-    pub encode: EncodePreset,
+    pub encode_routes: Vec<EncodeRoutePreset>,
     pub latency_requests: usize,
     pub latency_concurrency: usize,
     pub stress_requests: usize,
@@ -110,7 +118,7 @@ fn ethereum_balanced_profile(vm_enabled: bool) -> BalancedProfilePreset {
         simulate_scenarios: ethereum_simulate_scenarios(),
         latency_scenarios: ethereum_latency_scenarios(),
         stress_scenarios: ethereum_stress_scenarios(),
-        encode: ethereum_encode_preset(),
+        encode_routes: vec![ethereum_encode_preset()],
         latency_requests: 36,
         latency_concurrency: if vm_enabled { 4 } else { 6 },
         stress_requests: 72,
@@ -123,7 +131,7 @@ fn base_balanced_profile() -> BalancedProfilePreset {
         simulate_scenarios: base_simulate_scenarios(),
         latency_scenarios: base_latency_scenarios(),
         stress_scenarios: base_stress_scenarios(),
-        encode: base_encode_preset(),
+        encode_routes: base_encode_presets(),
         latency_requests: 36,
         latency_concurrency: 6,
         stress_requests: 72,
@@ -230,8 +238,10 @@ fn ethereum_stress_scenarios() -> Vec<SimulateScenarioPreset> {
     ]
 }
 
-fn ethereum_encode_preset() -> EncodePreset {
-    EncodePreset {
+fn ethereum_encode_preset() -> EncodeRoutePreset {
+    EncodeRoutePreset {
+        label: "generic-multihop-encode",
+        kind: EncodeRouteKind::GenericMultihop,
         token_in_symbol: "DAI",
         mid_symbol: "USDC",
         token_out_symbol: "USDT",
@@ -331,15 +341,29 @@ fn base_stress_scenarios() -> Vec<SimulateScenarioPreset> {
     ]
 }
 
-fn base_encode_preset() -> EncodePreset {
-    EncodePreset {
-        token_in_symbol: "USDC",
-        mid_symbol: "WETH",
-        token_out_symbol: "USDC",
-        amounts: &["1000000", "5000000", "10000000", "50000000"],
-        settlement_address: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
-        tycho_router_address: "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369",
-    }
+fn base_encode_presets() -> Vec<EncodeRoutePreset> {
+    vec![
+        EncodeRoutePreset {
+            label: "generic-multihop-encode",
+            kind: EncodeRouteKind::GenericMultihop,
+            token_in_symbol: "USDC",
+            mid_symbol: "WETH",
+            token_out_symbol: "USDC",
+            amounts: &["1000000", "5000000", "10000000", "50000000"],
+            settlement_address: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+            tycho_router_address: "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369",
+        },
+        EncodeRoutePreset {
+            label: "bebop-partial-fill-encode",
+            kind: EncodeRouteKind::BebopPartialFill,
+            token_in_symbol: "USDC",
+            mid_symbol: "WETH",
+            token_out_symbol: "USDC",
+            amounts: &["1000000", "5000000", "10000000", "50000000"],
+            settlement_address: "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+            tycho_router_address: "0xea3207778e39EB02D72C9D3c4Eac7E224ac5d369",
+        },
+    ]
 }
 
 fn scenario(

@@ -79,10 +79,27 @@ pub struct ScenarioReport {
     pub result_quality_counts: BTreeMap<String, usize>,
     pub protocols_seen: BTreeMap<String, usize>,
     pub latency_ms: LatencySummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encode_inspections: Vec<EncodeInspectionReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EncodeInspectionReport {
+    pub label: String,
+    pub status: String,
+    pub inspected_bebop_payloads: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_filled_taker_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_taker_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_fill_offset: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -266,6 +283,34 @@ fn add_scenario_findings(report: &AnalysisReport, findings: &mut Vec<Finding>) {
                 ),
             });
         }
+
+        for inspection in &scenario.encode_inspections {
+            match inspection.status.as_str() {
+                "missing" => findings.push(Finding {
+                    severity: "investigate".to_string(),
+                    title: format!("{} missed Bebop calldata inspection", scenario.label),
+                    detail: inspection.detail.clone().unwrap_or_else(|| {
+                        "The Bebop partial-fill encode probe did not find a Bebop executor payload in router calldata.".to_string()
+                    }),
+                }),
+                "mismatch" => findings.push(Finding {
+                    severity: "investigate".to_string(),
+                    title: format!("{} Bebop taker amount mismatch", scenario.label),
+                    detail: format!(
+                        "originalFilledTakerAmount={} expected={} partialFillOffset={}.",
+                        inspection
+                            .original_filled_taker_amount
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        inspection.expected_taker_amount.as_deref().unwrap_or("unknown"),
+                        inspection
+                            .partial_fill_offset
+                            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+                    ),
+                }),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -406,6 +451,21 @@ fn append_scenario_overview(lines: &mut Vec<String>, report: &AnalysisReport) {
         for note in &scenario.notes {
             lines.push(format!("  note: {}", note));
         }
+        for inspection in &scenario.encode_inspections {
+            lines.push(format!(
+                "  note: Bebop inspection {} inspected={} originalFilledTakerAmount={} expected={} partialFillOffset={}",
+                inspection.status,
+                inspection.inspected_bebop_payloads,
+                inspection
+                    .original_filled_taker_amount
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                inspection.expected_taker_amount.as_deref().unwrap_or("unknown"),
+                inspection
+                    .partial_fill_offset
+                    .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+            ));
+        }
     }
 }
 
@@ -497,7 +557,7 @@ mod tests {
         build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSummary,
         ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
-    use super::{ReadinessSnapshot, RunMetadata, ScenarioReport};
+    use super::{EncodeInspectionReport, ReadinessSnapshot, RunMetadata, ScenarioReport};
     use std::collections::BTreeMap;
 
     fn scenario(label: &str, degraded_count: usize, error_count: usize) -> ScenarioReport {
@@ -513,6 +573,7 @@ mod tests {
             result_quality_counts: BTreeMap::new(),
             protocols_seen: BTreeMap::new(),
             latency_ms: LatencySummary::default(),
+            encode_inspections: Vec::new(),
             notes: Vec::new(),
             evidence_files: Vec::new(),
         }
@@ -520,7 +581,7 @@ mod tests {
 
     fn report(findings: Vec<Finding>, scenarios: Vec<ScenarioReport>) -> AnalysisReport {
         AnalysisReport {
-            schema_version: 3,
+            schema_version: 4,
             run: RunMetadata {
                 started_at_epoch_s: 1,
                 finished_at_epoch_s: 2,
@@ -646,5 +707,57 @@ mod tests {
         assert!(summary.contains("vm_status=disabled rfq_status=ready"));
         assert!(summary.contains("native_status=ready"));
         assert!(summary.contains("vm_status=disabled rfq_status=rebuilding"));
+    }
+
+    #[test]
+    fn report_helper_uses_schema_version_four() {
+        let analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+
+        assert_eq!(analysis.schema_version, 4);
+    }
+
+    #[test]
+    fn render_summary_includes_bebop_encode_inspection_notes() {
+        let mut scenario = scenario("bebop-partial-fill-encode", 0, 0);
+        scenario.encode_inspections.push(EncodeInspectionReport {
+            label: "bebop-partial-fill-encode".to_string(),
+            status: "matched".to_string(),
+            inspected_bebop_payloads: 1,
+            original_filled_taker_amount: Some("37364114182137972".to_string()),
+            expected_taker_amount: Some("37364114182137972".to_string()),
+            partial_fill_offset: Some(92),
+            detail: None,
+        });
+        let analysis = report(Vec::new(), vec![scenario]);
+
+        let summary = render_summary(&analysis);
+
+        assert!(summary.contains("Bebop inspection matched"));
+        assert!(summary.contains("originalFilledTakerAmount=37364114182137972"));
+        assert!(summary.contains("partialFillOffset=92"));
+    }
+
+    #[test]
+    fn build_findings_marks_bebop_taker_amount_mismatch() {
+        let mut scenario = scenario("bebop-partial-fill-encode", 1, 0);
+        scenario.encode_inspections.push(EncodeInspectionReport {
+            label: "bebop-partial-fill-encode".to_string(),
+            status: "mismatch".to_string(),
+            inspected_bebop_payloads: 1,
+            original_filled_taker_amount: Some("84452306".to_string()),
+            expected_taker_amount: Some("37364114182137972".to_string()),
+            partial_fill_offset: Some(92),
+            detail: Some(
+                "originalFilledTakerAmount did not match expected token-in amount".to_string(),
+            ),
+        });
+        let analysis = report(Vec::new(), vec![scenario]);
+
+        let findings = build_findings(&analysis);
+
+        assert!(findings.iter().any(|finding| {
+            finding.title == "bebop-partial-fill-encode Bebop taker amount mismatch"
+                && finding.severity == "investigate"
+        }));
     }
 }
