@@ -7,9 +7,9 @@
 - Per-hop and per-swap amounts are not accepted and not returned.
 - `/encode` keeps its current success/error response contract. `/simulate` selection semantics are documented in [docs/simulate_example.md](../../../docs/simulate_example.md).
 
-## Analyzer route probe
+## Analyzer route probes
 
-The local analyzer uses a narrow 2-hop route probe:
+The local analyzer keeps a generic 2-hop route probe:
 
 - resolves chain from `--chain-id` (or `CHAIN_ID`)
 - calls `/simulate` for each hop to pick a representative candidate pool
@@ -18,7 +18,9 @@ The local analyzer uses a narrow 2-hop route probe:
 - records `/encode` interaction shape, router-call presence, latency, and oddities without mixing in prep-hop metrics
 - uses chain-specific default routes and amounts, but treats the result as analytical evidence rather than a strict gate
 
-The probe is intentionally small. If the report suggests an encode-specific issue, follow up with targeted manual routes instead of assuming the default probe captured the full contract surface.
+On Base, when RFQ is enabled and ready, the analyzer also builds `bebop-partial-fill-encode`: `USDC -> WETH -> USDC`, with hop 2 split across a required `rfq:bebop` WETH -> USDC leg and a required non-RFQ comparison leg. The `/encode` response is inspected locally by decoding router calldata and checking that the Bebop executor payload packs `originalFilledTakerAmount` in WETH token-in units. Missing Bebop, missing comparison liquidity, missing Bebop calldata, or a taker-amount mismatch is reported as degraded or investigate-worthy evidence.
+
+These probes are intentionally small. If the report suggests an encode-specific issue, follow up with targeted manual routes instead of assuming the default probes captured the full contract surface.
 
 ## Common pitfalls
 
