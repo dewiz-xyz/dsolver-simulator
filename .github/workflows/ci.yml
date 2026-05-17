@@ -33,8 +33,8 @@ jobs:
           PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -50,8 +50,8 @@ jobs:
           PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -67,8 +67,8 @@ jobs:
           PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: cargo nextest run
@@ -85,7 +85,7 @@ jobs:
           PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - name: Build release binary
         run: cargo build --release

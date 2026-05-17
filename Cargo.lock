@@ -6562,7 +6562,7 @@ dependencies = [
 [[package]]
 name = "tycho-execution"
 version = "0.165.1"
-source = "git+ssh://git@github.com/dewiz-xyz/dsolver-execution.git?rev=46596c8#46596c8fd137661161edf11a7ed3e5be50452d95"
+source = "git+ssh://git@github.com/pedrobergamini/dsolver-execution.git?rev=46596c8#46596c8fd137661161edf11a7ed3e5be50452d95"
 dependencies = [
  "alloy",
  "chrono",

@@ -11,10 +11,10 @@ COPY . .
 RUN --mount=type=secret,id=github_token \
     GITHUB_TOKEN="$(cat /run/secrets/github_token)" && \
     test -n "$GITHUB_TOKEN" && \
-    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/" && \
-    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/" && \
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/" && \
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/" && \
     CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release && \
-    git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf
+    git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf
 
 
 FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
