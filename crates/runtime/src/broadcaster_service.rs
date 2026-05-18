@@ -5,9 +5,9 @@ use anyhow::Result;
 use tracing::info;
 use tycho_simulation::utils::load_all_tokens;
 
+use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
 use crate::config::{init_logging, load_broadcaster_config, BroadcasterConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
-use crate::models::broadcaster::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{TokenStore, TokenStoreError};
 use crate::services::broadcaster::BroadcasterServiceState;
@@ -77,7 +77,7 @@ impl BroadcasterAppState {
         self.service.attach_snapshot_session(session_id).await
     }
 
-    pub async fn status_snapshot(&self) -> crate::models::broadcaster::BroadcasterStatusSnapshot {
+    pub async fn status_snapshot(&self) -> crate::broadcaster::state::BroadcasterStatusSnapshot {
         self.service.status_snapshot().await
     }
 

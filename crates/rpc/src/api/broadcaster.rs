@@ -44,8 +44,8 @@ mod tests {
     use num_bigint::BigUint;
     use num_traits::Zero;
     use runtime::{
+        broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         broadcaster_service::BroadcasterAppState,
-        models::broadcaster::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         models::tokens::TokenStore,
         services::broadcaster::BroadcasterServiceState,
     };

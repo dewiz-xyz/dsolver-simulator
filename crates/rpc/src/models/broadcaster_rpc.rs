@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use runtime::models::broadcaster::{
+use runtime::broadcaster::state::{
     BroadcasterBackendStatus, BroadcasterSnapshotStatus, BroadcasterStatusSnapshot,
     BroadcasterSubscriberSnapshot, BroadcasterUpstreamSnapshot,
 };

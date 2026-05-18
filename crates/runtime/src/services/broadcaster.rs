@@ -7,7 +7,7 @@ use tycho_simulation::{
     tycho_client::feed::{BlockHeader, FeedMessage},
 };
 
-use crate::models::broadcaster::{
+use crate::broadcaster::state::{
     BroadcasterLiveState, BroadcasterReadiness, BroadcasterSnapshotCache,
     BroadcasterStatusSnapshot, BroadcasterUpstreamState,
 };
@@ -177,7 +177,7 @@ mod tests {
     };
 
     use super::BroadcasterServiceState;
-    use crate::models::broadcaster::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
+    use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterPayload};
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
