@@ -15,8 +15,8 @@ use futures::{
     SinkExt, StreamExt,
 };
 use runtime::{
+    broadcaster::state::BroadcasterReadiness,
     broadcaster_service::BroadcasterAppState,
-    models::broadcaster::BroadcasterReadiness,
     services::broadcaster_sessions::{
         BroadcasterAttachedSession, SessionCloseReason, SnapshotSessionError,
     },

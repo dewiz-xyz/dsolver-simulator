@@ -1,6 +1,5 @@
 pub use simulator_core::models::{factories, messages, protocol};
 
-pub mod broadcaster;
 pub mod broadcaster_urls;
 pub mod erc4626;
 pub mod rfq;

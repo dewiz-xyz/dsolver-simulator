@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 
-use crate::models::broadcaster::{BroadcasterSnapshotExport, BroadcasterSubscriberSnapshot};
+use crate::broadcaster::state::{BroadcasterSnapshotExport, BroadcasterSubscriberSnapshot};
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterPayload, BroadcasterSnapshotSessionResponse,
 };
@@ -376,7 +376,7 @@ mod tests {
     use anyhow::{anyhow, Result};
 
     use super::{BroadcasterSubscriberRegistry, SessionCloseReason, SnapshotSessionError};
-    use crate::models::broadcaster::BroadcasterSnapshotExport;
+    use crate::broadcaster::state::BroadcasterSnapshotExport;
     use simulator_core::broadcaster::{
         BroadcasterPayload, BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
     };
