@@ -4,21 +4,31 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
 use crate::models::state::{
-    AppState, SimulatorBackendStatusSnapshot, SimulatorBackendSubscriptionSnapshot,
-    SimulatorReadinessReason, SimulatorServiceStatus, SimulatorStatusSnapshot,
+    AppState, SimulatorBackendKind, SimulatorBackendStatusSnapshot,
+    SimulatorBackendSubscriptionSnapshot, SimulatorReadinessReason, SimulatorServiceStatus,
+    SimulatorStatusSnapshot,
 };
 
 #[derive(Serialize)]
 pub struct StatusPayload {
     status: &'static str,
+    block: u64,
+    pools: usize,
     chain_id: u64,
     backends: BTreeMap<&'static str, BackendStatusPayload>,
 }
 
 impl From<SimulatorStatusSnapshot> for StatusPayload {
     fn from(snapshot: SimulatorStatusSnapshot) -> Self {
+        let native_backend = snapshot
+            .backends
+            .iter()
+            .find(|backend| backend.kind == SimulatorBackendKind::Native);
+
         Self {
             status: snapshot.status.label(),
+            block: native_backend.map_or(0, |backend| backend.block_number),
+            pools: native_backend.map_or(0, |backend| backend.pool_count),
             chain_id: snapshot.chain_id,
             backends: snapshot
                 .backends
@@ -260,6 +270,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_exposes_legacy_native_block_and_pool_fields() {
+        let state = test_state(false, false);
+        seed_native_ready_store(&state).await;
+        state.native_stream_health.record_update(1).await;
+
+        let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(payload.status, "ready");
+        assert_eq!(payload.block, 1);
+        assert_eq!(payload.pools, 1);
+        assert_eq!(payload.block, payload.backends["native"].block_number);
+        assert_eq!(payload.pools, payload.backends["native"].pool_count);
+    }
+
+    #[tokio::test]
     async fn status_returns_service_unavailable_for_stale_native_state() {
         let mut state = test_state(false, false);
         seed_native_ready_store(&state).await;
@@ -271,6 +297,8 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(payload.status, "stale");
+        assert_eq!(payload.block, payload.backends["native"].block_number);
+        assert_eq!(payload.pools, payload.backends["native"].pool_count);
         assert_eq!(payload.backends["native"].status, "stale");
         assert_eq!(payload.backends["native"].reason, Some("stale"));
     }
