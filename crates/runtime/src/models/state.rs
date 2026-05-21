@@ -36,6 +36,7 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
+    pub rfq_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub native_state_store: Arc<StateStore>,
     pub vm_state_store: Arc<StateStore>,
     pub rfq_state_store: Arc<StateStore>,
@@ -43,13 +44,13 @@ pub struct AppState {
     pub vm_stream_health: Arc<StreamHealth>,
     pub rfq_stream_health: Arc<StreamHealth>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
-    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
     pub configured_backends: ConfiguredBackends,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
     pub readiness_stale: Duration,
     pub request_timeout: Duration,
-    pub simulation_rebuild_gate: Arc<RwLock<()>>,
+    pub vm_simulation_rebuild_gate: Arc<RwLock<()>>,
+    pub rfq_simulation_rebuild_gate: Arc<RwLock<()>>,
     pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
@@ -65,12 +66,13 @@ pub struct ConfiguredBackends {
 
 #[derive(Debug)]
 pub(crate) struct SimulationRebuildGuard {
-    _read_guard: Option<OwnedRwLockReadGuard<()>>,
+    _vm_read_guard: Option<OwnedRwLockReadGuard<()>>,
+    _rfq_read_guard: Option<OwnedRwLockReadGuard<()>>,
 }
 
 impl SimulationRebuildGuard {
-    pub(crate) const fn blocks_rebuilds(&self) -> bool {
-        self._read_guard.is_some()
+    pub(crate) const fn blocks_required_rebuilds(&self, uses_vm: bool, uses_rfq: bool) -> bool {
+        (!uses_vm || self._vm_read_guard.is_some()) && (!uses_rfq || self._rfq_read_guard.is_some())
     }
 }
 
@@ -385,6 +387,11 @@ impl AppState {
         subscription.connected && subscription.bootstrap_complete
     }
 
+    async fn rfq_broadcaster_bootstrap_ready(&self) -> bool {
+        let subscription = self.rfq_broadcaster_subscription.snapshot().await;
+        subscription.connected && subscription.bootstrap_complete
+    }
+
     pub async fn status_snapshot(&self) -> SimulatorStatusSnapshot {
         let native = self.native_status_snapshot().await;
         let status = match native.readiness {
@@ -497,13 +504,12 @@ impl AppState {
     }
 
     async fn rfq_status_snapshot(&self) -> SimulatorBackendStatusSnapshot {
-        let stream_status = self.rfq_stream.read().await.clone();
+        let subscription = self.rfq_broadcaster_subscription.snapshot().await;
+        let subscription_reason = subscription_readiness_reason(&subscription);
         let last_update_age_ms = self.rfq_update_age_ms().await;
         let readiness = if !self.enable_rfq_pools {
             SimulatorBackendReadiness::Disabled
-        } else if stream_status.rebuilding {
-            SimulatorBackendReadiness::Rebuilding
-        } else if !self.rfq_state_store.is_ready() {
+        } else if subscription_reason.is_some() || !self.rfq_state_store.is_ready() {
             SimulatorBackendReadiness::WarmingUp
         } else if is_update_stale(last_update_age_ms, self.readiness_stale_ms()) {
             SimulatorBackendReadiness::Stale
@@ -512,10 +518,11 @@ impl AppState {
         };
         let reason = match readiness {
             SimulatorBackendReadiness::Disabled => Some(SimulatorReadinessReason::DisabledByConfig),
-            SimulatorBackendReadiness::Rebuilding => Some(SimulatorReadinessReason::Rebuilding),
-            SimulatorBackendReadiness::WarmingUp => Some(SimulatorReadinessReason::StateWarmingUp),
+            SimulatorBackendReadiness::WarmingUp => {
+                subscription_reason.or(Some(SimulatorReadinessReason::StateWarmingUp))
+            }
             SimulatorBackendReadiness::Stale => Some(SimulatorReadinessReason::Stale),
-            SimulatorBackendReadiness::Ready => None,
+            SimulatorBackendReadiness::Ready | SimulatorBackendReadiness::Rebuilding => None,
         };
 
         SimulatorBackendStatusSnapshot {
@@ -525,17 +532,11 @@ impl AppState {
             reason,
             block_number: self.rfq_block().await,
             pool_count: self.rfq_pools().await,
-            restart_count: stream_status.restart_count,
-            last_error: stream_status.last_error.clone(),
-            rebuild_duration_ms: if matches!(readiness, SimulatorBackendReadiness::Rebuilding) {
-                stream_status
-                    .rebuild_started_at
-                    .map(|instant| instant.elapsed().as_millis() as u64)
-            } else {
-                None
-            },
+            restart_count: subscription.restart_count,
+            last_error: subscription.last_error.clone(),
+            rebuild_duration_ms: None,
             last_update_age_ms,
-            subscription: None,
+            subscription: self.enable_rfq_pools.then_some(subscription.into()),
         }
     }
 
@@ -629,8 +630,8 @@ impl AppState {
             return RfqReadiness::Disabled;
         }
 
-        if self.rfq_rebuilding().await {
-            return RfqReadiness::Rebuilding;
+        if !self.rfq_broadcaster_bootstrap_ready().await {
+            return RfqReadiness::WarmingUp;
         }
 
         if !self.rfq_state_store.is_ready() {
@@ -707,8 +708,12 @@ impl AppState {
         self.request_timeout
     }
 
-    pub fn simulation_rebuild_gate(&self) -> Arc<RwLock<()>> {
-        Arc::clone(&self.simulation_rebuild_gate)
+    pub fn vm_simulation_rebuild_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.vm_simulation_rebuild_gate)
+    }
+
+    pub fn rfq_simulation_rebuild_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.rfq_simulation_rebuild_gate)
     }
 
     pub(crate) async fn acquire_simulation_rebuild_guard(
@@ -716,13 +721,19 @@ impl AppState {
         uses_vm: bool,
         uses_rfq: bool,
     ) -> Arc<SimulationRebuildGuard> {
-        let read_guard = if uses_vm || uses_rfq {
-            Some(self.simulation_rebuild_gate.clone().read_owned().await)
+        let vm_read_guard = if uses_vm {
+            Some(self.vm_simulation_rebuild_gate.clone().read_owned().await)
+        } else {
+            None
+        };
+        let rfq_read_guard = if uses_rfq {
+            Some(self.rfq_simulation_rebuild_gate.clone().read_owned().await)
         } else {
             None
         };
         Arc::new(SimulationRebuildGuard {
-            _read_guard: read_guard,
+            _vm_read_guard: vm_read_guard,
+            _rfq_read_guard: rfq_read_guard,
         })
     }
 
@@ -807,10 +818,6 @@ impl AppState {
         self.vm_stream.read().await.rebuilding
     }
 
-    pub async fn rfq_rebuilding(&self) -> bool {
-        self.rfq_stream.read().await.rebuilding
-    }
-
     pub async fn vm_block(&self) -> u64 {
         self.vm_state_store.current_block().await
     }
@@ -861,14 +868,6 @@ impl From<BroadcasterSubscriptionSnapshot> for SimulatorBackendSubscriptionSnaps
 
 #[derive(Debug, Clone, Default)]
 pub struct VmStreamStatus {
-    pub rebuilding: bool,
-    pub restart_count: u64,
-    pub last_error: Option<String>,
-    pub rebuild_started_at: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RfqStreamStatus {
     pub rebuilding: bool,
     pub restart_count: u64,
     pub last_error: Option<String>,
@@ -1605,6 +1604,7 @@ mod tests {
             tokens: stores.token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store: stores.native_state_store,
             vm_state_store: stores.vm_state_store,
             rfq_state_store: stores.rfq_state_store,
@@ -1612,7 +1612,6 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: flags.enable_vm_pools,
                 rfq: flags.enable_rfq_pools,
@@ -1621,7 +1620,8 @@ mod tests {
             enable_rfq_pools: flags.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
-            simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
@@ -1669,42 +1669,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simulation_rebuild_guard_holds_and_releases_read_guard() {
+    async fn simulation_rebuild_guard_holds_and_releases_vm_read_guard() {
         let state = build_readiness_test_state(true, true).await;
 
         let guard = state.acquire_simulation_rebuild_guard(true, false).await;
-        let gate = state.simulation_rebuild_gate();
+        let vm_gate = state.vm_simulation_rebuild_gate();
+        let rfq_gate = state.rfq_simulation_rebuild_gate();
 
         assert!(
-            gate.try_write().is_err(),
+            vm_gate.try_write().is_err(),
             "VM guard should block rebuild writers"
+        );
+        assert!(
+            rfq_gate.try_write().is_ok(),
+            "VM-only guard should not block RFQ rebuild writers"
         );
 
         drop(guard);
 
         assert!(
-            gate.try_write().is_ok(),
-            "rebuild writer should acquire after guard drop"
+            vm_gate.try_write().is_ok(),
+            "VM rebuild writer should acquire after guard drop"
         );
     }
 
     #[tokio::test]
-    async fn simulation_rebuild_guard_uses_shared_gate_for_rfq_only_reads() {
+    async fn simulation_rebuild_guard_holds_and_releases_rfq_read_guard() {
         let state = build_readiness_test_state(true, true).await;
 
         let guard = state.acquire_simulation_rebuild_guard(false, true).await;
-        let gate = state.simulation_rebuild_gate();
+        let vm_gate = state.vm_simulation_rebuild_gate();
+        let rfq_gate = state.rfq_simulation_rebuild_gate();
 
         assert!(
-            gate.try_write().is_err(),
-            "RFQ-only guard should block shared rebuild writers"
+            vm_gate.try_write().is_ok(),
+            "RFQ-only guard should not block VM rebuild writers"
+        );
+        assert!(
+            rfq_gate.try_write().is_err(),
+            "RFQ-only guard should block RFQ rebuild writers"
         );
 
         drop(guard);
 
         assert!(
-            gate.try_write().is_ok(),
-            "shared rebuild writer should acquire after RFQ guard drop"
+            rfq_gate.try_write().is_ok(),
+            "RFQ rebuild writer should acquire after guard drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_rebuild_guard_holds_both_guards_for_mixed_routes() {
+        let state = build_readiness_test_state(true, true).await;
+
+        let guard = state.acquire_simulation_rebuild_guard(true, true).await;
+        let vm_gate = state.vm_simulation_rebuild_gate();
+        let rfq_gate = state.rfq_simulation_rebuild_gate();
+
+        assert!(
+            vm_gate.try_write().is_err(),
+            "mixed guard should block VM rebuild writers"
+        );
+        assert!(
+            rfq_gate.try_write().is_err(),
+            "mixed guard should block RFQ rebuild writers"
+        );
+
+        drop(guard);
+
+        assert!(
+            vm_gate.try_write().is_ok(),
+            "VM rebuild writer should acquire after mixed guard drop"
+        );
+        assert!(
+            rfq_gate.try_write().is_ok(),
+            "RFQ rebuild writer should acquire after mixed guard drop"
         );
     }
 
@@ -1713,11 +1752,16 @@ mod tests {
         let state = build_readiness_test_state(true, true).await;
 
         let guard = state.acquire_simulation_rebuild_guard(false, false).await;
-        let gate = state.simulation_rebuild_gate();
+        let vm_gate = state.vm_simulation_rebuild_gate();
+        let rfq_gate = state.rfq_simulation_rebuild_gate();
 
         assert!(
-            gate.try_write().is_ok(),
-            "native-only guard should not block rebuild writers"
+            vm_gate.try_write().is_ok(),
+            "native-only guard should not block VM rebuild writers"
+        );
+        assert!(
+            rfq_gate.try_write().is_ok(),
+            "native-only guard should not block RFQ rebuild writers"
         );
 
         drop(guard);
@@ -1854,7 +1898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_and_vm_readiness_distinguishes_disabled_warming_up_rebuilding_ready_and_stale() {
+    async fn rfq_and_vm_readiness_distinguishes_disabled_warming_up_ready_and_stale() {
         let disabled_state = build_readiness_test_state(false, false).await;
         assert_eq!(disabled_state.vm_readiness().await, VmReadiness::Disabled);
         assert_eq!(disabled_state.rfq_readiness().await, RfqReadiness::Disabled);
@@ -1894,28 +1938,22 @@ mod tests {
         state.vm_stream_health.record_update(1).await;
         state.rfq_stream_health.record_update(1).await;
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
 
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = true;
         }
-        {
-            let mut rfq_status = state.rfq_stream.write().await;
-            rfq_status.rebuilding = true;
-        }
         assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Rebuilding);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
 
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
         }
-        {
-            let mut rfq_status = state.rfq_stream.write().await;
-            rfq_status.rebuilding = false;
-        }
         state.readiness_stale = Duration::ZERO;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
     }
 
     #[tokio::test]
@@ -1970,6 +2008,77 @@ mod tests {
         assert_eq!(
             state.encode_availability(false, true, false).await,
             EncodeAvailability::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn rfq_readiness_requires_connected_bootstrapped_broadcaster_subscription() {
+        let state = build_readiness_test_state(false, true).await;
+        state
+            .rfq_state_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                mk_component(
+                    45,
+                    "rfq:hashflow",
+                    "hashflow_pool",
+                    vec![mk_token(46, "TKNA"), mk_token(47, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        state.rfq_stream_health.record_update(1).await;
+
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
+
+        state
+            .rfq_broadcaster_subscription
+            .mark_disconnected(None)
+            .await;
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::WarmingUp);
+
+        state.rfq_broadcaster_subscription.mark_connected().await;
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::WarmingUp);
+
+        state
+            .rfq_broadcaster_subscription
+            .mark_snapshot_started("stream-rfq", "snapshot-rfq")
+            .await;
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::WarmingUp);
+
+        state
+            .rfq_broadcaster_subscription
+            .mark_bootstrap_complete()
+            .await;
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn rfq_status_reports_broadcaster_subscription_restart_and_error() {
+        let state = build_readiness_test_state(false, true).await;
+        state
+            .rfq_broadcaster_subscription
+            .mark_disconnected(Some("rfq broadcaster dropped".to_string()))
+            .await;
+
+        let snapshot = state.status_snapshot().await;
+        let rfq = backend_snapshot(&snapshot, SimulatorBackendKind::Rfq);
+        let subscription = rfq
+            .subscription
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("RFQ status must include subscription"));
+
+        assert_eq!(rfq.readiness, SimulatorBackendReadiness::WarmingUp);
+        assert_eq!(
+            rfq.reason,
+            Some(SimulatorReadinessReason::BroadcasterDisconnected)
+        );
+        assert_eq!(rfq.restart_count, 1);
+        assert_eq!(rfq.last_error.as_deref(), Some("rfq broadcaster dropped"));
+        assert_eq!(subscription.restart_count, 1);
+        assert_eq!(
+            subscription.last_error.as_deref(),
+            Some("rfq broadcaster dropped")
         );
     }
 
@@ -2102,29 +2211,18 @@ mod tests {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = true;
         }
-        {
-            let mut rfq_status = state.rfq_stream.write().await;
-            rfq_status.rebuilding = true;
-        }
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Rebuilding);
+        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
         assert!(matches!(
             state.pool_by_id("pool-vm").await,
             Err(EncodeAvailability::VmRebuilding)
         ));
-        assert!(matches!(
-            state.pool_by_id("pool-rfq").await,
-            Err(EncodeAvailability::RfqRebuilding)
-        ));
+        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
 
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
-        }
-        {
-            let mut rfq_status = state.rfq_stream.write().await;
-            rfq_status.rebuilding = false;
         }
 
         assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));

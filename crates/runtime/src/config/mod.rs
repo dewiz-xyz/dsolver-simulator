@@ -81,9 +81,8 @@ pub fn load_config() -> AppConfig {
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
-    let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
     let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
-        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
+        empty_rfq_credentials();
 
     AppConfig {
         chain_profile,
@@ -145,7 +144,11 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     };
     let network = load_network_config();
     let timeouts = load_timeout_config();
-    let resolved_chain = match resolve_chain_config(&registries, chain_id, None) {
+    let resolved_chain = match resolve_chain_config(
+        &registries,
+        chain_id,
+        optional_trimmed_env("HASHFLOW_FILENAME_CSV"),
+    ) {
         Ok(chain) => chain,
         Err(message) => {
             eprintln!("{message}");
@@ -166,15 +169,22 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         reset_allowance_tokens: resolved_chain.chain_profile.reset_allowance_tokens,
         erc4626_pair_policies: resolved_chain.chain_profile.erc4626_pair_policies,
     };
+    let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
+    let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     BroadcasterConfig {
         chain_profile,
         tycho_url: resolved_chain.tycho_url,
+        bebop_url: resolved_chain.bebop_url,
+        hashflow_filename: resolved_chain.hashflow_filename,
+        liquorice_url: resolved_chain.liquorice_url,
         api_key: network.api_key,
         tvl_threshold: network.tvl_threshold,
         tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
         host: network.host,
+        enable_rfq_pools: network.enable_rfq_pools,
         token_refresh_timeout_ms: timeouts.token_refresh_timeout_ms,
         stream_stale_secs: stream.stream_stale_secs,
         stream_missing_block_burst: stream.stream_missing_block_burst,
@@ -188,6 +198,12 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         readiness_stale_secs: stream.readiness_stale_secs,
         memory,
         tuning,
+        bebop_key,
+        bebop_user,
+        hashflow_key,
+        hashflow_user,
+        liquorice_key,
+        liquorice_user,
     }
 }
 
@@ -195,6 +211,10 @@ fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile)
     enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
 }
 
+#[expect(
+    clippy::panic,
+    reason = "startup config remains fail-fast on missing RFQ credentials"
+)]
 fn load_rfq_credentials(
     rfq_enabled: bool,
     rfq_protocols: &[String],
@@ -202,8 +222,7 @@ fn load_rfq_credentials(
     match try_load_rfq_credentials(rfq_enabled, rfq_protocols) {
         Ok(credentials) => credentials,
         Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
+            panic!("{message}");
         }
     }
 }
@@ -213,14 +232,7 @@ fn try_load_rfq_credentials(
     rfq_protocols: &[String],
 ) -> Result<(String, String, String, String, String, String), String> {
     if !rfq_enabled || rfq_protocols.is_empty() {
-        return Ok((
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ));
+        return Ok(empty_rfq_credentials());
     }
 
     let (bebop_user, bebop_key) = load_provider_credentials(
@@ -249,6 +261,17 @@ fn try_load_rfq_credentials(
     ))
 }
 
+fn empty_rfq_credentials() -> (String, String, String, String, String, String) {
+    (
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    )
+}
+
 fn load_provider_credentials(
     enabled: bool,
     user_key: &str,
@@ -258,8 +281,8 @@ fn load_provider_credentials(
         return Ok((String::new(), String::new()));
     }
 
-    let user = env::var(user_key).map_err(|message| format!("{user_key}: {message}"))?;
-    let key = env::var(auth_key).map_err(|message| format!("{auth_key}: {message}"))?;
+    let user = required_trimmed_env(user_key)?;
+    let key = required_trimmed_env(auth_key)?;
 
     Ok((user, key))
 }
@@ -567,11 +590,15 @@ pub struct AppConfig {
 pub struct BroadcasterConfig {
     pub chain_profile: ChainProfile,
     pub tycho_url: String,
+    pub bebop_url: String,
+    pub hashflow_filename: String,
+    pub liquorice_url: Option<String>,
     pub api_key: String,
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: IpAddr,
+    pub enable_rfq_pools: bool,
     pub token_refresh_timeout_ms: u64,
     pub stream_stale_secs: u64,
     pub stream_missing_block_burst: u64,
@@ -585,6 +612,12 @@ pub struct BroadcasterConfig {
     pub readiness_stale_secs: u64,
     pub memory: MemoryConfig,
     pub tuning: BroadcasterTuning,
+    pub bebop_user: String,
+    pub bebop_key: String,
+    pub hashflow_user: String,
+    pub hashflow_key: String,
+    pub liquorice_user: String,
+    pub liquorice_key: String,
 }
 
 fn env_or_default(key: &str, default: &str) -> String {
@@ -601,6 +634,15 @@ fn optional_trimmed_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn required_trimmed_env(key: &str) -> Result<String, String> {
+    let value = env::var(key).map_err(|message| format!("{key}: {message}"))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{key} must not be empty"));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn optional_parsed_env<T>(key: &str) -> Option<T>
@@ -706,12 +748,19 @@ mod tests {
         }
     }
 
-    const CONFIG_TEST_ENV_KEYS: [&str; 5] = [
+    const CONFIG_TEST_ENV_KEYS: [&str; 12] = [
         "CHAIN_ID",
         "ENABLE_RFQ_POOLS",
+        "HASHFLOW_FILENAME_CSV",
         "TOKEN_SNAPSHOT_TIMEOUT_MS",
         "TYCHO_API_KEY",
         "TYCHO_BROADCASTER_WS_URL",
+        "BEBOP_USER",
+        "BEBOP_KEY",
+        "HASHFLOW_USER",
+        "HASHFLOW_KEY",
+        "LIQUORICE_USER",
+        "LIQUORICE_KEY",
     ];
 
     fn manifest_path() -> std::path::PathBuf {
@@ -763,6 +812,7 @@ mod tests {
         std::env::set_var("CHAIN_ID", "1");
         std::env::set_var("ENABLE_RFQ_POOLS", "false");
         std::env::set_var("TYCHO_API_KEY", "test-api-key");
+        std::env::remove_var("HASHFLOW_FILENAME_CSV");
         std::env::remove_var("TOKEN_SNAPSHOT_TIMEOUT_MS");
         match broadcaster_ws_url {
             Some(value) => std::env::set_var("TYCHO_BROADCASTER_WS_URL", value),
@@ -1148,6 +1198,125 @@ route_policy = " default "
     }
 
     #[test]
+    fn load_config_allows_rfq_without_provider_credentials() {
+        let config = with_isolated_config_env(Some("ws://127.0.0.1:3001/ws"), || {
+            clear_rfq_credential_env();
+            std::env::set_var("ENABLE_RFQ_POOLS", "true");
+            load_config()
+        });
+
+        assert!(rfq_effectively_enabled(
+            config.enable_rfq_pools,
+            &config.chain_profile
+        ));
+        assert!(config.bebop_user.is_empty());
+        assert!(config.bebop_key.is_empty());
+        assert!(config.hashflow_user.is_empty());
+        assert!(config.hashflow_key.is_empty());
+        assert!(config.liquorice_user.is_empty());
+        assert!(config.liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn load_broadcaster_config_requires_bebop_credentials_when_effective() {
+        let message = with_isolated_config_env(None, || {
+            clear_rfq_credential_env();
+            std::env::set_var("ENABLE_RFQ_POOLS", "true");
+            std::env::set_var("HASHFLOW_USER", "hashflow-user");
+            std::env::set_var("HASHFLOW_KEY", "hashflow-key");
+            match std::panic::catch_unwind(load_broadcaster_config) {
+                Ok(_) => unreachable!("broadcaster config should require Bebop credentials"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("BEBOP_USER"));
+    }
+
+    #[test]
+    fn load_broadcaster_config_requires_hashflow_credentials_when_effective() {
+        let message = with_isolated_config_env(None, || {
+            clear_rfq_credential_env();
+            std::env::set_var("ENABLE_RFQ_POOLS", "true");
+            std::env::set_var("BEBOP_USER", "bebop-user");
+            std::env::set_var("BEBOP_KEY", "bebop-key");
+            match std::panic::catch_unwind(load_broadcaster_config) {
+                Ok(_) => unreachable!("broadcaster config should require Hashflow credentials"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("HASHFLOW_USER"));
+    }
+
+    #[test]
+    fn load_broadcaster_config_accepts_empty_provider_credentials_when_rfq_disabled() {
+        let config = with_isolated_config_env(None, || {
+            clear_rfq_credential_env();
+            std::env::set_var("ENABLE_RFQ_POOLS", "false");
+            load_broadcaster_config()
+        });
+
+        assert!(!config.enable_rfq_pools);
+        assert!(config.bebop_user.is_empty());
+        assert!(config.bebop_key.is_empty());
+        assert!(config.hashflow_user.is_empty());
+        assert!(config.hashflow_key.is_empty());
+        assert!(config.liquorice_user.is_empty());
+        assert!(config.liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn load_broadcaster_config_carries_rfq_provider_config() {
+        let config = with_isolated_config_env(None, || {
+            clear_rfq_credential_env();
+            std::env::set_var("ENABLE_RFQ_POOLS", "true");
+            std::env::set_var("BEBOP_USER", "bebop-user");
+            std::env::set_var("BEBOP_KEY", "bebop-key");
+            std::env::set_var("HASHFLOW_USER", "hashflow-user");
+            std::env::set_var("HASHFLOW_KEY", "hashflow-key");
+            load_broadcaster_config()
+        });
+
+        assert!(rfq_effectively_enabled(
+            config.enable_rfq_pools,
+            &config.chain_profile
+        ));
+        assert_eq!(
+            config.bebop_url,
+            "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
+        );
+        assert_eq!(config.hashflow_filename, "./hashflow_supported_tokens.csv");
+        assert_eq!(
+            config.liquorice_url.as_deref(),
+            Some("https://api.liquorice.tech/v1/solver/supported-tokens")
+        );
+        assert_eq!(config.bebop_user, "bebop-user");
+        assert_eq!(config.bebop_key, "bebop-key");
+        assert_eq!(config.hashflow_user, "hashflow-user");
+        assert_eq!(config.hashflow_key, "hashflow-key");
+        assert!(config.liquorice_user.is_empty());
+        assert!(config.liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn load_broadcaster_config_prefers_hashflow_env_override() {
+        let config = with_isolated_config_env(None, || {
+            clear_rfq_credential_env();
+            std::env::set_var(
+                "HASHFLOW_FILENAME_CSV",
+                "/app/hashflow_supported_tokens.csv",
+            );
+            load_broadcaster_config()
+        });
+
+        assert_eq!(
+            config.hashflow_filename,
+            "/app/hashflow_supported_tokens.csv"
+        );
+    }
+
+    #[test]
     fn try_load_rfq_credentials_only_requires_enabled_providers() {
         let _guard = ENV_MUTEX
             .lock()
@@ -1184,6 +1353,23 @@ route_policy = " default "
         };
 
         assert!(err.contains("LIQUORICE_USER"));
+    }
+
+    #[test]
+    fn try_load_rfq_credentials_rejects_blank_enabled_provider_credentials() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_rfq_credential_env();
+        std::env::set_var("HASHFLOW_USER", "  ");
+        std::env::set_var("HASHFLOW_KEY", "hashflow-key");
+
+        let Err(err) = try_load_rfq_credentials(true, &["rfq:hashflow".to_string()]) else {
+            unreachable!("expected blank Hashflow user to fail");
+        };
+
+        assert!(err.contains("HASHFLOW_USER must not be empty"));
+        clear_rfq_credential_env();
     }
 
     #[test]

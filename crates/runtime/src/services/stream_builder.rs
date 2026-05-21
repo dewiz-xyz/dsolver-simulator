@@ -257,6 +257,7 @@ pub async fn build_broadcaster_subscription_decoder(
     decoder.skip_state_decode_failures(decode_skip_state_failures(match backend {
         BroadcasterBackend::Native => StreamDecodePolicy::Native,
         BroadcasterBackend::Vm => StreamDecodePolicy::Vm,
+        BroadcasterBackend::Rfq => StreamDecodePolicy::Broadcaster,
     }));
 
     match backend {
@@ -270,6 +271,7 @@ pub async fn build_broadcaster_subscription_decoder(
                 register_vm_decoder(&mut decoder, protocol)?;
             }
         }
+        BroadcasterBackend::Rfq => {}
     }
 
     initialize_hook_handlers().map_err(|error| {
