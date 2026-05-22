@@ -216,6 +216,7 @@ impl BroadcasterSnapshotCache {
             guard.known_backends.clone()
         };
         let message = BroadcasterUpdateMessage::from_tycho_update(update, &known_backends)?;
+        ensure_configured_update_backends(&message, &self.configured_backends)?;
         let mut guard = self.inner.write().await;
         apply_update_message(&mut guard, &message)?;
         Ok(message)
@@ -226,6 +227,7 @@ impl BroadcasterSnapshotCache {
         feed: &FeedMessage<BlockHeader>,
     ) -> Result<BroadcasterUpdateMessage> {
         let message = BroadcasterUpdateMessage::from_tycho_feed_message(feed)?;
+        ensure_configured_update_backends(&message, &self.configured_backends)?;
         let mut guard = self.inner.write().await;
         apply_raw_update_message(&mut guard, &message);
         Ok(message)
@@ -394,6 +396,20 @@ fn apply_raw_update_message(
             merge_raw_message(&mut partition_state.messages, message.clone());
         }
     }
+}
+
+fn ensure_configured_update_backends(
+    message: &BroadcasterUpdateMessage,
+    configured_backends: &[BroadcasterBackend],
+) -> Result<()> {
+    for partition in &message.partitions {
+        ensure!(
+            configured_backends.contains(&partition.backend),
+            "update partition backend {} is not configured",
+            partition.backend.as_str()
+        );
+    }
+    Ok(())
 }
 
 fn merge_raw_message(
@@ -1638,6 +1654,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_exports_empty_rfq_backend_partition_in_snapshot() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        );
+        cache.apply_update(&native_only_update()).await?;
+        cache.apply_update(&rfq_sync_only_update()).await?;
+
+        let export = cache.export_snapshot(8_388_608).await?;
+        let Some(BroadcasterPayload::SnapshotChunk(chunk)) =
+            export.payloads.iter().find(|payload| {
+                matches!(
+                    payload,
+                    BroadcasterPayload::SnapshotChunk(chunk)
+                        if chunk
+                            .partitions
+                            .iter()
+                            .any(|partition| partition.backend == BroadcasterBackend::Rfq)
+                )
+            })
+        else {
+            return Err(anyhow!("expected rfq snapshot_chunk payload"));
+        };
+
+        let Some(rfq_partition) = chunk
+            .partitions
+            .iter()
+            .find(|partition| partition.backend == BroadcasterBackend::Rfq)
+        else {
+            return Err(anyhow!("expected rfq snapshot partition"));
+        };
+        assert!(rfq_partition.states.is_empty());
+        assert_eq!(rfq_partition.block_number, 12);
+        assert_eq!(
+            rfq_partition.sync_statuses["rfq:hashflow"].kind,
+            BroadcasterProtocolSyncStatusKind::Ready
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_applies_rfq_update_to_rfq_partition() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        );
+        cache.apply_update(&native_only_update()).await?;
+        let message = cache.apply_update(&rfq_only_update(12, "rfq-1", 3)).await?;
+
+        let rfq = message
+            .partitions
+            .iter()
+            .find(|partition| partition.backend == BroadcasterBackend::Rfq)
+            .ok_or_else(|| anyhow!("expected rfq update partition"))?;
+        assert_eq!(rfq.block_number, 12);
+        assert_eq!(rfq.new_pairs.len(), 1);
+        assert_eq!(rfq.new_pairs[0].component_id, "rfq-1");
+
+        let status = cache
+            .status_snapshot(
+                8_388_608,
+                connected_upstream().await,
+                BroadcasterSubscriberSnapshot::default(),
+            )
+            .await;
+        let rfq_status = status
+            .backends
+            .get(&BroadcasterBackend::Rfq)
+            .ok_or_else(|| anyhow!("expected rfq backend status"))?;
+        assert_eq!(rfq_status.block_number, Some(12));
+        assert_eq!(rfq_status.pool_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_and_heartbeat_report_rfq_backend() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        );
+        cache.apply_update(&native_only_update()).await?;
+        cache.apply_update(&rfq_only_update(12, "rfq-1", 3)).await?;
+
+        let status = cache
+            .status_snapshot(
+                8_388_608,
+                connected_upstream().await,
+                BroadcasterSubscriberSnapshot::default(),
+            )
+            .await;
+        assert_eq!(status.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(status.snapshot.configured_backends.len(), 2);
+        assert!(status.backends.contains_key(&BroadcasterBackend::Rfq));
+
+        let Some(BroadcasterPayload::Heartbeat(heartbeat)) = cache.heartbeat().await? else {
+            return Err(anyhow!("expected ready heartbeat"));
+        };
+        assert!(heartbeat
+            .backend_heads
+            .iter()
+            .any(|head| head.backend == BroadcasterBackend::Rfq && head.block_number == 12));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_rejects_undeclared_rfq_partition() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+
+        let Err(error) = cache.apply_update(&rfq_only_update(12, "rfq-1", 3)).await else {
+            return Err(anyhow!("undeclared rfq update should fail"));
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("update partition backend rfq is not configured"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cache_resets_generation_on_reset() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         cache.apply_update(&native_only_update()).await?;
@@ -1688,6 +1827,13 @@ mod tests {
             .await;
         assert_eq!(ready.readiness, BroadcasterReadiness::Ready);
         Ok(())
+    }
+
+    async fn connected_upstream() -> super::BroadcasterUpstreamSnapshot {
+        let upstream = BroadcasterUpstreamState::default();
+        upstream.mark_connected().await;
+        upstream.record_update().await;
+        upstream.snapshot().await
     }
 
     fn mixed_update() -> Update {
@@ -1772,6 +1918,32 @@ mod tests {
             )]))
     }
 
+    fn rfq_sync_only_update() -> Update {
+        Update::new(12, HashMap::new(), HashMap::new()).set_sync_states(HashMap::from([(
+            "rfq:hashflow".to_string(),
+            SynchronizerState::Ready(block_header(12, 4)),
+        )]))
+    }
+
+    fn rfq_only_update(block_number: u64, component_id: &str, seed: u8) -> Update {
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert(
+            component_id.to_string(),
+            rfq_component(component_id, "rfq:hashflow", seed),
+        );
+
+        let mut states = HashMap::new();
+        states.insert(
+            component_id.to_string(),
+            Box::new(DummySim(seed)) as Box<dyn ProtocolSim>,
+        );
+
+        Update::new(block_number, states, new_pairs).set_sync_states(HashMap::from([(
+            "rfq:hashflow".to_string(),
+            SynchronizerState::Ready(block_header(block_number, seed)),
+        )]))
+    }
+
     fn raw_protocol_message_with_states(
         states: HashMap<String, ComponentWithState>,
     ) -> BroadcasterProtocolMessage {
@@ -1835,6 +2007,22 @@ mod tests {
             Vec::new(),
             HashMap::new(),
             Bytes::from([8u8; 32]),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .unwrap_or_else(|| unreachable!("unix epoch"))
+                .naive_utc(),
+        )
+    }
+
+    fn rfq_component(_id: &str, protocol: &str, seed: u8) -> ProtocolComponent {
+        ProtocolComponent::new(
+            Bytes::from([seed; 20]),
+            protocol.to_string(),
+            "hashflow_pool".to_string(),
+            Chain::Ethereum,
+            vec![dummy_token(seed, "RFQA"), dummy_token(seed + 1, "RFQB")],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::from([seed; 32]),
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
                 .unwrap_or_else(|| unreachable!("unix epoch"))
                 .naive_utc(),

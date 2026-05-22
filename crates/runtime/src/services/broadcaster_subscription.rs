@@ -31,7 +31,8 @@ use simulator_core::broadcaster::{
 
 use crate::memory::maybe_purge_allocator;
 use crate::models::broadcaster_urls::{
-    derive_broadcaster_http_url, derive_broadcaster_session_ws_url,
+    derive_broadcaster_http_url, derive_broadcaster_rfq_session_ws_url,
+    derive_broadcaster_session_ws_url,
 };
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
@@ -45,6 +46,7 @@ const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
 pub enum BroadcasterSubscriptionControls {
     Native(NativeBroadcasterSubscriptionControls),
     Vm(VmBroadcasterSubscriptionControls),
+    Rfq(RfqBroadcasterSubscriptionControls),
 }
 
 #[derive(Clone)]
@@ -67,11 +69,22 @@ pub struct VmBroadcasterSubscriptionControls {
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
+#[derive(Clone)]
+pub struct RfqBroadcasterSubscriptionControls {
+    pub broadcaster_subscription: BroadcasterSubscriptionStatus,
+    pub state_store: Arc<StateStore>,
+    pub stream_health: Arc<StreamHealth>,
+    pub tokens: Arc<TokenStore>,
+    pub protocols: Vec<String>,
+    pub simulation_rebuild_gate: Arc<RwLock<()>>,
+}
+
 impl BroadcasterSubscriptionControls {
     fn backend(&self) -> BroadcasterBackend {
         match self {
             Self::Native(_) => BroadcasterBackend::Native,
             Self::Vm(_) => BroadcasterBackend::Vm,
+            Self::Rfq(_) => BroadcasterBackend::Rfq,
         }
     }
 
@@ -83,6 +96,7 @@ impl BroadcasterSubscriptionControls {
         match self {
             Self::Native(controls) => &controls.broadcaster_subscription,
             Self::Vm(controls) => &controls.broadcaster_subscription,
+            Self::Rfq(controls) => &controls.broadcaster_subscription,
         }
     }
 
@@ -90,6 +104,7 @@ impl BroadcasterSubscriptionControls {
         match self {
             Self::Native(controls) => &controls.state_store,
             Self::Vm(controls) => &controls.state_store,
+            Self::Rfq(controls) => &controls.state_store,
         }
     }
 
@@ -97,6 +112,7 @@ impl BroadcasterSubscriptionControls {
         match self {
             Self::Native(controls) => &controls.stream_health,
             Self::Vm(controls) => &controls.stream_health,
+            Self::Rfq(controls) => &controls.stream_health,
         }
     }
 
@@ -104,6 +120,7 @@ impl BroadcasterSubscriptionControls {
         match self {
             Self::Native(controls) => Arc::clone(&controls.tokens),
             Self::Vm(controls) => Arc::clone(&controls.tokens),
+            Self::Rfq(controls) => Arc::clone(&controls.tokens),
         }
     }
 
@@ -111,6 +128,7 @@ impl BroadcasterSubscriptionControls {
         match self {
             Self::Native(controls) => &controls.protocols,
             Self::Vm(controls) => &controls.protocols,
+            Self::Rfq(controls) => &controls.protocols,
         }
     }
 }
@@ -122,7 +140,7 @@ pub async fn supervise_broadcaster_subscription(
     controls: BroadcasterSubscriptionControls,
 ) {
     let mut backoff = cfg.restart_backoff_min;
-    let mut vm_rebuild = None;
+    let mut rebuild = None;
     let client = Client::new();
 
     loop {
@@ -132,17 +150,17 @@ pub async fn supervise_broadcaster_subscription(
             expected_chain_id,
             &cfg,
             &controls,
-            vm_rebuild,
+            rebuild,
         )
         .await
         {
             Ok(bootstrap) => bootstrap,
             Err(error) => {
-                (vm_rebuild, backoff) = reset_subscription_after_error(
+                (rebuild, backoff) = reset_subscription_after_error(
                     &controls,
                     &cfg,
                     backoff,
-                    error.vm_rebuild,
+                    error.rebuild,
                     error.message,
                     error.event,
                     error.detail,
@@ -156,11 +174,11 @@ pub async fn supervise_broadcaster_subscription(
             Ok((stream, _response)) => stream,
             Err(error) => {
                 let message = format!("Failed to connect to broadcaster websocket: {error}");
-                (vm_rebuild, backoff) = reset_subscription_after_error(
+                (rebuild, backoff) = reset_subscription_after_error(
                     &controls,
                     &cfg,
                     backoff,
-                    bootstrap.processor.vm_rebuild,
+                    bootstrap.processor.rebuild,
                     message,
                     "broadcaster_subscription_connect_failed",
                     "Failed to connect to broadcaster subscription",
@@ -176,10 +194,10 @@ pub async fn supervise_broadcaster_subscription(
             backend = controls.backend_label(),
             "Connected to broadcaster subscription"
         );
-        let (exit, next_vm_rebuild) =
+        let (exit, next_rebuild) =
             process_broadcaster_subscription(stream, bootstrap.processor, &cfg).await;
-        (vm_rebuild, backoff) =
-            restart_after_subscription_exit(&controls, &cfg, backoff, exit, next_vm_rebuild).await;
+        (rebuild, backoff) =
+            restart_after_subscription_exit(&controls, &cfg, backoff, exit, next_rebuild).await;
     }
 }
 
@@ -193,7 +211,7 @@ struct PrepareBroadcasterSubscriptionError {
     message: String,
     event: &'static str,
     detail: &'static str,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
+    rebuild: Option<SubscriptionRebuildState>,
 }
 
 impl PrepareBroadcasterSubscriptionError {
@@ -201,13 +219,13 @@ impl PrepareBroadcasterSubscriptionError {
         message: String,
         event: &'static str,
         detail: &'static str,
-        vm_rebuild: Option<VmSubscriptionRebuildState>,
+        rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
         Self {
             message,
             event,
             detail,
-            vm_rebuild,
+            rebuild,
         }
     }
 }
@@ -218,16 +236,19 @@ async fn prepare_broadcaster_subscription(
     expected_chain_id: u64,
     cfg: &StreamSupervisorConfig,
     controls: &BroadcasterSubscriptionControls,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
+    rebuild: Option<SubscriptionRebuildState>,
 ) -> std::result::Result<PreparedBroadcasterSubscription, PrepareBroadcasterSubscriptionError> {
-    let snapshot_sessions_url = match derive_broadcaster_http_url(ws_url, "snapshot-sessions") {
+    let snapshot_sessions_url = match derive_broadcaster_http_url(
+        ws_url,
+        broadcaster_snapshot_sessions_path(controls.backend()),
+    ) {
         Ok(url) => url,
         Err(error) => {
             return Err(PrepareBroadcasterSubscriptionError::new(
                 format!("Invalid broadcaster websocket URL: {error}"),
                 "broadcaster_subscription_url_invalid",
                 "Failed to derive broadcaster snapshot session URL",
-                vm_rebuild,
+                rebuild,
             ));
         }
     };
@@ -244,7 +265,7 @@ async fn prepare_broadcaster_subscription(
                 error.to_string(),
                 "broadcaster_subscription_decoder_failed",
                 "Failed to build broadcaster subscription decoder",
-                vm_rebuild,
+                rebuild,
             ));
         }
     };
@@ -252,7 +273,7 @@ async fn prepare_broadcaster_subscription(
         expected_chain_id,
         controls.clone(),
         decoder,
-        vm_rebuild,
+        rebuild,
     );
     let session = match bootstrap_broadcaster_snapshot(
         client,
@@ -270,18 +291,22 @@ async fn prepare_broadcaster_subscription(
                 error.to_string(),
                 "broadcaster_subscription_bootstrap_failed",
                 "Failed to bootstrap broadcaster subscription from HTTP snapshot",
-                processor.vm_rebuild,
+                processor.rebuild,
             ));
         }
     };
-    let session_ws_url = match derive_broadcaster_session_ws_url(ws_url, session.session_id) {
+    let session_ws_url = match derive_broadcaster_subscription_ws_url(
+        ws_url,
+        controls.backend(),
+        session.session_id,
+    ) {
         Ok(url) => url,
         Err(error) => {
             return Err(PrepareBroadcasterSubscriptionError::new(
                 format!("Invalid broadcaster websocket URL: {error}"),
                 "broadcaster_subscription_url_invalid",
                 "Failed to derive broadcaster session websocket URL",
-                processor.vm_rebuild,
+                processor.rebuild,
             ));
         }
     };
@@ -297,12 +322,12 @@ async fn reset_subscription_after_error(
     controls: &BroadcasterSubscriptionControls,
     cfg: &StreamSupervisorConfig,
     backoff: Duration,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
+    rebuild: Option<SubscriptionRebuildState>,
     message: String,
     event: &'static str,
     detail: &'static str,
-) -> (Option<VmSubscriptionRebuildState>, Duration) {
-    let vm_rebuild = handle_subscription_reset(controls, Some(message.clone()), vm_rebuild).await;
+) -> (Option<SubscriptionRebuildState>, Duration) {
+    let rebuild = handle_subscription_reset(controls, Some(message.clone()), rebuild).await;
     let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
     warn!(
         event = event,
@@ -312,7 +337,7 @@ async fn reset_subscription_after_error(
         "{detail}"
     );
     sleep_backoff(backoff_ms, cfg.memory).await;
-    (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+    (rebuild, next_backoff(backoff, cfg.restart_backoff_max))
 }
 
 async fn restart_after_subscription_exit(
@@ -320,9 +345,9 @@ async fn restart_after_subscription_exit(
     cfg: &StreamSupervisorConfig,
     backoff: Duration,
     exit: SubscriptionExit,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
-) -> (Option<VmSubscriptionRebuildState>, Duration) {
-    let vm_rebuild = handle_subscription_reset(controls, exit.last_error.clone(), vm_rebuild).await;
+    rebuild: Option<SubscriptionRebuildState>,
+) -> (Option<SubscriptionRebuildState>, Duration) {
+    let rebuild = handle_subscription_reset(controls, exit.last_error.clone(), rebuild).await;
     let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
     warn!(
         event = "broadcaster_subscription_restart",
@@ -333,7 +358,7 @@ async fn restart_after_subscription_exit(
         "Restarting broadcaster subscription"
     );
     sleep_backoff(backoff_ms, cfg.memory).await;
-    (vm_rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+    (rebuild, next_backoff(backoff, cfg.restart_backoff_max))
 }
 
 #[derive(Default)]
@@ -578,7 +603,7 @@ struct BroadcasterSubscriptionProcessor {
     tracker: BroadcasterSubscriptionTracker,
     raw_snapshot: RawSnapshotReassembly,
     bootstrap_block: Option<u64>,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
+    rebuild: Option<SubscriptionRebuildState>,
 }
 
 impl BroadcasterSubscriptionProcessor {
@@ -586,13 +611,13 @@ impl BroadcasterSubscriptionProcessor {
     fn new(
         expected_chain_id: u64,
         controls: BroadcasterSubscriptionControls,
-        vm_rebuild: Option<VmSubscriptionRebuildState>,
+        rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
         Self::with_decoder(
             expected_chain_id,
             controls,
             Arc::new(TychoStreamDecoder::new()),
-            vm_rebuild,
+            rebuild,
         )
     }
 
@@ -600,7 +625,7 @@ impl BroadcasterSubscriptionProcessor {
         expected_chain_id: u64,
         controls: BroadcasterSubscriptionControls,
         decoder: Arc<TychoStreamDecoder<BlockHeader>>,
-        vm_rebuild: Option<VmSubscriptionRebuildState>,
+        rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
         Self {
             expected_chain_id,
@@ -609,7 +634,7 @@ impl BroadcasterSubscriptionProcessor {
             tracker: BroadcasterSubscriptionTracker::new(),
             raw_snapshot: RawSnapshotReassembly::default(),
             bootstrap_block: None,
-            vm_rebuild,
+            rebuild,
         }
     }
 
@@ -653,7 +678,7 @@ impl BroadcasterSubscriptionProcessor {
                     .broadcaster_subscription()
                     .mark_bootstrap_complete()
                     .await;
-                self.finish_vm_rebuild().await;
+                self.finish_rebuild().await;
             }
             BroadcasterPayload::Update(update) => {
                 for partition in update.partitions {
@@ -686,8 +711,8 @@ impl BroadcasterSubscriptionProcessor {
         Ok(())
     }
 
-    async fn finish_vm_rebuild(&mut self) {
-        let Some(rebuild) = self.vm_rebuild.take() else {
+    async fn finish_rebuild(&mut self) {
+        let Some(rebuild) = self.rebuild.take() else {
             return;
         };
 
@@ -722,6 +747,7 @@ impl BroadcasterSubscriptionProcessor {
         if partition.messages.is_empty() {
             return self.apply_snapshot_partition(partition).await;
         }
+        self.ensure_raw_messages_supported()?;
 
         for message in partition.messages {
             self.raw_snapshot.push(message)?;
@@ -740,6 +766,7 @@ impl BroadcasterSubscriptionProcessor {
     ) -> Result<()> {
         let block_number = partition.block_number;
         if !partition.messages.is_empty() {
+            self.ensure_raw_messages_supported()?;
             self.apply_protocol_messages(partition.messages).await?;
             self.controls
                 .stream_health()
@@ -808,6 +835,15 @@ impl BroadcasterSubscriptionProcessor {
                 .await;
         }
     }
+
+    fn ensure_raw_messages_supported(&self) -> Result<()> {
+        if self.controls.backend() == BroadcasterBackend::Rfq {
+            return Err(anyhow!(
+                "raw RFQ broadcaster messages are unsupported; expected decoded RFQ state partitions"
+            ));
+        }
+        Ok(())
+    }
 }
 
 async fn bootstrap_broadcaster_snapshot(
@@ -831,6 +867,7 @@ async fn bootstrap_broadcaster_snapshot(
                     fetch_broadcaster_snapshot_payload(
                         client,
                         ws_url,
+                        controls.backend(),
                         &session,
                         index,
                         cfg.readiness_stale,
@@ -881,13 +918,14 @@ async fn create_broadcaster_snapshot_session(
 async fn fetch_broadcaster_snapshot_payload(
     client: &Client,
     ws_url: &str,
+    backend: BroadcasterBackend,
     session: &BroadcasterSnapshotSessionResponse,
     index: u32,
     request_timeout: Duration,
 ) -> Result<BroadcasterEnvelope> {
     let payload_url = derive_broadcaster_http_url(
         ws_url,
-        &format!("snapshot-sessions/{}/payloads/{index}", session.session_id),
+        &broadcaster_snapshot_payload_path(backend, session.session_id, index),
     )
     .map_err(|error| anyhow!("failed to derive broadcaster snapshot payload URL: {error}"))?;
     let response = client
@@ -901,6 +939,37 @@ async fn fetch_broadcaster_snapshot_payload(
             )
         })?;
     decode_success_json(response, &payload_url, "fetch broadcaster snapshot payload").await
+}
+
+fn broadcaster_snapshot_sessions_path(backend: BroadcasterBackend) -> &'static str {
+    match backend {
+        BroadcasterBackend::Rfq => "rfq/snapshot-sessions",
+        BroadcasterBackend::Native | BroadcasterBackend::Vm => "snapshot-sessions",
+    }
+}
+
+fn broadcaster_snapshot_payload_path(
+    backend: BroadcasterBackend,
+    session_id: u64,
+    index: u32,
+) -> String {
+    format!(
+        "{}/{session_id}/payloads/{index}",
+        broadcaster_snapshot_sessions_path(backend)
+    )
+}
+
+fn derive_broadcaster_subscription_ws_url(
+    ws_url: &str,
+    backend: BroadcasterBackend,
+    session_id: u64,
+) -> std::result::Result<String, crate::models::broadcaster_urls::BroadcasterUrlError> {
+    match backend {
+        BroadcasterBackend::Rfq => derive_broadcaster_rfq_session_ws_url(ws_url, session_id),
+        BroadcasterBackend::Native | BroadcasterBackend::Vm => {
+            derive_broadcaster_session_ws_url(ws_url, session_id)
+        }
+    }
 }
 
 async fn decode_success_json<T>(
@@ -931,7 +1000,7 @@ async fn process_broadcaster_subscription(
     mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
     mut processor: BroadcasterSubscriptionProcessor,
     cfg: &StreamSupervisorConfig,
-) -> (SubscriptionExit, Option<VmSubscriptionRebuildState>) {
+) -> (SubscriptionExit, Option<SubscriptionRebuildState>) {
     loop {
         let next_timeout = if processor.bootstrap_complete() {
             cfg.stream_stale
@@ -945,14 +1014,14 @@ async fn process_broadcaster_subscription(
             } else {
                 "bootstrap timeout from broadcaster"
             };
-            return (SubscriptionExit::error(reason), processor.vm_rebuild);
+            return (SubscriptionExit::error(reason), processor.rebuild);
         };
 
         match next_message {
             None => {
                 return (
                     SubscriptionExit::error("broadcaster websocket ended"),
-                    processor.vm_rebuild,
+                    processor.rebuild,
                 )
             }
             Some(Ok(Message::Text(text))) => {
@@ -963,7 +1032,7 @@ async fn process_broadcaster_subscription(
                             SubscriptionExit::error(format!(
                                 "failed to decode broadcaster payload: {error}"
                             )),
-                            processor.vm_rebuild,
+                            processor.rebuild,
                         )
                     }
                 };
@@ -971,27 +1040,27 @@ async fn process_broadcaster_subscription(
                 if let Err(error) = processor.observe(envelope).await {
                     return (
                         SubscriptionExit::error(error.to_string()),
-                        processor.vm_rebuild,
+                        processor.rebuild,
                     );
                 }
             }
             Some(Ok(Message::Binary(_))) => {
                 return (
                     SubscriptionExit::error("unexpected binary broadcaster payload"),
-                    processor.vm_rebuild,
+                    processor.rebuild,
                 );
             }
             Some(Ok(Message::Close(_))) => {
                 return (
                     SubscriptionExit::error("broadcaster websocket closed"),
-                    processor.vm_rebuild,
+                    processor.rebuild,
                 );
             }
             Some(Ok(_)) => {}
             Some(Err(error)) => {
                 return (
                     SubscriptionExit::error(error.to_string()),
-                    processor.vm_rebuild,
+                    processor.rebuild,
                 )
             }
         }
@@ -1001,8 +1070,8 @@ async fn process_broadcaster_subscription(
 async fn handle_subscription_reset(
     controls: &BroadcasterSubscriptionControls,
     last_error: Option<String>,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
-) -> Option<VmSubscriptionRebuildState> {
+    rebuild: Option<SubscriptionRebuildState>,
+) -> Option<SubscriptionRebuildState> {
     controls
         .broadcaster_subscription()
         .mark_disconnected(last_error.clone())
@@ -1024,21 +1093,26 @@ async fn handle_subscription_reset(
                 let mut vm_stream = vm_controls.vm_stream.write().await;
                 vm_stream.last_error = last_error;
             }
-            let vm_rebuild = begin_or_continue_vm_rebuild(vm_controls, vm_rebuild).await;
+            let rebuild = begin_or_continue_vm_rebuild(vm_controls, rebuild).await;
             controls.state_store().reset().await;
-            Some(vm_rebuild)
+            Some(rebuild)
+        }
+        BroadcasterSubscriptionControls::Rfq(rfq_controls) => {
+            let rebuild = begin_or_continue_rfq_rebuild(rfq_controls, rebuild).await;
+            controls.state_store().reset().await;
+            Some(rebuild)
         }
     }
 }
 
-struct VmSubscriptionRebuildState {
+struct SubscriptionRebuildState {
     guard: OwnedRwLockWriteGuard<()>,
 }
 
 async fn begin_or_continue_vm_rebuild(
     controls: &VmBroadcasterSubscriptionControls,
-    vm_rebuild: Option<VmSubscriptionRebuildState>,
-) -> VmSubscriptionRebuildState {
+    rebuild: Option<SubscriptionRebuildState>,
+) -> SubscriptionRebuildState {
     {
         let mut vm_stream = controls.vm_stream.write().await;
         vm_stream.rebuilding = true;
@@ -1048,8 +1122,8 @@ async fn begin_or_continue_vm_rebuild(
         }
     }
 
-    if let Some(vm_rebuild) = vm_rebuild {
-        return vm_rebuild;
+    if let Some(rebuild) = rebuild {
+        return rebuild;
     }
 
     let guard = controls.simulation_rebuild_gate.clone().write_owned().await;
@@ -1061,7 +1135,20 @@ async fn begin_or_continue_vm_rebuild(
         );
     }
 
-    VmSubscriptionRebuildState { guard }
+    SubscriptionRebuildState { guard }
+}
+
+async fn begin_or_continue_rfq_rebuild(
+    controls: &RfqBroadcasterSubscriptionControls,
+    rebuild: Option<SubscriptionRebuildState>,
+) -> SubscriptionRebuildState {
+    if let Some(rebuild) = rebuild {
+        return rebuild;
+    }
+
+    let guard = controls.simulation_rebuild_gate.clone().write_owned().await;
+
+    SubscriptionRebuildState { guard }
 }
 
 fn snapshot_partition_update(partition: BroadcasterSnapshotPartition) -> Update {
@@ -1268,12 +1355,16 @@ mod tests {
         token_store: Arc<TokenStore>,
         native_subscription: BroadcasterSubscriptionStatus,
         vm_subscription: BroadcasterSubscriptionStatus,
+        rfq_subscription: BroadcasterSubscriptionStatus,
         native_state_store: Arc<StateStore>,
         vm_state_store: Arc<StateStore>,
+        rfq_state_store: Arc<StateStore>,
         native_stream_health: Arc<StreamHealth>,
         vm_stream_health: Arc<StreamHealth>,
+        rfq_stream_health: Arc<StreamHealth>,
         vm_stream: Arc<RwLock<VmStreamStatus>>,
-        simulation_rebuild_gate: Arc<RwLock<()>>,
+        vm_simulation_rebuild_gate: Arc<RwLock<()>>,
+        rfq_simulation_rebuild_gate: Arc<RwLock<()>>,
     }
 
     impl TestControls {
@@ -1290,12 +1381,16 @@ mod tests {
                 token_store: Arc::clone(&token_store),
                 native_subscription: BroadcasterSubscriptionStatus::default(),
                 vm_subscription: BroadcasterSubscriptionStatus::default(),
+                rfq_subscription: BroadcasterSubscriptionStatus::default(),
                 native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
                 vm_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
+                rfq_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
                 native_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream_health: Arc::new(StreamHealth::new()),
+                rfq_stream_health: Arc::new(StreamHealth::new()),
                 vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-                simulation_rebuild_gate: Arc::new(RwLock::new(())),
+                vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
+                rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             }
         }
 
@@ -1317,7 +1412,18 @@ mod tests {
                 tokens: Arc::clone(&self.token_store),
                 protocols: vec!["vm:curve".to_string()],
                 vm_stream: Arc::clone(&self.vm_stream),
-                simulation_rebuild_gate: Arc::clone(&self.simulation_rebuild_gate),
+                simulation_rebuild_gate: Arc::clone(&self.vm_simulation_rebuild_gate),
+            })
+        }
+
+        fn rfq(&self) -> BroadcasterSubscriptionControls {
+            BroadcasterSubscriptionControls::Rfq(super::RfqBroadcasterSubscriptionControls {
+                broadcaster_subscription: self.rfq_subscription.clone(),
+                state_store: Arc::clone(&self.rfq_state_store),
+                stream_health: Arc::clone(&self.rfq_stream_health),
+                tokens: Arc::clone(&self.token_store),
+                protocols: vec!["rfq:hashflow".to_string()],
+                simulation_rebuild_gate: Arc::clone(&self.rfq_simulation_rebuild_gate),
             })
         }
     }
@@ -1355,6 +1461,22 @@ mod tests {
             Vec::new(),
             HashMap::new(),
             Bytes::from([8u8; 32]),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .unwrap_or_else(|| unreachable!("valid timestamp"))
+                .naive_utc(),
+        )
+    }
+
+    fn rfq_component() -> ProtocolComponent {
+        ProtocolComponent::new(
+            Bytes::from([7u8; 20]),
+            "rfq:hashflow".to_string(),
+            "hashflow_pool".to_string(),
+            Chain::Ethereum,
+            vec![dummy_token(8, "RFQA"), dummy_token(9, "RFQB")],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::from([6u8; 32]),
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
                 .unwrap_or_else(|| unreachable!("valid timestamp"))
                 .naive_utc(),
@@ -1449,6 +1571,57 @@ mod tests {
         )
     }
 
+    fn rfq_snapshot_start_envelope(total_chunks: u32) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            1,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                "snapshot-1",
+                Chain::Ethereum.id(),
+                vec![BroadcasterBackend::Rfq],
+                total_chunks,
+            )?),
+        ))
+    }
+
+    fn rfq_snapshot_chunk_envelope(block_number: u64) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                0,
+                vec![BroadcasterSnapshotPartition::new(
+                    BroadcasterBackend::Rfq,
+                    block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-rfq",
+                        rfq_component(),
+                        Box::new(DummySim(7)),
+                    )],
+                    BTreeMap::new(),
+                )],
+            )?),
+        ))
+    }
+
+    fn empty_rfq_snapshot_chunk_envelope(block_number: u64) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                0,
+                vec![BroadcasterSnapshotPartition::new(
+                    BroadcasterBackend::Rfq,
+                    block_number,
+                    Vec::new(),
+                    BTreeMap::new(),
+                )],
+            )?),
+        ))
+    }
+
     fn update_envelope() -> Result<BroadcasterEnvelope> {
         Ok(BroadcasterEnvelope::new(
             "stream-1",
@@ -1467,6 +1640,53 @@ mod tests {
                     BTreeMap::new(),
                 ),
             ])?),
+        ))
+    }
+
+    fn rfq_update_envelope(block_number: u64) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            4,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Rfq,
+                    block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-rfq",
+                        rfq_component(),
+                        Box::new(DummySim(8)),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                ),
+            ])?),
+        ))
+    }
+
+    fn raw_rfq_snapshot_chunk_envelope() -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                0,
+                vec![BroadcasterSnapshotPartition::with_messages(
+                    BroadcasterBackend::Rfq,
+                    21,
+                    vec![BroadcasterProtocolMessage::new(
+                        "rfq:hashflow",
+                        SynchronizerState::Ready(raw_block_header(21, 7)),
+                        StateSyncMessage {
+                            header: raw_block_header(21, 7),
+                            snapshots: Snapshot::default(),
+                            deltas: None,
+                            removed_components: HashMap::new(),
+                        },
+                    )],
+                    BTreeMap::new(),
+                )],
+            )?),
         ))
     }
 
@@ -1861,6 +2081,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rfq_snapshot_partition_hydrates_rfq_state_store() -> Result<()> {
+        let controls = TestControls::new();
+        let mut rfq_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.rfq(), None);
+
+        rfq_processor
+            .observe(rfq_snapshot_start_envelope(1)?)
+            .await?;
+        rfq_processor
+            .observe(rfq_snapshot_chunk_envelope(21)?)
+            .await?;
+        rfq_processor.observe(snapshot_end_envelope()).await?;
+
+        assert_eq!(controls.rfq_state_store.current_block().await, 21);
+        assert_eq!(controls.rfq_state_store.total_states().await, 1);
+        assert!(controls.rfq_state_store.has_pool("pool-rfq").await);
+        assert!(
+            controls
+                .rfq_subscription
+                .snapshot()
+                .await
+                .bootstrap_complete
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_live_update_partition_advances_rfq_state_store() -> Result<()> {
+        let controls = TestControls::new();
+        let mut rfq_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.rfq(), None);
+
+        rfq_processor
+            .observe(rfq_snapshot_start_envelope(1)?)
+            .await?;
+        rfq_processor
+            .observe(empty_rfq_snapshot_chunk_envelope(20)?)
+            .await?;
+        rfq_processor.observe(snapshot_end_envelope()).await?;
+        rfq_processor.observe(rfq_update_envelope(22)?).await?;
+
+        assert_eq!(controls.rfq_state_store.current_block().await, 22);
+        assert_eq!(controls.rfq_state_store.total_states().await, 1);
+        assert!(controls.rfq_state_store.has_pool("pool-rfq").await);
+        assert_eq!(controls.rfq_stream_health.last_block().await, 22);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_raw_message_partition_fails_explicitly() -> Result<()> {
+        let controls = TestControls::new();
+        let mut rfq_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.rfq(), None);
+
+        rfq_processor
+            .observe(rfq_snapshot_start_envelope(1)?)
+            .await?;
+        let Err(error) = rfq_processor
+            .observe(raw_rfq_snapshot_chunk_envelope()?)
+            .await
+        else {
+            return Err(anyhow!("raw rfq partition should fail"));
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("raw RFQ broadcaster messages are unsupported"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn http_snapshot_bootstrap_populates_processor_before_live_attach() -> Result<()> {
         let controls = TestControls::new();
         let native_controls = controls.native();
@@ -2138,7 +2432,7 @@ mod tests {
 
         bootstrap(&mut native_processor).await?;
         bootstrap(&mut vm_processor).await?;
-        let vm_rebuild_read_guard = Arc::clone(&controls.simulation_rebuild_gate)
+        let vm_rebuild_read_guard = Arc::clone(&controls.vm_simulation_rebuild_gate)
             .read_owned()
             .await;
 
@@ -2242,6 +2536,120 @@ mod tests {
         let vm_stream = controls.vm_stream.read().await;
         assert!(!vm_stream.rebuilding);
         assert!(vm_stream.rebuild_started_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vm_subscription_reset_does_not_wait_on_rfq_route_guards() -> Result<()> {
+        let controls = TestControls::new();
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
+
+        controls.vm_stream_health.mark_started().await;
+        bootstrap(&mut processor).await?;
+
+        let rfq_route_guard = Arc::clone(&controls.rfq_simulation_rebuild_gate)
+            .read_owned()
+            .await;
+        let vm_controls = controls.vm();
+        let vm_rebuild = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_subscription_reset(
+                &vm_controls,
+                Some("vm broadcaster dropped".to_string()),
+                None,
+            ),
+        )
+        .await?;
+        drop(rfq_route_guard);
+
+        assert!(vm_rebuild.is_some());
+        assert_eq!(controls.vm_state_store.current_block().await, 0);
+        assert!(!controls.vm_state_store.has_pool("pool-vm").await);
+        assert!(controls.rfq_simulation_rebuild_gate.try_write().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_subscription_reset_waits_on_rfq_rebuild_gate_until_bootstrap() -> Result<()> {
+        let controls = TestControls::new();
+        let mut native_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        let mut vm_processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.rfq(), None);
+
+        bootstrap(&mut native_processor).await?;
+        bootstrap(&mut vm_processor).await?;
+        controls.rfq_stream_health.mark_started().await;
+        processor.observe(rfq_snapshot_start_envelope(1)?).await?;
+        processor.observe(rfq_snapshot_chunk_envelope(21)?).await?;
+        processor.observe(snapshot_end_envelope()).await?;
+
+        let route_read_guard = Arc::clone(&controls.rfq_simulation_rebuild_gate)
+            .read_owned()
+            .await;
+        let rfq_controls = controls.rfq();
+        let mut reset_task = tokio::spawn(async move {
+            handle_subscription_reset(
+                &rfq_controls,
+                Some("rfq broadcaster dropped".to_string()),
+                None,
+            )
+            .await
+        });
+
+        wait_for_subscription_restart(&controls.rfq_subscription, 1).await?;
+        assert!(
+            !reset_task.is_finished(),
+            "RFQ reset should wait for in-flight RFQ route guards"
+        );
+        assert!(controls.rfq_state_store.has_pool("pool-rfq").await);
+
+        drop(route_read_guard);
+
+        let rfq_rebuild = tokio::time::timeout(Duration::from_secs(5), &mut reset_task).await??;
+        assert!(rfq_rebuild.is_some());
+        assert!(controls.rfq_simulation_rebuild_gate.try_write().is_err());
+        assert!(controls.vm_simulation_rebuild_gate.try_write().is_ok());
+        assert_eq!(controls.rfq_state_store.current_block().await, 0);
+        assert!(!controls.rfq_state_store.has_pool("pool-rfq").await);
+        assert!(!controls.rfq_state_store.is_ready());
+        assert_ne!(controls.native_state_store.current_block().await, 0);
+        assert!(controls.native_state_store.has_pool("pool-native").await);
+        assert_ne!(controls.vm_state_store.current_block().await, 0);
+        assert!(controls.vm_state_store.has_pool("pool-vm").await);
+
+        let mut processor = BroadcasterSubscriptionProcessor::new(
+            Chain::Ethereum.id(),
+            controls.rfq(),
+            rfq_rebuild,
+        );
+        processor.observe(rfq_snapshot_start_envelope(1)?).await?;
+        processor.observe(rfq_snapshot_chunk_envelope(23)?).await?;
+        processor.observe(snapshot_end_envelope()).await?;
+
+        assert!(controls.rfq_simulation_rebuild_gate.try_write().is_ok());
+        assert_eq!(controls.rfq_state_store.current_block().await, 23);
+        assert!(controls.rfq_state_store.has_pool("pool-rfq").await);
+        Ok(())
+    }
+
+    async fn wait_for_subscription_restart(
+        status: &BroadcasterSubscriptionStatus,
+        expected_restart_count: u64,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if status.snapshot().await.restart_count >= expected_restart_count {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timed out waiting for broadcaster subscription restart"))?;
         Ok(())
     }
 
