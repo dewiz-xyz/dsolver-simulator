@@ -249,7 +249,11 @@ impl<'a> RouteResimulator<'a> {
             .await
             .map_err(availability_error)?
         {
-            if (uses_vm || uses_rfq) && !self.rebuild_guard.blocks_rebuilds() {
+            if (uses_vm || uses_rfq)
+                && !self
+                    .rebuild_guard
+                    .blocks_required_rebuilds(uses_vm, uses_rfq)
+            {
                 self.rebuild_guard = self
                     .state
                     .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
@@ -263,8 +267,15 @@ impl<'a> RouteResimulator<'a> {
             .await
             .map_err(availability_error)?
             .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
+        let backend = PoolBackend::from_component(component.as_ref());
+        if backend.is_rfq() {
+            return Err(EncodeError::unavailable(
+                super::RFQ_ENCODE_UNAVAILABLE_MESSAGE,
+            ));
+        }
+
         let entry = CachedPoolEntry {
-            backend: PoolBackend::from_component(component.as_ref()),
+            backend,
             pool_state,
             component,
         };
@@ -716,7 +727,7 @@ mod tests {
                 ..TestAppStateConfig::default()
             },
         );
-        let request_guard = app_state.simulation_rebuild_gate().write_owned().await;
+        let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
         let token_in_address = token_in.address.clone();
         let token_out_address = token_out.address.clone();
         let normalized = NormalizedRouteInternal {
@@ -820,7 +831,7 @@ mod tests {
                 ..TestAppStateConfig::default()
             },
         );
-        let request_guard = app_state.simulation_rebuild_gate().write_owned().await;
+        let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
         let token_in_address = token_in.address.clone();
         let token_out_address = token_out.address.clone();
         let normalized = NormalizedRouteInternal {

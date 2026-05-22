@@ -14,8 +14,7 @@ use crate::config::SlippageConfig;
 use crate::models::erc4626::Erc4626PairPolicy;
 use crate::models::messages::PoolRef;
 use crate::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
-    VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
@@ -158,6 +157,7 @@ pub(super) fn test_app_state(
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
@@ -165,7 +165,6 @@ pub(super) fn test_app_state(
         vm_stream_health: Arc::new(StreamHealth::new()),
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-        rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
         configured_backends: ConfiguredBackends {
             vm: config.enable_vm_pools,
             rfq: config.enable_rfq_pools,
@@ -174,7 +173,8 @@ pub(super) fn test_app_state(
         enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
         request_timeout: config.request_timeout,
-        simulation_rebuild_gate: Arc::new(RwLock::new(())),
+        vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
+        rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
