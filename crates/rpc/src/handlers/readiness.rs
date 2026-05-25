@@ -122,8 +122,7 @@ mod tests {
     use super::{status, StatusPayload};
     use crate::config::SlippageConfig;
     use crate::models::state::{
-        AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
-        VmStreamStatus,
+        AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -245,6 +244,7 @@ mod tests {
             tokens: Arc::clone(&token_store),
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
             vm_state_store: Arc::new(StateStore::new(token_store.clone())),
             rfq_state_store: Arc::new(StateStore::new(token_store)),
@@ -252,7 +252,6 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-            rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: enable_vm_pools,
                 rfq: enable_rfq_pools,
@@ -261,7 +260,8 @@ mod tests {
             enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
-            simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+            vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+            rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
@@ -333,10 +333,6 @@ mod tests {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
         }
-        {
-            let mut rfq_status = state.rfq_stream.write().await;
-            rfq_status.rebuilding = true;
-        }
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -346,8 +342,39 @@ mod tests {
         assert_eq!(payload.backends["native"].reason, Some("state_warming_up"));
         assert_eq!(payload.backends["vm"].status, "ready");
         assert!(payload.backends["rfq"].enabled);
-        assert_eq!(payload.backends["rfq"].status, "rebuilding");
-        assert_eq!(payload.backends["rfq"].reason, Some("rebuilding"));
+        assert_eq!(payload.backends["rfq"].status, "warming_up");
+        assert_eq!(payload.backends["rfq"].reason, Some("state_warming_up"));
+        assert!(payload.backends["rfq"].subscription.is_some());
+    }
+
+    #[tokio::test]
+    async fn status_reports_rfq_broadcaster_subscription_restart_and_error() {
+        let state = test_state(false, true);
+        state
+            .rfq_broadcaster_subscription
+            .mark_disconnected(Some("rfq broadcaster dropped".to_string()))
+            .await;
+
+        let (_status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+
+        let rfq = &payload.backends["rfq"];
+        let subscription = rfq
+            .subscription
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("RFQ status must include subscription"));
+
+        assert!(rfq.enabled);
+        assert_eq!(rfq.status, "warming_up");
+        assert_eq!(rfq.reason, Some("broadcaster_disconnected"));
+        assert_eq!(rfq.restart_count, 1);
+        assert_eq!(rfq.last_error.as_deref(), Some("rfq broadcaster dropped"));
+        assert!(!subscription.connected);
+        assert!(!subscription.bootstrap_complete);
+        assert_eq!(subscription.restart_count, 1);
+        assert_eq!(
+            subscription.last_error.as_deref(),
+            Some("rfq broadcaster dropped")
+        );
     }
 
     #[tokio::test]

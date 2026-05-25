@@ -11,8 +11,7 @@ use jemallocator::Jemalloc;
 use num_bigint::BigUint;
 use runtime::config::{MemoryConfig, SlippageConfig};
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
-    VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -613,6 +612,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         tokens: Arc::clone(&token_store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),
@@ -620,7 +620,6 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         vm_stream_health: Arc::new(StreamHealth::new()),
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         configured_backends: ConfiguredBackends {
             vm: true,
             rfq: true,
@@ -629,7 +628,8 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
         enable_rfq_pools: true,
         readiness_stale: Duration::from_secs(120),
         request_timeout: Duration::from_millis(1000),
-        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(Vec::new()),
@@ -647,12 +647,6 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
     }
 
     rfq_state_store.reset().await;
-    {
-        let mut status = app_state.rfq_stream.write().await;
-        status.rebuilding = true;
-        status.rebuild_started_at = Some(tokio::time::Instant::now());
-    }
-
     assert!(!app_state.vm_ready().await);
     assert_eq!(vm_state_store.total_states().await, 0);
 

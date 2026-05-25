@@ -6,7 +6,8 @@ use axum::{
 use runtime::broadcaster_service::BroadcasterAppState;
 
 use crate::handlers::broadcaster::{
-    create_snapshot_session, snapshot_session_payload, status, token_lookup, token_snapshot, ws,
+    create_rfq_snapshot_session, create_snapshot_session, rfq_snapshot_session_payload, rfq_status,
+    rfq_ws, snapshot_session_payload, status, token_lookup, token_snapshot, ws,
 };
 
 pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
@@ -18,6 +19,13 @@ pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
             get(snapshot_session_payload),
         )
         .route("/ws", get(ws))
+        .route("/rfq/status", get(rfq_status))
+        .route("/rfq/snapshot-sessions", post(create_rfq_snapshot_session))
+        .route(
+            "/rfq/snapshot-sessions/:session_id/payloads/:index",
+            get(rfq_snapshot_session_payload),
+        )
+        .route("/rfq/ws", get(rfq_ws))
         .route("/tokens/snapshot", get(token_snapshot))
         .route("/tokens/lookup", post(token_lookup))
         .with_state(app_state)
@@ -219,6 +227,85 @@ mod tests {
         assert_eq!(payload["stream_id"], "chain-1-stream-1");
         assert_eq!(payload["message_seq"], 1);
         assert_eq!(payload["kind"], "snapshot_start");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_snapshot_session_ignores_warming_rfq_service() -> Result<()> {
+        let app = create_broadcaster_router(
+            build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
+        );
+        let (status, body) = get_json(app.clone(), "/status").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["snapshot"]["configured_backends"],
+            serde_json::json!(["native"])
+        );
+
+        let (status, body) =
+            post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::CREATED);
+        let session_id = body["sessionId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
+        let (_status, payload) =
+            get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
+        assert_eq!(payload["backends"], serde_json::json!(["native"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_snapshot_session_uses_rfq_service() -> Result<()> {
+        let app = create_broadcaster_router(
+            build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
+        );
+        let (status, body) =
+            post_json(app.clone(), "/rfq/snapshot-sessions", serde_json::json!({})).await?;
+
+        assert_eq!(status, StatusCode::CREATED);
+        let session_id = body["sessionId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
+        let (_status, payload) = get_json(
+            app,
+            &format!("/rfq/snapshot-sessions/{session_id}/payloads/0"),
+        )
+        .await?;
+        assert_eq!(payload["backends"], serde_json::json!(["rfq"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_status_reports_rfq_service_independently() -> Result<()> {
+        let app = create_broadcaster_router(
+            build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
+        );
+
+        let (root_status, root_body) = get_json(app.clone(), "/status").await?;
+        assert_eq!(root_status, StatusCode::OK);
+        assert_eq!(root_body["status"], "ready");
+
+        let (rfq_status, rfq_body) = get_json(app, "/rfq/status").await?;
+        assert_eq!(rfq_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rfq_body["status"], "snapshot_warming_up");
+        assert_eq!(
+            rfq_body["snapshot"]["configured_backends"],
+            serde_json::json!(["rfq"])
+        );
+        assert!(rfq_body["upstream"]["connected"].as_bool().unwrap_or(false));
+        assert!(!rfq_body["snapshot"]["ready"].as_bool().unwrap_or(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_status_returns_not_found_when_disabled() -> Result<()> {
+        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
+
+        let (status, body) = get_json(app, "/rfq/status").await?;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "rfq broadcaster disabled");
         Ok(())
     }
 
@@ -551,6 +638,22 @@ mod tests {
         .await
     }
 
+    async fn build_state_with_rfq(
+        raw_mode: SeedMode,
+        rfq_mode: SeedMode,
+    ) -> Result<BroadcasterAppState> {
+        let tokens = token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum);
+        let raw_service = service_with_backend(raw_mode, BroadcasterBackend::Native).await?;
+        let rfq_service = service_with_backend(rfq_mode, BroadcasterBackend::Rfq).await?;
+        Ok(BroadcasterAppState::with_rfq_snapshot_session_ttl(
+            raw_service,
+            rfq_service,
+            tokens,
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+        ))
+    }
+
     async fn build_state_with_tokens(
         mode: SeedMode,
         tokens: Arc<TokenStore>,
@@ -570,6 +673,32 @@ mod tests {
         }
 
         Ok(BroadcasterAppState::new(service, tokens, chain.id()))
+    }
+
+    async fn service_with_backend(
+        mode: SeedMode,
+        backend: BroadcasterBackend,
+    ) -> Result<BroadcasterServiceState> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![backend]);
+        let upstream = BroadcasterUpstreamState::default();
+        let service = BroadcasterServiceState::new(8_388_608, 8, cache, upstream);
+
+        match mode {
+            SeedMode::Disconnected => {}
+            SeedMode::WarmingUp => service.mark_upstream_connected().await,
+            SeedMode::Ready => {
+                service.mark_upstream_connected().await;
+                match backend {
+                    BroadcasterBackend::Native => {
+                        service.apply_update(&native_only_update()).await?
+                    }
+                    BroadcasterBackend::Rfq => service.apply_update(&rfq_only_update()).await?,
+                    BroadcasterBackend::Vm => unreachable!("vm test service is not used"),
+                }
+            }
+        }
+
+        Ok(service)
     }
 
     async fn get_json(app: Router, uri: &str) -> Result<(StatusCode, serde_json::Value)> {
@@ -627,6 +756,25 @@ mod tests {
         Update::new(10, states, new_pairs).set_sync_states(HashMap::from([(
             "uniswap_v2".to_string(),
             SynchronizerState::Ready(block_header(10, 1)),
+        )]))
+    }
+
+    fn rfq_only_update() -> Update {
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert(
+            "rfq-1".to_string(),
+            native_component("rfq-1", "rfq:hashflow"),
+        );
+
+        let mut states = HashMap::new();
+        states.insert(
+            "rfq-1".to_string(),
+            Box::new(DummySim(7)) as Box<dyn ProtocolSim>,
+        );
+
+        Update::new(12, states, new_pairs).set_sync_states(HashMap::from([(
+            "rfq:hashflow".to_string(),
+            SynchronizerState::Ready(block_header(12, 1)),
         )]))
     }
 
