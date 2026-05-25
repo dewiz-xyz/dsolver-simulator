@@ -3,7 +3,8 @@ name: Build & Push Docker Image
 on:
   push:
     branches:
-      - master
+      - solve-base
+      - quoter-base
       - staging
       - shadow
   workflow_dispatch:
@@ -51,9 +52,15 @@ jobs:
           elif [ "$REF_NAME" = "staging" ]; then
             TARGETS='["staging-solve-base"]'
             ENV="staging"
-          else
-            TARGETS='["quoter-base","solve-base"]'
+          elif [ "$REF_NAME" = "solve-base" ]; then
+            TARGETS='["solve-base"]'
             ENV="production"
+          elif [ "$REF_NAME" = "quoter-base" ]; then
+            TARGETS='["quoter-base"]'
+            ENV="production"
+          else
+            echo "Unsupported deploy branch: $REF_NAME" >&2
+            exit 1
           fi
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
