@@ -88,7 +88,6 @@ fn build_rfq_token_client(request_timeout: Duration) -> anyhow::Result<Client> {
     Client::builder()
         .connect_timeout(request_timeout)
         .timeout(request_timeout)
-        .no_proxy()
         .build()
         .map_err(|error| anyhow::anyhow!("Failed to build RFQ token HTTP client: {}", error))
 }
@@ -275,10 +274,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
+    use reqwest::Client;
     use tokio::{io::AsyncReadExt, net::TcpListener, task::JoinHandle};
     use tycho_simulation::tycho_common::models::Chain;
 
-    use super::{load_bebop_token_store, load_liquorice_token_store};
+    use super::{load_bebop_tokens, load_liquorice_tokens};
 
     async fn spawn_stalling_provider() -> Result<(String, JoinHandle<()>)> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -295,12 +295,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bebop_token_bootstrap_times_out_stalled_provider() -> Result<()> {
+    async fn bebop_token_request_times_out_stalled_provider() -> Result<()> {
         let (url, handle) = spawn_stalling_provider().await?;
+        let request_timeout = Duration::from_millis(50);
+        let client = Client::builder()
+            .connect_timeout(request_timeout)
+            .timeout(request_timeout)
+            .no_proxy()
+            .build()?;
         let started_at = Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            load_bebop_token_store(&url, Chain::Base, Duration::from_millis(50)),
+            load_bebop_tokens(&client, &url, Chain::Base, request_timeout),
         )
         .await;
         handle.abort();
@@ -322,18 +328,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn liquorice_token_bootstrap_times_out_stalled_provider() -> Result<()> {
+    async fn liquorice_token_request_times_out_stalled_provider() -> Result<()> {
         let (url, handle) = spawn_stalling_provider().await?;
+        let request_timeout = Duration::from_millis(50);
+        let client = Client::builder()
+            .connect_timeout(request_timeout)
+            .timeout(request_timeout)
+            .no_proxy()
+            .build()?;
         let started_at = Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            load_liquorice_token_store(
-                &url,
-                Chain::Base,
-                "solver",
-                "key",
-                Duration::from_millis(50),
-            ),
+            load_liquorice_tokens(&client, &url, Chain::Base, "solver", "key", request_timeout),
         )
         .await;
         handle.abort();
