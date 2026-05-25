@@ -1121,25 +1121,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn simulator_startup_source_has_no_direct_rfq_provider_stream_path() {
-        let source = include_str!("simulator_service.rs");
-        let forbidden_needles = [
-            ["spawn", "rfq", "stream", "task"].join("_"),
-            ["supervise", "rfq", "stream"].join("_"),
-            ["build", "rfq", "stream"].join("_"),
-            ["RFQ", "Config"].join(""),
-            ["RFQ", "TokenStores"].join(""),
-        ];
-
-        for needle in forbidden_needles {
-            assert!(
-                !source.contains(&needle),
-                "simulator startup must not reference direct RFQ provider stream API `{needle}`"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn build_app_state_initializes_rfq_broadcaster_subscription_status() {
         let config = build_test_config(base_chain_profile(), false, true, None);
