@@ -122,7 +122,8 @@ impl fmt::Display for BroadcasterBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BroadcasterMessageKind {
     SnapshotStart,
     SnapshotChunk,
@@ -146,6 +147,291 @@ impl BroadcasterMessageKind {
 impl fmt::Display for BroadcasterMessageKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+const REDIS_STREAM_SCHEMA_VERSION: &str = "1";
+
+/// Redis Streams field model for one serialized broadcaster envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BroadcasterRedisStreamEntry {
+    pub schema_version: String,
+    #[serde(with = "u64_string")]
+    pub chain_id: u64,
+    pub stream_id: String,
+    #[serde(with = "u64_string")]
+    pub message_seq: u64,
+    pub kind: BroadcasterMessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    pub backend_scope: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_u64_string"
+    )]
+    pub block_number: Option<u64>,
+    #[serde(with = "u64_string")]
+    pub event_time_ms: u64,
+    pub payload_json: String,
+}
+
+impl BroadcasterRedisStreamEntry {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the Redis stream field contract"
+    )]
+    pub fn new(
+        chain_id: u64,
+        stream_id: impl Into<String>,
+        message_seq: u64,
+        kind: BroadcasterMessageKind,
+        snapshot_id: Option<impl Into<String>>,
+        backends: Vec<BroadcasterBackend>,
+        block_number: Option<u64>,
+        event_time_ms: u64,
+        payload_json: impl Into<String>,
+    ) -> Result<Self, BroadcasterContractError> {
+        let snapshot_id = snapshot_id
+            .map(|value| required_redis_field("snapshot_id", value.into()))
+            .transpose()?;
+        let entry = Self {
+            schema_version: REDIS_STREAM_SCHEMA_VERSION.to_string(),
+            chain_id,
+            stream_id: required_redis_field("stream_id", stream_id.into())?,
+            message_seq,
+            kind,
+            snapshot_id,
+            backend_scope: redis_backend_scope(backends)?,
+            block_number,
+            event_time_ms,
+            payload_json: required_redis_field("payload_json", payload_json.into())?,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn validate(&self) -> Result<(), BroadcasterContractError> {
+        ensure_redis_schema_version(&self.schema_version)?;
+        required_redis_field("stream_id", self.stream_id.clone())?;
+        required_redis_field("payload_json", self.payload_json.clone())?;
+        ensure_redis_message_seq(self.message_seq)?;
+        ensure_redis_snapshot_start_message_seq(self.kind, self.message_seq)?;
+        let backends = parse_redis_backend_scope(&self.backend_scope)?;
+        if let Some(snapshot_id) = &self.snapshot_id {
+            required_redis_field("snapshot_id", snapshot_id.clone())?;
+        }
+        if self.snapshot_id.is_none() && redis_entry_requires_snapshot_id(self.kind) {
+            return Err(BroadcasterContractError::RedisEntryMissingSnapshotId { kind: self.kind });
+        }
+        ensure_redis_block_number(self.kind, &backends, self.block_number)?;
+        self.validate_payload(&backends)
+    }
+
+    fn validate_payload(
+        &self,
+        backends: &[BroadcasterBackend],
+    ) -> Result<(), BroadcasterContractError> {
+        let envelope = parse_redis_payload_json(&self.payload_json)?;
+        ensure_stream_id(&self.stream_id, &envelope.stream_id)?;
+        ensure_message_seq(Some(self.message_seq), envelope.message_seq)?;
+        if envelope.kind() != self.kind {
+            return Err(BroadcasterContractError::RedisPayloadKindMismatch {
+                expected: self.kind,
+                found: envelope.kind(),
+            });
+        }
+        if let Some(payload_snapshot_id) = redis_payload_snapshot_id(&envelope.payload) {
+            ensure_redis_snapshot_id(self.snapshot_id.as_deref(), payload_snapshot_id)?;
+        }
+        if let Some(payload_chain_id) = redis_payload_chain_id(&envelope.payload) {
+            ensure_chain_id(self.chain_id, payload_chain_id)?;
+        }
+        if let Some(payload_backends) = redis_payload_backend_scope(&envelope.payload)? {
+            ensure_redis_backend_scope(backends, &payload_backends)?;
+        }
+        ensure_redis_payload_block_number(self.block_number, &envelope.payload)?;
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireEntry {
+            schema_version: String,
+            #[serde(with = "u64_string")]
+            chain_id: u64,
+            stream_id: String,
+            #[serde(with = "u64_string")]
+            message_seq: u64,
+            kind: BroadcasterMessageKind,
+            #[serde(default)]
+            snapshot_id: Option<String>,
+            backend_scope: String,
+            #[serde(default, with = "optional_u64_string")]
+            block_number: Option<u64>,
+            #[serde(with = "u64_string")]
+            event_time_ms: u64,
+            payload_json: String,
+        }
+
+        let wire = WireEntry::deserialize(deserializer)?;
+        let entry = Self {
+            schema_version: wire.schema_version,
+            chain_id: wire.chain_id,
+            stream_id: wire.stream_id,
+            message_seq: wire.message_seq,
+            kind: wire.kind,
+            snapshot_id: wire.snapshot_id,
+            backend_scope: wire.backend_scope,
+            block_number: wire.block_number,
+            event_time_ms: wire.event_time_ms,
+            payload_json: wire.payload_json,
+        };
+        entry.validate().map_err(de::Error::custom)?;
+        Ok(entry)
+    }
+}
+
+/// Pointer to the latest complete snapshot segment in a Redis stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterRedisSnapshotPointer {
+    pub schema_version: String,
+    pub chain_id: u64,
+    pub stream_key: String,
+    pub stream_id: String,
+    pub snapshot_id: String,
+    pub snapshot_start_entry_id: String,
+    pub snapshot_end_entry_id: String,
+    pub live_cursor_entry_id: String,
+    pub completed_at_ms: u64,
+}
+
+impl BroadcasterRedisSnapshotPointer {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the snapshot pointer wire contract"
+    )]
+    pub fn new(
+        chain_id: u64,
+        stream_key: impl Into<String>,
+        stream_id: impl Into<String>,
+        snapshot_id: impl Into<String>,
+        snapshot_start_entry_id: impl Into<String>,
+        snapshot_end_entry_id: impl Into<String>,
+        live_cursor_entry_id: impl Into<String>,
+        completed_at_ms: u64,
+    ) -> Result<Self, BroadcasterContractError> {
+        let snapshot_start_entry_id =
+            required_redis_field("snapshot_start_entry_id", snapshot_start_entry_id.into())?;
+        let snapshot_end_entry_id =
+            required_redis_field("snapshot_end_entry_id", snapshot_end_entry_id.into())?;
+        let live_cursor_entry_id =
+            required_redis_field("live_cursor_entry_id", live_cursor_entry_id.into())?;
+
+        ensure_redis_entry_range(&snapshot_start_entry_id, &snapshot_end_entry_id)?;
+        if live_cursor_entry_id != snapshot_end_entry_id {
+            return Err(
+                BroadcasterContractError::RedisSnapshotPointerLiveCursorMismatch {
+                    snapshot_end_entry_id,
+                    live_cursor_entry_id,
+                },
+            );
+        }
+
+        let pointer = Self {
+            schema_version: REDIS_STREAM_SCHEMA_VERSION.to_string(),
+            chain_id,
+            stream_key: required_redis_field("stream_key", stream_key.into())?,
+            stream_id: required_redis_field("stream_id", stream_id.into())?,
+            snapshot_id: required_redis_field("snapshot_id", snapshot_id.into())?,
+            snapshot_start_entry_id,
+            snapshot_end_entry_id,
+            live_cursor_entry_id,
+            completed_at_ms,
+        };
+        pointer.validate()?;
+        Ok(pointer)
+    }
+
+    pub fn ensure_snapshot_retained(
+        &self,
+        oldest_retained_entry_id: &str,
+    ) -> Result<(), BroadcasterContractError> {
+        let oldest_retained = parse_redis_entry_id(oldest_retained_entry_id)?;
+        let snapshot_start = parse_redis_entry_id(&self.snapshot_start_entry_id)?;
+        if oldest_retained <= snapshot_start {
+            return Ok(());
+        }
+
+        Err(BroadcasterContractError::RedisSnapshotRetentionGap {
+            oldest_retained_entry_id: oldest_retained_entry_id.to_string(),
+            snapshot_start_entry_id: self.snapshot_start_entry_id.clone(),
+        })
+    }
+
+    fn validate(&self) -> Result<(), BroadcasterContractError> {
+        ensure_redis_schema_version(&self.schema_version)?;
+        required_redis_field("stream_key", self.stream_key.clone())?;
+        required_redis_field("stream_id", self.stream_id.clone())?;
+        required_redis_field("snapshot_id", self.snapshot_id.clone())?;
+        required_redis_field(
+            "snapshot_start_entry_id",
+            self.snapshot_start_entry_id.clone(),
+        )?;
+        required_redis_field("snapshot_end_entry_id", self.snapshot_end_entry_id.clone())?;
+        required_redis_field("live_cursor_entry_id", self.live_cursor_entry_id.clone())?;
+        ensure_redis_entry_range(&self.snapshot_start_entry_id, &self.snapshot_end_entry_id)?;
+        if self.live_cursor_entry_id != self.snapshot_end_entry_id {
+            return Err(
+                BroadcasterContractError::RedisSnapshotPointerLiveCursorMismatch {
+                    snapshot_end_entry_id: self.snapshot_end_entry_id.clone(),
+                    live_cursor_entry_id: self.live_cursor_entry_id.clone(),
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for BroadcasterRedisSnapshotPointer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WirePointer {
+            schema_version: String,
+            chain_id: u64,
+            stream_key: String,
+            stream_id: String,
+            snapshot_id: String,
+            snapshot_start_entry_id: String,
+            snapshot_end_entry_id: String,
+            live_cursor_entry_id: String,
+            completed_at_ms: u64,
+        }
+
+        let wire = WirePointer::deserialize(deserializer)?;
+        let pointer = Self {
+            schema_version: wire.schema_version,
+            chain_id: wire.chain_id,
+            stream_key: wire.stream_key,
+            stream_id: wire.stream_id,
+            snapshot_id: wire.snapshot_id,
+            snapshot_start_entry_id: wire.snapshot_start_entry_id,
+            snapshot_end_entry_id: wire.snapshot_end_entry_id,
+            live_cursor_entry_id: wire.live_cursor_entry_id,
+            completed_at_ms: wire.completed_at_ms,
+        };
+        pointer.validate().map_err(de::Error::custom)?;
+        Ok(pointer)
     }
 }
 
@@ -1151,6 +1437,45 @@ pub enum BroadcasterContractError {
         partition_backend: BroadcasterBackend,
         entry_backend: BroadcasterBackend,
     },
+    RedisEntryEmptyField {
+        field: &'static str,
+    },
+    RedisUnsupportedSchemaVersion {
+        found: String,
+    },
+    RedisEntryMissingSnapshotId {
+        kind: BroadcasterMessageKind,
+    },
+    RedisMessageSequenceZero,
+    RedisBackendScopeInvalid {
+        backend_scope: String,
+    },
+    RedisPayloadJsonInvalid {
+        message: String,
+    },
+    RedisPayloadKindMismatch {
+        expected: BroadcasterMessageKind,
+        found: BroadcasterMessageKind,
+    },
+    RedisBlockNumberMismatch {
+        entry_block_number: u64,
+        payload_block_number: u64,
+    },
+    InvalidRedisEntryId {
+        entry_id: String,
+    },
+    RedisSnapshotEntryRangeInvalid {
+        snapshot_start_entry_id: String,
+        snapshot_end_entry_id: String,
+    },
+    RedisSnapshotPointerLiveCursorMismatch {
+        snapshot_end_entry_id: String,
+        live_cursor_entry_id: String,
+    },
+    RedisSnapshotRetentionGap {
+        oldest_retained_entry_id: String,
+        snapshot_start_entry_id: String,
+    },
     TokenChainMismatch {
         expected: u64,
         actual: u64,
@@ -1287,6 +1612,133 @@ fn fmt_unsupported_sync_state_protocol(f: &mut fmt::Formatter<'_>, protocol: &st
     )
 }
 
+fn fmt_redis_contract_error(
+    f: &mut fmt::Formatter<'_>,
+    error: &BroadcasterContractError,
+) -> fmt::Result {
+    match error {
+        BroadcasterContractError::RedisEntryEmptyField { field } => {
+            write!(f, "redis stream field {field} must not be empty")
+        }
+        BroadcasterContractError::RedisUnsupportedSchemaVersion { found } => {
+            write!(f, "unsupported redis schema version: {found}")
+        }
+        BroadcasterContractError::RedisEntryMissingSnapshotId { kind } => {
+            write!(f, "redis {kind} entry requires snapshot_id")
+        }
+        BroadcasterContractError::RedisMessageSequenceZero => {
+            write!(f, "redis message_seq must start at 1")
+        }
+        BroadcasterContractError::RedisBackendScopeInvalid { backend_scope } => {
+            write!(f, "invalid redis backend_scope: {backend_scope}")
+        }
+        BroadcasterContractError::RedisPayloadJsonInvalid { message } => {
+            write!(f, "redis payload_json is invalid: {message}")
+        }
+        BroadcasterContractError::RedisPayloadKindMismatch { expected, found } => {
+            write!(
+                f,
+                "redis payload kind mismatch: expected {expected}, found {found}"
+            )
+        }
+        BroadcasterContractError::RedisBlockNumberMismatch {
+            entry_block_number,
+            payload_block_number,
+        } => write!(
+            f,
+            "redis block_number mismatch: entry {entry_block_number}, payload {payload_block_number}"
+        ),
+        BroadcasterContractError::InvalidRedisEntryId { entry_id } => {
+            write!(f, "invalid redis stream entry id: {entry_id}")
+        }
+        BroadcasterContractError::RedisSnapshotEntryRangeInvalid {
+            snapshot_start_entry_id,
+            snapshot_end_entry_id,
+        } => write!(
+            f,
+            "redis snapshot range is invalid: start {snapshot_start_entry_id}, end {snapshot_end_entry_id}"
+        ),
+        BroadcasterContractError::RedisSnapshotPointerLiveCursorMismatch {
+            snapshot_end_entry_id,
+            live_cursor_entry_id,
+        } => write!(
+            f,
+            "redis snapshot pointer live cursor {live_cursor_entry_id} must match snapshot end {snapshot_end_entry_id}"
+        ),
+        BroadcasterContractError::RedisSnapshotRetentionGap {
+            oldest_retained_entry_id,
+            snapshot_start_entry_id,
+        } => write!(
+            f,
+            "redis retention starts at {oldest_retained_entry_id}, after latest snapshot start {snapshot_start_entry_id}"
+        ),
+        _ => f.write_str("redis contract error"),
+    }
+}
+
+fn fmt_protocol_classification_error(
+    f: &mut fmt::Formatter<'_>,
+    error: &BroadcasterContractError,
+) -> fmt::Result {
+    match error {
+        BroadcasterContractError::UnknownComponentProtocol { component_id } => {
+            fmt_unknown_component_protocol(f, component_id)
+        }
+        BroadcasterContractError::UnsupportedComponentProtocol {
+            component_id,
+            protocol,
+        } => fmt_unsupported_component_protocol(f, component_id, protocol),
+        BroadcasterContractError::StateBackendMissing { component_id } => {
+            fmt_state_backend_missing(f, component_id)
+        }
+        BroadcasterContractError::UnknownSyncStateProtocol { protocol } => {
+            fmt_unknown_sync_state_protocol(f, protocol)
+        }
+        BroadcasterContractError::UnsupportedSyncStateProtocol { protocol } => {
+            fmt_unsupported_sync_state_protocol(f, protocol)
+        }
+        _ => f.write_str("protocol classification error"),
+    }
+}
+
+fn fmt_snapshot_flow_error(
+    f: &mut fmt::Formatter<'_>,
+    error: &BroadcasterContractError,
+) -> fmt::Result {
+    match error {
+        BroadcasterContractError::UnexpectedSnapshotStart { state } => {
+            write!(f, "unexpected snapshot_start while in {state}")
+        }
+        BroadcasterContractError::UnexpectedSnapshotChunk => {
+            write!(f, "unexpected snapshot_chunk while live")
+        }
+        BroadcasterContractError::UnexpectedSnapshotEnd => {
+            write!(f, "unexpected snapshot_end while live")
+        }
+        BroadcasterContractError::UnexpectedSnapshotId { expected, found } => {
+            fmt_unexpected_snapshot_id(f, expected, found)
+        }
+        BroadcasterContractError::UnexpectedChunkIndex { expected, found } => {
+            fmt_unexpected_chunk_index(f, *expected, *found)
+        }
+        BroadcasterContractError::ExtraSnapshotChunk {
+            total_chunks,
+            found,
+        } => write!(
+            f,
+            "received extra snapshot chunk {found} after declared total of {total_chunks}"
+        ),
+        BroadcasterContractError::SnapshotIncomplete {
+            expected_chunks,
+            observed_chunks,
+        } => fmt_snapshot_incomplete(f, *expected_chunks, *observed_chunks),
+        BroadcasterContractError::MissingDeclaredSnapshotBackends { missing } => {
+            fmt_missing_declared_snapshot_backends(f, missing)
+        }
+        _ => f.write_str("snapshot flow error"),
+    }
+}
+
 impl fmt::Display for BroadcasterContractError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1306,31 +1758,14 @@ impl fmt::Display for BroadcasterContractError {
             Self::MessageSequenceOverflow { message_seq } => {
                 write!(f, "message sequence overflow at {message_seq}")
             }
-            Self::UnexpectedSnapshotStart { state } => {
-                write!(f, "unexpected snapshot_start while in {state}")
-            }
-            Self::UnexpectedSnapshotChunk => write!(f, "unexpected snapshot_chunk while live"),
-            Self::UnexpectedSnapshotEnd => write!(f, "unexpected snapshot_end while live"),
-            Self::UnexpectedSnapshotId { expected, found } => {
-                fmt_unexpected_snapshot_id(f, expected, found)
-            }
-            Self::UnexpectedChunkIndex { expected, found } => {
-                fmt_unexpected_chunk_index(f, *expected, *found)
-            }
-            Self::ExtraSnapshotChunk {
-                total_chunks,
-                found,
-            } => write!(
-                f,
-                "received extra snapshot chunk {found} after declared total of {total_chunks}"
-            ),
-            Self::SnapshotIncomplete {
-                expected_chunks,
-                observed_chunks,
-            } => fmt_snapshot_incomplete(f, *expected_chunks, *observed_chunks),
-            Self::MissingDeclaredSnapshotBackends { missing } => {
-                fmt_missing_declared_snapshot_backends(f, missing)
-            }
+            Self::UnexpectedSnapshotStart { .. }
+            | Self::UnexpectedSnapshotChunk
+            | Self::UnexpectedSnapshotEnd
+            | Self::UnexpectedSnapshotId { .. }
+            | Self::UnexpectedChunkIndex { .. }
+            | Self::ExtraSnapshotChunk { .. }
+            | Self::SnapshotIncomplete { .. }
+            | Self::MissingDeclaredSnapshotBackends { .. } => fmt_snapshot_flow_error(f, self),
             Self::UpdateBeforeSnapshotComplete => {
                 write!(f, "received update before snapshot bootstrap completed")
             }
@@ -1353,21 +1788,12 @@ impl fmt::Display for BroadcasterContractError {
             Self::NewPairMissingState { component_id } => {
                 write!(f, "new pair {component_id} is missing its state payload")
             }
-            Self::UnknownComponentProtocol { component_id } => {
-                fmt_unknown_component_protocol(f, component_id)
-            }
-            Self::UnsupportedComponentProtocol {
-                component_id,
-                protocol,
-            } => fmt_unsupported_component_protocol(f, component_id, protocol),
-            Self::StateBackendMissing { component_id } => {
-                fmt_state_backend_missing(f, component_id)
-            }
-            Self::UnknownSyncStateProtocol { protocol } => {
-                fmt_unknown_sync_state_protocol(f, protocol)
-            }
-            Self::UnsupportedSyncStateProtocol { protocol } => {
-                fmt_unsupported_sync_state_protocol(f, protocol)
+            Self::UnknownComponentProtocol { .. }
+            | Self::UnsupportedComponentProtocol { .. }
+            | Self::StateBackendMissing { .. }
+            | Self::UnknownSyncStateProtocol { .. }
+            | Self::UnsupportedSyncStateProtocol { .. } => {
+                fmt_protocol_classification_error(f, self)
             }
             Self::PartitionContentBackendMismatch {
                 context,
@@ -1381,6 +1807,18 @@ impl fmt::Display for BroadcasterContractError {
                 *partition_backend,
                 *entry_backend,
             ),
+            Self::RedisEntryEmptyField { .. }
+            | Self::RedisUnsupportedSchemaVersion { .. }
+            | Self::RedisEntryMissingSnapshotId { .. }
+            | Self::RedisMessageSequenceZero
+            | Self::RedisBackendScopeInvalid { .. }
+            | Self::RedisPayloadJsonInvalid { .. }
+            | Self::RedisPayloadKindMismatch { .. }
+            | Self::RedisBlockNumberMismatch { .. }
+            | Self::InvalidRedisEntryId { .. }
+            | Self::RedisSnapshotEntryRangeInvalid { .. }
+            | Self::RedisSnapshotPointerLiveCursorMismatch { .. }
+            | Self::RedisSnapshotRetentionGap { .. } => fmt_redis_contract_error(f, self),
             Self::TokenChainMismatch { expected, actual } => {
                 write!(
                     f,
@@ -1455,6 +1893,386 @@ fn next_message_seq(message_seq: u64) -> Result<u64, BroadcasterContractError> {
     message_seq
         .checked_add(1)
         .ok_or(BroadcasterContractError::MessageSequenceOverflow { message_seq })
+}
+
+fn redis_entry_requires_snapshot_id(kind: BroadcasterMessageKind) -> bool {
+    matches!(
+        kind,
+        BroadcasterMessageKind::SnapshotStart
+            | BroadcasterMessageKind::SnapshotChunk
+            | BroadcasterMessageKind::SnapshotEnd
+            | BroadcasterMessageKind::Heartbeat
+    )
+}
+
+fn required_redis_field(
+    field: &'static str,
+    value: String,
+) -> Result<String, BroadcasterContractError> {
+    if value.trim().is_empty() {
+        Err(BroadcasterContractError::RedisEntryEmptyField { field })
+    } else {
+        Ok(value)
+    }
+}
+
+fn ensure_redis_schema_version(schema_version: &str) -> Result<(), BroadcasterContractError> {
+    if schema_version == REDIS_STREAM_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(BroadcasterContractError::RedisUnsupportedSchemaVersion {
+            found: schema_version.to_string(),
+        })
+    }
+}
+
+fn ensure_redis_message_seq(message_seq: u64) -> Result<(), BroadcasterContractError> {
+    if message_seq == 0 {
+        Err(BroadcasterContractError::RedisMessageSequenceZero)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_redis_snapshot_start_message_seq(
+    kind: BroadcasterMessageKind,
+    message_seq: u64,
+) -> Result<(), BroadcasterContractError> {
+    if kind == BroadcasterMessageKind::SnapshotStart {
+        ensure_message_seq(Some(1), message_seq)
+    } else {
+        Ok(())
+    }
+}
+
+fn redis_backend_scope(
+    backends: Vec<BroadcasterBackend>,
+) -> Result<String, BroadcasterContractError> {
+    if backends.is_empty() {
+        return Err(BroadcasterContractError::RedisEntryEmptyField {
+            field: "backend_scope",
+        });
+    }
+
+    let mut unique = BTreeSet::new();
+    for backend in backends {
+        if !unique.insert(backend) {
+            return Err(BroadcasterContractError::DuplicateBackendEntry {
+                context: "redis_entry.backend_scope",
+                backend,
+            });
+        }
+    }
+
+    let mut scope = String::new();
+    for backend in unique {
+        if !scope.is_empty() {
+            scope.push(',');
+        }
+        scope.push_str(backend.as_str());
+    }
+    Ok(scope)
+}
+
+fn parse_redis_backend_scope(
+    backend_scope: &str,
+) -> Result<Vec<BroadcasterBackend>, BroadcasterContractError> {
+    required_redis_field("backend_scope", backend_scope.to_string())?;
+    let mut backends = Vec::new();
+    for value in backend_scope.split(',') {
+        let backend = parse_redis_backend(value)?;
+        if backends.contains(&backend) {
+            return Err(BroadcasterContractError::DuplicateBackendEntry {
+                context: "redis_entry.backend_scope",
+                backend,
+            });
+        }
+        backends.push(backend);
+    }
+    let expected = redis_backend_scope(backends.clone())?;
+    if backend_scope != expected {
+        return Err(BroadcasterContractError::RedisBackendScopeInvalid {
+            backend_scope: backend_scope.to_string(),
+        });
+    }
+    Ok(backends)
+}
+
+fn parse_redis_backend(value: &str) -> Result<BroadcasterBackend, BroadcasterContractError> {
+    match value {
+        "native" => Ok(BroadcasterBackend::Native),
+        "vm" => Ok(BroadcasterBackend::Vm),
+        "rfq" => Ok(BroadcasterBackend::Rfq),
+        _ => Err(BroadcasterContractError::RedisBackendScopeInvalid {
+            backend_scope: value.to_string(),
+        }),
+    }
+}
+
+fn ensure_redis_block_number(
+    kind: BroadcasterMessageKind,
+    backends: &[BroadcasterBackend],
+    block_number: Option<u64>,
+) -> Result<(), BroadcasterContractError> {
+    let requires_block = matches!(
+        kind,
+        BroadcasterMessageKind::SnapshotChunk | BroadcasterMessageKind::Update
+    ) && backends
+        .iter()
+        .any(|backend| matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm));
+    if requires_block && block_number.is_none() {
+        return Err(BroadcasterContractError::RedisEntryEmptyField {
+            field: "block_number",
+        });
+    }
+    Ok(())
+}
+
+fn ensure_redis_payload_block_number(
+    entry_block_number: Option<u64>,
+    payload: &BroadcasterPayload,
+) -> Result<(), BroadcasterContractError> {
+    let Some(entry_block_number) = entry_block_number else {
+        return Ok(());
+    };
+    for payload_block_number in redis_payload_native_vm_blocks(payload) {
+        if payload_block_number != entry_block_number {
+            return Err(BroadcasterContractError::RedisBlockNumberMismatch {
+                entry_block_number,
+                payload_block_number,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn redis_payload_native_vm_blocks(payload: &BroadcasterPayload) -> Vec<u64> {
+    match payload {
+        BroadcasterPayload::SnapshotChunk(chunk) => chunk
+            .partitions
+            .iter()
+            .filter(|partition| {
+                matches!(
+                    partition.backend,
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm
+                )
+            })
+            .map(|partition| partition.block_number)
+            .collect(),
+        BroadcasterPayload::Update(update) => update
+            .partitions
+            .iter()
+            .filter(|partition| {
+                matches!(
+                    partition.backend,
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm
+                )
+            })
+            .map(|partition| partition.block_number)
+            .collect(),
+        BroadcasterPayload::SnapshotStart(_)
+        | BroadcasterPayload::SnapshotEnd(_)
+        | BroadcasterPayload::Heartbeat(_) => Vec::new(),
+    }
+}
+
+fn parse_redis_payload_json(
+    payload_json: &str,
+) -> Result<BroadcasterEnvelope, BroadcasterContractError> {
+    serde_json::from_str(payload_json).map_err(|error| {
+        BroadcasterContractError::RedisPayloadJsonInvalid {
+            message: error.to_string(),
+        }
+    })
+}
+
+fn redis_payload_snapshot_id(payload: &BroadcasterPayload) -> Option<&str> {
+    match payload {
+        BroadcasterPayload::SnapshotStart(start) => Some(&start.snapshot_id),
+        BroadcasterPayload::SnapshotChunk(chunk) => Some(&chunk.snapshot_id),
+        BroadcasterPayload::SnapshotEnd(end) => Some(&end.snapshot_id),
+        BroadcasterPayload::Update(_) => None,
+        BroadcasterPayload::Heartbeat(heartbeat) => Some(&heartbeat.snapshot_id),
+    }
+}
+
+fn redis_payload_chain_id(payload: &BroadcasterPayload) -> Option<u64> {
+    match payload {
+        BroadcasterPayload::SnapshotStart(start) => Some(start.chain_id),
+        BroadcasterPayload::Heartbeat(heartbeat) => Some(heartbeat.chain_id),
+        BroadcasterPayload::SnapshotChunk(_)
+        | BroadcasterPayload::SnapshotEnd(_)
+        | BroadcasterPayload::Update(_) => None,
+    }
+}
+
+fn redis_payload_backend_scope(
+    payload: &BroadcasterPayload,
+) -> Result<Option<Vec<BroadcasterBackend>>, BroadcasterContractError> {
+    match payload {
+        BroadcasterPayload::SnapshotStart(start) => Ok(Some(start.backends.clone())),
+        BroadcasterPayload::SnapshotChunk(chunk) => {
+            redis_partition_backend_scope(&chunk.partitions)
+        }
+        BroadcasterPayload::SnapshotEnd(_) => Ok(None),
+        BroadcasterPayload::Update(update) => redis_partition_backend_scope(&update.partitions),
+        BroadcasterPayload::Heartbeat(heartbeat) => Ok(Some(
+            heartbeat
+                .backend_heads
+                .iter()
+                .map(|head| head.backend)
+                .collect(),
+        )),
+    }
+}
+
+fn redis_partition_backend_scope<T: RedisPartitionBackend>(
+    partitions: &[T],
+) -> Result<Option<Vec<BroadcasterBackend>>, BroadcasterContractError> {
+    let backends: Vec<_> = partitions
+        .iter()
+        .map(RedisPartitionBackend::backend)
+        .collect();
+    if backends.is_empty() {
+        return Ok(Some(backends));
+    }
+    parse_redis_backend_scope(&redis_backend_scope(backends)?).map(Some)
+}
+
+trait RedisPartitionBackend {
+    fn backend(&self) -> BroadcasterBackend;
+}
+
+impl RedisPartitionBackend for BroadcasterSnapshotPartition {
+    fn backend(&self) -> BroadcasterBackend {
+        self.backend
+    }
+}
+
+impl RedisPartitionBackend for BroadcasterUpdatePartition {
+    fn backend(&self) -> BroadcasterBackend {
+        self.backend
+    }
+}
+
+fn ensure_redis_snapshot_id(
+    entry_snapshot_id: Option<&str>,
+    payload_snapshot_id: &str,
+) -> Result<(), BroadcasterContractError> {
+    let Some(entry_snapshot_id) = entry_snapshot_id else {
+        return Err(BroadcasterContractError::RedisEntryMissingSnapshotId {
+            kind: BroadcasterMessageKind::SnapshotStart,
+        });
+    };
+    ensure_snapshot_id(entry_snapshot_id, payload_snapshot_id)
+}
+
+fn ensure_redis_backend_scope(
+    entry_backends: &[BroadcasterBackend],
+    payload_backends: &[BroadcasterBackend],
+) -> Result<(), BroadcasterContractError> {
+    let entry_scope = redis_backend_scope(entry_backends.to_vec())?;
+    let payload_scope = redis_backend_scope(payload_backends.to_vec()).unwrap_or_default();
+    if entry_scope == payload_scope {
+        Ok(())
+    } else {
+        Err(BroadcasterContractError::RedisBackendScopeInvalid {
+            backend_scope: entry_scope,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RedisEntryIdParts {
+    millis: u64,
+    sequence: u64,
+}
+
+fn parse_redis_entry_id(entry_id: &str) -> Result<RedisEntryIdParts, BroadcasterContractError> {
+    let Some((millis, sequence)) = entry_id.split_once('-') else {
+        return Err(BroadcasterContractError::InvalidRedisEntryId {
+            entry_id: entry_id.to_string(),
+        });
+    };
+    let Ok(millis) = millis.parse() else {
+        return Err(BroadcasterContractError::InvalidRedisEntryId {
+            entry_id: entry_id.to_string(),
+        });
+    };
+    let Ok(sequence) = sequence.parse() else {
+        return Err(BroadcasterContractError::InvalidRedisEntryId {
+            entry_id: entry_id.to_string(),
+        });
+    };
+    Ok(RedisEntryIdParts { millis, sequence })
+}
+
+fn ensure_redis_entry_range(
+    snapshot_start_entry_id: &str,
+    snapshot_end_entry_id: &str,
+) -> Result<(), BroadcasterContractError> {
+    let snapshot_start = parse_redis_entry_id(snapshot_start_entry_id)?;
+    let snapshot_end = parse_redis_entry_id(snapshot_end_entry_id)?;
+    if snapshot_start < snapshot_end {
+        return Ok(());
+    }
+
+    Err(BroadcasterContractError::RedisSnapshotEntryRangeInvalid {
+        snapshot_start_entry_id: snapshot_start_entry_id.to_string(),
+        snapshot_end_entry_id: snapshot_end_entry_id.to_string(),
+    })
+}
+
+mod u64_string {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde serializer helpers receive values by reference"
+    )]
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value
+            .parse()
+            .map_err(|_| de::Error::custom("expected u64 string"))
+    }
+}
+
+mod optional_u64_string {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let Some(value) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| de::Error::custom("expected optional u64 string"))
+    }
 }
 
 fn backend_for_component(
@@ -1820,14 +2638,15 @@ mod tests {
 
     use super::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair,
-        BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
-        BroadcasterSnapshotSessionResponse, BroadcasterSnapshotStart, BroadcasterStateDelta,
-        BroadcasterStateEntry, BroadcasterSubscriptionEvent, BroadcasterSubscriptionState,
-        BroadcasterSubscriptionTracker, BroadcasterTokenDto, BroadcasterTokenLookupRequest,
-        BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage,
-        BroadcasterUpdatePartition,
+        BroadcasterHeartbeat, BroadcasterMessageKind, BroadcasterPayload,
+        BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
+        BroadcasterProtocolSyncStatusKind, BroadcasterRedisSnapshotPointer,
+        BroadcasterRedisStreamEntry, BroadcasterRemovedPair, BroadcasterSnapshotChunk,
+        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
+        BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
+        BroadcasterSubscriptionEvent, BroadcasterSubscriptionState, BroadcasterSubscriptionTracker,
+        BroadcasterTokenDto, BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
+        BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2306,6 +3125,455 @@ mod tests {
         assert_eq!(heartbeat.backend_heads[0].block_number, 100);
         assert_eq!(heartbeat.backend_heads[1].backend, BroadcasterBackend::Rfq);
         assert_eq!(heartbeat.backend_heads[1].block_number, 102);
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_round_trips_with_stable_field_shape() -> Result<()> {
+        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
+            "stream-1",
+            3,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        ))?;
+        let entry = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            3,
+            BroadcasterMessageKind::SnapshotEnd,
+            Some("snapshot-1"),
+            vec![
+                BroadcasterBackend::Rfq,
+                BroadcasterBackend::Native,
+                BroadcasterBackend::Vm,
+            ],
+            Some(177),
+            1_710_000_000_123,
+            payload_json.clone(),
+        )?;
+
+        let value = serde_json::to_value(&entry)?;
+
+        assert_eq!(value["schema_version"], "1");
+        assert_eq!(value["chain_id"], "8453");
+        assert_eq!(value["stream_id"], "stream-1");
+        assert_eq!(value["message_seq"], "3");
+        assert_eq!(value["kind"], "snapshot_end");
+        assert_eq!(value["snapshot_id"], "snapshot-1");
+        assert_eq!(value["backend_scope"], "native,vm,rfq");
+        assert_eq!(value["block_number"], "177");
+        assert_eq!(value["event_time_ms"], "1710000000123");
+        assert_eq!(value["payload_json"], payload_json);
+
+        let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
+        assert_eq!(decoded, entry);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_deserialization_requires_payload_json() -> Result<()> {
+        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
+            "schema_version": "1",
+            "chain_id": "8453",
+            "stream_id": "stream-1",
+            "message_seq": "1",
+            "kind": "snapshot_start",
+            "snapshot_id": "snapshot-1",
+            "backend_scope": "native",
+            "event_time_ms": "1710000000000"
+        }))
+        .err()
+        .ok_or_else(|| anyhow!("missing payload_json should fail deserialization"))?;
+
+        assert!(error.to_string().contains("missing field `payload_json`"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_deserialization_validates_contract_invariants() -> Result<()> {
+        let payload_json = serde_json::to_string(&snapshot_end_envelope("stream-1", 1))?;
+
+        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
+            "schema_version": "1",
+            "chain_id": "8453",
+            "stream_id": "stream-1",
+            "message_seq": "1",
+            "kind": "snapshot_end",
+            "backend_scope": "native",
+            "event_time_ms": "1710000000000",
+            "payload_json": payload_json
+        }))
+        .err()
+        .ok_or_else(|| anyhow!("snapshot entry without snapshot_id should fail"))?;
+        assert!(error.to_string().contains("requires snapshot_id"));
+
+        let payload_json = serde_json::to_string(&snapshot_end_envelope("stream-1", 1))?;
+        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
+            "schema_version": "2",
+            "chain_id": "8453",
+            "stream_id": "stream-1",
+            "message_seq": "1",
+            "kind": "snapshot_end",
+            "snapshot_id": "snapshot-1",
+            "backend_scope": "native",
+            "event_time_ms": "1710000000000",
+            "payload_json": payload_json
+        }))
+        .err()
+        .ok_or_else(|| anyhow!("unsupported schema version should fail"))?;
+        assert!(error
+            .to_string()
+            .contains("unsupported redis schema version"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_requires_snapshot_id_for_snapshot_and_heartbeat() -> Result<()> {
+        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
+            "stream-1",
+            1,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        ))?;
+
+        let Err(error) = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            1,
+            BroadcasterMessageKind::SnapshotEnd,
+            None::<String>,
+            vec![BroadcasterBackend::Native],
+            None,
+            1_710_000_000_000,
+            payload_json,
+        ) else {
+            return Err(anyhow!("snapshot entry without snapshot_id should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisEntryMissingSnapshotId {
+                kind: BroadcasterMessageKind::SnapshotEnd,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_rejects_zero_message_sequence() -> Result<()> {
+        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
+            "stream-1",
+            0,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        ))?;
+
+        let Err(error) = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            0,
+            BroadcasterMessageKind::SnapshotEnd,
+            Some("snapshot-1"),
+            vec![BroadcasterBackend::Native],
+            None,
+            1_710_000_000_000,
+            payload_json,
+        ) else {
+            return Err(anyhow!("zero message_seq should fail"));
+        };
+
+        assert_eq!(error, BroadcasterContractError::RedisMessageSequenceZero);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_requires_snapshot_start_to_begin_at_one() -> Result<()> {
+        let payload_json = serde_json::to_string(&snapshot_start_envelope(
+            "stream-1",
+            8453,
+            "snapshot-1",
+            2,
+            1,
+        )?)?;
+
+        let Err(error) = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            2,
+            BroadcasterMessageKind::SnapshotStart,
+            Some("snapshot-1"),
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+            None,
+            1_710_000_000_000,
+            payload_json,
+        ) else {
+            return Err(anyhow!("snapshot_start message_seq must start at one"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::UnexpectedMessageSeq {
+                expected: 1,
+                found: 2,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_deserialization_rejects_empty_snapshot_id() -> Result<()> {
+        let envelope = update_envelope("stream-1", 4)?;
+        let payload_json = serde_json::to_string(&envelope)?;
+
+        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
+            "schema_version": "1",
+            "chain_id": "8453",
+            "stream_id": "stream-1",
+            "message_seq": "4",
+            "kind": "update",
+            "snapshot_id": "",
+            "backend_scope": "native",
+            "block_number": "124",
+            "event_time_ms": "1710000000000",
+            "payload_json": payload_json
+        }))
+        .err()
+        .ok_or_else(|| anyhow!("empty snapshot_id should fail deserialization"))?;
+        assert!(error.to_string().contains("snapshot_id must not be empty"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_requires_block_number_for_native_or_vm_state_entries() -> Result<()> {
+        let envelope = update_envelope("stream-1", 4)?;
+        let payload_json = serde_json::to_string(&envelope)?;
+
+        let Err(error) = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            4,
+            BroadcasterMessageKind::Update,
+            None::<String>,
+            vec![BroadcasterBackend::Native],
+            None,
+            1_710_000_000_000,
+            payload_json,
+        ) else {
+            return Err(anyhow!("native update without block_number should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisEntryEmptyField {
+                field: "block_number",
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_rejects_payload_block_number_mismatch() -> Result<()> {
+        let envelope = update_envelope("stream-1", 4)?;
+        let payload_json = serde_json::to_string(&envelope)?;
+
+        let Err(error) = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            4,
+            BroadcasterMessageKind::Update,
+            None::<String>,
+            vec![BroadcasterBackend::Native],
+            Some(125),
+            1_710_000_000_000,
+            payload_json,
+        ) else {
+            return Err(anyhow!("mismatched block_number should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisBlockNumberMismatch {
+                entry_block_number: 125,
+                payload_block_number: 124,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_rejects_snapshot_chunk_empty_payload_scope() -> Result<()> {
+        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                0,
+                Vec::new(),
+            )?),
+        ))?;
+
+        let Err(error) = BroadcasterRedisStreamEntry::new(
+            8453,
+            "stream-1",
+            2,
+            BroadcasterMessageKind::SnapshotChunk,
+            Some("snapshot-1"),
+            vec![BroadcasterBackend::Native],
+            Some(124),
+            1_710_000_000_000,
+            payload_json,
+        ) else {
+            return Err(anyhow!("empty snapshot chunk payload scope should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisBackendScopeInvalid {
+                backend_scope: "native".to_string(),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_snapshot_pointer_uses_camel_case_shape_and_validates_live_cursor() -> Result<()> {
+        let pointer = BroadcasterRedisSnapshotPointer::new(
+            8453,
+            "dsolver:broadcaster:prod-base:8453:events",
+            "chain-8453-stream-7",
+            "chain-8453-snapshot-7",
+            "1710000000000-0",
+            "1710000000123-0",
+            "1710000000123-0",
+            1_710_000_000_123,
+        )?;
+
+        let value = serde_json::to_value(&pointer)?;
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schemaVersion": "1",
+                "chainId": 8453,
+                "streamKey": "dsolver:broadcaster:prod-base:8453:events",
+                "streamId": "chain-8453-stream-7",
+                "snapshotId": "chain-8453-snapshot-7",
+                "snapshotStartEntryId": "1710000000000-0",
+                "snapshotEndEntryId": "1710000000123-0",
+                "liveCursorEntryId": "1710000000123-0",
+                "completedAtMs": 1710000000123u64
+            })
+        );
+        let decoded: BroadcasterRedisSnapshotPointer = serde_json::from_value(value)?;
+        assert_eq!(decoded, pointer);
+
+        let Err(error) = BroadcasterRedisSnapshotPointer::new(
+            8453,
+            "dsolver:broadcaster:prod-base:8453:events",
+            "chain-8453-stream-7",
+            "chain-8453-snapshot-7",
+            "1710000000000-0",
+            "1710000000123-0",
+            "1710000000999-0",
+            1_710_000_000_123,
+        ) else {
+            return Err(anyhow!("pointer with mismatched live cursor should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisSnapshotPointerLiveCursorMismatch {
+                snapshot_end_entry_id: "1710000000123-0".to_string(),
+                live_cursor_entry_id: "1710000000999-0".to_string(),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_snapshot_pointer_deserialization_validates_invariants() -> Result<()> {
+        let error = serde_json::from_value::<BroadcasterRedisSnapshotPointer>(serde_json::json!({
+            "schemaVersion": "1",
+            "chainId": 8453,
+            "streamKey": "dsolver:broadcaster:prod-base:8453:events",
+            "streamId": "chain-8453-stream-7",
+            "snapshotId": "chain-8453-snapshot-7",
+            "snapshotStartEntryId": "1710000000000-0",
+            "snapshotEndEntryId": "1710000000123-0",
+            "liveCursorEntryId": "1710000000999-0",
+            "completedAtMs": 1710000000123u64
+        }))
+        .err()
+        .ok_or_else(|| anyhow!("mismatched live cursor should fail"))?;
+
+        assert!(error
+            .to_string()
+            .contains("live cursor 1710000000999-0 must match snapshot end"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_snapshot_pointer_rejects_single_entry_range() -> Result<()> {
+        let Err(error) = BroadcasterRedisSnapshotPointer::new(
+            8453,
+            "dsolver:broadcaster:prod-base:8453:events",
+            "chain-8453-stream-7",
+            "chain-8453-snapshot-7",
+            "1710000000000-0",
+            "1710000000000-0",
+            "1710000000000-0",
+            1_710_000_000_123,
+        ) else {
+            return Err(anyhow!("single-entry snapshot range should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisSnapshotEntryRangeInvalid {
+                snapshot_start_entry_id: "1710000000000-0".to_string(),
+                snapshot_end_entry_id: "1710000000000-0".to_string(),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_snapshot_pointer_detects_retention_gap() -> Result<()> {
+        let pointer = BroadcasterRedisSnapshotPointer::new(
+            8453,
+            "dsolver:broadcaster:prod-base:8453:events",
+            "chain-8453-stream-7",
+            "chain-8453-snapshot-7",
+            "1710000000000-0",
+            "1710000000123-0",
+            "1710000000123-0",
+            1_710_000_000_123,
+        )?;
+
+        pointer.ensure_snapshot_retained("1709999999999-0")?;
+        pointer.ensure_snapshot_retained("1710000000000-0")?;
+        let Err(error) = pointer.ensure_snapshot_retained("1710000000001-0") else {
+            return Err(anyhow!("retention past snapshot start should fail"));
+        };
+
+        assert_eq!(
+            error,
+            BroadcasterContractError::RedisSnapshotRetentionGap {
+                oldest_retained_entry_id: "1710000000001-0".to_string(),
+                snapshot_start_entry_id: "1710000000000-0".to_string(),
+            }
+        );
+
         Ok(())
     }
 

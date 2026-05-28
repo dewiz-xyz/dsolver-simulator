@@ -17,6 +17,10 @@ pub use memory::MemoryConfig;
 // 8 MiB per serialized snapshot payload: big enough for efficient HTTP transfer, small enough
 // that retrying one failed chunk stays cheap.
 const DEFAULT_BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES: &str = "8388608";
+const DEFAULT_BROADCASTER_REDIS_BLOCK_MS: &str = "5000";
+const DEFAULT_BROADCASTER_REDIS_READ_COUNT: &str = "128";
+const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
+const DEFAULT_BROADCASTER_REDIS_RETENTION_SECS: &str = "300";
 
 /// Per-chain runtime profile resolved from `CHAIN_ID`.
 #[derive(Clone, Debug)]
@@ -321,6 +325,18 @@ struct StreamConfig {
     readiness_stale_secs: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BroadcasterRedisConfig {
+    pub redis_url: String,
+    pub stream_key: String,
+    pub snapshot_key: String,
+    pub block_ms: u64,
+    pub read_count: u64,
+    pub append_retry_window_ms: u64,
+    pub retention_secs: u64,
+    pub maxlen: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BroadcasterTuning {
     pub snapshot_max_payload_bytes: usize,
@@ -468,6 +484,120 @@ fn load_stream_config() -> StreamConfig {
         stream_restart_backoff_jitter_pct,
         readiness_stale_secs,
     }
+}
+
+pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
+    dotenv::dotenv().ok();
+
+    let redis_url = require_trimmed_env("BROADCASTER_REDIS_URL");
+    let stream_key = require_trimmed_env("BROADCASTER_REDIS_STREAM_KEY");
+    let snapshot_key = require_trimmed_env("BROADCASTER_REDIS_SNAPSHOT_KEY");
+    let block_ms = parse_env_or_default(
+        "BROADCASTER_REDIS_BLOCK_MS",
+        DEFAULT_BROADCASTER_REDIS_BLOCK_MS,
+    );
+    let read_count = parse_env_or_default(
+        "BROADCASTER_REDIS_READ_COUNT",
+        DEFAULT_BROADCASTER_REDIS_READ_COUNT,
+    );
+    let append_retry_window_ms = parse_env_or_default(
+        "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
+        DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS,
+    );
+    let retention_secs = parse_env_or_default(
+        "BROADCASTER_REDIS_RETENTION_SECS",
+        DEFAULT_BROADCASTER_REDIS_RETENTION_SECS,
+    );
+    let maxlen = optional_trimmed_env("BROADCASTER_REDIS_MAXLEN")
+        .map(|value| parse_value_or_panic("BROADCASTER_REDIS_MAXLEN", &value));
+
+    assert_valid_redis_url(&redis_url);
+    assert!(
+        stream_key != snapshot_key,
+        "BROADCASTER_REDIS_STREAM_KEY and BROADCASTER_REDIS_SNAPSHOT_KEY must be different"
+    );
+    assert!(block_ms > 0, "BROADCASTER_REDIS_BLOCK_MS must be > 0");
+    assert!(read_count > 0, "BROADCASTER_REDIS_READ_COUNT must be > 0");
+    assert!(
+        append_retry_window_ms > 0,
+        "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS must be > 0"
+    );
+    assert!(
+        retention_secs > 0,
+        "BROADCASTER_REDIS_RETENTION_SECS must be > 0"
+    );
+    if let Some(maxlen) = maxlen {
+        assert!(maxlen > 0, "BROADCASTER_REDIS_MAXLEN must be > 0");
+    }
+
+    BroadcasterRedisConfig {
+        redis_url,
+        stream_key,
+        snapshot_key,
+        block_ms,
+        read_count,
+        append_retry_window_ms,
+        retention_secs,
+        maxlen,
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "startup config remains fail-fast on invalid Redis URL"
+)]
+fn assert_valid_redis_url(redis_url: &str) {
+    let rest = if let Some(rest) = redis_url.strip_prefix("redis://") {
+        rest
+    } else if let Some(rest) = redis_url.strip_prefix("rediss://") {
+        rest
+    } else {
+        panic!("BROADCASTER_REDIS_URL must start with redis:// or rediss://");
+    };
+
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_else(|| unreachable!("split always yields first segment"));
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let host = if let Some(without_bracket) = host_port.strip_prefix('[') {
+        let (host, rest) = without_bracket.split_once(']').unwrap_or_else(|| {
+            panic!("BROADCASTER_REDIS_URL bracketed host must close with ]");
+        });
+        assert!(
+            rest.is_empty() || rest.starts_with(':'),
+            "BROADCASTER_REDIS_URL bracketed host must be followed by a port or end of authority"
+        );
+        validate_redis_port(rest.strip_prefix(':'));
+        host
+    } else {
+        let (host, port) = host_port
+            .rsplit_once(':')
+            .map_or((host_port, None), |(host, port)| (host, Some(port)));
+        assert!(
+            !host.contains(':'),
+            "BROADCASTER_REDIS_URL IPv6 hosts must use brackets"
+        );
+        validate_redis_port(port);
+        host
+    };
+
+    assert!(
+        !host.trim().is_empty(),
+        "BROADCASTER_REDIS_URL must include a host"
+    );
+}
+
+fn validate_redis_port(port: Option<&str>) {
+    let Some(port) = port else {
+        return;
+    };
+    assert!(
+        !port.is_empty() && port.parse::<u16>().is_ok(),
+        "BROADCASTER_REDIS_URL port must be a valid u16"
+    );
 }
 
 fn load_broadcaster_tuning() -> BroadcasterTuning {
@@ -721,6 +851,16 @@ mod tests {
         "BROADCASTER_TOKEN_MIN_QUALITY",
         "BROADCASTER_SNAPSHOT_SESSION_TTL_SECS",
     ];
+    const BROADCASTER_REDIS_ENV_KEYS: [&str; 8] = [
+        "BROADCASTER_REDIS_URL",
+        "BROADCASTER_REDIS_STREAM_KEY",
+        "BROADCASTER_REDIS_SNAPSHOT_KEY",
+        "BROADCASTER_REDIS_BLOCK_MS",
+        "BROADCASTER_REDIS_READ_COUNT",
+        "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
+        "BROADCASTER_REDIS_RETENTION_SECS",
+        "BROADCASTER_REDIS_MAXLEN",
+    ];
     const RFQ_CREDENTIAL_ENV_KEYS: [&str; 6] = [
         "BEBOP_USER",
         "BEBOP_KEY",
@@ -740,6 +880,24 @@ mod tests {
         for key in BROADCASTER_TUNING_ENV_KEYS {
             std::env::remove_var(key);
         }
+    }
+
+    fn clear_broadcaster_redis_env() {
+        for key in BROADCASTER_REDIS_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn set_required_broadcaster_redis_env() {
+        std::env::set_var("BROADCASTER_REDIS_URL", "redis://127.0.0.1:6379/0");
+        std::env::set_var(
+            "BROADCASTER_REDIS_STREAM_KEY",
+            "dsolver:broadcaster:test:8453:events",
+        );
+        std::env::set_var(
+            "BROADCASTER_REDIS_SNAPSHOT_KEY",
+            "dsolver:broadcaster:test:8453:snapshot",
+        );
     }
 
     fn clear_rfq_credential_env() {
@@ -800,6 +958,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved_env: Vec<_> = CONFIG_TEST_ENV_KEYS
             .iter()
+            .chain(BROADCASTER_REDIS_ENV_KEYS.iter())
             .map(|key| (*key, std::env::var(key).ok()))
             .collect();
         let original_dir = std::env::current_dir()
@@ -814,6 +973,7 @@ mod tests {
         std::env::set_var("TYCHO_API_KEY", "test-api-key");
         std::env::remove_var("HASHFLOW_FILENAME_CSV");
         std::env::remove_var("TOKEN_SNAPSHOT_TIMEOUT_MS");
+        clear_broadcaster_redis_env();
         match broadcaster_ws_url {
             Some(value) => std::env::set_var("TYCHO_BROADCASTER_WS_URL", value),
             None => std::env::remove_var("TYCHO_BROADCASTER_WS_URL"),
@@ -841,6 +1001,16 @@ mod tests {
                 let _ = load_config();
             })) {
                 Ok(_) => unreachable!("load_config should fail fast for invalid broadcaster url"),
+                Err(panic) => panic_message(panic),
+            }
+        })
+    }
+
+    fn broadcaster_redis_config_panic_message(setup: impl FnOnce()) -> String {
+        with_isolated_config_env(None, || {
+            setup();
+            match std::panic::catch_unwind(load_broadcaster_redis_config) {
+                Ok(_) => unreachable!("load_broadcaster_redis_config should fail fast"),
                 Err(panic) => panic_message(panic),
             }
         })
@@ -1489,6 +1659,146 @@ route_policy = " default "
         assert!(message.contains("BROADCASTER_SNAPSHOT_SESSION_TTL_SECS must be > 0"));
 
         clear_broadcaster_tuning_env();
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_reads_required_values_with_defaults() {
+        let config = with_isolated_config_env(None, || {
+            set_required_broadcaster_redis_env();
+            load_broadcaster_redis_config()
+        });
+
+        assert_eq!(config.redis_url, "redis://127.0.0.1:6379/0");
+        assert_eq!(config.stream_key, "dsolver:broadcaster:test:8453:events");
+        assert_eq!(
+            config.snapshot_key,
+            "dsolver:broadcaster:test:8453:snapshot"
+        );
+        assert_eq!(config.block_ms, 5_000);
+        assert_eq!(config.read_count, 128);
+        assert_eq!(config.append_retry_window_ms, 5_000);
+        assert_eq!(config.retention_secs, 300);
+        assert_eq!(config.maxlen, None);
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_reads_overrides() {
+        let config = with_isolated_config_env(None, || {
+            set_required_broadcaster_redis_env();
+            std::env::set_var("BROADCASTER_REDIS_BLOCK_MS", "2500");
+            std::env::set_var("BROADCASTER_REDIS_READ_COUNT", "64");
+            std::env::set_var("BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS", "7000");
+            std::env::set_var("BROADCASTER_REDIS_RETENTION_SECS", "600");
+            std::env::set_var("BROADCASTER_REDIS_MAXLEN", "4096");
+            load_broadcaster_redis_config()
+        });
+
+        assert_eq!(config.block_ms, 2_500);
+        assert_eq!(config.read_count, 64);
+        assert_eq!(config.append_retry_window_ms, 7_000);
+        assert_eq!(config.retention_secs, 600);
+        assert_eq!(config.maxlen, Some(4_096));
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_reads_dotenv() {
+        let config = with_isolated_config_env(None, || {
+            fs::write(
+                ".env",
+                [
+                    "BROADCASTER_REDIS_URL=rediss://redis.internal:6380/0",
+                    "BROADCASTER_REDIS_STREAM_KEY=dsolver:broadcaster:test:8453:events",
+                    "BROADCASTER_REDIS_SNAPSHOT_KEY=dsolver:broadcaster:test:8453:snapshot",
+                    "BROADCASTER_REDIS_READ_COUNT=256",
+                ]
+                .join("\n"),
+            )
+            .unwrap_or_else(|_| unreachable!("expected isolated .env write to succeed"));
+
+            load_broadcaster_redis_config()
+        });
+
+        assert_eq!(config.redis_url, "rediss://redis.internal:6380/0");
+        assert_eq!(config.stream_key, "dsolver:broadcaster:test:8453:events");
+        assert_eq!(
+            config.snapshot_key,
+            "dsolver:broadcaster:test:8453:snapshot"
+        );
+        assert_eq!(config.block_ms, 5_000);
+        assert_eq!(config.read_count, 256);
+        assert_eq!(config.append_retry_window_ms, 5_000);
+        assert_eq!(config.retention_secs, 300);
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_rejects_missing_required_url() {
+        let message = broadcaster_redis_config_panic_message(|| {
+            std::env::set_var(
+                "BROADCASTER_REDIS_STREAM_KEY",
+                "dsolver:broadcaster:test:8453:events",
+            );
+            std::env::set_var(
+                "BROADCASTER_REDIS_SNAPSHOT_KEY",
+                "dsolver:broadcaster:test:8453:snapshot",
+            );
+        });
+
+        assert!(message.contains("BROADCASTER_REDIS_URL must be set"));
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_rejects_invalid_url() {
+        let message = broadcaster_redis_config_panic_message(|| {
+            set_required_broadcaster_redis_env();
+            std::env::set_var("BROADCASTER_REDIS_URL", "http://127.0.0.1:6379");
+        });
+
+        assert!(message.contains("BROADCASTER_REDIS_URL must start with redis:// or rediss://"));
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_rejects_url_without_host() {
+        let message = broadcaster_redis_config_panic_message(|| {
+            set_required_broadcaster_redis_env();
+            std::env::set_var("BROADCASTER_REDIS_URL", "redis:///0");
+        });
+
+        assert!(message.contains("BROADCASTER_REDIS_URL must include a host"));
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_rejects_invalid_url_port() {
+        let message = broadcaster_redis_config_panic_message(|| {
+            set_required_broadcaster_redis_env();
+            std::env::set_var("BROADCASTER_REDIS_URL", "redis://localhost:notaport/0");
+        });
+
+        assert!(message.contains("BROADCASTER_REDIS_URL port must be a valid u16"));
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_rejects_snapshot_key_alias() {
+        let message = broadcaster_redis_config_panic_message(|| {
+            set_required_broadcaster_redis_env();
+            std::env::set_var(
+                "BROADCASTER_REDIS_SNAPSHOT_KEY",
+                "dsolver:broadcaster:test:8453:events",
+            );
+        });
+
+        assert!(message.contains(
+            "BROADCASTER_REDIS_STREAM_KEY and BROADCASTER_REDIS_SNAPSHOT_KEY must be different"
+        ));
+    }
+
+    #[test]
+    fn load_broadcaster_redis_config_rejects_zero_retention() {
+        let message = broadcaster_redis_config_panic_message(|| {
+            set_required_broadcaster_redis_env();
+            std::env::set_var("BROADCASTER_REDIS_RETENTION_SECS", "0");
+        });
+
+        assert!(message.contains("BROADCASTER_REDIS_RETENTION_SECS must be > 0"));
     }
 
     #[test]
