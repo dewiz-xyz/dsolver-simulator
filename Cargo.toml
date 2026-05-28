@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.248.1" }
-tycho-execution = "0.165.0"
+tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
@@ -37,7 +37,7 @@ jemalloc-ctl = "0.5"
 jemallocator = "0.5"
 tokio-stream = "0.1.18"
 csv = "1.4.0"
-tycho-common = "0.152.4"
+tycho-common = "0.147.2"
 
 [dev-dependencies]
 chrono = "0.4"

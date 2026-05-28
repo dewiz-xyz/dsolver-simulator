@@ -20,13 +20,41 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  dependency-provenance:
+    name: dependency provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify private execution dependency
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lock = Path("Cargo.lock").read_text()
+          expected = (
+              'name = "tycho-execution"\n'
+              'version = "0.165.1"\n'
+              'source = "git+ssh://git@github.com/pedrobergamini/dsolver-execution.git?rev=46596c8#46596c8fd137661161edf11a7ed3e5be50452d95"'
+          )
+          if expected not in lock:
+              raise SystemExit("tycho-execution must resolve from private dsolver-execution rev 46596c8")
+          PY
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -37,6 +65,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
@@ -47,6 +82,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -58,7 +100,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
