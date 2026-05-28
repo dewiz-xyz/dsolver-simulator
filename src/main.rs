@@ -213,8 +213,8 @@ async fn load_bebop_tokens(
 
     response
         .tokens
-        .into_iter()
-        .filter_map(|(_ticker, token)| match token.to_tycho_token(chain) {
+        .into_values()
+        .filter_map(|token| match token.to_tycho_token(chain) {
             Ok(Some(new)) => Some(Ok((new.address.clone(), new))),
             Ok(None) => None,
             Err(err) => Some(Err(err)),
