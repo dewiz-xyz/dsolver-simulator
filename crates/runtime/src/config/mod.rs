@@ -559,10 +559,10 @@ fn assert_valid_redis_url(redis_url: &str) {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_else(|| unreachable!("split always yields first segment"));
-    let host_port = authority
+    let host = authority
         .rsplit_once('@')
-        .map_or(authority, |(_, host_port)| host_port);
-    let host = if let Some(without_bracket) = host_port.strip_prefix('[') {
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(without_bracket) = host.strip_prefix('[') {
         let (host, rest) = without_bracket.split_once(']').unwrap_or_else(|| {
             panic!("BROADCASTER_REDIS_URL bracketed host must close with ]");
         });
@@ -573,9 +573,9 @@ fn assert_valid_redis_url(redis_url: &str) {
         validate_redis_port(rest.strip_prefix(':'));
         host
     } else {
-        let (host, port) = host_port
+        let (host, port) = host
             .rsplit_once(':')
-            .map_or((host_port, None), |(host, port)| (host, Some(port)));
+            .map_or((host, None), |(host, port)| (host, Some(port)));
         assert!(
             !host.contains(':'),
             "BROADCASTER_REDIS_URL IPv6 hosts must use brackets"
@@ -898,6 +898,56 @@ mod tests {
             "BROADCASTER_REDIS_SNAPSHOT_KEY",
             "dsolver:broadcaster:test:8453:snapshot",
         );
+    }
+
+    struct RedisConfigFailureCase {
+        name: &'static str,
+        setup: fn(),
+        expected: &'static str,
+    }
+
+    fn missing_broadcaster_redis_url() {
+        std::env::set_var(
+            "BROADCASTER_REDIS_STREAM_KEY",
+            "dsolver:broadcaster:test:8453:events",
+        );
+        std::env::set_var(
+            "BROADCASTER_REDIS_SNAPSHOT_KEY",
+            "dsolver:broadcaster:test:8453:snapshot",
+        );
+    }
+
+    fn invalid_broadcaster_redis_scheme() {
+        set_required_broadcaster_redis_env();
+        std::env::set_var("BROADCASTER_REDIS_URL", "http://127.0.0.1:6379");
+    }
+
+    fn missing_broadcaster_redis_host() {
+        set_required_broadcaster_redis_env();
+        std::env::set_var("BROADCASTER_REDIS_URL", "redis:///0");
+    }
+
+    fn empty_broadcaster_redis_host() {
+        set_required_broadcaster_redis_env();
+        std::env::set_var("BROADCASTER_REDIS_URL", "redis://:6379/0");
+    }
+
+    fn invalid_broadcaster_redis_port() {
+        set_required_broadcaster_redis_env();
+        std::env::set_var("BROADCASTER_REDIS_URL", "redis://127.0.0.1:notaport/0");
+    }
+
+    fn aliased_broadcaster_redis_keys() {
+        set_required_broadcaster_redis_env();
+        std::env::set_var(
+            "BROADCASTER_REDIS_SNAPSHOT_KEY",
+            "dsolver:broadcaster:test:8453:events",
+        );
+    }
+
+    fn zero_broadcaster_redis_retention() {
+        set_required_broadcaster_redis_env();
+        std::env::set_var("BROADCASTER_REDIS_RETENTION_SECS", "0");
     }
 
     fn clear_rfq_credential_env() {
@@ -1731,74 +1781,53 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_broadcaster_redis_config_rejects_missing_required_url() {
-        let message = broadcaster_redis_config_panic_message(|| {
-            std::env::set_var(
-                "BROADCASTER_REDIS_STREAM_KEY",
-                "dsolver:broadcaster:test:8453:events",
+    fn load_broadcaster_redis_config_rejects_invalid_values() {
+        for case in [
+            RedisConfigFailureCase {
+                name: "missing url",
+                setup: missing_broadcaster_redis_url,
+                expected: "BROADCASTER_REDIS_URL must be set",
+            },
+            RedisConfigFailureCase {
+                name: "invalid scheme",
+                setup: invalid_broadcaster_redis_scheme,
+                expected: "BROADCASTER_REDIS_URL must start with redis:// or rediss://",
+            },
+            RedisConfigFailureCase {
+                name: "missing host",
+                setup: missing_broadcaster_redis_host,
+                expected: "BROADCASTER_REDIS_URL must include a host",
+            },
+            RedisConfigFailureCase {
+                name: "empty host",
+                setup: empty_broadcaster_redis_host,
+                expected: "BROADCASTER_REDIS_URL must include a host",
+            },
+            RedisConfigFailureCase {
+                name: "invalid port",
+                setup: invalid_broadcaster_redis_port,
+                expected: "BROADCASTER_REDIS_URL port must be a valid u16",
+            },
+            RedisConfigFailureCase {
+                name: "snapshot key alias",
+                setup: aliased_broadcaster_redis_keys,
+                expected: "BROADCASTER_REDIS_STREAM_KEY and BROADCASTER_REDIS_SNAPSHOT_KEY must be different",
+            },
+            RedisConfigFailureCase {
+                name: "zero retention",
+                setup: zero_broadcaster_redis_retention,
+                expected: "BROADCASTER_REDIS_RETENTION_SECS must be > 0",
+            },
+        ] {
+            let message = broadcaster_redis_config_panic_message(case.setup);
+            assert!(
+                message.contains(case.expected),
+                "{}: expected `{}` in `{}`",
+                case.name,
+                case.expected,
+                message
             );
-            std::env::set_var(
-                "BROADCASTER_REDIS_SNAPSHOT_KEY",
-                "dsolver:broadcaster:test:8453:snapshot",
-            );
-        });
-
-        assert!(message.contains("BROADCASTER_REDIS_URL must be set"));
-    }
-
-    #[test]
-    fn load_broadcaster_redis_config_rejects_invalid_url() {
-        let message = broadcaster_redis_config_panic_message(|| {
-            set_required_broadcaster_redis_env();
-            std::env::set_var("BROADCASTER_REDIS_URL", "http://127.0.0.1:6379");
-        });
-
-        assert!(message.contains("BROADCASTER_REDIS_URL must start with redis:// or rediss://"));
-    }
-
-    #[test]
-    fn load_broadcaster_redis_config_rejects_url_without_host() {
-        let message = broadcaster_redis_config_panic_message(|| {
-            set_required_broadcaster_redis_env();
-            std::env::set_var("BROADCASTER_REDIS_URL", "redis:///0");
-        });
-
-        assert!(message.contains("BROADCASTER_REDIS_URL must include a host"));
-    }
-
-    #[test]
-    fn load_broadcaster_redis_config_rejects_invalid_url_port() {
-        let message = broadcaster_redis_config_panic_message(|| {
-            set_required_broadcaster_redis_env();
-            std::env::set_var("BROADCASTER_REDIS_URL", "redis://localhost:notaport/0");
-        });
-
-        assert!(message.contains("BROADCASTER_REDIS_URL port must be a valid u16"));
-    }
-
-    #[test]
-    fn load_broadcaster_redis_config_rejects_snapshot_key_alias() {
-        let message = broadcaster_redis_config_panic_message(|| {
-            set_required_broadcaster_redis_env();
-            std::env::set_var(
-                "BROADCASTER_REDIS_SNAPSHOT_KEY",
-                "dsolver:broadcaster:test:8453:events",
-            );
-        });
-
-        assert!(message.contains(
-            "BROADCASTER_REDIS_STREAM_KEY and BROADCASTER_REDIS_SNAPSHOT_KEY must be different"
-        ));
-    }
-
-    #[test]
-    fn load_broadcaster_redis_config_rejects_zero_retention() {
-        let message = broadcaster_redis_config_panic_message(|| {
-            set_required_broadcaster_redis_env();
-            std::env::set_var("BROADCASTER_REDIS_RETENTION_SECS", "0");
-        });
-
-        assert!(message.contains("BROADCASTER_REDIS_RETENTION_SECS must be > 0"));
+        }
     }
 
     #[test]
