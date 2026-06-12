@@ -753,19 +753,18 @@ mod tests {
     }
 
     #[test]
-    fn readiness_backend_snapshot_preserves_update_timestamp() {
+    fn readiness_backend_snapshot_preserves_update_timestamp() -> serde_json::Result<()> {
         let snapshot: ReadinessBackendSnapshot = serde_json::from_value(serde_json::json!({
             "enabled": true,
             "status": "ready",
             "update_timestamp": 1_710_000_000u64,
             "pool_count": 1
-        }))
-        .expect("readiness backend snapshot should deserialize");
+        }))?;
 
-        let value =
-            serde_json::to_value(snapshot).expect("readiness backend snapshot should serialize");
+        let value = serde_json::to_value(snapshot)?;
 
         assert_eq!(value["update_timestamp"], 1_710_000_000u64);
+        Ok(())
     }
 
     #[test]
