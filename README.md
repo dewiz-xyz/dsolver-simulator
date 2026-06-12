@@ -91,14 +91,14 @@ Common optional inputs:
 
 - `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
-- `ENABLE_RFQ_POOLS` to enable or disable RFQ-backed pool feeds (defaults to `false`)
+- `ENABLE_RFQ_POOLS` to enable or disable RFQ pool feeds (defaults to `false`)
 - `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY` only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
 - `HOST` and `PORT` to change the bind address
 - `BROADCASTER_TOKEN_MIN_QUALITY` to tune the broadcaster's startup Tycho token quality floor
 - `BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES` to cap serialized HTTP snapshot payloads
 - `BROADCASTER_SNAPSHOT_SESSION_TTL_SECS` to set how long an unattached snapshot session can wait before cleanup
 - `TOKEN_SNAPSHOT_TIMEOUT_MS` for the simulator's startup load of the full broadcaster token snapshot
-- `TOKEN_REFRESH_TIMEOUT_MS` for later single-token lookup misses
+- `TOKEN_REFRESH_TIMEOUT_MS` for RFQ provider token bootstrap and later single-token lookup misses
 - timeout and stream-health knobs from `crates/runtime/src/config/mod.rs`
 
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`

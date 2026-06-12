@@ -36,11 +36,7 @@ pub fn derive_broadcaster_http_url(
         }
     };
     let prefix = websocket_path_prefix(&url)?;
-    let http_path = if prefix.is_empty() {
-        format!("/{relative_path}")
-    } else {
-        format!("{prefix}/{relative_path}")
-    };
+    let http_path = prefixed_path(prefix, relative_path);
 
     url.set_scheme(scheme)
         .map_err(|_| BroadcasterUrlError::new("invalid broadcaster URL scheme"))?;
@@ -61,9 +57,31 @@ pub fn derive_broadcaster_session_ws_url(
     Ok(url.to_string())
 }
 
+pub fn derive_broadcaster_rfq_session_ws_url(
+    ws_url: &str,
+    session_id: u64,
+) -> Result<String, BroadcasterUrlError> {
+    let mut url = parse_broadcaster_ws_url(ws_url)?;
+    let prefix = websocket_path_prefix(&url)?;
+    let rfq_ws_path = prefixed_path(prefix, "rfq/ws");
+    url.set_path(&rfq_ws_path);
+    url.query_pairs_mut()
+        .clear()
+        .append_pair("sessionId", &session_id.to_string());
+    Ok(url.to_string())
+}
+
 fn parse_broadcaster_ws_url(ws_url: &str) -> Result<reqwest::Url, BroadcasterUrlError> {
     reqwest::Url::parse(ws_url)
         .map_err(|err| BroadcasterUrlError::new(format!("invalid TYCHO_BROADCASTER_WS_URL: {err}")))
+}
+
+fn prefixed_path(prefix: &str, relative_path: &str) -> String {
+    if prefix.is_empty() {
+        format!("/{relative_path}")
+    } else {
+        format!("{prefix}/{relative_path}")
+    }
 }
 
 fn websocket_path_prefix(url: &reqwest::Url) -> Result<&str, BroadcasterUrlError> {
@@ -76,7 +94,10 @@ fn websocket_path_prefix(url: &reqwest::Url) -> Result<&str, BroadcasterUrlError
 mod tests {
     use anyhow::Result;
 
-    use super::{derive_broadcaster_http_url, derive_broadcaster_session_ws_url};
+    use super::{
+        derive_broadcaster_http_url, derive_broadcaster_rfq_session_ws_url,
+        derive_broadcaster_session_ws_url,
+    };
 
     #[test]
     fn derives_http_url_from_broadcaster_websocket_url() -> Result<()> {
@@ -103,6 +124,19 @@ mod tests {
         assert_eq!(
             derive_broadcaster_session_ws_url("wss://broadcaster.example/prod/base/ws", 9)?,
             "wss://broadcaster.example/prod/base/ws?sessionId=9"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derives_rfq_session_websocket_url_from_broadcaster_websocket_url() -> Result<()> {
+        assert_eq!(
+            derive_broadcaster_rfq_session_ws_url("ws://127.0.0.1:3001/ws", 42)?,
+            "ws://127.0.0.1:3001/rfq/ws?sessionId=42"
+        );
+        assert_eq!(
+            derive_broadcaster_rfq_session_ws_url("wss://broadcaster.example/prod/base/ws", 9)?,
+            "wss://broadcaster.example/prod/base/rfq/ws?sessionId=9"
         );
         Ok(())
     }

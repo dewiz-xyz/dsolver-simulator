@@ -20,6 +20,7 @@ use crate::models::protocol::ProtocolKind;
 pub enum BroadcasterBackend {
     Native,
     Vm,
+    Rfq,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +111,7 @@ impl BroadcasterBackend {
         match self {
             Self::Native => "native",
             Self::Vm => "vm",
+            Self::Rfq => "rfq",
         }
     }
 }
@@ -1464,10 +1466,7 @@ fn backend_for_component(
             component_id: component_id.to_string(),
         });
     };
-    backend_for_kind(kind).ok_or_else(|| BroadcasterContractError::UnsupportedComponentProtocol {
-        component_id: component_id.to_string(),
-        protocol: component_protocol_label(component),
-    })
+    Ok(backend_for_kind(kind))
 }
 
 fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, BroadcasterContractError> {
@@ -1476,26 +1475,18 @@ fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, Broadcas
             protocol: protocol.to_string(),
         });
     };
-    backend_for_kind(kind).ok_or_else(|| BroadcasterContractError::UnsupportedSyncStateProtocol {
-        protocol: protocol.to_string(),
-    })
+    Ok(backend_for_kind(kind))
 }
 
-fn backend_for_kind(kind: ProtocolKind) -> Option<BroadcasterBackend> {
+fn backend_for_kind(kind: ProtocolKind) -> BroadcasterBackend {
     match kind {
         ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => {
-            Some(BroadcasterBackend::Vm)
+            BroadcasterBackend::Vm
         }
-        ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => None,
-        _ => Some(BroadcasterBackend::Native),
-    }
-}
-
-fn component_protocol_label(component: &ProtocolComponent) -> String {
-    if !component.protocol_system.is_empty() {
-        component.protocol_system.clone()
-    } else {
-        component.protocol_type_name.clone()
+        ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => {
+            BroadcasterBackend::Rfq
+        }
+        _ => BroadcasterBackend::Native,
     }
 }
 
@@ -2040,6 +2031,33 @@ mod tests {
     }
 
     #[test]
+    fn broadcaster_backend_rfq_round_trips() -> Result<()> {
+        let json = serde_json::to_value(BroadcasterBackend::Rfq)?;
+        assert_eq!(json, serde_json::json!("rfq"));
+
+        let decoded: BroadcasterBackend = serde_json::from_value(json)?;
+        assert_eq!(decoded, BroadcasterBackend::Rfq);
+        assert_eq!(BroadcasterBackend::Rfq.as_str(), "rfq");
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_start_accepts_declared_rfq_backend() -> Result<()> {
+        let start = BroadcasterSnapshotStart::new(
+            "snapshot-1",
+            8453,
+            vec![BroadcasterBackend::Rfq, BroadcasterBackend::Native],
+            2,
+        )?;
+
+        assert_eq!(
+            start.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_start_constructor_rejects_duplicate_backends() -> Result<()> {
         let Err(error) = BroadcasterSnapshotStart::new(
             "snapshot-1",
@@ -2175,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn update_from_tycho_update_rejects_rfq_content() -> Result<()> {
+    fn update_from_tycho_update_accepts_rfq_content() -> Result<()> {
         let mut update = tycho_update();
         update.new_pairs.insert(
             "pool-rfq".to_string(),
@@ -2185,18 +2203,16 @@ mod tests {
             .states
             .insert("pool-rfq".to_string(), dummy_state("rfq-state"));
 
-        let Err(error) = BroadcasterUpdateMessage::from_tycho_update(&update, &known_backends())
-        else {
-            return Err(anyhow!("rfq content should fail"));
-        };
+        let message = BroadcasterUpdateMessage::from_tycho_update(&update, &known_backends())?;
+        let rfq = message
+            .partitions
+            .iter()
+            .find(|partition| partition.backend == BroadcasterBackend::Rfq)
+            .ok_or_else(|| anyhow!("expected RFQ partition"))?;
 
-        assert_eq!(
-            error,
-            BroadcasterContractError::UnsupportedComponentProtocol {
-                component_id: "pool-rfq".to_string(),
-                protocol: "rfq:hashflow".to_string(),
-            }
-        );
+        assert_eq!(rfq.new_pairs.len(), 1);
+        assert_eq!(rfq.new_pairs[0].component_id, "pool-rfq");
+        assert_dummy_state(rfq.new_pairs[0].state.as_ref(), "rfq-state");
         Ok(())
     }
 
@@ -2268,6 +2284,28 @@ mod tests {
             BroadcasterBackend::Native
         );
         assert_eq!(heartbeat.backend_heads[1].backend, BroadcasterBackend::Vm);
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_accepts_rfq_backend_head() -> Result<()> {
+        let heartbeat = BroadcasterHeartbeat::new(
+            8453,
+            "snapshot-1",
+            vec![
+                BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 102),
+                BroadcasterBackendHead::new(BroadcasterBackend::Native, 100),
+            ],
+        )?;
+
+        assert_eq!(heartbeat.backend_heads.len(), 2);
+        assert_eq!(
+            heartbeat.backend_heads[0].backend,
+            BroadcasterBackend::Native
+        );
+        assert_eq!(heartbeat.backend_heads[0].block_number, 100);
+        assert_eq!(heartbeat.backend_heads[1].backend, BroadcasterBackend::Rfq);
+        assert_eq!(heartbeat.backend_heads[1].block_number, 102);
         Ok(())
     }
 

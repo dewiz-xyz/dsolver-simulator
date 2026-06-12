@@ -42,6 +42,19 @@ pub async fn status(
     (status_code, Json(BroadcasterStatusPayload::from(snapshot)))
 }
 
+pub async fn rfq_status(State(state): State<BroadcasterAppState>) -> Response {
+    let Some(snapshot) = state.rfq_status_snapshot().await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "rfq broadcaster disabled" })),
+        )
+            .into_response();
+    };
+    let status_code = readiness_status_code(snapshot.readiness);
+
+    (status_code, Json(BroadcasterStatusPayload::from(snapshot))).into_response()
+}
+
 pub async fn create_snapshot_session(State(state): State<BroadcasterAppState>) -> Response {
     match state.create_snapshot_session().await {
         Ok(Some(session)) => (StatusCode::CREATED, Json(session)).into_response(),
@@ -60,11 +73,43 @@ pub async fn create_snapshot_session(State(state): State<BroadcasterAppState>) -
     }
 }
 
+pub async fn create_rfq_snapshot_session(State(state): State<BroadcasterAppState>) -> Response {
+    match state.create_rfq_snapshot_session().await {
+        Ok(Some(session)) => (StatusCode::CREATED, Json(session)).into_response(),
+        Ok(None) => match state.rfq_status_snapshot().await {
+            Some(snapshot) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(BroadcasterStatusPayload::from(snapshot)),
+            )
+                .into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "rfq broadcaster disabled" })),
+            )
+                .into_response(),
+        },
+        Err(error) => {
+            warn!(error = %error, "Failed to create RFQ broadcaster snapshot session");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn snapshot_session_payload(
     State(state): State<BroadcasterAppState>,
     Path((session_id, index)): Path<(u64, u32)>,
 ) -> Response {
     match state.snapshot_session_payload(session_id, index).await {
+        Ok(envelope) => (StatusCode::OK, Json(envelope)).into_response(),
+        Err(error) => snapshot_session_error_response(error, StatusCode::GONE),
+    }
+}
+
+pub async fn rfq_snapshot_session_payload(
+    State(state): State<BroadcasterAppState>,
+    Path((session_id, index)): Path<(u64, u32)>,
+) -> Response {
+    match state.rfq_snapshot_session_payload(session_id, index).await {
         Ok(envelope) => (StatusCode::OK, Json(envelope)).into_response(),
         Err(error) => snapshot_session_error_response(error, StatusCode::GONE),
     }
@@ -96,6 +141,35 @@ pub async fn ws(
     };
 
     ws.on_upgrade(move |socket| handle_session(socket, state, registration))
+        .into_response()
+}
+
+pub async fn rfq_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<BroadcasterAppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(session_id) = query.get("sessionId") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing sessionId" })),
+        )
+            .into_response();
+    };
+    let Ok(session_id) = session_id.parse::<u64>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid sessionId" })),
+        )
+            .into_response();
+    };
+
+    let registration = match state.attach_rfq_snapshot_session(session_id).await {
+        Ok(registration) => registration,
+        Err(error) => return snapshot_session_error_response(error, StatusCode::CONFLICT),
+    };
+
+    ws.on_upgrade(move |socket| handle_rfq_session(socket, state, registration))
         .into_response()
 }
 
@@ -160,6 +234,23 @@ async fn handle_session(
     state: BroadcasterAppState,
     registration: BroadcasterAttachedSession,
 ) {
+    handle_attached_session(socket, state, registration, false).await;
+}
+
+async fn handle_rfq_session(
+    socket: WebSocket,
+    state: BroadcasterAppState,
+    registration: BroadcasterAttachedSession,
+) {
+    handle_attached_session(socket, state, registration, true).await;
+}
+
+async fn handle_attached_session(
+    socket: WebSocket,
+    state: BroadcasterAppState,
+    registration: BroadcasterAttachedSession,
+    rfq: bool,
+) {
     let BroadcasterAttachedSession {
         session_id,
         stream_id,
@@ -171,7 +262,11 @@ async fn handle_session(
     let (sender, receiver) = socket.split();
 
     drive_session(sender, receiver, close_receiver, session_stream).await;
-    state.remove_subscriber(session_id).await;
+    if rfq {
+        state.remove_rfq_subscriber(session_id).await;
+    } else {
+        state.remove_subscriber(session_id).await;
+    }
 }
 
 async fn drive_session(
@@ -180,15 +275,45 @@ async fn drive_session(
     close_receiver: oneshot::Receiver<SessionCloseReason>,
     session_stream: BroadcasterSessionStream,
 ) {
-    let mut send_task = tokio::spawn(pump_session(sender, close_receiver, session_stream));
-    let mut receive_task = tokio::spawn(watch_client_disconnect(receiver));
+    let send_task = tokio::spawn(pump_session(sender, close_receiver, session_stream));
+    let receive_task = tokio::spawn(watch_client_disconnect(receiver));
 
-    tokio::select! {
-        _ = &mut send_task => receive_task.abort(),
-        _ = &mut receive_task => send_task.abort(),
+    await_session_tasks(send_task, receive_task).await;
+}
+
+async fn await_session_tasks(mut send_task: JoinHandle<()>, mut receive_task: JoinHandle<()>) {
+    enum CompletedTask {
+        Send(std::result::Result<(), tokio::task::JoinError>),
+        Receive(std::result::Result<(), tokio::task::JoinError>),
     }
-    await_join(send_task).await;
-    await_join(receive_task).await;
+
+    let completed = tokio::select! {
+        result = &mut send_task => {
+            receive_task.abort();
+            CompletedTask::Send(result)
+        },
+        result = &mut receive_task => {
+            send_task.abort();
+            CompletedTask::Receive(result)
+        },
+    };
+
+    match completed {
+        CompletedTask::Send(result) => {
+            ignore_join_result(result);
+            await_join(receive_task).await;
+        }
+        CompletedTask::Receive(result) => {
+            ignore_join_result(result);
+            await_join(send_task).await;
+        }
+    }
+}
+
+fn ignore_join_result(_result: std::result::Result<(), tokio::task::JoinError>) {}
+
+async fn await_join(task: JoinHandle<()>) {
+    ignore_join_result(task.await);
 }
 
 async fn pump_session(
@@ -267,10 +392,6 @@ impl BroadcasterSessionStream {
     }
 }
 
-async fn await_join(task: JoinHandle<()>) {
-    let _ = task.await;
-}
-
 fn snapshot_session_error_response(
     error: SnapshotSessionError,
     already_attached_status: StatusCode,
@@ -294,7 +415,7 @@ mod tests {
     use anyhow::{anyhow, Result};
     use tokio::sync::mpsc;
 
-    use super::BroadcasterSessionStream;
+    use super::{await_session_tasks, BroadcasterSessionStream};
     use simulator_core::broadcaster::{
         BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload,
     };
@@ -321,6 +442,14 @@ mod tests {
             ),
         )?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn await_session_tasks_does_not_repoll_completed_task() {
+        let send_task = tokio::spawn(async {});
+        let receive_task = tokio::spawn(async {});
+
+        await_session_tasks(send_task, receive_task).await;
     }
 
     fn assert_envelope(

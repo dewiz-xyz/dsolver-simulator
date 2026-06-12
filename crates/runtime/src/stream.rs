@@ -5,7 +5,7 @@ use futures::StreamExt;
 use rand::Rng;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{sleep, timeout, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tycho_simulation::{
     evm::engine_db::SHARED_TYCHO_DB,
     protocol::models::Update as TychoUpdate,
@@ -16,7 +16,7 @@ use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
     protocol,
-    state::{RfqStreamStatus, StateStore, VmStreamStatus},
+    state::{StateStore, VmStreamStatus},
     stream_health::StreamHealth,
 };
 use crate::services::broadcaster::BroadcasterServiceState;
@@ -25,7 +25,6 @@ use crate::services::broadcaster::BroadcasterServiceState;
 pub enum StreamKind {
     Native,
     Vm,
-    Rfq,
     Broadcaster,
 }
 
@@ -34,7 +33,6 @@ impl StreamKind {
         match self {
             StreamKind::Native => protocol::NATIVE,
             StreamKind::Vm => protocol::VM,
-            StreamKind::Rfq => protocol::RFQ,
             StreamKind::Broadcaster => "broadcaster",
         }
     }
@@ -86,11 +84,6 @@ pub struct StreamSupervisorConfig {
 
 pub struct VmStreamControls {
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
-    pub simulation_rebuild_gate: Arc<RwLock<()>>,
-}
-
-pub struct RfqStreamControls {
-    pub rfq_stream: Arc<RwLock<RfqStreamStatus>>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
@@ -446,6 +439,17 @@ async fn handle_broadcaster_update(
 
     let block_number = update.block_number_or_timestamp;
     let new_pairs = update.new_pairs.len();
+    if broadcaster_update_is_empty(&update) {
+        health.record_update(block_number).await;
+        debug!(
+            event = "stream_noop_update",
+            stream = StreamKind::Broadcaster.as_str(),
+            block = block_number,
+            "Ignoring empty decoded broadcaster update"
+        );
+        return None;
+    }
+
     if let Err(error) = service.apply_update(&update).await {
         let error = error.to_string();
         health.set_last_error(Some(error.clone())).await;
@@ -482,6 +486,13 @@ async fn handle_broadcaster_update(
     }
 
     None
+}
+
+fn broadcaster_update_is_empty(update: &TychoUpdate) -> bool {
+    update.states.is_empty()
+        && update.new_pairs.is_empty()
+        && update.removed_pairs.is_empty()
+        && update.sync_states.is_empty()
 }
 
 async fn handle_broadcaster_raw_update(
@@ -959,97 +970,7 @@ pub async fn supervise_vm_stream<F, Fut, S>(
     }
 }
 
-pub async fn supervise_rfq_stream<F, Fut, S>(
-    build_stream: F,
-    state_store: Arc<StateStore>,
-    health: Arc<StreamHealth>,
-    cfg: StreamSupervisorConfig,
-    controls: RfqStreamControls,
-) where
-    F: Fn() -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
-    S: futures::Stream<
-            Item = Result<TychoUpdate, Box<dyn std::error::Error + Send + Sync + 'static>>,
-        > + Unpin
-        + Send,
-{
-    let mut backoff = cfg.restart_backoff_min;
-    let mut pending_rebuild: Option<RfqRebuildState> = None;
-
-    loop {
-        let stream = match build_stream().await {
-            Ok(stream) => {
-                if let Some(rebuild) = pending_rebuild.take() {
-                    finish_rfq_rebuild(&controls, rebuild, cfg.memory).await;
-                }
-                stream
-            }
-            Err(err) => {
-                warn!(
-                    event = "stream_build_failed",
-                    stream = StreamKind::Rfq.as_str(),
-                    error = %err,
-                    "Failed to build RFQ stream"
-                );
-                let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
-                backoff = next_backoff(backoff, cfg.restart_backoff_max);
-                continue;
-            }
-        };
-
-        let exit = process_stream(
-            StreamKind::Rfq,
-            stream,
-            Arc::clone(&state_store),
-            Arc::clone(&health),
-            cfg.clone(),
-        )
-        .await;
-
-        let restart_count = health.increment_restart().await;
-        health.reset_bursts().await;
-        let started_age_ms = health.started_age_ms().await.unwrap_or(0);
-        let has_received_update = health.has_received_update().await;
-        let last_update_age_ms = health.last_update_age_ms().await.unwrap_or(0);
-        let last_block = health.last_block().await;
-
-        let rebuild_state = begin_rfq_rebuild(
-            &controls,
-            Arc::clone(&state_store),
-            exit.reason,
-            exit.last_error,
-            cfg.memory,
-        )
-        .await;
-        pending_rebuild = Some(rebuild_state);
-
-        let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-        warn!(
-            event = "stream_restart",
-            stream = StreamKind::Rfq.as_str(),
-            reason = exit.reason.as_str(),
-            restart_count,
-            backoff_ms,
-            started_age_ms,
-            has_received_update,
-            last_block,
-            last_update_age_ms,
-            "Restarting RFQ stream"
-        );
-
-        sleep(Duration::from_millis(backoff_ms)).await;
-        backoff = next_backoff(backoff, cfg.restart_backoff_max);
-    }
-}
-
 struct VmRebuildState {
-    guard: OwnedRwLockWriteGuard<()>,
-    rebuild_id: u64,
-    started_at: Instant,
-}
-
-struct RfqRebuildState {
     guard: OwnedRwLockWriteGuard<()>,
     rebuild_id: u64,
     started_at: Instant,
@@ -1102,58 +1023,7 @@ async fn begin_vm_rebuild(
     }
 }
 
-async fn begin_rfq_rebuild(
-    controls: &RfqStreamControls,
-    state_store: Arc<StateStore>,
-    reason: StreamRestartReason,
-    last_error: Option<String>,
-    memory_cfg: MemoryConfig,
-) -> RfqRebuildState {
-    let rebuild_id = {
-        let mut status = controls.rfq_stream.write().await;
-        status.rebuilding = true;
-        status.restart_count = status.restart_count.saturating_add(1);
-        status.rebuild_started_at = Some(Instant::now());
-        status.last_error = last_error.or_else(|| Some(reason.as_str().to_string()));
-        status.restart_count
-    };
-
-    info!(
-        event = "rfq_rebuild_start",
-        rebuild_id,
-        rebuild_started_age_ms = 0_u64,
-        "RFQ rebuild started"
-    );
-    maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_start", None, memory_cfg, true);
-
-    let guard = acquire_rfq_rebuild_guard(controls).await;
-
-    state_store.reset().await;
-
-    if let Err(err) = SHARED_TYCHO_DB.clear() {
-        warn!(error = %err, "Failed clearing TychoDB during RFQ rebuild");
-    }
-    maybe_purge_allocator("rfq_rebuild", memory_cfg);
-    maybe_log_memory_snapshot(
-        protocol::RFQ,
-        "rfq_rebuild_after_clear",
-        None,
-        memory_cfg,
-        true,
-    );
-
-    RfqRebuildState {
-        guard,
-        rebuild_id,
-        started_at: Instant::now(),
-    }
-}
-
 async fn acquire_vm_rebuild_guard(controls: &VmStreamControls) -> OwnedRwLockWriteGuard<()> {
-    controls.simulation_rebuild_gate.clone().write_owned().await
-}
-
-async fn acquire_rfq_rebuild_guard(controls: &RfqStreamControls) -> OwnedRwLockWriteGuard<()> {
     controls.simulation_rebuild_gate.clone().write_owned().await
 }
 
@@ -1179,30 +1049,6 @@ async fn finish_vm_rebuild(
         "VM rebuild completed"
     );
     maybe_log_memory_snapshot(protocol::VM, "vm_rebuild_success", None, memory_cfg, true);
-}
-
-async fn finish_rfq_rebuild(
-    controls: &RfqStreamControls,
-    rebuild: RfqRebuildState,
-    memory_cfg: MemoryConfig,
-) {
-    drop(rebuild.guard);
-
-    let duration_ms = rebuild.started_at.elapsed().as_millis() as u64;
-    {
-        let mut status = controls.rfq_stream.write().await;
-        status.rebuilding = false;
-        status.rebuild_started_at = None;
-    }
-
-    info!(
-        event = "rfq_rebuild_success",
-        rebuild_id = rebuild.rebuild_id,
-        duration_ms,
-        rebuild_started_age_ms = duration_ms,
-        "RFQ rebuild completed"
-    );
-    maybe_log_memory_snapshot(protocol::RFQ, "rfq_rebuild_success", None, memory_cfg, true);
 }
 
 fn is_missing_block_error(message: &str) -> bool {
@@ -1248,10 +1094,17 @@ mod tests {
     use tokio::sync::RwLock;
     use tycho_simulation::protocol::models::Update;
 
-    use super::{begin_vm_rebuild, classify_stream_error, StreamRestartReason, VmStreamControls};
+    use super::{
+        begin_vm_rebuild, classify_stream_error, handle_broadcaster_update, StreamRestartReason,
+        StreamSupervisorConfig, VmStreamControls,
+    };
+    use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
     use crate::config::MemoryConfig;
     use crate::models::state::{StateStore, VmStreamStatus};
+    use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
+    use crate::services::broadcaster::BroadcasterServiceState;
+    use simulator_core::broadcaster::BroadcasterBackend;
     use tycho_simulation::tycho_common::models::Chain;
 
     #[test]
@@ -1276,6 +1129,37 @@ mod tests {
     fn classifies_other_messages() {
         let kind = classify_stream_error("stream closed by peer");
         assert_eq!(kind, "other");
+    }
+
+    #[tokio::test]
+    async fn empty_decoded_broadcaster_update_is_ignored_without_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = BroadcasterServiceState::new(
+            1024,
+            16,
+            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+        );
+        service.mark_upstream_connected().await;
+        let health = StreamHealth::new();
+        let mut ready_logged = false;
+
+        let exit = handle_broadcaster_update(
+            Update::new(123, HashMap::new(), HashMap::new()),
+            &service,
+            &health,
+            &test_supervisor_config(),
+            &mut ready_logged,
+        )
+        .await;
+
+        assert!(exit.is_none(), "empty RFQ updates should not restart");
+        assert!(health.has_received_update().await);
+        let status = service.status_snapshot().await;
+        assert!(status.upstream.connected);
+        assert!(status.upstream.last_error.is_none());
+        assert!(!status.snapshot.ready);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1336,5 +1220,27 @@ mod tests {
         assert_eq!(state_store.current_block().await, 0);
         drop(rebuild);
         Ok(())
+    }
+
+    fn test_supervisor_config() -> StreamSupervisorConfig {
+        StreamSupervisorConfig {
+            readiness_stale: Duration::from_secs(120),
+            stream_stale: Duration::from_secs(120),
+            missing_block_burst: 3,
+            missing_block_window: Duration::from_secs(60),
+            error_burst: 3,
+            error_window: Duration::from_secs(60),
+            resync_grace: Duration::from_secs(60),
+            restart_backoff_min: Duration::from_millis(500),
+            restart_backoff_max: Duration::from_secs(30),
+            restart_backoff_jitter_pct: 0.0,
+            memory: MemoryConfig {
+                purge_enabled: false,
+                snapshots_enabled: false,
+                snapshots_min_interval_secs: 60,
+                snapshots_min_new_pairs: 1000,
+                snapshots_emit_emf: false,
+            },
+        }
     }
 }

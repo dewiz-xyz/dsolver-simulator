@@ -12,34 +12,21 @@ use tycho_simulation::tycho_common::{
 
 use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
 use crate::memory::maybe_log_memory_snapshot;
-use crate::models::rfq::bebop::BebopResponse;
-use crate::models::rfq::hashflow::read_hashflow_csv;
-use crate::models::rfq::liquorice::TokenLiquorice;
-use crate::models::state::{
-    AppState, BroadcasterSubscriptionStatus, RfqStreamStatus, StateStore, VmStreamStatus,
-};
+use crate::models::state::{AppState, BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{
     derive_broadcaster_token_lookup_url, derive_broadcaster_token_snapshot_url, TokenStore,
 };
 use crate::services::broadcaster_subscription::{
     supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
-    NativeBroadcasterSubscriptionControls, VmBroadcasterSubscriptionControls,
+    NativeBroadcasterSubscriptionControls, RfqBroadcasterSubscriptionControls,
+    VmBroadcasterSubscriptionControls,
 };
-use crate::services::stream_builder::{build_rfq_stream, RFQConfig, RFQTokenStores};
 use crate::services::{EncodeService, QuoteService};
-use crate::stream::{supervise_rfq_stream, RfqStreamControls, StreamSupervisorConfig};
+use crate::stream::StreamSupervisorConfig;
 
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const TOKEN_SNAPSHOT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
-
-struct RfqStreamDeps<'a> {
-    resources: &'a StreamResources,
-    app_state: &'a AppState,
-    bebop_tokens: Arc<TokenStore>,
-    hashflow_tokens: Arc<TokenStore>,
-    liquorice_tokens: Arc<TokenStore>,
-}
 
 pub struct SimulatorServiceParts {
     pub config: AppConfig,
@@ -84,73 +71,18 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     init_logging();
     let config = load_config();
     let chain = config.chain_profile.chain;
-    let effective_rfq_enabled =
-        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
     log_memory_config(config.memory);
     log_erc4626_capability(&config);
     spawn_memory_snapshot_task(config.memory);
 
     let tokens = load_token_store(&config).await?;
-    let bebop_tokens: Arc<TokenStore>;
-    let hashflow_tokens: Arc<TokenStore>;
-    let liquorice_tokens: Arc<TokenStore>;
-
-    if effective_rfq_enabled {
-        // RFQ enabled means RFQ bootstrap must succeed.
-        bebop_tokens = if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:bebop") {
-            load_bebop_token_store(&config, &config.bebop_url, chain).await?
-        } else {
-            new_local_token_store(HashMap::new(), &config)
-        };
-        hashflow_tokens =
-            if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:hashflow") {
-                load_hashflow_token_store(&config, &config.hashflow_filename, chain)?
-            } else {
-                new_local_token_store(HashMap::new(), &config)
-            };
-        liquorice_tokens =
-            if rfq_protocol_enabled(&config.chain_profile.rfq_protocols, "rfq:liquorice") {
-                let liquorice_url = config.liquorice_url.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("Liquorice RFQ enabled for {chain} without liquorice_url")
-                })?;
-                load_liquorice_token_store(&config, liquorice_url, chain).await?
-            } else {
-                new_local_token_store(HashMap::new(), &config)
-            };
-    } else {
-        bebop_tokens = new_local_token_store(HashMap::new(), &config);
-        hashflow_tokens = new_local_token_store(HashMap::new(), &config);
-        liquorice_tokens = new_local_token_store(HashMap::new(), &config);
-    }
-
     let stream_resources = create_stream_resources(Arc::clone(&tokens));
     let app_state = build_app_state(&config, Arc::clone(&tokens), &stream_resources);
     let supervisor_cfg = build_supervisor_config(&config);
 
     log_rebuild_config(&config);
     spawn_broadcaster_subscription_task(&config, &supervisor_cfg, &stream_resources, &app_state);
-    let rfq_config = RFQConfig {
-        bebop_user: config.bebop_user.clone(),
-        bebop_key: config.bebop_key.clone(),
-        hashflow_user: config.hashflow_user.clone(),
-        hashflow_key: config.hashflow_key.clone(),
-        liquorice_user: config.liquorice_user.clone(),
-        liquorice_key: config.liquorice_key.clone(),
-    };
-    spawn_rfq_stream_task(
-        &config,
-        &supervisor_cfg,
-        Arc::clone(&tokens),
-        RfqStreamDeps {
-            resources: &stream_resources,
-            app_state: &app_state,
-            bebop_tokens: Arc::clone(&bebop_tokens),
-            hashflow_tokens: Arc::clone(&hashflow_tokens),
-            liquorice_tokens: Arc::clone(&liquorice_tokens),
-        },
-        rfq_config,
-    );
 
     Ok(SimulatorServiceParts {
         config,
@@ -166,7 +98,6 @@ struct StreamResources {
     vm_stream_health: Arc<StreamHealth>,
     rfq_stream_health: Arc<StreamHealth>,
     vm_stream: Arc<tokio::sync::RwLock<VmStreamStatus>>,
-    rfq_stream: Arc<tokio::sync::RwLock<RfqStreamStatus>>,
 }
 
 fn log_memory_config(memory: MemoryConfig) {
@@ -371,119 +302,6 @@ async fn load_broadcaster_token_snapshot(
         .map_err(|error| TokenSnapshotLoadError::InvalidToken(anyhow::anyhow!("{error}")))
 }
 
-async fn load_bebop_token_store(
-    config: &AppConfig,
-    bebop_url: &str,
-    chain: Chain,
-) -> anyhow::Result<Arc<TokenStore>> {
-    let client = Client::new();
-    let bebop_tokens = load_bebop_tokens(&client, bebop_url, chain).await?;
-    info!("all bebop tokens: {:?}", bebop_tokens);
-    Ok(new_local_token_store(bebop_tokens, config))
-}
-
-async fn load_bebop_tokens(
-    client: &Client,
-    bebop_url: &str,
-    chain: Chain,
-) -> anyhow::Result<HashMap<Bytes, Token>> {
-    let response: BebopResponse = client
-        .get(bebop_url)
-        .query(&[
-            ("active_only", "true"),
-            ("gasless", "false"),
-            ("expiry_type", "standard"),
-        ])
-        .header("accept", "application/json")
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    response
-        .tokens
-        .into_values()
-        .filter_map(|token| match token.to_tycho_token(chain) {
-            Ok(Some(new)) => Some(Ok((new.address.clone(), new))),
-            Ok(None) => None,
-            Err(err) => Some(Err(err)),
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|error| anyhow::anyhow!("Failed to parse Bebop token: {}", error))
-}
-
-fn load_hashflow_token_store(
-    config: &AppConfig,
-    hashflow_filename: &str,
-    chain: Chain,
-) -> anyhow::Result<Arc<TokenStore>> {
-    let hashflow_tokens = read_hashflow_csv(hashflow_filename, chain)
-        .map_err(|error| anyhow::anyhow!("Failed to read hashflow CSV: {}", error))?;
-    info!("all_hashflow_tokens: {:?}", hashflow_tokens);
-    Ok(new_local_token_store(hashflow_tokens, config))
-}
-
-async fn load_liquorice_token_store(
-    config: &AppConfig,
-    liquorice_url: &str,
-    chain: Chain,
-) -> anyhow::Result<Arc<TokenStore>> {
-    let client = Client::new();
-    let liquorice_tokens = load_liquorice_tokens(
-        &client,
-        liquorice_url,
-        chain,
-        &config.liquorice_user,
-        &config.liquorice_key,
-    )
-    .await?;
-    info!("all_liquorice_tokens: {:?}", liquorice_tokens);
-    Ok(new_local_token_store(liquorice_tokens, config))
-}
-
-async fn load_liquorice_tokens(
-    client: &Client,
-    liquorice_url: &str,
-    chain: Chain,
-    solver: &str,
-    authorization: &str,
-) -> anyhow::Result<HashMap<Bytes, Token>> {
-    let chain_id = chain.id().to_string();
-    let response: Vec<TokenLiquorice> = client
-        .get(liquorice_url)
-        .query(&[("chainId", chain_id)])
-        .header("accept", "application/json")
-        .header("solver", solver)
-        .header("authorization", authorization)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    response
-        .into_iter()
-        .map(|token| {
-            token
-                .to_tycho_token(chain)
-                .map(|new| (new.address.clone(), new))
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|error| anyhow::anyhow!("Failed to parse Liquorice token: {}", error))
-}
-
-fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
-    protocols.iter().any(|configured| configured == protocol)
-}
-
-fn new_local_token_store(tokens: HashMap<Bytes, Token>, config: &AppConfig) -> Arc<TokenStore> {
-    Arc::new(TokenStore::local_only(
-        tokens,
-        config.chain_profile.chain,
-        Duration::from_millis(config.token_refresh_timeout_ms),
-    ))
-}
-
 fn create_stream_resources(tokens: Arc<TokenStore>) -> StreamResources {
     let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
     let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
@@ -492,7 +310,6 @@ fn create_stream_resources(tokens: Arc<TokenStore>) -> StreamResources {
     let vm_stream_health = Arc::new(StreamHealth::new());
     let rfq_stream_health = Arc::new(StreamHealth::new());
     let vm_stream = Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default()));
-    let rfq_stream = Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default()));
     debug!("Created shared state");
 
     StreamResources {
@@ -503,7 +320,6 @@ fn create_stream_resources(tokens: Arc<TokenStore>) -> StreamResources {
         vm_stream_health,
         rfq_stream_health,
         vm_stream,
-        rfq_stream,
     }
 }
 
@@ -530,6 +346,7 @@ fn build_app_state(
         tokens,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
+        rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         native_state_store: Arc::clone(&resources.native_state_store),
         vm_state_store: Arc::clone(&resources.vm_state_store),
         rfq_state_store: Arc::clone(&resources.rfq_state_store),
@@ -537,7 +354,6 @@ fn build_app_state(
         vm_stream_health: Arc::clone(&resources.vm_stream_health),
         rfq_stream_health: Arc::clone(&resources.rfq_stream_health),
         vm_stream: Arc::clone(&resources.vm_stream),
-        rfq_stream: Arc::clone(&resources.rfq_stream),
         configured_backends: crate::models::state::ConfiguredBackends {
             vm: configured_vm_pools,
             rfq: configured_rfq_pools,
@@ -546,7 +362,8 @@ fn build_app_state(
         enable_rfq_pools: effective_rfq_enabled,
         readiness_stale,
         request_timeout,
-        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: config.slippage,
         erc4626_deposits_enabled: config.rpc_url.is_some(),
         erc4626_pair_policies: Arc::clone(&config.erc4626_pair_policies),
@@ -597,9 +414,76 @@ fn spawn_broadcaster_subscription_task(
     resources: &StreamResources,
     app_state: &AppState,
 ) {
-    spawn_native_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+    for backend in broadcaster_subscription_plan(app_state) {
+        spawn_broadcaster_subscription_backend(
+            backend,
+            config,
+            supervisor_cfg,
+            resources,
+            app_state,
+        );
+    }
+}
+
+#[cfg(test)]
+fn enabled_broadcaster_subscription_backends(app_state: &AppState) -> Vec<&'static str> {
+    broadcaster_subscription_plan(app_state)
+        .into_iter()
+        .map(BroadcasterSubscriptionBackend::label)
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BroadcasterSubscriptionBackend {
+    Native,
+    Vm,
+    Rfq,
+}
+
+impl BroadcasterSubscriptionBackend {
+    #[cfg(test)]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Vm => "vm",
+            Self::Rfq => "rfq",
+        }
+    }
+}
+
+fn broadcaster_subscription_plan(app_state: &AppState) -> Vec<BroadcasterSubscriptionBackend> {
+    let mut backends = vec![BroadcasterSubscriptionBackend::Native];
     if app_state.enable_vm_pools {
-        spawn_vm_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+        backends.push(BroadcasterSubscriptionBackend::Vm);
+    }
+    if app_state.enable_rfq_pools {
+        backends.push(BroadcasterSubscriptionBackend::Rfq);
+    }
+    backends
+}
+
+fn spawn_broadcaster_subscription_backend(
+    backend: BroadcasterSubscriptionBackend,
+    config: &AppConfig,
+    supervisor_cfg: &StreamSupervisorConfig,
+    resources: &StreamResources,
+    app_state: &AppState,
+) {
+    match backend {
+        BroadcasterSubscriptionBackend::Native => {
+            spawn_native_broadcaster_subscription_task(
+                config,
+                supervisor_cfg,
+                resources,
+                app_state,
+            );
+        }
+        BroadcasterSubscriptionBackend::Vm => {
+            spawn_vm_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+        }
+        BroadcasterSubscriptionBackend::Rfq => {
+            spawn_rfq_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+        }
     }
 }
 
@@ -638,10 +522,33 @@ fn spawn_vm_broadcaster_subscription_task(
         tokens: Arc::clone(&app_state.tokens),
         protocols: config.chain_profile.vm_protocols.clone(),
         vm_stream: Arc::clone(&resources.vm_stream),
-        simulation_rebuild_gate: app_state.simulation_rebuild_gate(),
+        simulation_rebuild_gate: app_state.vm_simulation_rebuild_gate(),
     });
     spawn_backend_broadcaster_subscription_task(
         "vm",
+        config.tycho_broadcaster_ws_url.clone(),
+        config.chain_profile.chain.id(),
+        supervisor_cfg.clone(),
+        controls,
+    );
+}
+
+fn spawn_rfq_broadcaster_subscription_task(
+    config: &AppConfig,
+    supervisor_cfg: &StreamSupervisorConfig,
+    resources: &StreamResources,
+    app_state: &AppState,
+) {
+    let controls = BroadcasterSubscriptionControls::Rfq(RfqBroadcasterSubscriptionControls {
+        broadcaster_subscription: app_state.rfq_broadcaster_subscription.clone(),
+        state_store: Arc::clone(&resources.rfq_state_store),
+        stream_health: Arc::clone(&resources.rfq_stream_health),
+        tokens: Arc::clone(&app_state.tokens),
+        protocols: config.chain_profile.rfq_protocols.clone(),
+        simulation_rebuild_gate: app_state.rfq_simulation_rebuild_gate(),
+    });
+    spawn_backend_broadcaster_subscription_task(
+        "rfq",
         config.tycho_broadcaster_ws_url.clone(),
         config.chain_profile.chain.id(),
         supervisor_cfg.clone(),
@@ -664,73 +571,6 @@ fn spawn_backend_broadcaster_subscription_task(
     debug!(backend, "Broadcaster subscription supervisor task spawned");
 }
 
-fn spawn_rfq_stream_task(
-    config: &AppConfig,
-    supervisor_cfg: &StreamSupervisorConfig,
-    tokens: Arc<TokenStore>,
-    deps: RfqStreamDeps<'_>,
-    rfq_config: RFQConfig,
-) {
-    let chain = config.chain_profile.chain;
-    let effective_rfq_enabled =
-        config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty();
-    if !effective_rfq_enabled {
-        if !config.enable_rfq_pools {
-            info!("RFQ pool feeds disabled");
-        } else {
-            info!(
-                chain = %chain,
-                "RFQ pool feeds enabled but no RFQ protocols configured for this chain; skipping RFQ stream"
-            );
-        }
-        return;
-    }
-
-    let rfq_supervisor_cfg = supervisor_cfg.clone();
-    let tokens_bg = tokens;
-    let bebop_tokens_bg = deps.bebop_tokens;
-    let hashflow_tokens_bg = deps.hashflow_tokens;
-    let liquorice_tokens_bg = deps.liquorice_tokens;
-    let state_store_bg = Arc::clone(&deps.resources.rfq_state_store);
-    let health_bg = Arc::clone(&deps.resources.rfq_stream_health);
-    let rfq_stream_bg = Arc::clone(&deps.resources.rfq_stream);
-    let simulation_rebuild_gate = deps.app_state.simulation_rebuild_gate();
-    let tvl_threshold = config.tvl_threshold;
-    let rfq_protocols = config.chain_profile.rfq_protocols.clone();
-    tokio::spawn(async move {
-        info!("Starting RFQ protocol stream supervisor...");
-        supervise_rfq_stream(
-            move || {
-                let tokens = Arc::clone(&tokens_bg);
-                let bebop_tokens = Arc::clone(&bebop_tokens_bg);
-                let hashflow_tokens = Arc::clone(&hashflow_tokens_bg);
-                let liquorice_tokens = Arc::clone(&liquorice_tokens_bg);
-                let protocols = rfq_protocols.clone();
-                let rfq_config = rfq_config.clone();
-                let token_stores = RFQTokenStores {
-                    tokens,
-                    bebop: bebop_tokens,
-                    hashflow: hashflow_tokens,
-                    liquorice: liquorice_tokens,
-                };
-                async move {
-                    build_rfq_stream(tvl_threshold, token_stores, chain, &protocols, rfq_config)
-                        .await
-                }
-            },
-            state_store_bg,
-            health_bg,
-            rfq_supervisor_cfg,
-            RfqStreamControls {
-                rfq_stream: rfq_stream_bg,
-                simulation_rebuild_gate,
-            },
-        )
-        .await;
-    });
-    debug!("RFQ stream supervisor task spawned");
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -750,7 +590,11 @@ mod tests {
     use tokio::task::JoinHandle;
     use tycho_simulation::tycho_common::{models::token::Token, models::Chain, Bytes};
 
-    use super::{build_app_state, create_stream_resources, load_token_store};
+    use super::{
+        broadcaster_subscription_plan, build_app_state, create_stream_resources,
+        enabled_broadcaster_subscription_backends, load_token_store,
+        BroadcasterSubscriptionBackend,
+    };
 
     struct TokenAuthority {
         ws_url: String,
@@ -1255,6 +1099,38 @@ mod tests {
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
+    }
+
+    #[test]
+    fn enabled_broadcaster_subscription_backends_include_rfq_when_effective() {
+        let config = build_test_config(base_chain_profile(), true, true, None);
+        let tokens = build_test_token_store(Chain::Base);
+        let resources = create_stream_resources(Arc::clone(&tokens));
+        let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
+
+        assert_eq!(
+            broadcaster_subscription_plan(&app_state),
+            vec![
+                BroadcasterSubscriptionBackend::Native,
+                BroadcasterSubscriptionBackend::Rfq
+            ]
+        );
+        assert_eq!(
+            enabled_broadcaster_subscription_backends(&app_state),
+            vec!["native", "rfq"]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_app_state_initializes_rfq_broadcaster_subscription_status() {
+        let config = build_test_config(base_chain_profile(), false, true, None);
+        let tokens = build_test_token_store(Chain::Base);
+        let resources = create_stream_resources(Arc::clone(&tokens));
+        let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
+
+        let snapshot = app_state.rfq_broadcaster_subscription.snapshot().await;
+        assert!(!snapshot.connected);
+        assert!(!snapshot.bootstrap_complete);
     }
 
     #[test]

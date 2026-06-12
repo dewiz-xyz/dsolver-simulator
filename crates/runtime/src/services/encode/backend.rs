@@ -27,7 +27,7 @@ impl PoolBackend {
     }
 
     pub(super) fn from_protocol_hint(protocol: &str) -> Self {
-        Self::from_kind(ProtocolKind::from_sync_state_key(protocol))
+        Self::from_kind(ProtocolKind::from_protocol_hint(protocol))
     }
 
     pub(super) const fn is_native(self) -> bool {
@@ -75,14 +75,15 @@ mod tests {
     #[test]
     fn from_protocol_hint_recognizes_vm_and_rfq_hints() {
         assert!(PoolBackend::from_protocol_hint("VM:MAVERICK_V2").is_vm());
+        assert!(PoolBackend::from_protocol_hint("curve_pool").is_vm());
         assert!(PoolBackend::from_protocol_hint("RFQ:BEBOP").is_rfq());
+        assert!(PoolBackend::from_protocol_hint("hashflow_pool").is_rfq());
         assert!(PoolBackend::from_protocol_hint("uniswap_v3").is_native());
     }
 
     #[test]
     fn from_protocol_hint_defaults_unknown_to_native() {
         assert!(PoolBackend::from_protocol_hint("unknown").is_native());
-        assert!(PoolBackend::from_protocol_hint("hashflow_pool").is_native());
     }
 
     #[test]

@@ -555,8 +555,7 @@ mod tests {
     use crate::config::SlippageConfig;
     use crate::models::messages::{QuoteFailure, QuoteFailureKind};
     use crate::models::state::{
-        BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
-        VmStreamStatus,
+        BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -603,6 +602,7 @@ mod tests {
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store,
             vm_state_store,
             rfq_state_store,
@@ -610,7 +610,6 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: false,
                 rfq: false,
@@ -619,7 +618,8 @@ mod tests {
             enable_rfq_pools: false,
             readiness_stale: Duration::from_secs(120),
             request_timeout,
-            simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),

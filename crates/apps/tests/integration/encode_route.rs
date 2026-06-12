@@ -15,8 +15,7 @@ use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
-    VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -349,7 +348,6 @@ struct EncodeFixtureConfig<'a> {
     mark_rfq_healthy: bool,
     vm_broadcaster_bootstrap_complete: bool,
     vm_rebuilding: bool,
-    rfq_rebuilding: bool,
     request_id: &'a str,
 }
 
@@ -378,7 +376,6 @@ impl Default for EncodeFixtureConfig<'_> {
             mark_rfq_healthy: true,
             vm_broadcaster_bootstrap_complete: true,
             vm_rebuilding: false,
-            rfq_rebuilding: false,
             request_id: "req-1",
         }
     }
@@ -572,11 +569,6 @@ async fn build_app_state_and_request(
         ..VmStreamStatus::default()
     }));
 
-    let rfq_stream = Arc::new(tokio::sync::RwLock::new(RfqStreamStatus {
-        rebuilding: config.rfq_rebuilding,
-        ..RfqStreamStatus::default()
-    }));
-
     let vm_broadcaster_subscription = if config.vm_broadcaster_bootstrap_complete {
         BroadcasterSubscriptionStatus::ready_for_test()
     } else {
@@ -591,6 +583,7 @@ async fn build_app_state_and_request(
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription,
+        rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store: Arc::clone(&native_state_store),
         vm_state_store: Arc::clone(&vm_state_store),
         rfq_state_store: Arc::clone(&rfq_state_store),
@@ -598,7 +591,6 @@ async fn build_app_state_and_request(
         vm_stream_health,
         rfq_stream_health,
         vm_stream,
-        rfq_stream,
         configured_backends: ConfiguredBackends {
             vm: config.enable_vm_pools,
             rfq: config.enable_rfq_pools,
@@ -607,7 +599,8 @@ async fn build_app_state_and_request(
         enable_rfq_pools: config.enable_rfq_pools,
         readiness_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
-        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: config.erc4626_deposits_enabled,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
@@ -688,6 +681,7 @@ async fn setup_timeout_app(
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
@@ -695,7 +689,6 @@ async fn setup_timeout_app(
         vm_stream_health,
         rfq_stream_health,
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         configured_backends: ConfiguredBackends {
             vm: false,
             rfq: false,
@@ -704,7 +697,8 @@ async fn setup_timeout_app(
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         request_timeout,
-        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
@@ -1019,6 +1013,80 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
     assert_eq!(
         response.error,
         "Encode unavailable: VM state stale for requested route"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_rfq_route_under_broadcaster_snapshot_model() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "rfq:hashflow",
+        component_protocol_system: "rfq:hashflow",
+        component_protocol_type_name: "hashflow_pool",
+        rfq_pool: true,
+        enable_rfq_pools: true,
+        request_id: "req-rfq-indicative-only",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: RFQ signed quote generation is not supported from broadcaster RFQ snapshots"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_rejects_rfq_pool_even_when_request_hint_is_native() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "uniswap_v2",
+        component_protocol_system: "",
+        component_protocol_type_name: "hashflow_pool",
+        rfq_pool: true,
+        enable_rfq_pools: true,
+        request_id: "req-rfq-actual-backend",
+        ..EncodeFixtureConfig::default()
+    };
+    let (app, request) = setup_app_state_and_request(config).await?;
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: RFQ signed quote generation is not supported from broadcaster RFQ snapshots"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_route_keeps_rfq_unavailable_for_type_hint_after_reset() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "hashflow_pool",
+        component_protocol_system: "",
+        component_protocol_type_name: "hashflow_pool",
+        rfq_pool: true,
+        enable_rfq_pools: true,
+        request_id: "req-rfq-reset-type-hint",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    state.rfq_state_store.reset().await;
+    let app = create_router(SimulatorRuntime::new(state));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encode unavailable: RFQ state warming up for requested route"
     );
     Ok(())
 }
@@ -1419,6 +1487,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+        rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         native_state_store,
         vm_state_store,
         rfq_state_store,
@@ -1426,7 +1495,6 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         vm_stream_health: Arc::new(StreamHealth::new()),
         rfq_stream_health: Arc::new(StreamHealth::new()),
         vm_stream: Arc::new(tokio::sync::RwLock::new(VmStreamStatus::default())),
-        rfq_stream: Arc::new(tokio::sync::RwLock::new(RfqStreamStatus::default())),
         configured_backends: ConfiguredBackends {
             vm: false,
             rfq: false,
@@ -1435,7 +1503,8 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         enable_rfq_pools: false,
         readiness_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
-        simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
+        rfq_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(erc4626_pair_policies()),

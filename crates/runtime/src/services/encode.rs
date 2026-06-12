@@ -80,6 +80,9 @@ pub struct EncodeComputation {
     pub reset_approval: bool,
 }
 
+const RFQ_ENCODE_UNAVAILABLE_MESSAGE: &str =
+    "Encode unavailable: RFQ signed quote generation is not supported from broadcaster RFQ snapshots";
+
 async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
@@ -124,6 +127,9 @@ async fn encode_route(
         .await;
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
+    }
+    if uses_rfq {
+        return Err(EncodeError::unavailable(RFQ_ENCODE_UNAVAILABLE_MESSAGE));
     }
     let resimulated = resimulate::resimulate_route(
         &state,

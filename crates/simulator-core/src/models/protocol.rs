@@ -88,6 +88,12 @@ impl ProtocolKind {
         Self::from_protocol_system(name.as_str())
     }
 
+    pub fn from_protocol_hint(protocol: &str) -> Option<Self> {
+        let name = normalize_proto_name(protocol);
+        Self::from_protocol_system(name.as_str())
+            .or_else(|| Self::from_protocol_type_name(name.as_str()))
+    }
+
     fn from_protocol_type_name(name: &str) -> Option<Self> {
         match name {
             "uniswap_v2_pool" => Some(ProtocolKind::UniswapV2),
@@ -326,5 +332,25 @@ mod tests {
         for type_name in type_names {
             assert_eq!(ProtocolKind::from_sync_state_key(type_name), None);
         }
+    }
+
+    #[test]
+    fn from_protocol_hint_accepts_systems_and_type_names() {
+        assert_eq!(
+            ProtocolKind::from_protocol_hint("rfq:hashflow"),
+            Some(ProtocolKind::Hashflow)
+        );
+        assert_eq!(
+            ProtocolKind::from_protocol_hint("hashflow_pool"),
+            Some(ProtocolKind::Hashflow)
+        );
+        assert_eq!(
+            ProtocolKind::from_protocol_hint("curve_pool"),
+            Some(ProtocolKind::Curve)
+        );
+        assert_eq!(
+            ProtocolKind::from_protocol_hint("uniswap_v2"),
+            Some(ProtocolKind::UniswapV2)
+        );
     }
 }

@@ -21,6 +21,7 @@ use crate::models::messages::{
     AmountOutRequest, AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteFailure,
     QuoteFailureKind, QuoteMeta, QuotePartialKind, QuoteResultQuality, QuoteStatus,
 };
+use crate::models::protocol::ProtocolKind;
 use crate::models::state::{AppState, SimulationRebuildGuard};
 use crate::models::tokens::TokenStoreError;
 
@@ -343,7 +344,9 @@ fn pool_descriptor(id: String, component: &ProtocolComponent) -> PoolDescriptor 
     PoolDescriptor {
         name: derive_pool_name(component),
         address: component.id.to_string(),
-        protocol: component.protocol_system.clone(),
+        protocol: ProtocolKind::from_component(component)
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| component.protocol_system.clone()),
         id,
     }
 }
@@ -2561,8 +2564,7 @@ mod tests {
     use tycho_simulation::tycho_common::Bytes;
 
     use crate::models::state::{
-        BroadcasterSubscriptionStatus, ConfiguredBackends, RfqStreamStatus, StateStore,
-        VmStreamStatus,
+        BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -3004,6 +3006,28 @@ mod tests {
         )
     }
 
+    #[test]
+    fn pool_descriptor_uses_canonical_protocol_for_type_only_rfq_component() {
+        let token_a = make_token(
+            &Bytes::from_str("0x0000000000000000000000000000000000000001").expect("valid address"),
+            "TK1",
+        );
+        let token_b = make_token(
+            &Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address"),
+            "TK2",
+        );
+        let component = make_pair_component(
+            "0x0000000000000000000000000000000000000009",
+            "",
+            "hashflow_pool",
+            vec![token_a, token_b],
+        );
+
+        let descriptor = pool_descriptor("pool-rfq".to_string(), &component);
+
+        assert_eq!(descriptor.protocol, "rfq:hashflow");
+    }
+
     #[expect(
         clippy::panic,
         reason = "quote test fixtures should fail immediately on invalid literal addresses"
@@ -3075,6 +3099,7 @@ mod tests {
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
+            rfq_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             native_state_store,
             vm_state_store,
             rfq_state_store,
@@ -3082,7 +3107,6 @@ mod tests {
             vm_stream_health: Arc::new(StreamHealth::new()),
             rfq_stream_health: Arc::new(StreamHealth::new()),
             vm_stream: Arc::new(RwLock::new(VmStreamStatus::default())),
-            rfq_stream: Arc::new(RwLock::new(RfqStreamStatus::default())),
             configured_backends: ConfiguredBackends {
                 vm: config.enable_vm_pools,
                 rfq: config.enable_rfq_pools,
@@ -3091,7 +3115,8 @@ mod tests {
             enable_rfq_pools: config.enable_rfq_pools,
             readiness_stale: Duration::from_secs(120),
             request_timeout: config.request_timeout,
-            simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            rfq_simulation_rebuild_gate: Arc::new(RwLock::new(())),
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
@@ -4323,7 +4348,7 @@ mod tests {
                 ..TestAppStateConfig::default()
             },
         );
-        let request_guard = app_state.simulation_rebuild_gate().write_owned().await;
+        let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
         let request = fixture.request("req-vm-rebuild-guard", &["10"]);
         let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
 
@@ -5286,8 +5311,8 @@ mod tests {
             _token_in: &Token,
             _token_out: &Token,
         ) -> Result<GetAmountOutResult, SimulationError> {
-            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call_index == 0 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in == BigUint::from(1u8) {
                 return Ok(GetAmountOutResult::new(
                     BigUint::zero(),
                     BigUint::from(7u8),
@@ -5499,7 +5524,7 @@ mod tests {
             "uniswap_v2",
             fixture.pair_tokens(),
             Box::new(StepSelectiveFailureSim {
-                fail_on_calls: vec![1],
+                fail_on_amounts: vec![2],
                 calls: Arc::clone(&calls),
             }),
         );
@@ -5647,7 +5672,7 @@ mod tests {
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct StepSelectiveFailureSim {
-        fail_on_calls: Vec<usize>,
+        fail_on_amounts: Vec<u64>,
         #[serde(skip, default = "default_calls")]
         calls: Arc<AtomicUsize>,
     }
@@ -5668,15 +5693,18 @@ mod tests {
             _token_in: &Token,
             _token_out: &Token,
         ) -> Result<GetAmountOutResult, SimulationError> {
-            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_on_calls.contains(&call_index) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if amount_in
+                .to_u64()
+                .is_some_and(|amount| self.fail_on_amounts.contains(&amount))
+            {
                 return Err(SimulationError::FatalError(format!(
-                    "simulated requested amount {call_index} failure"
+                    "simulated requested amount {amount_in} failure"
                 )));
             }
             Ok(GetAmountOutResult::new(
                 amount_in.clone(),
-                BigUint::from((call_index + 1) as u64),
+                amount_in,
                 self.clone_box(),
             ))
         }
@@ -5861,7 +5889,7 @@ mod tests {
             "uniswap_v2",
             fixture.pair_tokens(),
             Box::new(StepSelectiveFailureSim {
-                fail_on_calls: vec![1],
+                fail_on_amounts: vec![2],
                 calls: default_calls(),
             }),
         );
