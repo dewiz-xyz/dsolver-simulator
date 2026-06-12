@@ -41,7 +41,7 @@ Contract invariants:
 
 - `schema_version` must match the supported Redis stream schema version
 - `stream_id` and `message_seq` must match the serialized envelope in `payload_json`
-- `message_seq` starts at `1`, and `snapshot_start` must be the first message in a generation
+- `message_seq` starts at `1`, and only a `snapshot_start` entry can carry sequence `1` as the first message in a generation
 - snapshot and heartbeat entries carry `snapshot_id`
 - `backend_scope` must match the backends represented by the payload
 - native and VM chain block numbers stay attached to the backend partition that produced them
@@ -52,6 +52,8 @@ Contract invariants:
 
 The snapshot pointer is stored separately from the event stream. It records:
 
+- `schema_version`
+- `chain_id`
 - `stream_key`
 - `stream_id`
 - `snapshot_id`
