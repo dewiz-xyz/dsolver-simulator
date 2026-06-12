@@ -44,8 +44,10 @@ Contract invariants:
 - `message_seq` starts at `1`, and `snapshot_start` must be the first message in a generation
 - snapshot and heartbeat entries carry `snapshot_id`
 - `backend_scope` must match the backends represented by the payload
-- native, VM, and RFQ block numbers stay attached to the backend partition that produced them
-- entry `block_number` must match any block number carried by the payload
+- native and VM chain block numbers stay attached to the backend partition that produced them
+- RFQ partitions carry Tycho RFQ update timestamps/cursors through the existing partition progress field; those values are not chain blocks
+- entry `block_number` is a chain-block summary only: it is present only when native/VM payload partitions provide one unambiguous chain block, and when present it must match that chain block
+- RFQ-only entries, heartbeat entries, snapshot boundary entries, and divergent native/VM payloads omit entry `block_number`
 - payload kind, snapshot id, chain id, and backend scope are validated before an entry is accepted
 
 The snapshot pointer is stored separately from the event stream. It records:
@@ -89,7 +91,7 @@ RFQ ingestion moves from the simulator into the broadcaster:
 
 - broadcaster config loads RFQ provider URLs, credentials, and token sources
 - the broadcaster builds the RFQ stream when `ENABLE_RFQ_POOLS=true` and the chain has RFQ protocols
-- RFQ updates are stored in a broadcaster cache configured only for the `rfq` backend
+- RFQ updates are timestamped by Tycho's RFQ stream and stored in a broadcaster cache configured only for the `rfq` backend
 - RFQ snapshots and heartbeats use the same envelope lifecycle as native and VM snapshots
 
 The broadcaster still serves token metadata as the authority for the simulator. RFQ-only tokens are merged into the broadcaster token view before RFQ stream construction, so the simulator does not need provider-specific token bootstrap logic.
@@ -320,12 +322,14 @@ RFQ no longer has a separate simulator-local `rebuilding` state. RFQ reconnects 
 - `enabled`
 - `readiness`
 - `reason`
-- `block_number`
+- `update_timestamp`
 - `pool_count`
 - `restart_count`
 - `last_error`
 - `last_update_age_ms`
 - `subscription`
+
+For RFQ status, `update_timestamp` is the current RFQ update timestamp/cursor. RFQ backend status does not expose `block_number`.
 
 The top-level simulator status remains native-first. Optional VM and RFQ backend degradation should not turn a native-ready service into top-level warming-up unless native itself is warming or stale.
 
@@ -338,7 +342,7 @@ Required quote behavior:
 - compute `initial_rfq_ready` through `AppState::rfq_readiness`
 - skip RFQ candidates when RFQ pools are enabled but RFQ readiness is not `ready`
 - set `meta.rfq_unavailable=true` when RFQ was enabled and skipped
-- set `meta.rfq_block_number` only when RFQ readiness is `ready`
+- set `meta.rfq_update_timestamp` only when RFQ readiness is `ready`; the field carries the current RFQ update timestamp/cursor, not a chain block
 - keep native readiness as the hard request gate
 - keep VM and RFQ degradation as optional backend degradation when native can still quote
 - keep directional RFQ filtering unchanged
@@ -418,7 +422,7 @@ The stream and snapshot keys must be different. Redis URLs must use `redis://` o
 Important status surfaces:
 
 - broadcaster root `/status`: native and VM publisher readiness
-- broadcaster `/rfq/status`: RFQ publisher readiness
+- broadcaster `/rfq/status`: RFQ publisher readiness; RFQ backend progress is `update_timestamp`, not `block_number`
 - simulator `/status`: consumer readiness for native, VM, and RFQ local state
 
 Important identifiers:

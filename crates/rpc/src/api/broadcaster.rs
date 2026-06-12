@@ -299,6 +299,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rfq_status_reports_update_timestamp_without_block_number() -> Result<()> {
+        let app = create_broadcaster_router(
+            build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
+        );
+
+        let (status, body) = get_json(app, "/rfq/status").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["backends"]["rfq"]["update_timestamp"], 12);
+        assert!(body["backends"]["rfq"].get("block_number").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rfq_status_returns_not_found_when_disabled() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
 

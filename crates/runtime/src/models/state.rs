@@ -316,7 +316,8 @@ pub struct SimulatorBackendStatusSnapshot {
     pub enabled: bool,
     pub readiness: SimulatorBackendReadiness,
     pub reason: Option<SimulatorReadinessReason>,
-    pub block_number: u64,
+    pub block_number: Option<u64>,
+    pub update_timestamp: Option<u64>,
     pub pool_count: usize,
     pub restart_count: u64,
     pub last_error: Option<String>,
@@ -443,7 +444,8 @@ impl AppState {
             enabled: true,
             readiness,
             reason,
-            block_number: self.current_block().await,
+            block_number: Some(self.current_block().await),
+            update_timestamp: None,
             pool_count: self.native_state_store.total_states().await,
             restart_count: stream_restart_count,
             last_error: subscription.last_error.clone().or(stream_last_error),
@@ -484,7 +486,8 @@ impl AppState {
             enabled: self.enable_vm_pools,
             readiness,
             reason,
-            block_number: self.vm_block().await,
+            block_number: self.enable_vm_pools.then_some(self.vm_block().await),
+            update_timestamp: None,
             pool_count: self.vm_pools().await,
             restart_count: stream_status.restart_count,
             last_error: subscription
@@ -524,13 +527,19 @@ impl AppState {
             SimulatorBackendReadiness::Stale => Some(SimulatorReadinessReason::Stale),
             SimulatorBackendReadiness::Ready | SimulatorBackendReadiness::Rebuilding => None,
         };
+        let update_timestamp = if self.rfq_state_store.is_ready() {
+            Some(self.rfq_update_timestamp().await)
+        } else {
+            None
+        };
 
         SimulatorBackendStatusSnapshot {
             kind: SimulatorBackendKind::Rfq,
             enabled: self.enable_rfq_pools,
             readiness,
             reason,
-            block_number: self.rfq_block().await,
+            block_number: None,
+            update_timestamp,
             pool_count: self.rfq_pools().await,
             restart_count: subscription.restart_count,
             last_error: subscription.last_error.clone(),
@@ -551,7 +560,7 @@ impl AppState {
         Some(self.vm_state_store.current_block().await)
     }
 
-    pub async fn current_rfq_block(&self) -> Option<u64> {
+    pub async fn current_rfq_update_timestamp(&self) -> Option<u64> {
         if !self.rfq_ready().await {
             return None;
         }
@@ -822,7 +831,7 @@ impl AppState {
         self.vm_state_store.current_block().await
     }
 
-    pub async fn rfq_block(&self) -> u64 {
+    pub async fn rfq_update_timestamp(&self) -> u64 {
         self.rfq_state_store.current_block().await
     }
 

@@ -56,6 +56,8 @@ pub struct ReadinessBackendSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_number: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_count: Option<u64>,
@@ -634,6 +636,7 @@ mod tests {
             status: status.to_string(),
             reason: None,
             block_number,
+            update_timestamp: None,
             pool_count,
             restart_count: Some(0),
             last_error: None,
@@ -747,6 +750,22 @@ mod tests {
             finding.title == "rfq-usdc-weth missed expected RFQ visibility"
                 && finding.severity == "attention"
         }));
+    }
+
+    #[test]
+    fn readiness_backend_snapshot_preserves_update_timestamp() {
+        let snapshot: ReadinessBackendSnapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "status": "ready",
+            "update_timestamp": 1_710_000_000u64,
+            "pool_count": 1
+        }))
+        .expect("readiness backend snapshot should deserialize");
+
+        let value =
+            serde_json::to_value(snapshot).expect("readiness backend snapshot should serialize");
+
+        assert_eq!(value["update_timestamp"], 1_710_000_000u64);
     }
 
     #[test]

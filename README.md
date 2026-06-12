@@ -108,7 +108,7 @@ is an example setup, not the source of truth for every default.
 
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
 - `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
-- `GET /status` reports overall service health plus nested backend readiness, block progress, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
+- `GET /status` reports overall service health plus nested backend readiness, native/VM block progress, RFQ cursor/freshness, and VM or RFQ rebuild or restart context for pollers and deploy scripts.
 
 `/encode` keeps its current HTTP control flow, but the server emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
@@ -180,13 +180,15 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 - `backends.native.status="warming_up"` while initial native state is still loading
 - `backends.native.status="stale"` when native updates are past the readiness freshness window
 
-`backends.vm.status` and `backends.rfq.status` are one of:
+`backends.vm.status` is one of:
 
 - `disabled`
 - `warming_up`
 - `rebuilding`
 - `stale`
 - `ready`
+
+`backends.rfq.status` is one of `disabled`, `warming_up`, `stale`, or `ready`. Native and VM backend status use `block_number`; RFQ backend status uses `update_timestamp` for the current Tycho RFQ update cursor.
 
 Timeout behavior differs by endpoint:
 

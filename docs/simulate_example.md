@@ -49,6 +49,7 @@ This document describes the `/simulate` request and response shape.
     "result_quality": "complete",
     "block_number": 19876543,
     "vm_block_number": 19876540,
+    "rfq_update_timestamp": 1710000000,
     "matching_pools": 4,
     "candidate_pools": 4,
     "total_pools": 412,
@@ -91,7 +92,7 @@ In this example, the smallest requested amount failed for that pool, so `amounts
 - `amounts_out[i] = "0"` means that requested amount did not produce a usable quote for that pool. It is not a real output amount.
 - `data[]` contains only pools with at least one positive output across the requested amounts. Pools whose entire `amounts_out` row is `"0"` stay out of `data[]` and remain visible through `meta.failures` and `meta.pool_results`.
 - `data[]` row order is deterministic, but it is not a best-to-worst ranking. Consumers should rely on requested-amount alignment within each row and choose pools explicitly rather than inferring semantics from `data[0]`.
-- `block_number` is the native stream block. `vm_block_number` is present when VM pool support is enabled and VM state has a current block.
+- `block_number` is the native stream block. `vm_block_number` is present when VM pool support is enabled and VM state has a current block. `rfq_update_timestamp` is present when RFQ pool support is enabled and RFQ state is ready; it carries the current RFQ update timestamp/cursor, not a chain block.
 
 ### How to consume `data[]`
 

@@ -196,7 +196,7 @@ impl BroadcasterRedisStreamEntry {
             kind: envelope.kind(),
             snapshot_id: redis_payload_snapshot_id(&envelope.payload).map(str::to_string),
             backend_scope: redis_backend_scope(backends)?,
-            block_number: redis_entry_block_number(&envelope.payload)?,
+            block_number: redis_entry_block_number(&envelope.payload),
             event_time_ms,
             payload_json,
         };
@@ -217,7 +217,6 @@ impl BroadcasterRedisStreamEntry {
         if self.snapshot_id.is_none() && redis_entry_requires_snapshot_id(self.kind) {
             return Err(BroadcasterContractError::RedisEntryMissingSnapshotId { kind: self.kind });
         }
-        ensure_redis_block_number(self.kind, &backends, self.block_number)?;
         self.validate_payload(&backends)
     }
 
@@ -1433,6 +1432,9 @@ pub enum BroadcasterContractError {
     RedisEntryEmptyField {
         field: &'static str,
     },
+    RedisEntryUnexpectedField {
+        field: &'static str,
+    },
     RedisUnsupportedSchemaVersion {
         found: String,
     },
@@ -1612,6 +1614,9 @@ fn fmt_redis_contract_error(
     match error {
         BroadcasterContractError::RedisEntryEmptyField { field } => {
             write!(f, "redis stream field {field} must not be empty")
+        }
+        BroadcasterContractError::RedisEntryUnexpectedField { field } => {
+            write!(f, "redis stream field {field} is not allowed for this payload")
         }
         BroadcasterContractError::RedisUnsupportedSchemaVersion { found } => {
             write!(f, "unsupported redis schema version: {found}")
@@ -1801,6 +1806,7 @@ impl fmt::Display for BroadcasterContractError {
                 *entry_backend,
             ),
             Self::RedisEntryEmptyField { .. }
+            | Self::RedisEntryUnexpectedField { .. }
             | Self::RedisUnsupportedSchemaVersion { .. }
             | Self::RedisEntryMissingSnapshotId { .. }
             | Self::RedisMessageSequenceZero
@@ -2002,71 +2008,69 @@ fn parse_redis_backend(value: &str) -> Result<BroadcasterBackend, BroadcasterCon
     }
 }
 
-fn ensure_redis_block_number(
-    kind: BroadcasterMessageKind,
-    backends: &[BroadcasterBackend],
-    block_number: Option<u64>,
-) -> Result<(), BroadcasterContractError> {
-    let requires_block = matches!(
-        kind,
-        BroadcasterMessageKind::SnapshotChunk | BroadcasterMessageKind::Update
-    ) && backends
-        .iter()
-        .any(|backend| matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm));
-    if requires_block && block_number.is_none() {
-        return Err(BroadcasterContractError::RedisEntryEmptyField {
-            field: "block_number",
-        });
-    }
-    Ok(())
-}
-
 fn ensure_redis_payload_block_number(
     entry_block_number: Option<u64>,
     payload: &BroadcasterPayload,
 ) -> Result<(), BroadcasterContractError> {
-    let Some(entry_block_number) = entry_block_number else {
-        return Ok(());
-    };
-    for payload_block_number in redis_payload_block_numbers(payload) {
-        if payload_block_number != entry_block_number {
+    let payload_block_number = redis_entry_block_number(payload);
+    match (entry_block_number, payload_block_number) {
+        (Some(entry_block_number), Some(payload_block_number))
+            if entry_block_number != payload_block_number =>
+        {
             return Err(BroadcasterContractError::RedisBlockNumberMismatch {
                 entry_block_number,
                 payload_block_number,
             });
         }
+        (Some(_), None) => {
+            return Err(BroadcasterContractError::RedisEntryUnexpectedField {
+                field: "block_number",
+            });
+        }
+        (None, Some(_)) => {
+            return Err(BroadcasterContractError::RedisEntryEmptyField {
+                field: "block_number",
+            });
+        }
+        (Some(_), Some(_)) | (None, None) => {}
     }
     Ok(())
 }
 
-fn redis_entry_block_number(
-    payload: &BroadcasterPayload,
-) -> Result<Option<u64>, BroadcasterContractError> {
-    let mut block_numbers = redis_payload_block_numbers(payload).into_iter();
-    let Some(first_block_number) = block_numbers.next() else {
-        return Ok(None);
-    };
-    for payload_block_number in block_numbers {
-        if payload_block_number != first_block_number {
-            return Err(BroadcasterContractError::RedisBlockNumberMismatch {
-                entry_block_number: first_block_number,
-                payload_block_number,
-            });
-        }
-    }
-    Ok(Some(first_block_number))
+fn redis_entry_block_number(payload: &BroadcasterPayload) -> Option<u64> {
+    redis_payload_global_block_number(&redis_payload_chain_block_numbers(payload))
 }
 
-fn redis_payload_block_numbers(payload: &BroadcasterPayload) -> Vec<u64> {
+fn redis_payload_global_block_number(block_numbers: &[u64]) -> Option<u64> {
+    let (&first_block_number, remaining) = block_numbers.split_first()?;
+    remaining
+        .iter()
+        .all(|block_number| *block_number == first_block_number)
+        .then_some(first_block_number)
+}
+
+fn redis_payload_chain_block_numbers(payload: &BroadcasterPayload) -> Vec<u64> {
     match payload {
         BroadcasterPayload::SnapshotChunk(chunk) => chunk
             .partitions
             .iter()
+            .filter(|partition| {
+                matches!(
+                    partition.backend,
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm
+                )
+            })
             .map(|partition| partition.block_number)
             .collect(),
         BroadcasterPayload::Update(update) => update
             .partitions
             .iter()
+            .filter(|partition| {
+                matches!(
+                    partition.backend,
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm
+                )
+            })
             .map(|partition| partition.block_number)
             .collect(),
         BroadcasterPayload::SnapshotStart(_)
@@ -3144,12 +3148,115 @@ mod tests {
     }
 
     #[test]
-    fn redis_stream_entry_derives_rfq_block_number_from_envelope() -> Result<()> {
+    fn redis_stream_entry_omits_block_number_for_rfq_only_update() -> Result<()> {
         let envelope = rfq_update_envelope("stream-1", 4, 321)?;
         let entry = redis_entry(&envelope, vec![BroadcasterBackend::Rfq])?;
 
         assert_eq!(entry.backend_scope, "rfq");
-        assert_eq!(entry.block_number, Some(321));
+        assert_eq!(entry.block_number, None);
+
+        let value = serde_json::to_value(&entry)?;
+        assert!(value.get("block_number").is_none());
+
+        let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
+        assert_eq!(decoded, entry);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_omits_block_number_for_rfq_only_snapshot_chunk() -> Result<()> {
+        let envelope = rfq_snapshot_chunk_envelope("stream-1", 2, 321)?;
+        let entry = redis_entry(&envelope, vec![BroadcasterBackend::Rfq])?;
+
+        assert_eq!(entry.backend_scope, "rfq");
+        assert_eq!(entry.block_number, None);
+
+        let value = serde_json::to_value(&entry)?;
+        assert!(value.get("block_number").is_none());
+
+        let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
+        assert_eq!(decoded, entry);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_omits_block_number_for_mixed_backend_update_blocks() -> Result<()> {
+        let envelope = mixed_backend_update_envelope("stream-1", 4, 124, 125)?;
+        let entry = redis_entry(
+            &envelope,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        )?;
+
+        assert_eq!(entry.backend_scope, "native,vm");
+        assert_eq!(entry.block_number, None);
+
+        let value = serde_json::to_value(&entry)?;
+        assert!(value.get("block_number").is_none());
+
+        let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
+        assert_eq!(decoded, entry);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_omits_block_number_for_mixed_backend_snapshot_blocks() -> Result<()> {
+        let envelope = snapshot_chunk_envelope_with_partitions(
+            "stream-1",
+            2,
+            0,
+            vec![
+                BroadcasterSnapshotPartition::new(
+                    BroadcasterBackend::Native,
+                    124,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-native",
+                        protocol_component("pool-native", "uniswap_v2"),
+                        dummy_state("native-snapshot"),
+                    )],
+                    BTreeMap::new(),
+                ),
+                BroadcasterSnapshotPartition::new(
+                    BroadcasterBackend::Vm,
+                    125,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-vm",
+                        protocol_component("pool-vm", "vm:curve"),
+                        dummy_state("vm-snapshot"),
+                    )],
+                    BTreeMap::new(),
+                ),
+            ],
+        )?;
+        let entry = redis_entry(
+            &envelope,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        )?;
+
+        assert_eq!(entry.backend_scope, "native,vm");
+        assert_eq!(entry.block_number, None);
+
+        let value = serde_json::to_value(&entry)?;
+        assert!(value.get("block_number").is_none());
+
+        let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
+        assert_eq!(decoded, entry);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_uses_native_block_number_for_native_and_rfq_update() -> Result<()> {
+        let envelope = native_and_rfq_update_envelope("stream-1", 4, 124, 321)?;
+        let entry = redis_entry(
+            &envelope,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        )?;
+
+        assert_eq!(entry.backend_scope, "native,rfq");
+        assert_eq!(entry.block_number, Some(124));
 
         Ok(())
     }
@@ -3315,18 +3422,52 @@ mod tests {
     }
 
     #[test]
-    fn redis_stream_entry_rejects_rfq_payload_block_number_mismatch() -> Result<()> {
+    fn redis_stream_entry_rejects_block_number_for_rfq_only_payload() -> Result<()> {
         let mut value = redis_entry_value(
             &rfq_update_envelope("stream-1", 4, 321)?,
             vec![BroadcasterBackend::Rfq],
         )?;
         value["block_number"] = serde_json::json!("322");
 
-        let error = redis_entry_decode_error(value, "mismatched RFQ block_number")?;
+        let error = redis_entry_decode_error(value, "unexpected RFQ block_number")?;
 
         assert!(error
             .to_string()
-            .contains("redis block_number mismatch: entry 322, payload 321"));
+            .contains("redis stream field block_number is not allowed for this payload"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_rejects_block_number_for_divergent_backend_blocks() -> Result<()> {
+        let mut value = redis_entry_value(
+            &mixed_backend_update_envelope("stream-1", 4, 124, 125)?,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        )?;
+        value["block_number"] = serde_json::json!("125");
+
+        let error = redis_entry_decode_error(value, "unexpected divergent block_number")?;
+
+        assert!(error
+            .to_string()
+            .contains("redis stream field block_number is not allowed for this payload"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_omits_block_number_for_heartbeat_with_backend_heads() -> Result<()> {
+        let envelope = heartbeat_envelope("stream-1", 8453, "snapshot-1", 5)?;
+        let entry = redis_entry(&envelope, vec![BroadcasterBackend::Native])?;
+
+        assert_eq!(entry.kind, BroadcasterMessageKind::Heartbeat);
+        assert_eq!(entry.block_number, None);
+
+        let value = serde_json::to_value(&entry)?;
+        assert!(value.get("block_number").is_none());
+
+        let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
+        assert_eq!(decoded, entry);
 
         Ok(())
     }
@@ -4623,6 +4764,104 @@ mod tests {
                 BroadcasterUpdatePartition::new(
                     BroadcasterBackend::Rfq,
                     block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-rfq",
+                        protocol_component("pool-rfq", "rfq:hashflow"),
+                        dummy_state("rfq-update"),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                ),
+            ])?),
+        ))
+    }
+
+    fn rfq_snapshot_chunk_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        block_number: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        snapshot_chunk_envelope_with_partitions(
+            stream_id,
+            message_seq,
+            0,
+            vec![BroadcasterSnapshotPartition::new(
+                BroadcasterBackend::Rfq,
+                block_number,
+                vec![BroadcasterStateEntry::new(
+                    "pool-rfq",
+                    protocol_component("pool-rfq", "rfq:hashflow"),
+                    dummy_state("rfq-snapshot"),
+                )],
+                BTreeMap::new(),
+            )],
+        )
+    }
+
+    fn mixed_backend_update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        native_block_number: u64,
+        vm_block_number: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Native,
+                    native_block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-native",
+                        protocol_component("pool-native", "uniswap_v2"),
+                        dummy_state("native-update"),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                ),
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Vm,
+                    vm_block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-vm",
+                        protocol_component("pool-vm", "vm:curve"),
+                        dummy_state("vm-update"),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                ),
+            ])?),
+        ))
+    }
+
+    fn native_and_rfq_update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        native_block_number: u64,
+        rfq_timestamp: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Native,
+                    native_block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-native",
+                        protocol_component("pool-native", "uniswap_v2"),
+                        dummy_state("native-update"),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                ),
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Rfq,
+                    rfq_timestamp,
                     vec![BroadcasterStateEntry::new(
                         "pool-rfq",
                         protocol_component("pool-rfq", "rfq:hashflow"),

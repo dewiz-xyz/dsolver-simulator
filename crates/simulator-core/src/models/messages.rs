@@ -171,7 +171,7 @@ pub struct QuoteMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rfq_block_number: Option<u64>,
+    pub rfq_update_timestamp: Option<u64>,
     pub matching_pools: usize,
     pub candidate_pools: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,7 +371,7 @@ mod tests {
             partial_kind: None,
             block_number: 1,
             vm_block_number: None,
-            rfq_block_number: None,
+            rfq_update_timestamp: None,
             matching_pools: 0,
             candidate_pools: 0,
             total_pools: None,
@@ -383,6 +383,32 @@ mod tests {
         };
         let value = serde_json::to_value(meta)?;
         assert!(value.get("partial_kind").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn quote_meta_serializes_rfq_update_timestamp_without_legacy_block_field() -> Result<()> {
+        let meta = QuoteMeta {
+            status: QuoteStatus::Ready,
+            result_quality: QuoteResultQuality::Complete,
+            partial_kind: None,
+            block_number: 1,
+            vm_block_number: None,
+            rfq_update_timestamp: Some(1_710_000_000),
+            matching_pools: 0,
+            candidate_pools: 0,
+            total_pools: None,
+            auction_id: None,
+            pool_results: Vec::new(),
+            vm_unavailable: false,
+            rfq_unavailable: false,
+            failures: Vec::new(),
+        };
+
+        let value = serde_json::to_value(meta)?;
+
+        assert_eq!(value["rfq_update_timestamp"], 1_710_000_000);
+        assert!(value.get("rfq_block_number").is_none());
         Ok(())
     }
 
