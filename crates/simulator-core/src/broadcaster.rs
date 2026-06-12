@@ -2062,23 +2062,11 @@ fn redis_payload_block_numbers(payload: &BroadcasterPayload) -> Vec<u64> {
         BroadcasterPayload::SnapshotChunk(chunk) => chunk
             .partitions
             .iter()
-            .filter(|partition| {
-                matches!(
-                    partition.backend,
-                    BroadcasterBackend::Native | BroadcasterBackend::Vm
-                )
-            })
             .map(|partition| partition.block_number)
             .collect(),
         BroadcasterPayload::Update(update) => update
             .partitions
             .iter()
-            .filter(|partition| {
-                matches!(
-                    partition.backend,
-                    BroadcasterBackend::Native | BroadcasterBackend::Vm
-                )
-            })
             .map(|partition| partition.block_number)
             .collect(),
         BroadcasterPayload::SnapshotStart(_)
@@ -3156,6 +3144,17 @@ mod tests {
     }
 
     #[test]
+    fn redis_stream_entry_derives_rfq_block_number_from_envelope() -> Result<()> {
+        let envelope = rfq_update_envelope("stream-1", 4, 321)?;
+        let entry = redis_entry(&envelope, vec![BroadcasterBackend::Rfq])?;
+
+        assert_eq!(entry.backend_scope, "rfq");
+        assert_eq!(entry.block_number, Some(321));
+
+        Ok(())
+    }
+
+    #[test]
     fn redis_stream_entry_round_trips_with_stable_field_shape() -> Result<()> {
         let envelope = update_envelope("stream-1", 4)?;
         let entry = redis_entry(&envelope, vec![BroadcasterBackend::Native])?;
@@ -3311,6 +3310,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("redis block_number mismatch: entry 125, payload 124"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_rejects_rfq_payload_block_number_mismatch() -> Result<()> {
+        let mut value = redis_entry_value(
+            &rfq_update_envelope("stream-1", 4, 321)?,
+            vec![BroadcasterBackend::Rfq],
+        )?;
+        value["block_number"] = serde_json::json!("322");
+
+        let error = redis_entry_decode_error(value, "mismatched RFQ block_number")?;
+
+        assert!(error
+            .to_string()
+            .contains("redis block_number mismatch: entry 322, payload 321"));
 
         Ok(())
     }
@@ -4589,6 +4605,31 @@ mod tests {
                         "pool-removed",
                         protocol_component("pool-removed", "uniswap_v2"),
                     )],
+                    BTreeMap::new(),
+                ),
+            ])?),
+        ))
+    }
+
+    fn rfq_update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        block_number: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Rfq,
+                    block_number,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-rfq",
+                        protocol_component("pool-rfq", "rfq:hashflow"),
+                        dummy_state("rfq-update"),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
                     BTreeMap::new(),
                 ),
             ])?),
