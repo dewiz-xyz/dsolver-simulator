@@ -177,35 +177,28 @@ pub struct BroadcasterRedisStreamEntry {
 }
 
 impl BroadcasterRedisStreamEntry {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "constructor mirrors the Redis stream field contract"
-    )]
-    pub fn new(
+    pub fn from_envelope(
         chain_id: u64,
-        stream_id: impl Into<String>,
-        message_seq: u64,
-        kind: BroadcasterMessageKind,
-        snapshot_id: Option<impl Into<String>>,
-        backends: Vec<BroadcasterBackend>,
-        block_number: Option<u64>,
         event_time_ms: u64,
-        payload_json: impl Into<String>,
+        envelope: &BroadcasterEnvelope,
+        backends: Vec<BroadcasterBackend>,
     ) -> Result<Self, BroadcasterContractError> {
-        let snapshot_id = snapshot_id
-            .map(|value| required_redis_field("snapshot_id", value.into()))
-            .transpose()?;
+        let payload_json = serde_json::to_string(envelope).map_err(|error| {
+            BroadcasterContractError::RedisPayloadJsonInvalid {
+                message: error.to_string(),
+            }
+        })?;
         let entry = Self {
             schema_version: REDIS_STREAM_SCHEMA_VERSION.to_string(),
             chain_id,
-            stream_id: required_redis_field("stream_id", stream_id.into())?,
-            message_seq,
-            kind,
-            snapshot_id,
+            stream_id: required_redis_field("stream_id", envelope.stream_id.clone())?,
+            message_seq: envelope.message_seq,
+            kind: envelope.kind(),
+            snapshot_id: redis_payload_snapshot_id(&envelope.payload).map(str::to_string),
             backend_scope: redis_backend_scope(backends)?,
-            block_number,
+            block_number: redis_entry_block_number(&envelope.payload)?,
             event_time_ms,
-            payload_json: required_redis_field("payload_json", payload_json.into())?,
+            payload_json,
         };
         entry.validate()?;
         Ok(entry)
@@ -2035,7 +2028,7 @@ fn ensure_redis_payload_block_number(
     let Some(entry_block_number) = entry_block_number else {
         return Ok(());
     };
-    for payload_block_number in redis_payload_native_vm_blocks(payload) {
+    for payload_block_number in redis_payload_block_numbers(payload) {
         if payload_block_number != entry_block_number {
             return Err(BroadcasterContractError::RedisBlockNumberMismatch {
                 entry_block_number,
@@ -2046,7 +2039,25 @@ fn ensure_redis_payload_block_number(
     Ok(())
 }
 
-fn redis_payload_native_vm_blocks(payload: &BroadcasterPayload) -> Vec<u64> {
+fn redis_entry_block_number(
+    payload: &BroadcasterPayload,
+) -> Result<Option<u64>, BroadcasterContractError> {
+    let mut block_numbers = redis_payload_block_numbers(payload).into_iter();
+    let Some(first_block_number) = block_numbers.next() else {
+        return Ok(None);
+    };
+    for payload_block_number in block_numbers {
+        if payload_block_number != first_block_number {
+            return Err(BroadcasterContractError::RedisBlockNumberMismatch {
+                entry_block_number: first_block_number,
+                payload_block_number,
+            });
+        }
+    }
+    Ok(Some(first_block_number))
+}
+
+fn redis_payload_block_numbers(payload: &BroadcasterPayload) -> Vec<u64> {
     match payload {
         BroadcasterPayload::SnapshotChunk(chunk) => chunk
             .partitions
@@ -3129,40 +3140,38 @@ mod tests {
     }
 
     #[test]
+    fn redis_stream_entry_derives_fields_from_envelope() -> Result<()> {
+        let envelope = update_envelope("stream-1", 4)?;
+        let entry = redis_entry(&envelope, vec![BroadcasterBackend::Native])?;
+
+        assert_eq!(entry.stream_id, "stream-1");
+        assert_eq!(entry.message_seq, 4);
+        assert_eq!(entry.kind, BroadcasterMessageKind::Update);
+        assert_eq!(entry.snapshot_id, None);
+        assert_eq!(entry.backend_scope, "native");
+        assert_eq!(entry.block_number, Some(124));
+        assert_eq!(entry.payload_json, serde_json::to_string(&envelope)?);
+
+        Ok(())
+    }
+
+    #[test]
     fn redis_stream_entry_round_trips_with_stable_field_shape() -> Result<()> {
-        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
-            "stream-1",
-            3,
-            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
-        ))?;
-        let entry = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            3,
-            BroadcasterMessageKind::SnapshotEnd,
-            Some("snapshot-1"),
-            vec![
-                BroadcasterBackend::Rfq,
-                BroadcasterBackend::Native,
-                BroadcasterBackend::Vm,
-            ],
-            Some(177),
-            1_710_000_000_123,
-            payload_json.clone(),
-        )?;
+        let envelope = update_envelope("stream-1", 4)?;
+        let entry = redis_entry(&envelope, vec![BroadcasterBackend::Native])?;
 
         let value = serde_json::to_value(&entry)?;
 
         assert_eq!(value["schema_version"], "1");
         assert_eq!(value["chain_id"], "8453");
         assert_eq!(value["stream_id"], "stream-1");
-        assert_eq!(value["message_seq"], "3");
-        assert_eq!(value["kind"], "snapshot_end");
-        assert_eq!(value["snapshot_id"], "snapshot-1");
-        assert_eq!(value["backend_scope"], "native,vm,rfq");
-        assert_eq!(value["block_number"], "177");
+        assert_eq!(value["message_seq"], "4");
+        assert_eq!(value["kind"], "update");
+        assert!(value.get("snapshot_id").is_none());
+        assert_eq!(value["backend_scope"], "native");
+        assert_eq!(value["block_number"], "124");
         assert_eq!(value["event_time_ms"], "1710000000123");
-        assert_eq!(value["payload_json"], payload_json);
+        assert_eq!(value["payload_json"], serde_json::to_string(&envelope)?);
 
         let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
         assert_eq!(decoded, entry);
@@ -3192,36 +3201,25 @@ mod tests {
 
     #[test]
     fn redis_stream_entry_deserialization_validates_contract_invariants() -> Result<()> {
-        let payload_json = serde_json::to_string(&snapshot_end_envelope("stream-1", 1))?;
+        let mut value = redis_entry_value(
+            &snapshot_end_envelope("stream-1", 1),
+            vec![BroadcasterBackend::Native],
+        )?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("redis entry should encode as object"))?
+            .remove("snapshot_id");
 
-        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
-            "schema_version": "1",
-            "chain_id": "8453",
-            "stream_id": "stream-1",
-            "message_seq": "1",
-            "kind": "snapshot_end",
-            "backend_scope": "native",
-            "event_time_ms": "1710000000000",
-            "payload_json": payload_json
-        }))
-        .err()
-        .ok_or_else(|| anyhow!("snapshot entry without snapshot_id should fail"))?;
+        let error = redis_entry_decode_error(value, "snapshot entry without snapshot_id")?;
         assert!(error.to_string().contains("requires snapshot_id"));
 
-        let payload_json = serde_json::to_string(&snapshot_end_envelope("stream-1", 1))?;
-        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
-            "schema_version": "2",
-            "chain_id": "8453",
-            "stream_id": "stream-1",
-            "message_seq": "1",
-            "kind": "snapshot_end",
-            "snapshot_id": "snapshot-1",
-            "backend_scope": "native",
-            "event_time_ms": "1710000000000",
-            "payload_json": payload_json
-        }))
-        .err()
-        .ok_or_else(|| anyhow!("unsupported schema version should fail"))?;
+        let mut value = redis_entry_value(
+            &snapshot_end_envelope("stream-1", 1),
+            vec![BroadcasterBackend::Native],
+        )?;
+        value["schema_version"] = serde_json::json!("2");
+
+        let error = redis_entry_decode_error(value, "unsupported schema version")?;
         assert!(error
             .to_string()
             .contains("unsupported redis schema version"));
@@ -3230,56 +3228,14 @@ mod tests {
     }
 
     #[test]
-    fn redis_stream_entry_requires_snapshot_id_for_snapshot_and_heartbeat() -> Result<()> {
-        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
+    fn redis_stream_entry_rejects_zero_message_sequence() -> Result<()> {
+        let envelope = BroadcasterEnvelope::new(
             "stream-1",
-            1,
+            0,
             BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
-        ))?;
-
-        let Err(error) = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            1,
-            BroadcasterMessageKind::SnapshotEnd,
-            None::<String>,
-            vec![BroadcasterBackend::Native],
-            None,
-            1_710_000_000_000,
-            payload_json,
-        ) else {
-            return Err(anyhow!("snapshot entry without snapshot_id should fail"));
-        };
-
-        assert_eq!(
-            error,
-            BroadcasterContractError::RedisEntryMissingSnapshotId {
-                kind: BroadcasterMessageKind::SnapshotEnd,
-            }
         );
 
-        Ok(())
-    }
-
-    #[test]
-    fn redis_stream_entry_rejects_zero_message_sequence() -> Result<()> {
-        let payload_json = serde_json::to_string(&BroadcasterEnvelope::new(
-            "stream-1",
-            0,
-            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
-        ))?;
-
-        let Err(error) = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            0,
-            BroadcasterMessageKind::SnapshotEnd,
-            Some("snapshot-1"),
-            vec![BroadcasterBackend::Native],
-            None,
-            1_710_000_000_000,
-            payload_json,
-        ) else {
+        let Err(error) = redis_entry(&envelope, vec![BroadcasterBackend::Native]) else {
             return Err(anyhow!("zero message_seq should fail"));
         };
 
@@ -3290,24 +3246,11 @@ mod tests {
 
     #[test]
     fn redis_stream_entry_requires_snapshot_start_to_begin_at_one() -> Result<()> {
-        let payload_json = serde_json::to_string(&snapshot_start_envelope(
-            "stream-1",
-            8453,
-            "snapshot-1",
-            2,
-            1,
-        )?)?;
+        let envelope = snapshot_start_envelope("stream-1", 8453, "snapshot-1", 2, 1)?;
 
-        let Err(error) = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            2,
-            BroadcasterMessageKind::SnapshotStart,
-            Some("snapshot-1"),
+        let Err(error) = redis_entry(
+            &envelope,
             vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
-            None,
-            1_710_000_000_000,
-            payload_json,
         ) else {
             return Err(anyhow!("snapshot_start message_seq must start at one"));
         };
@@ -3325,23 +3268,13 @@ mod tests {
 
     #[test]
     fn redis_stream_entry_deserialization_rejects_empty_snapshot_id() -> Result<()> {
-        let envelope = update_envelope("stream-1", 4)?;
-        let payload_json = serde_json::to_string(&envelope)?;
+        let mut value = redis_entry_value(
+            &update_envelope("stream-1", 4)?,
+            vec![BroadcasterBackend::Native],
+        )?;
+        value["snapshot_id"] = serde_json::json!("");
 
-        let error = serde_json::from_value::<BroadcasterRedisStreamEntry>(serde_json::json!({
-            "schema_version": "1",
-            "chain_id": "8453",
-            "stream_id": "stream-1",
-            "message_seq": "4",
-            "kind": "update",
-            "snapshot_id": "",
-            "backend_scope": "native",
-            "block_number": "124",
-            "event_time_ms": "1710000000000",
-            "payload_json": payload_json
-        }))
-        .err()
-        .ok_or_else(|| anyhow!("empty snapshot_id should fail deserialization"))?;
+        let error = redis_entry_decode_error(value, "empty snapshot_id")?;
         assert!(error.to_string().contains("snapshot_id must not be empty"));
 
         Ok(())
@@ -3349,59 +3282,35 @@ mod tests {
 
     #[test]
     fn redis_stream_entry_requires_block_number_for_native_or_vm_state_entries() -> Result<()> {
-        let envelope = update_envelope("stream-1", 4)?;
-        let payload_json = serde_json::to_string(&envelope)?;
-
-        let Err(error) = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            4,
-            BroadcasterMessageKind::Update,
-            None::<String>,
+        let mut value = redis_entry_value(
+            &update_envelope("stream-1", 4)?,
             vec![BroadcasterBackend::Native],
-            None,
-            1_710_000_000_000,
-            payload_json,
-        ) else {
-            return Err(anyhow!("native update without block_number should fail"));
-        };
+        )?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("redis entry should encode as object"))?
+            .remove("block_number");
 
-        assert_eq!(
-            error,
-            BroadcasterContractError::RedisEntryEmptyField {
-                field: "block_number",
-            }
-        );
+        let error = redis_entry_decode_error(value, "native update without block_number")?;
+
+        assert!(error.to_string().contains("block_number must not be empty"));
 
         Ok(())
     }
 
     #[test]
     fn redis_stream_entry_rejects_payload_block_number_mismatch() -> Result<()> {
-        let envelope = update_envelope("stream-1", 4)?;
-        let payload_json = serde_json::to_string(&envelope)?;
-
-        let Err(error) = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            4,
-            BroadcasterMessageKind::Update,
-            None::<String>,
+        let mut value = redis_entry_value(
+            &update_envelope("stream-1", 4)?,
             vec![BroadcasterBackend::Native],
-            Some(125),
-            1_710_000_000_000,
-            payload_json,
-        ) else {
-            return Err(anyhow!("mismatched block_number should fail"));
-        };
+        )?;
+        value["block_number"] = serde_json::json!("125");
 
-        assert_eq!(
-            error,
-            BroadcasterContractError::RedisBlockNumberMismatch {
-                entry_block_number: 125,
-                payload_block_number: 124,
-            }
-        );
+        let error = redis_entry_decode_error(value, "mismatched block_number")?;
+
+        assert!(error
+            .to_string()
+            .contains("redis block_number mismatch: entry 125, payload 124"));
 
         Ok(())
     }
@@ -3418,26 +3327,25 @@ mod tests {
             )?),
         ))?;
 
-        let Err(error) = BroadcasterRedisStreamEntry::new(
-            8453,
-            "stream-1",
-            2,
-            BroadcasterMessageKind::SnapshotChunk,
-            Some("snapshot-1"),
-            vec![BroadcasterBackend::Native],
-            Some(124),
-            1_710_000_000_000,
-            payload_json,
-        ) else {
-            return Err(anyhow!("empty snapshot chunk payload scope should fail"));
-        };
+        let error = redis_entry_decode_error(
+            serde_json::json!({
+                "schema_version": "1",
+                "chain_id": "8453",
+                "stream_id": "stream-1",
+                "message_seq": "2",
+                "kind": "snapshot_chunk",
+                "snapshot_id": "snapshot-1",
+                "backend_scope": "native",
+                "block_number": "124",
+                "event_time_ms": "1710000000123",
+                "payload_json": payload_json
+            }),
+            "empty snapshot chunk payload scope",
+        )?;
 
-        assert_eq!(
-            error,
-            BroadcasterContractError::RedisBackendScopeInvalid {
-                backend_scope: "native".to_string(),
-            }
-        );
+        assert!(error
+            .to_string()
+            .contains("invalid redis backend_scope: native"));
 
         Ok(())
     }
@@ -4634,6 +4542,29 @@ mod tests {
             message_seq,
             BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
         )
+    }
+
+    fn redis_entry(
+        envelope: &BroadcasterEnvelope,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<BroadcasterRedisStreamEntry, BroadcasterContractError> {
+        BroadcasterRedisStreamEntry::from_envelope(8453, 1_710_000_000_123, envelope, backends)
+    }
+
+    fn redis_entry_value(
+        envelope: &BroadcasterEnvelope,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(redis_entry(envelope, backends)?).map_err(Into::into)
+    }
+
+    fn redis_entry_decode_error(
+        value: serde_json::Value,
+        context: &'static str,
+    ) -> Result<serde_json::Error> {
+        serde_json::from_value::<BroadcasterRedisStreamEntry>(value)
+            .err()
+            .ok_or_else(|| anyhow!("{context} should fail"))
     }
 
     fn update_envelope(stream_id: &str, message_seq: u64) -> Result<BroadcasterEnvelope> {
