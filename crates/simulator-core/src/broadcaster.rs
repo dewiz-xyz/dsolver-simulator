@@ -1965,19 +1965,15 @@ fn validate_partition_content_backend(
 }
 
 #[cfg(test)]
-mod tests {
+mod test_support {
     use std::any::Any;
     use std::collections::{BTreeMap, HashMap};
 
-    use anyhow::{anyhow, Result};
+    use anyhow::Result;
     use chrono::NaiveDateTime;
     use num_bigint::BigUint;
     use tycho_simulation::{
-        protocol::models::{ProtocolComponent, Update as TychoUpdate},
-        tycho_client::feed::{
-            synchronizer::{Snapshot, StateSyncMessage},
-            BlockHeader, SynchronizerState,
-        },
+        protocol::models::ProtocolComponent,
         tycho_common::{
             dto::ProtocolStateDelta,
             models::{token::Token, Chain},
@@ -1990,14 +1986,10 @@ mod tests {
     };
 
     use super::{
-        BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair,
-        BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
-        BroadcasterSnapshotSessionResponse, BroadcasterSnapshotStart, BroadcasterStateDelta,
-        BroadcasterStateEntry, BroadcasterSubscriptionEvent, BroadcasterSubscriptionState,
-        BroadcasterSubscriptionTracker, BroadcasterTokenDto, BroadcasterTokenLookupRequest,
-        BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage,
+        BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
+        BroadcasterPayload, BroadcasterRemovedPair, BroadcasterSnapshotChunk,
+        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+        BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
         BroadcasterUpdatePartition,
     };
 
@@ -2065,6 +2057,188 @@ mod tests {
                 .is_some_and(|state| state == self)
         }
     }
+
+    pub(super) fn snapshot_start_envelope(
+        stream_id: &str,
+        chain_id: u64,
+        snapshot_id: &str,
+        message_seq: u64,
+        total_chunks: u32,
+    ) -> Result<BroadcasterEnvelope> {
+        snapshot_start_envelope_with_backends(
+            stream_id,
+            chain_id,
+            snapshot_id,
+            message_seq,
+            total_chunks,
+            vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
+        )
+    }
+
+    pub(super) fn snapshot_start_envelope_with_backends(
+        stream_id: &str,
+        chain_id: u64,
+        snapshot_id: &str,
+        message_seq: u64,
+        total_chunks: u32,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                snapshot_id,
+                chain_id,
+                backends,
+                total_chunks,
+            )?),
+        ))
+    }
+
+    pub(super) fn snapshot_chunk_envelope_with_partitions(
+        stream_id: &str,
+        message_seq: u64,
+        chunk_index: u32,
+        partitions: Vec<BroadcasterSnapshotPartition>,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-1",
+                chunk_index,
+                partitions,
+            )?),
+        ))
+    }
+
+    pub(super) fn snapshot_end_envelope(stream_id: &str, message_seq: u64) -> BroadcasterEnvelope {
+        BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        )
+    }
+
+    pub(super) fn update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Native,
+                    124,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-new",
+                        protocol_component("pool-new", "uniswap_v2"),
+                        dummy_state("update-new"),
+                    )],
+                    vec![BroadcasterStateDelta::new(
+                        "pool-existing",
+                        BroadcasterBackend::Native,
+                        dummy_state("update-existing"),
+                    )],
+                    vec![BroadcasterRemovedPair::new(
+                        "pool-removed",
+                        protocol_component("pool-removed", "uniswap_v2"),
+                    )],
+                    BTreeMap::new(),
+                ),
+            ])?),
+        ))
+    }
+
+    pub(super) fn heartbeat_envelope(
+        stream_id: &str,
+        chain_id: u64,
+        snapshot_id: &str,
+        message_seq: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
+                chain_id,
+                snapshot_id,
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 124)],
+            )?),
+        ))
+    }
+
+    pub(super) fn protocol_component(
+        component_id: &str,
+        protocol_system: &str,
+    ) -> ProtocolComponent {
+        let token_a = token(1, "USDC");
+        let token_b = token(2, "WETH");
+        ProtocolComponent::new(
+            Bytes::from(component_id.as_bytes().to_vec()),
+            protocol_system.to_string(),
+            "pool".to_string(),
+            Chain::Ethereum,
+            vec![token_a, token_b],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::from(vec![0u8; 32]),
+            NaiveDateTime::default(),
+        )
+    }
+
+    fn token(seed: u8, symbol: &str) -> Token {
+        let address = Bytes::from(vec![seed; 20]);
+        Token::new(&address, symbol, 18, 0, &[Some(0)], Chain::Ethereum, 100)
+    }
+
+    pub(super) fn dummy_state(label: &str) -> Box<dyn ProtocolSim> {
+        Box::new(DummySim {
+            label: label.to_string(),
+        })
+    }
+
+    pub(super) fn assert_dummy_state(state: &dyn ProtocolSim, expected_label: &str) {
+        let dummy = state.as_any().downcast_ref::<DummySim>();
+        assert!(dummy.is_some(), "expected DummySim state");
+        let dummy = dummy.unwrap_or_else(|| unreachable!());
+        assert_eq!(dummy.label, expected_label);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use anyhow::{anyhow, Result};
+    use tycho_simulation::{
+        protocol::models::Update as TychoUpdate,
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, SynchronizerState,
+        },
+        tycho_common::{
+            models::{token::Token, Chain},
+            Bytes,
+        },
+    };
+
+    use super::test_support::{
+        assert_dummy_state, dummy_state, heartbeat_envelope, protocol_component,
+        snapshot_chunk_envelope_with_partitions, snapshot_end_envelope, snapshot_start_envelope,
+        snapshot_start_envelope_with_backends, update_envelope,
+    };
+    use super::{
+        BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
+        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
+        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair,
+        BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
+        BroadcasterSnapshotSessionResponse, BroadcasterSnapshotStart, BroadcasterStateDelta,
+        BroadcasterStateEntry, BroadcasterSubscriptionEvent, BroadcasterSubscriptionState,
+        BroadcasterSubscriptionTracker, BroadcasterTokenDto, BroadcasterTokenLookupRequest,
+        BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage,
+        BroadcasterUpdatePartition,
+    };
 
     #[test]
     fn token_lookup_contract_uses_camel_case_shape() -> Result<()> {
@@ -3464,43 +3638,6 @@ mod tests {
         Ok(tracker)
     }
 
-    fn snapshot_start_envelope(
-        stream_id: &str,
-        chain_id: u64,
-        snapshot_id: &str,
-        message_seq: u64,
-        total_chunks: u32,
-    ) -> Result<BroadcasterEnvelope> {
-        snapshot_start_envelope_with_backends(
-            stream_id,
-            chain_id,
-            snapshot_id,
-            message_seq,
-            total_chunks,
-            vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
-        )
-    }
-
-    fn snapshot_start_envelope_with_backends(
-        stream_id: &str,
-        chain_id: u64,
-        snapshot_id: &str,
-        message_seq: u64,
-        total_chunks: u32,
-        backends: Vec<BroadcasterBackend>,
-    ) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
-                snapshot_id,
-                chain_id,
-                backends,
-                total_chunks,
-            )?),
-        ))
-    }
-
     fn snapshot_chunk_envelope(
         stream_id: &str,
         message_seq: u64,
@@ -3512,76 +3649,6 @@ mod tests {
             chunk_index,
             vec![native_snapshot_partition(), vm_snapshot_partition()],
         )
-    }
-
-    fn snapshot_chunk_envelope_with_partitions(
-        stream_id: &str,
-        message_seq: u64,
-        chunk_index: u32,
-        partitions: Vec<BroadcasterSnapshotPartition>,
-    ) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
-                "snapshot-1",
-                chunk_index,
-                partitions,
-            )?),
-        ))
-    }
-
-    fn snapshot_end_envelope(stream_id: &str, message_seq: u64) -> BroadcasterEnvelope {
-        BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
-        )
-    }
-
-    fn update_envelope(stream_id: &str, message_seq: u64) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
-                BroadcasterUpdatePartition::new(
-                    BroadcasterBackend::Native,
-                    124,
-                    vec![BroadcasterStateEntry::new(
-                        "pool-new",
-                        protocol_component("pool-new", "uniswap_v2"),
-                        dummy_state("update-new"),
-                    )],
-                    vec![BroadcasterStateDelta::new(
-                        "pool-existing",
-                        BroadcasterBackend::Native,
-                        dummy_state("update-existing"),
-                    )],
-                    vec![BroadcasterRemovedPair::new(
-                        "pool-removed",
-                        protocol_component("pool-removed", "uniswap_v2"),
-                    )],
-                    BTreeMap::new(),
-                ),
-            ])?),
-        ))
-    }
-
-    fn heartbeat_envelope(
-        stream_id: &str,
-        chain_id: u64,
-        snapshot_id: &str,
-        message_seq: u64,
-    ) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
-                chain_id,
-                snapshot_id,
-                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 124)],
-            )?),
-        ))
     }
 
     fn known_backends() -> HashMap<String, BroadcasterBackend> {
@@ -3659,33 +3726,6 @@ mod tests {
             .set_sync_states(sync_states)
     }
 
-    fn protocol_component(component_id: &str, protocol_system: &str) -> ProtocolComponent {
-        let token_a = token(1, "USDC");
-        let token_b = token(2, "WETH");
-        ProtocolComponent::new(
-            Bytes::from(component_id.as_bytes().to_vec()),
-            protocol_system.to_string(),
-            "pool".to_string(),
-            Chain::Ethereum,
-            vec![token_a, token_b],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::from(vec![0u8; 32]),
-            NaiveDateTime::default(),
-        )
-    }
-
-    fn token(seed: u8, symbol: &str) -> Token {
-        let address = Bytes::from(vec![seed; 20]);
-        Token::new(&address, symbol, 18, 0, &[Some(0)], Chain::Ethereum, 100)
-    }
-
-    fn dummy_state(label: &str) -> Box<dyn ProtocolSim> {
-        Box::new(DummySim {
-            label: label.to_string(),
-        })
-    }
-
     fn block_header(number: u64, seed: u8) -> BlockHeader {
         BlockHeader {
             hash: Bytes::from(vec![seed; 32]),
@@ -3711,12 +3751,5 @@ mod tests {
                 removed_components: HashMap::new(),
             },
         )
-    }
-
-    fn assert_dummy_state(state: &dyn ProtocolSim, expected_label: &str) {
-        let dummy = state.as_any().downcast_ref::<DummySim>();
-        assert!(dummy.is_some(), "expected DummySim state");
-        let dummy = dummy.unwrap_or_else(|| unreachable!());
-        assert_eq!(dummy.label, expected_label);
     }
 }

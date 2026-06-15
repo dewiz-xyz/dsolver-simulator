@@ -679,98 +679,22 @@ mod optional_u64_string {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
 
     use anyhow::{anyhow, Result};
-    use chrono::NaiveDateTime;
-    use num_bigint::BigUint;
-    use tycho_simulation::{
-        protocol::models::ProtocolComponent,
-        tycho_common::{
-            dto::ProtocolStateDelta,
-            models::{token::Token, Chain},
-            simulation::{
-                errors::{SimulationError, TransitionError},
-                protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
-            },
-            Bytes,
-        },
-    };
 
     use super::{BroadcasterRedisSnapshotPointer, BroadcasterRedisStreamEntry};
-    use crate::broadcaster::{
-        BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterHeartbeat, BroadcasterMessageKind, BroadcasterPayload, BroadcasterRemovedPair,
-        BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
-        BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
-        BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    use crate::broadcaster::test_support::{
+        dummy_state, heartbeat_envelope, protocol_component,
+        snapshot_chunk_envelope_with_partitions, snapshot_end_envelope, snapshot_start_envelope,
+        update_envelope,
     };
-
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    struct RedisDummySim {
-        label: String,
-    }
-
-    #[typetag::serde]
-    impl ProtocolSim for RedisDummySim {
-        fn fee(&self) -> f64 {
-            0.0
-        }
-
-        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
-            Ok(1.0)
-        }
-
-        fn get_amount_out(
-            &self,
-            amount_in: BigUint,
-            _token_in: &Token,
-            _token_out: &Token,
-        ) -> Result<GetAmountOutResult, SimulationError> {
-            Ok(GetAmountOutResult::new(
-                amount_in,
-                BigUint::default(),
-                Box::new(self.clone()),
-            ))
-        }
-
-        fn get_limits(
-            &self,
-            _sell_token: Bytes,
-            _buy_token: Bytes,
-        ) -> Result<(BigUint, BigUint), SimulationError> {
-            Ok((BigUint::from(10u32), BigUint::from(20u32)))
-        }
-
-        fn delta_transition(
-            &mut self,
-            _delta: ProtocolStateDelta,
-            _tokens: &HashMap<Bytes, Token>,
-            _balances: &Balances,
-        ) -> Result<(), TransitionError> {
-            Ok(())
-        }
-
-        fn clone_box(&self) -> Box<dyn ProtocolSim> {
-            Box::new(self.clone())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        fn eq(&self, other: &dyn ProtocolSim) -> bool {
-            other
-                .as_any()
-                .downcast_ref::<Self>()
-                .is_some_and(|state| state == self)
-        }
-    }
+    use crate::broadcaster::{
+        BroadcasterBackend, BroadcasterContractError, BroadcasterEnvelope, BroadcasterMessageKind,
+        BroadcasterPayload, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
+        BroadcasterSnapshotPartition, BroadcasterStateEntry, BroadcasterUpdateMessage,
+        BroadcasterUpdatePartition,
+    };
 
     #[test]
     fn redis_stream_entry_derives_fields_from_envelope() -> Result<()> {
@@ -1340,78 +1264,6 @@ mod tests {
             .ok_or_else(|| anyhow!("{context} should fail"))
     }
 
-    fn snapshot_start_envelope(
-        stream_id: &str,
-        chain_id: u64,
-        snapshot_id: &str,
-        message_seq: u64,
-        total_chunks: u32,
-    ) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
-                snapshot_id,
-                chain_id,
-                vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
-                total_chunks,
-            )?),
-        ))
-    }
-
-    fn snapshot_chunk_envelope_with_partitions(
-        stream_id: &str,
-        message_seq: u64,
-        chunk_index: u32,
-        partitions: Vec<BroadcasterSnapshotPartition>,
-    ) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
-                "snapshot-1",
-                chunk_index,
-                partitions,
-            )?),
-        ))
-    }
-
-    fn snapshot_end_envelope(stream_id: &str, message_seq: u64) -> BroadcasterEnvelope {
-        BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
-        )
-    }
-
-    fn update_envelope(stream_id: &str, message_seq: u64) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
-                BroadcasterUpdatePartition::new(
-                    BroadcasterBackend::Native,
-                    124,
-                    vec![BroadcasterStateEntry::new(
-                        "pool-new",
-                        protocol_component("pool-new", "uniswap_v2"),
-                        dummy_state("update-new"),
-                    )],
-                    vec![BroadcasterStateDelta::new(
-                        "pool-existing",
-                        BroadcasterBackend::Native,
-                        dummy_state("update-existing"),
-                    )],
-                    vec![BroadcasterRemovedPair::new(
-                        "pool-removed",
-                        protocol_component("pool-removed", "uniswap_v2"),
-                    )],
-                    BTreeMap::new(),
-                ),
-            ])?),
-        ))
-    }
-
     fn rfq_update_envelope(
         stream_id: &str,
         message_seq: u64,
@@ -1533,49 +1385,5 @@ mod tests {
                 ),
             ])?),
         ))
-    }
-
-    fn heartbeat_envelope(
-        stream_id: &str,
-        chain_id: u64,
-        snapshot_id: &str,
-        message_seq: u64,
-    ) -> Result<BroadcasterEnvelope> {
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
-                chain_id,
-                snapshot_id,
-                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 124)],
-            )?),
-        ))
-    }
-
-    fn protocol_component(component_id: &str, protocol_system: &str) -> ProtocolComponent {
-        let token_a = token(1, "USDC");
-        let token_b = token(2, "WETH");
-        ProtocolComponent::new(
-            Bytes::from(component_id.as_bytes().to_vec()),
-            protocol_system.to_string(),
-            "pool".to_string(),
-            Chain::Ethereum,
-            vec![token_a, token_b],
-            Vec::new(),
-            HashMap::new(),
-            Bytes::from(vec![0u8; 32]),
-            NaiveDateTime::default(),
-        )
-    }
-
-    fn token(seed: u8, symbol: &str) -> Token {
-        let address = Bytes::from(vec![seed; 20]);
-        Token::new(&address, symbol, 18, 0, &[Some(0)], Chain::Ethereum, 100)
-    }
-
-    fn dummy_state(label: &str) -> Box<dyn ProtocolSim> {
-        Box::new(RedisDummySim {
-            label: label.to_string(),
-        })
     }
 }
