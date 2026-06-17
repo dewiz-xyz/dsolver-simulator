@@ -389,7 +389,7 @@ impl QuoteRequestRunner {
     ) -> Self {
         let current_block = state.current_block().await;
         let current_vm_block = state.current_vm_block().await;
-        let current_rfq_block = state.current_rfq_block().await;
+        let current_rfq_update_timestamp = state.current_rfq_update_timestamp().await;
         let total_pools = state.total_pools().await;
         let meta = QuoteMeta {
             status: QuoteStatus::Ready,
@@ -397,7 +397,7 @@ impl QuoteRequestRunner {
             partial_kind: None,
             block_number: current_block,
             vm_block_number: current_vm_block,
-            rfq_block_number: current_rfq_block,
+            rfq_update_timestamp: current_rfq_update_timestamp,
             matching_pools: 0,
             candidate_pools: 0,
             total_pools: Some(total_pools),
@@ -604,7 +604,7 @@ impl QuoteRequestRunner {
     async fn refresh_meta_snapshot(&mut self) {
         self.run.meta.block_number = self.state.current_block().await;
         self.run.meta.vm_block_number = self.state.current_vm_block().await;
-        self.run.meta.rfq_block_number = self.state.current_rfq_block().await;
+        self.run.meta.rfq_update_timestamp = self.state.current_rfq_update_timestamp().await;
         self.run.meta.total_pools = Some(self.state.total_pools().await);
     }
 

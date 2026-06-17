@@ -29,7 +29,12 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
             backends: snapshot
                 .backends
                 .into_iter()
-                .map(|(backend, status)| (backend, status.into()))
+                .map(|(backend, status)| {
+                    (
+                        backend,
+                        BroadcasterBackendPayload::from_backend_status(backend, status),
+                    )
+                })
                 .collect(),
         }
     }
@@ -104,15 +109,23 @@ impl From<BroadcasterSubscriberSnapshot> for BroadcasterSubscribersPayload {
 pub struct BroadcasterBackendPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_timestamp: Option<u64>,
     pub pool_count: usize,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
 }
 
-impl From<BroadcasterBackendStatus> for BroadcasterBackendPayload {
-    fn from(status: BroadcasterBackendStatus) -> Self {
+impl BroadcasterBackendPayload {
+    fn from_backend_status(backend: BroadcasterBackend, status: BroadcasterBackendStatus) -> Self {
+        let (block_number, update_timestamp) = match backend {
+            BroadcasterBackend::Native | BroadcasterBackend::Vm => (status.block_number, None),
+            BroadcasterBackend::Rfq => (None, status.block_number),
+        };
+
         Self {
-            block_number: status.block_number,
+            block_number,
+            update_timestamp,
             pool_count: status.pool_count,
             sync_statuses: status.sync_statuses,
         }

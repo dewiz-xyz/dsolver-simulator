@@ -30,6 +30,7 @@ The request-level metadata shape is `QuoteMeta`:
 - optional `partial_kind`
 - `block_number`
 - optional `vm_block_number`
+- optional `rfq_update_timestamp`
 - `matching_pools`
 - `candidate_pools`
 - optional `total_pools`
@@ -53,6 +54,7 @@ Contract invariants:
 - `partial_kind` appears only when `result_quality=partial`
 - `no_liquidity` never appears alongside usable quote data
 - request-relevant fatal failures remain visible in `meta.failures` even when some usable amount outputs survive
+- `block_number` is the native stream block; `vm_block_number` is the VM stream block when VM state is ready; `rfq_update_timestamp` is the current RFQ update timestamp/cursor when RFQ state is ready
 - requested-amount order inside each pool row is part of the quote contract; `amounts_out[i]` matches the requested `amounts[i]`
 - emitted pool rows preserve request order and request length for usable partial results; failed or timed-out requested amounts are serialized in place as `"0"` with matching `gas_used=0`
 - `"0"` in `amounts_out` means that requested amount did not produce a usable quote for that pool; only positive outputs are usable quotes
@@ -115,11 +117,21 @@ VM readiness:
 - `backends.vm.status="stale"` when VM updates are past the readiness freshness window
 - `backends.vm.status="ready"` when VM state is usable
 
+RFQ readiness:
+
+- `backends.rfq.status="disabled"` when RFQ pools are configured but turned off
+- `backends.rfq.status="warming_up"` while RFQ subscriber bootstrap or RFQ state is still loading
+- `backends.rfq.status="stale"` when RFQ updates are past the readiness freshness window
+- `backends.rfq.status="ready"` when RFQ state is usable
+- `backends.rfq.update_timestamp` is the current Tycho RFQ update timestamp/cursor when RFQ state is ready; RFQ backend status does not expose `block_number`
+
 Quote-path implications:
 
 - native readiness still gates the whole request
 - VM readiness does not gate the whole request when native pools are still available
 - when VM pools are enabled but not ready, the runner skips VM candidates and sets `meta.vm_unavailable=true`
+- RFQ readiness does not gate the whole request when native pools are still available
+- when RFQ pools are enabled but not ready, the runner skips RFQ candidates and sets `meta.rfq_unavailable=true`
 
 ## Candidate selection and execution
 
@@ -127,6 +139,7 @@ Candidate discovery:
 
 - native candidates come from the native state store
 - VM candidates come from the VM state store only when VM state is ready
+- RFQ candidates come from the RFQ state store only when RFQ state is ready
 
 Execution rules:
 

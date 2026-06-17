@@ -27,7 +27,9 @@ impl From<SimulatorStatusSnapshot> for StatusPayload {
 
         Self {
             status: snapshot.status.label(),
-            block: native_backend.map_or(0, |backend| backend.block_number),
+            block: native_backend
+                .and_then(|backend| backend.block_number)
+                .unwrap_or(0),
             pools: native_backend.map_or(0, |backend| backend.pool_count),
             chain_id: snapshot.chain_id,
             backends: snapshot
@@ -45,7 +47,10 @@ pub struct BackendStatusPayload {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
-    block_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_timestamp: Option<u64>,
     pool_count: usize,
     restart_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +70,7 @@ impl From<SimulatorBackendStatusSnapshot> for BackendStatusPayload {
             status: snapshot.readiness.label(),
             reason: snapshot.reason.map(SimulatorReadinessReason::label),
             block_number: snapshot.block_number,
+            update_timestamp: snapshot.update_timestamp,
             pool_count: snapshot.pool_count,
             restart_count: snapshot.restart_count,
             last_error: snapshot.last_error,
@@ -281,7 +287,7 @@ mod tests {
         assert_eq!(payload.status, "ready");
         assert_eq!(payload.block, 1);
         assert_eq!(payload.pools, 1);
-        assert_eq!(payload.block, payload.backends["native"].block_number);
+        assert_eq!(Some(payload.block), payload.backends["native"].block_number);
         assert_eq!(payload.pools, payload.backends["native"].pool_count);
     }
 
@@ -297,7 +303,7 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(payload.status, "stale");
-        assert_eq!(payload.block, payload.backends["native"].block_number);
+        assert_eq!(Some(payload.block), payload.backends["native"].block_number);
         assert_eq!(payload.pools, payload.backends["native"].pool_count);
         assert_eq!(payload.backends["native"].status, "stale");
         assert_eq!(payload.backends["native"].reason, Some("stale"));
@@ -375,6 +381,44 @@ mod tests {
             subscription.last_error.as_deref(),
             Some("rfq broadcaster dropped")
         );
+    }
+
+    #[tokio::test]
+    async fn status_reports_rfq_update_timestamp_without_block_number() -> serde_json::Result<()> {
+        let state = test_state(false, true);
+        seed_native_ready_store(&state).await;
+        state.native_stream_health.record_update(1).await;
+
+        let rfq_component = ProtocolComponent::new(
+            address(31),
+            "rfq:hashflow".to_string(),
+            "hashflow".to_string(),
+            Chain::Ethereum,
+            vec![token(32, "RFQA"), token(33, "RFQB")],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        state
+            .rfq_state_store
+            .apply_update(Update::new(
+                1_710_000_000,
+                HashMap::from([(
+                    "pool-rfq".to_string(),
+                    Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([("pool-rfq".to_string(), rfq_component)]),
+            ))
+            .await;
+        state.rfq_stream_health.record_update(1_710_000_000).await;
+
+        let (_status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+        let value = serde_json::to_value(&payload.backends["rfq"])?;
+
+        assert_eq!(value["update_timestamp"], 1_710_000_000);
+        assert!(value.get("block_number").is_none());
+        Ok(())
     }
 
     #[tokio::test]

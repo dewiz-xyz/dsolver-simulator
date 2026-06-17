@@ -86,7 +86,7 @@ impl QuoteService {
     ) -> QuoteResult {
         let block_number = self.state.current_block().await;
         let vm_block_number = self.state.current_vm_block().await;
-        let rfq_block_number = self.state.current_rfq_block().await;
+        let rfq_update_timestamp = self.state.current_rfq_update_timestamp().await;
         let total_pools = self.state.total_pools().await;
         let timeout_ms = request_timeout.as_millis() as u64;
 
@@ -109,7 +109,7 @@ impl QuoteService {
             meta: simulate_timeout_meta(
                 block_number,
                 vm_block_number,
-                rfq_block_number,
+                rfq_update_timestamp,
                 Some(total_pools),
                 request.auction_id.clone(),
                 format!("Simulate request timed out after {}ms", timeout_ms),

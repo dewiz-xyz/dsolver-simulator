@@ -25,7 +25,7 @@ pub fn router_timeout_result() -> QuoteResult {
 pub fn simulate_timeout_meta(
     block_number: u64,
     vm_block_number: Option<u64>,
-    rfq_block_number: Option<u64>,
+    rfq_update_timestamp: Option<u64>,
     total_pools: Option<usize>,
     auction_id: Option<String>,
     message: String,
@@ -45,7 +45,7 @@ pub fn simulate_timeout_meta(
         partial_kind: None,
         block_number,
         vm_block_number,
-        rfq_block_number,
+        rfq_update_timestamp,
         matching_pools: 0,
         candidate_pools: 0,
         total_pools,
@@ -102,7 +102,7 @@ mod tests {
         assert!(meta.partial_kind.is_none());
         assert_eq!(meta.block_number, 42);
         assert_eq!(meta.vm_block_number, Some(41));
-        assert_eq!(meta.rfq_block_number, Some(42));
+        assert_eq!(meta.rfq_update_timestamp, Some(42));
         assert_eq!(meta.total_pools, Some(12));
         assert_eq!(meta.auction_id.as_deref(), Some("auction-1"));
         assert_eq!(meta.failures.len(), 1);
