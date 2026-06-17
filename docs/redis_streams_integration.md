@@ -50,6 +50,12 @@ Contract invariants:
 - RFQ-only entries, heartbeat entries, snapshot boundary entries, and divergent native/VM payloads omit entry `block_number`
 - payload kind, snapshot id, chain id, and backend scope are validated before an entry is accepted
 
+### Payload boundary
+
+Redis currently stores `payload_json` as a serialized `BroadcasterEnvelope`. That is intentional for this PR because it preserves the existing HTTP snapshot-session and websocket envelope contract while the Redis transport is introduced behind it.
+
+The trade-off is that snapshot chunks and live updates can still carry `BroadcasterStateEntry` or `BroadcasterStateDelta` values with `state: Box<dyn ProtocolSim>`. Redis consumers that deserialize `payload_json` are therefore coupled to the broadcaster's current trait-object serialization shape. Before Redis Streams becomes a live consumer contract, evaluate replacing `payload_json` with a stable typed payload, DTO payload, or per-protocol payload encoding so consumers do not depend on `ProtocolSim` trait-object serialization.
+
 The snapshot pointer is stored separately from the event stream. It records:
 
 - `schema_version`
