@@ -8,10 +8,11 @@
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
 - Keep `TYCHO_BROADCASTER_WS_URL` pointed at the broadcaster websocket. The local default lets the lifecycle helper start the broadcaster on port `3001` before the simulator.
+- Keep the `BROADCASTER_REDIS_*` keys from `.env.example`. The local default uses `redis://127.0.0.1:6379/0`; the lifecycle helper starts Docker Redis for loopback `redis://` when no Redis is already reachable.
 - RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently need the Bebop and Hashflow credential pairs; Liquorice credentials are only needed after `rfq:liquorice` is added to an active chain profile.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
-- Start the local stack:
+- Start the local Redis, broadcaster, and simulator stack:
   ```bash
   scripts/start_server.sh --repo . --chain-id 1
   ```
@@ -33,6 +34,8 @@
   - `cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop`
   - `cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop`
 - The analyzer starts or reuses the local broadcaster plus simulator stack, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` probes and the balanced `/encode` route matrix, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
+- For Redis publisher validation, run `scripts/verify_broadcaster_redis.sh --repo .` after the broadcaster publishes its first snapshot pointer. It checks broadcaster `/status`, Redis stream entries, and the retained snapshot pointer range.
+- In Codex command execution, keep `scripts/start_server.sh`, `scripts/verify_broadcaster_redis.sh`, readiness checks, and `scripts/stop_server.sh` in one shell or use a persistent terminal. If the command ends right after `start_server.sh`, Codex can reap the helper's background processes before the follow-up check runs.
 - The `/encode` matrix uses live `/simulate` prep hops to assemble 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain. Prep hops are reported separately as `encode-prep` scenarios.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
@@ -52,6 +55,7 @@
 - Build broadcaster: `cargo build -p apps --bin dsolver-tycho-broadcaster-service --release`
 - Manual lifecycle:
   - `scripts/start_server.sh --repo . --chain-id 1`
+  - `scripts/verify_broadcaster_redis.sh --repo .`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600`
   - `scripts/stop_server.sh --repo .`

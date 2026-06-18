@@ -10,8 +10,8 @@ metadata:
 ## Quick start
 
 1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
-2. Ensure `.env` exists and contains `TYCHO_API_KEY` plus `TYCHO_BROADCASTER_WS_URL`.
-   The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator.
+2. Ensure `.env` exists and contains `TYCHO_API_KEY`, `TYCHO_BROADCASTER_WS_URL`, and the `BROADCASTER_REDIS_*` keys from `.env.example`.
+   The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator. The default loopback Redis URL lets it start Docker Redis before the broadcaster.
    RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently need the Bebop and Hashflow credential pairs; Liquorice credentials are only needed after `rfq:liquorice` is added to an active chain profile.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
@@ -24,8 +24,8 @@ metadata:
 
 ## What the analyzer does
 
-- Reuses the existing local simulator if it is already responding, otherwise starts the local broadcaster plus simulator stack with the repo lifecycle scripts.
-- Starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_WS_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed.
+- Reuses the existing local simulator if it is already responding, otherwise starts the local Redis, broadcaster, and simulator stack with the repo lifecycle scripts.
+- Starts Docker Redis first when `BROADCASTER_REDIS_URL` is loopback `redis://` and no Redis is reachable, then starts `dsolver-tycho-broadcaster-service` when `TYCHO_BROADCASTER_WS_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs and non-loopback or TLS Redis URLs are treated as externally managed.
 - Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
@@ -75,6 +75,15 @@ Manual combined VM and RFQ wait for Ethereum when both backends matter:
 scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-vm-ready --require-rfq-ready --timeout 600
 ```
 
+Verify the local broadcaster Redis publisher path after the broadcaster has warmed enough to publish a snapshot pointer:
+```bash
+scripts/verify_broadcaster_redis.sh --repo .
+```
+
+That check reads broadcaster `/status`, requires `redis_publisher.healthy=true`, confirms the Redis stream has entries, and checks that the snapshot pointer range is still retained.
+
+When running this from Codex command execution, keep `scripts/start_server.sh`, the Redis verifier, readiness checks, and cleanup in one shell or use a persistent terminal session. A standalone Codex command that exits immediately after `start_server.sh` can reap the helper's background services before the next command runs.
+
 Write to a custom directory:
 ```bash
 cargo run -p apps --bin sim-analysis -- --chain-id 1 --out logs/simulation-reports/manual-check --stop
@@ -92,8 +101,9 @@ After the analyzer runs:
 1. Read `summary.md` first for the high-level picture.
 2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, and any RFQ readiness or RFQ-visibility findings.
 3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts.
-4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
-5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.
+4. When investigating Redis publisher behavior, run `scripts/verify_broadcaster_redis.sh --repo .` and inspect `redis_publisher` in the broadcaster `/status` response before looking at simulator behavior.
+5. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
+6. If something still looks off, continue with targeted manual requests, log inspection, Redis inspection, or deeper domain research.
 
 ## References
 

@@ -87,6 +87,54 @@ stop_process() {
   return 1
 }
 
+read_metadata_value() {
+  local metadata_file="$1"
+  local key="$2"
+
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      print substr($0, length(key) + 2)
+      exit
+    }
+  ' "$metadata_file" 2>/dev/null || true
+}
+
+stop_redis() {
+  local metadata_file="$repo/.tycho-redis-service.meta"
+
+  if [[ ! -f "$metadata_file" ]]; then
+    echo "No local Redis metadata found at $metadata_file."
+    return 0
+  fi
+
+  local compose_file
+  compose_file="$(read_metadata_value "$metadata_file" "compose_file")"
+  if [[ -z "$compose_file" || ! -f "$compose_file" ]]; then
+    echo "Local Redis compose file is missing; removing stale metadata." >&2
+    rm -f "$metadata_file"
+    return 0
+  fi
+  local compose_project
+  compose_project="$(read_metadata_value "$metadata_file" "compose_project")"
+  if [[ -z "$compose_project" ]]; then
+    echo "Local Redis compose project is missing; removing stale metadata." >&2
+    rm -f "$metadata_file"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    echo "Docker Compose v2 is required to stop local Redis from $compose_file." >&2
+    return 1
+  fi
+
+  echo "Stopping local Redis..."
+  (
+    cd "$repo"
+    docker compose -p "$compose_project" -f "$compose_file" stop redis
+  )
+  rm -f "$metadata_file"
+  echo "Stopped local Redis."
+}
+
 status=0
 if ! stop_process "simulator service" "$repo/.tycho-sim-server.pid"; then
   status=1
@@ -95,10 +143,19 @@ if ! stop_process "simulator service" "$repo/.tycho-sim-server.pid"; then
     exit "$status"
   fi
 fi
+redis_can_stop=true
 if stop_process "broadcaster service" "$repo/.tycho-broadcaster-service.pid"; then
   rm -f "$repo/.tycho-broadcaster-service.meta"
 else
   status=1
+  redis_can_stop=false
+fi
+if [[ "$redis_can_stop" == "true" ]]; then
+  if ! stop_redis; then
+    status=1
+  fi
+else
+  echo "Preserving local Redis because broadcaster service did not stop." >&2
 fi
 
 exit "$status"
