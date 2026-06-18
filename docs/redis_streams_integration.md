@@ -421,7 +421,7 @@ Defaults:
 - `BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS=5000`
 - `BROADCASTER_REDIS_RETENTION_SECS=300`
 
-The stream and snapshot keys must be different. Redis URLs must use `redis://`, include a host, and use a valid port when a port is present.
+The stream and snapshot keys must be different. Redis URLs must use `redis://` or `rediss://`, include a host, and use a valid port when a port is present.
 
 `BROADCASTER_REDIS_RETENTION_SECS` and `BROADCASTER_REDIS_MAXLEN` are validated in this branch so configuration mistakes fail early, but publisher-side stream trimming remains deferred.
 
