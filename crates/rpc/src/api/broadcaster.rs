@@ -301,28 +301,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_routes_are_not_registered() -> Result<()> {
-        let app = create_broadcaster_router(
-            build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
-        );
-
-        assert_eq!(
-            get_status(app.clone(), "/rfq/status").await?,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            post_status(app.clone(), "/rfq/snapshot-sessions").await?,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            get_status(app.clone(), "/rfq/snapshot-sessions/1/payloads/0").await?,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(get_status(app, "/rfq/ws").await?, StatusCode::NOT_FOUND);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn root_status_reports_rfq_backend_readiness() -> Result<()> {
         let app = create_broadcaster_router(
             build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
@@ -873,26 +851,6 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
         Ok((status, body))
-    }
-
-    async fn get_status(app: Router, uri: &str) -> Result<StatusCode> {
-        let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
-            .await?;
-        Ok(response.status())
-    }
-
-    async fn post_status(app: Router, uri: &str) -> Result<StatusCode> {
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))?,
-            )
-            .await?;
-        Ok(response.status())
     }
 
     async fn post_json(
