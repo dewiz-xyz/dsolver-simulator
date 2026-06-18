@@ -284,7 +284,7 @@ fn build_app_state(
     chain_id: u64,
     snapshot_session_ttl: Duration,
 ) -> BroadcasterAppState {
-    let app_state = match rfq_service {
+    match rfq_service {
         Some(rfq_service) => BroadcasterAppState::with_rfq_snapshot_session_ttl(
             raw_service,
             rfq_service,
@@ -298,8 +298,8 @@ fn build_app_state(
             chain_id,
             snapshot_session_ttl,
         ),
-    };
-    app_state.with_redis_publisher(redis_publisher)
+    }
+    .with_redis_publisher(redis_publisher)
 }
 
 fn combine_status_snapshots(
@@ -317,10 +317,10 @@ fn combine_status_snapshots(
         .upstream
         .last_disconnect_reason
         .or(rfq.upstream.last_disconnect_reason);
-    raw.upstream.last_update_age_ms = max_optional(
-        raw.upstream.last_update_age_ms,
-        rfq.upstream.last_update_age_ms,
-    );
+    raw.upstream.last_update_age_ms = raw
+        .upstream
+        .last_update_age_ms
+        .max(rfq.upstream.last_update_age_ms);
     raw.snapshot.ready = raw.snapshot.ready && rfq.snapshot.ready;
     raw.snapshot
         .configured_backends
@@ -348,28 +348,7 @@ fn combine_readiness(
     left: BroadcasterReadiness,
     right: BroadcasterReadiness,
 ) -> BroadcasterReadiness {
-    if readiness_severity(left) >= readiness_severity(right) {
-        left
-    } else {
-        right
-    }
-}
-
-fn readiness_severity(readiness: BroadcasterReadiness) -> u8 {
-    match readiness {
-        BroadcasterReadiness::UpstreamDisconnected => 3,
-        BroadcasterReadiness::SnapshotWarmingUp => 2,
-        BroadcasterReadiness::RedisPublisherUnhealthy => 1,
-        BroadcasterReadiness::Ready => 0,
-    }
-}
-
-fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
+    left.max(right)
 }
 
 async fn build_redis_publisher(

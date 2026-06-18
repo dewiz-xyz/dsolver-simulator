@@ -22,12 +22,12 @@ use simulator_core::broadcaster::{
 
 use super::redis_publisher::BroadcasterRedisPublisherStatus;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BroadcasterReadiness {
-    UpstreamDisconnected,
-    SnapshotWarmingUp,
-    RedisPublisherUnhealthy,
     Ready,
+    RedisPublisherUnhealthy,
+    SnapshotWarmingUp,
+    UpstreamDisconnected,
 }
 
 impl BroadcasterReadiness {

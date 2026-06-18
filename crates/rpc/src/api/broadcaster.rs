@@ -50,7 +50,6 @@ mod tests {
         },
         broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         broadcaster_service::BroadcasterAppState,
-        config::BroadcasterRedisConfig,
         models::tokens::TokenStore,
         services::broadcaster::BroadcasterServiceState,
     };
@@ -774,24 +773,21 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RpcFakeRedisWriter {
         fail_appends: bool,
-        appends: Arc<Mutex<Vec<BroadcasterRedisStreamEntry>>>,
-        latest_pointer: Arc<Mutex<Option<BroadcasterRedisSnapshotPointer>>>,
+        append_count: Arc<Mutex<usize>>,
     }
 
     impl RpcFakeRedisWriter {
         fn healthy() -> Self {
             Self {
                 fail_appends: false,
-                appends: Arc::new(Mutex::new(Vec::new())),
-                latest_pointer: Arc::new(Mutex::new(None)),
+                append_count: Arc::new(Mutex::new(0)),
             }
         }
 
         fn failing_appends() -> Self {
             Self {
                 fail_appends: true,
-                appends: Arc::new(Mutex::new(Vec::new())),
-                latest_pointer: Arc::new(Mutex::new(None)),
+                append_count: Arc::new(Mutex::new(0)),
             }
         }
     }
@@ -800,15 +796,15 @@ mod tests {
         fn append<'a>(
             &'a self,
             _stream_key: &'a str,
-            entry: &'a BroadcasterRedisStreamEntry,
+            _entry: &'a BroadcasterRedisStreamEntry,
         ) -> futures::future::BoxFuture<'a, Result<String>> {
             Box::pin(async move {
                 if self.fail_appends {
                     bail!("planned append failure");
                 }
-                let mut appends = self.appends.lock().await;
-                let entry_id = format!("1000-{}", appends.len());
-                appends.push(entry.clone());
+                let mut append_count = self.append_count.lock().await;
+                let entry_id = format!("1000-{append_count}");
+                *append_count = append_count.saturating_add(1);
                 Ok(entry_id)
             })
         }
@@ -816,30 +812,20 @@ mod tests {
         fn set_snapshot_pointer<'a>(
             &'a self,
             _snapshot_key: &'a str,
-            pointer: &'a BroadcasterRedisSnapshotPointer,
+            _pointer: &'a BroadcasterRedisSnapshotPointer,
         ) -> futures::future::BoxFuture<'a, Result<()>> {
-            Box::pin(async move {
-                *self.latest_pointer.lock().await = Some(pointer.clone());
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
     }
 
     fn redis_publisher_config() -> BroadcasterRedisPublisherConfig {
-        BroadcasterRedisPublisherConfig::from_redis_config(
-            &BroadcasterRedisConfig {
-                redis_url: "redis://127.0.0.1:6379/0".to_string(),
-                stream_key: "dsolver:broadcaster:test:events".to_string(),
-                snapshot_key: "dsolver:broadcaster:test:snapshot".to_string(),
-                block_ms: 5_000,
-                read_count: 128,
-                append_retry_window_ms: 1,
-                retention_secs: 300,
-                maxlen: None,
-            },
-            Chain::Ethereum.id(),
-            8_388_608,
-        )
+        BroadcasterRedisPublisherConfig {
+            stream_key: "dsolver:broadcaster:test:events".to_string(),
+            snapshot_key: "dsolver:broadcaster:test:snapshot".to_string(),
+            chain_id: Chain::Ethereum.id(),
+            snapshot_max_payload_bytes: 8_388_608,
+            append_retry_window: Duration::from_millis(1),
+        }
     }
 
     async fn get_json(app: Router, uri: &str) -> Result<(StatusCode, serde_json::Value)> {

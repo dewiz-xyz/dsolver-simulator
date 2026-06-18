@@ -95,7 +95,7 @@ pub async fn ws(
         Err(error) => return snapshot_session_error_response(error, StatusCode::CONFLICT),
     };
 
-    ws.on_upgrade(move |socket| handle_session(socket, state, registration))
+    ws.on_upgrade(move |socket| handle_attached_session(socket, state, registration))
         .into_response()
 }
 
@@ -153,14 +153,6 @@ pub async fn token_lookup(
 
 pub async fn token_snapshot(State(state): State<BroadcasterAppState>) -> Response {
     (StatusCode::OK, Json(state.token_snapshot().await)).into_response()
-}
-
-async fn handle_session(
-    socket: WebSocket,
-    state: BroadcasterAppState,
-    registration: BroadcasterAttachedSession,
-) {
-    handle_attached_session(socket, state, registration).await;
 }
 
 async fn handle_attached_session(
