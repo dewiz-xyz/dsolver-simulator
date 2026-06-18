@@ -82,22 +82,22 @@ For a healthy generation, the broadcaster writes:
 
 Redis appends are part of the broadcaster publication path. If append fails, the broadcaster retries inside `BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS`. During that retry window, later deltas for the same generation must wait behind the failed append so the stream cannot skip a message sequence.
 
-The same publication gate protects cache mutation, Redis append ordering, and subscriber broadcast. That means root websocket delivery also inherits Redis append latency in this phase; a later background publisher queue can relax this coupling if operational data says it is too expensive.
+The same publication gate protects cache mutation, Redis append ordering, and subscriber broadcast. That means root websocket delivery also inherits Redis append latency for the current publisher path; a later background publisher queue can relax this coupling if operational data says it is too expensive.
 
 If the retry window is exhausted, the broadcaster treats the Redis publisher generation as unhealthy, reports root `/status` as unavailable, starts a fresh Redis generation with a new `stream_id` and `snapshot_id`, exports a new snapshot from the current in-memory cache, and resumes publication from the new stream position. Redis failures do not clear the broadcaster cache.
 
-Redis append retries use short-lived dedupe keys keyed by Redis `stream_id` and `message_seq` so an accepted append followed by a client-side error can be retried without duplicating the logical entry. Redis publisher generations are process-unique, so a restarted broadcaster does not reuse durable dedupe keys from an older run.
+Redis append retries use explicit Redis Stream entry IDs derived from the publisher generation and `message_seq`. If an append is accepted but the client sees an error, the retry reuses the same entry ID and checks that entry before treating the append as failed.
 
 Retention must preserve the latest complete snapshot range. Before a consumer trusts the snapshot pointer, it checks that the oldest retained Redis entry is not newer than the pointer's `snapshot_start_entry_id`. If retention has already trimmed past that start entry, the consumer rejects the pointer and waits for a fresh snapshot.
 
-Phase 2 reads and validates the Redis retention knobs, but it does not trim the stream or apply `XADD MAXLEN`; retention cleanup is deferred to follow-up Redis operations work.
+The broadcaster reads and validates the Redis retention knobs, but it does not trim the stream or apply `XADD MAXLEN`; retention cleanup is deferred to follow-up Redis operations work.
 
 ## Broadcaster service changes
 
 The broadcaster keeps separate native/VM and RFQ ingestion internally, but public broadcaster status is rooted at `/status`:
 
 - root `/status` reports native, VM, RFQ, and Redis publisher health
-- root `/snapshot-sessions` and `/ws` remain native/VM-only in this phase
+- root `/snapshot-sessions` and `/ws` remain native/VM-only for this publisher path
 - broadcaster `/rfq/status`, `/rfq/snapshot-sessions`, and `/rfq/ws` are intentionally removed
 
 Root `/status` reports `503` until every enabled backend is snapshot-ready and the Redis publisher is healthy. Root snapshot sessions can still be created from the native/VM cache when that cache is ready.
@@ -119,7 +119,7 @@ The simulator no longer builds RFQ provider streams directly. It subscribes to t
 - VM is added when VM pools are effectively enabled
 - RFQ is added when RFQ pools are effectively enabled
 
-Native and VM continue to use the root broadcaster session paths. This Phase 2 publisher branch removes the broadcaster RFQ session paths before the simulator runtime handoff is updated, so simulator RFQ websocket handoff is intentionally broken until the follow-up runtime phase.
+Native and VM continue to use the root broadcaster session paths. The broadcaster RFQ session paths are removed before the simulator runtime handoff is updated, so simulator RFQ websocket handoff is intentionally broken until the follow-up runtime work lands.
 
 Readiness follows the backend source:
 
@@ -251,7 +251,7 @@ Root native and VM subscriptions use:
 - HTTP payload: `snapshot-sessions/{session_id}/payloads/{index}`
 - websocket attach: original `/ws?sessionId=...`
 
-RFQ broadcaster subscription URL handling is deferred to the follow-up runtime handoff phase. This branch intentionally does not expose RFQ snapshot-session or websocket routes.
+RFQ broadcaster subscription URL handling is deferred to the follow-up runtime handoff work. This branch intentionally does not expose RFQ snapshot-session or websocket routes.
 
 ### Subscription processor
 
@@ -446,5 +446,5 @@ Operational guidance:
 - alert on repeated Redis append retry exhaustion, because that causes a new Redis generation
 - alert when the snapshot pointer is unusable because retention trimmed past the latest snapshot start
 - if Redis data is flushed while the broadcaster process stays up, restart the broadcaster or force a generation reset so it publishes a fresh pointer
-- treat RFQ readiness as part of root broadcaster `/status` until the runtime handoff phase restores end-to-end simulator RFQ consumption
+- treat RFQ readiness as part of root broadcaster `/status` until follow-up runtime work restores end-to-end simulator RFQ consumption
 - use `stream_id`, `snapshot_id`, and `message_seq` together when correlating Redis entries, websocket messages, and simulator logs
