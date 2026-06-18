@@ -1,4 +1,5 @@
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,13 +45,15 @@ impl fmt::Debug for BroadcasterRedisPublisher {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BroadcasterRedisPublisherStatus {
     pub healthy: bool,
     pub stream_key: String,
     pub stream_id: String,
     pub snapshot_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_snapshot_pointer: Option<BroadcasterRedisSnapshotPointer>,
     pub append_success_count: u64,
     pub append_failure_count: u64,
@@ -58,28 +61,8 @@ pub struct BroadcasterRedisPublisherStatus {
     pub pointer_write_failure_count: u64,
     pub generation_reset_count: u64,
     pub retry_exhaustion_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-enum PublisherPhase {
-    AwaitingSnapshot,
-    Live {
-        snapshot_pointer: BroadcasterRedisSnapshotPointer,
-    },
-}
-
-impl PublisherPhase {
-    fn is_live(&self) -> bool {
-        matches!(self, Self::Live { .. })
-    }
-
-    fn snapshot_pointer(&self) -> Option<&BroadcasterRedisSnapshotPointer> {
-        match self {
-            Self::AwaitingSnapshot => None,
-            Self::Live { snapshot_pointer } => Some(snapshot_pointer),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -87,7 +70,7 @@ struct BroadcasterRedisPublisherState {
     generation: u64,
     stream_id: String,
     snapshot_id: String,
-    phase: PublisherPhase,
+    snapshot_pointer: Option<BroadcasterRedisSnapshotPointer>,
     next_message_seq: u64,
     latest_entry_id: Option<String>,
     append_success_count: u64,
@@ -101,7 +84,7 @@ struct BroadcasterRedisPublisherState {
 
 impl BroadcasterRedisPublisherState {
     fn is_live(&self) -> bool {
-        self.phase.is_live()
+        self.snapshot_pointer.is_some()
     }
 
     fn record_append_success(&mut self, entry_id: String, next_message_seq: u64) {
@@ -116,9 +99,7 @@ impl BroadcasterRedisPublisherState {
 
     fn record_pointer_write_success(&mut self, pointer: BroadcasterRedisSnapshotPointer) {
         self.pointer_write_success_count = self.pointer_write_success_count.saturating_add(1);
-        self.phase = PublisherPhase::Live {
-            snapshot_pointer: pointer,
-        };
+        self.snapshot_pointer = Some(pointer);
         self.last_error = None;
     }
 
@@ -142,11 +123,28 @@ impl BroadcasterRedisPublisherState {
             .ok_or_else(|| anyhow!("Redis broadcaster generation overflow"))?;
         self.stream_id = format_redis_stream_id(chain_id, self.generation);
         self.snapshot_id = format_redis_snapshot_id(chain_id, self.generation);
-        self.phase = PublisherPhase::AwaitingSnapshot;
+        self.snapshot_pointer = None;
         self.next_message_seq = 1;
         self.latest_entry_id = None;
         self.last_error = last_error;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RedisPublisherWrite<'a> {
+    StreamEntry(&'a BroadcasterRedisStreamEntry),
+    SnapshotPointer(&'a BroadcasterRedisSnapshotPointer),
+}
+
+impl RedisPublisherWrite<'_> {
+    fn exhausted_message(self) -> &'static str {
+        match self {
+            Self::StreamEntry(_) => "Redis broadcaster stream append retry window exhausted",
+            Self::SnapshotPointer(_) => {
+                "Redis broadcaster snapshot pointer update retry window exhausted"
+            }
+        }
     }
 }
 
@@ -184,7 +182,7 @@ impl BroadcasterRedisPublisher {
                 generation,
                 stream_id,
                 snapshot_id,
-                phase: PublisherPhase::AwaitingSnapshot,
+                snapshot_pointer: None,
                 next_message_seq: 1,
                 latest_entry_id: None,
                 append_success_count: 0,
@@ -320,7 +318,7 @@ impl BroadcasterRedisPublisher {
             stream_id: guard.stream_id.clone(),
             snapshot_id: guard.snapshot_id.clone(),
             latest_entry_id: guard.latest_entry_id.clone(),
-            latest_snapshot_pointer: guard.phase.snapshot_pointer().cloned(),
+            latest_snapshot_pointer: guard.snapshot_pointer.clone(),
             append_success_count: guard.append_success_count,
             append_failure_count: guard.append_failure_count,
             pointer_write_success_count: guard.pointer_write_success_count,
@@ -375,6 +373,46 @@ impl BroadcasterRedisPublisher {
         guard: &mut BroadcasterRedisPublisherState,
         entry: &BroadcasterRedisStreamEntry,
     ) -> Result<String> {
+        self.write_with_retry(guard, RedisPublisherWrite::StreamEntry(entry), || {
+            self.writer.append(&self.config.stream_key, entry)
+        })
+        .await
+    }
+
+    async fn set_snapshot_pointer_with_retry(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+        pointer: &BroadcasterRedisSnapshotPointer,
+    ) -> Result<()> {
+        self.write_with_retry(guard, RedisPublisherWrite::SnapshotPointer(pointer), || {
+            self.writer
+                .set_snapshot_pointer(&self.config.snapshot_key, pointer)
+        })
+        .await?;
+        emit_broadcaster_redis_pointer_write_success();
+        info!(
+            event = "redis_snapshot_pointer_updated",
+            snapshot_key = self.config.snapshot_key.as_str(),
+            stream_id = pointer.stream_id.as_str(),
+            snapshot_id = pointer.snapshot_id.as_str(),
+            snapshot_start_entry_id = pointer.snapshot_start_entry_id.as_str(),
+            snapshot_end_entry_id = pointer.snapshot_end_entry_id.as_str(),
+            live_cursor_entry_id = pointer.live_cursor_entry_id.as_str(),
+            "Redis broadcaster snapshot pointer updated"
+        );
+        Ok(())
+    }
+
+    async fn write_with_retry<T, Op, Fut>(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+        write: RedisPublisherWrite<'_>,
+        mut operation: Op,
+    ) -> Result<T>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
         let started_at = Instant::now();
         let mut attempts = 0u64;
         let mut last_error = None;
@@ -382,9 +420,40 @@ impl BroadcasterRedisPublisher {
             let Some(remaining) =
                 remaining_retry_window(started_at, self.config.append_retry_window)
             else {
-                let error = anyhow!(last_error.unwrap_or_else(|| {
-                    "Redis broadcaster stream append retry window exhausted".to_string()
-                }));
+                let error =
+                    anyhow!(last_error.unwrap_or_else(|| write.exhausted_message().to_string()));
+                self.record_write_failure(guard, write, attempts, &error);
+                return Err(error);
+            };
+            attempts = attempts.saturating_add(1);
+            match timeout(remaining, operation()).await {
+                Err(_) => {
+                    let error = anyhow!(write.exhausted_message());
+                    self.record_write_failure(guard, write, attempts, &error);
+                    return Err(error);
+                }
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(error)) => {
+                    if started_at.elapsed() >= self.config.append_retry_window {
+                        self.record_write_failure(guard, write, attempts, &error);
+                        return Err(error);
+                    }
+                    last_error = Some(error.to_string());
+                    sleep_before_retry(started_at, self.config.append_retry_window, attempts).await;
+                }
+            }
+        }
+    }
+
+    fn record_write_failure(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+        write: RedisPublisherWrite<'_>,
+        attempts: u64,
+        error: &anyhow::Error,
+    ) {
+        match write {
+            RedisPublisherWrite::StreamEntry(entry) => {
                 guard.record_append_failure();
                 emit_broadcaster_redis_append_failure();
                 warn!(
@@ -397,70 +466,8 @@ impl BroadcasterRedisPublisher {
                     error = %error,
                     "Redis broadcaster stream append retry window exhausted"
                 );
-                return Err(error);
-            };
-            attempts = attempts.saturating_add(1);
-            match timeout(
-                remaining,
-                self.writer.append(&self.config.stream_key, entry),
-            )
-            .await
-            {
-                Err(_) => {
-                    guard.record_append_failure();
-                    emit_broadcaster_redis_append_failure();
-                    warn!(
-                        event = "redis_stream_append_failed",
-                        stream_key = self.config.stream_key.as_str(),
-                        stream_id = entry.stream_id.as_str(),
-                        message_seq = entry.message_seq,
-                        kind = %entry.kind,
-                        attempts,
-                        "Redis broadcaster stream append retry window exhausted"
-                    );
-                    return Err(anyhow!(
-                        "Redis broadcaster stream append retry window exhausted"
-                    ));
-                }
-                Ok(Ok(entry_id)) => return Ok(entry_id),
-                Ok(Err(error)) => {
-                    if started_at.elapsed() >= self.config.append_retry_window {
-                        guard.record_append_failure();
-                        emit_broadcaster_redis_append_failure();
-                        warn!(
-                            event = "redis_stream_append_failed",
-                            stream_key = self.config.stream_key.as_str(),
-                            stream_id = entry.stream_id.as_str(),
-                            message_seq = entry.message_seq,
-                            kind = %entry.kind,
-                            attempts,
-                            error = %error,
-                            "Redis broadcaster stream append retry window exhausted"
-                        );
-                        return Err(error);
-                    }
-                    last_error = Some(error.to_string());
-                    sleep_before_retry(started_at, self.config.append_retry_window, attempts).await;
-                }
             }
-        }
-    }
-
-    async fn set_snapshot_pointer_with_retry(
-        &self,
-        guard: &mut BroadcasterRedisPublisherState,
-        pointer: &BroadcasterRedisSnapshotPointer,
-    ) -> Result<()> {
-        let started_at = Instant::now();
-        let mut attempts = 0u64;
-        let mut last_error = None;
-        loop {
-            let Some(remaining) =
-                remaining_retry_window(started_at, self.config.append_retry_window)
-            else {
-                let error = anyhow!(last_error.unwrap_or_else(|| {
-                    "Redis broadcaster snapshot pointer update retry window exhausted".to_string()
-                }));
+            RedisPublisherWrite::SnapshotPointer(pointer) => {
                 guard.record_pointer_write_failure();
                 emit_broadcaster_redis_pointer_write_failure();
                 warn!(
@@ -472,63 +479,6 @@ impl BroadcasterRedisPublisher {
                     error = %error,
                     "Redis broadcaster snapshot pointer update retry window exhausted"
                 );
-                return Err(error);
-            };
-            attempts = attempts.saturating_add(1);
-            match timeout(
-                remaining,
-                self.writer
-                    .set_snapshot_pointer(&self.config.snapshot_key, pointer),
-            )
-            .await
-            {
-                Err(_) => {
-                    guard.record_pointer_write_failure();
-                    emit_broadcaster_redis_pointer_write_failure();
-                    warn!(
-                        event = "redis_snapshot_pointer_update_failed",
-                        snapshot_key = self.config.snapshot_key.as_str(),
-                        stream_id = pointer.stream_id.as_str(),
-                        snapshot_id = pointer.snapshot_id.as_str(),
-                        attempts,
-                        "Redis broadcaster snapshot pointer update retry window exhausted"
-                    );
-                    return Err(anyhow!(
-                        "Redis broadcaster snapshot pointer update retry window exhausted"
-                    ));
-                }
-                Ok(Ok(())) => {
-                    emit_broadcaster_redis_pointer_write_success();
-                    info!(
-                        event = "redis_snapshot_pointer_updated",
-                        snapshot_key = self.config.snapshot_key.as_str(),
-                        stream_id = pointer.stream_id.as_str(),
-                        snapshot_id = pointer.snapshot_id.as_str(),
-                        snapshot_start_entry_id = pointer.snapshot_start_entry_id.as_str(),
-                        snapshot_end_entry_id = pointer.snapshot_end_entry_id.as_str(),
-                        live_cursor_entry_id = pointer.live_cursor_entry_id.as_str(),
-                        "Redis broadcaster snapshot pointer updated"
-                    );
-                    return Ok(());
-                }
-                Ok(Err(error)) => {
-                    if started_at.elapsed() >= self.config.append_retry_window {
-                        guard.record_pointer_write_failure();
-                        emit_broadcaster_redis_pointer_write_failure();
-                        warn!(
-                            event = "redis_snapshot_pointer_update_failed",
-                            snapshot_key = self.config.snapshot_key.as_str(),
-                            stream_id = pointer.stream_id.as_str(),
-                            snapshot_id = pointer.snapshot_id.as_str(),
-                            attempts,
-                            error = %error,
-                            "Redis broadcaster snapshot pointer update retry window exhausted"
-                        );
-                        return Err(error);
-                    }
-                    last_error = Some(error.to_string());
-                    sleep_before_retry(started_at, self.config.append_retry_window, attempts).await;
-                }
             }
         }
     }

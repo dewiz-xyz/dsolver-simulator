@@ -20,7 +20,6 @@ use super::{
     BroadcasterRedisSnapshotSource, RedisStreamWriter,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
-use crate::config::BroadcasterRedisConfig;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterPayload, BroadcasterRedisSnapshotPointer,
     BroadcasterRedisStreamEntry,
@@ -735,18 +734,11 @@ fn dummy_token(seed: u8, symbol: &str) -> Token {
 }
 
 fn publisher_config() -> BroadcasterRedisPublisherConfig {
-    BroadcasterRedisPublisherConfig::from_redis_config(
-        &BroadcasterRedisConfig {
-            redis_url: "redis://127.0.0.1:6379/0".to_string(),
-            stream_key: "dsolver:broadcaster:test:events".to_string(),
-            snapshot_key: "dsolver:broadcaster:test:snapshot".to_string(),
-            block_ms: 5_000,
-            read_count: 128,
-            append_retry_window_ms: 10,
-            retention_secs: 300,
-            maxlen: None,
-        },
-        Chain::Ethereum.id(),
-        8_388_608,
-    )
+    BroadcasterRedisPublisherConfig {
+        stream_key: "dsolver:broadcaster:test:events".to_string(),
+        snapshot_key: "dsolver:broadcaster:test:snapshot".to_string(),
+        chain_id: Chain::Ethereum.id(),
+        snapshot_max_payload_bytes: 8_388_608,
+        append_retry_window: Duration::from_millis(10),
+    }
 }
