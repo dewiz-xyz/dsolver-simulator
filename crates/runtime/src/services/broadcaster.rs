@@ -491,7 +491,6 @@ mod tests {
         fn append<'a>(
             &'a self,
             _stream_key: &'a str,
-            _dedupe_key_ttl_ms: u64,
             entry: &'a BroadcasterRedisStreamEntry,
         ) -> futures::future::BoxFuture<'a, Result<String>> {
             Box::pin(async move {
