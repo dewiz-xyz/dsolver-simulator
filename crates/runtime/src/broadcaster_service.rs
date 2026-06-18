@@ -5,8 +5,18 @@ use anyhow::Result;
 use tracing::info;
 use tycho_simulation::utils::load_all_tokens;
 
-use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
-use crate::config::{init_logging, load_broadcaster_config, BroadcasterConfig, MemoryConfig};
+use crate::broadcaster::redis_publisher::{
+    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, BroadcasterRedisSnapshotSource,
+    TokioRedisStreamWriter,
+};
+use crate::broadcaster::state::{
+    BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterStatusSnapshot,
+    BroadcasterUpstreamState,
+};
+use crate::config::{
+    init_logging, load_broadcaster_config, load_broadcaster_redis_config, BroadcasterConfig,
+    MemoryConfig,
+};
 use crate::memory::maybe_log_memory_snapshot;
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{TokenStore, TokenStoreError};
@@ -29,6 +39,7 @@ use tycho_simulation::tycho_common::Bytes;
 pub struct BroadcasterAppState {
     raw_service: BroadcasterServiceState,
     rfq_service: Option<BroadcasterServiceState>,
+    redis_publisher: Option<Arc<BroadcasterRedisPublisher>>,
     tokens: Arc<TokenStore>,
     chain_id: u64,
     snapshot_session_ttl: Duration,
@@ -48,6 +59,7 @@ impl BroadcasterAppState {
         Self {
             raw_service: service,
             rfq_service: None,
+            redis_publisher: None,
             tokens,
             chain_id,
             snapshot_session_ttl,
@@ -64,27 +76,22 @@ impl BroadcasterAppState {
         Self {
             raw_service,
             rfq_service: Some(rfq_service),
+            redis_publisher: None,
             tokens,
             chain_id,
             snapshot_session_ttl,
         }
     }
 
+    pub fn with_redis_publisher(mut self, redis_publisher: Arc<BroadcasterRedisPublisher>) -> Self {
+        self.redis_publisher = Some(redis_publisher);
+        self
+    }
+
     pub async fn create_snapshot_session(
         &self,
     ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
         self.raw_service
-            .create_snapshot_session(self.snapshot_session_ttl)
-            .await
-    }
-
-    pub async fn create_rfq_snapshot_session(
-        &self,
-    ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
-        let Some(service) = &self.rfq_service else {
-            return Ok(None);
-        };
-        service
             .create_snapshot_session(self.snapshot_session_ttl)
             .await
     }
@@ -100,18 +107,6 @@ impl BroadcasterAppState {
             .await
     }
 
-    pub async fn rfq_snapshot_session_payload(
-        &self,
-        session_id: u64,
-        index: u32,
-    ) -> Result<BroadcasterEnvelope, crate::services::broadcaster_sessions::SnapshotSessionError>
-    {
-        let Some(service) = &self.rfq_service else {
-            return Err(crate::services::broadcaster_sessions::SnapshotSessionError::NotFound);
-        };
-        service.snapshot_session_payload(session_id, index).await
-    }
-
     pub async fn attach_snapshot_session(
         &self,
         session_id: u64,
@@ -122,38 +117,23 @@ impl BroadcasterAppState {
         self.raw_service.attach_snapshot_session(session_id).await
     }
 
-    pub async fn attach_rfq_snapshot_session(
-        &self,
-        session_id: u64,
-    ) -> Result<
-        crate::services::broadcaster_sessions::BroadcasterAttachedSession,
-        crate::services::broadcaster_sessions::SnapshotSessionError,
-    > {
-        let Some(service) = &self.rfq_service else {
-            return Err(crate::services::broadcaster_sessions::SnapshotSessionError::NotFound);
-        };
-        service.attach_snapshot_session(session_id).await
-    }
-
-    pub async fn status_snapshot(&self) -> crate::broadcaster::state::BroadcasterStatusSnapshot {
-        self.raw_service.status_snapshot().await
-    }
-
-    pub async fn rfq_status_snapshot(
-        &self,
-    ) -> Option<crate::broadcaster::state::BroadcasterStatusSnapshot> {
-        let service = self.rfq_service.as_ref()?;
-        Some(service.status_snapshot().await)
+    pub async fn status_snapshot(&self) -> BroadcasterStatusSnapshot {
+        let mut snapshot = self.raw_service.status_snapshot().await;
+        if let Some(rfq_service) = &self.rfq_service {
+            snapshot = combine_status_snapshots(snapshot, rfq_service.status_snapshot().await);
+        }
+        if let Some(redis_publisher) = &self.redis_publisher {
+            let redis_status = redis_publisher.status_snapshot().await;
+            if !redis_status.healthy && snapshot.readiness == BroadcasterReadiness::Ready {
+                snapshot.readiness = BroadcasterReadiness::RedisPublisherUnhealthy;
+            }
+            snapshot.redis_publisher = Some(redis_status);
+        }
+        snapshot
     }
 
     pub async fn remove_subscriber(&self, session_id: u64) {
         self.raw_service.remove_subscriber(session_id).await;
-    }
-
-    pub async fn remove_rfq_subscriber(&self, session_id: u64) {
-        if let Some(service) = &self.rfq_service {
-            service.remove_subscriber(session_id).await;
-        }
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -207,13 +187,32 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     log_memory_config(config.memory);
 
     let tokens = load_token_store(&config).await?;
-    let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_configured_backends(&config));
+    let raw_backends = raw_configured_backends(&config);
+    let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
-    let raw_service = BroadcasterServiceState::new(
+    let rfq_backends = rfq_configured_backends(&config);
+    let rfq_cache = rfq_backends
+        .as_ref()
+        .map(|backends| BroadcasterSnapshotCache::new(chain.id(), backends.clone()));
+    let rfq_upstream_state = rfq_cache
+        .as_ref()
+        .map(|_| BroadcasterUpstreamState::default());
+    let redis_publisher = build_redis_publisher(
+        &config,
+        chain.id(),
+        &raw_cache,
+        &raw_backends,
+        rfq_cache.as_ref().zip(rfq_backends.as_ref()),
+    )
+    .await?;
+    let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let raw_service = BroadcasterServiceState::with_lifecycle_gate(
         config.tuning.snapshot_max_payload_bytes,
         config.tuning.subscriber_buffer_capacity,
         raw_cache,
         raw_upstream_state,
+        Some(Arc::clone(&redis_publisher)),
+        Arc::clone(&publication_gate),
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
@@ -224,63 +223,183 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         Arc::clone(&raw_health),
         raw_service.clone(),
     );
-    let rfq_service = if let Some(rfq_backends) = rfq_configured_backends(&config) {
-        let rfq_cache = BroadcasterSnapshotCache::new(chain.id(), rfq_backends);
-        let rfq_upstream_state = BroadcasterUpstreamState::default();
-        let service = BroadcasterServiceState::new(
-            config.tuning.snapshot_max_payload_bytes,
-            config.tuning.subscriber_buffer_capacity,
-            rfq_cache,
-            rfq_upstream_state,
-        );
-        let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
-            tokens: Arc::clone(&tokens),
-            chain,
-            token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
-            protocols: &config.chain_profile.rfq_protocols,
-            bebop_url: &config.bebop_url,
-            hashflow_filename: &config.hashflow_filename,
-            liquorice_url: config.liquorice_url.as_deref(),
-            liquorice_user: &config.liquorice_user,
-            liquorice_key: &config.liquorice_key,
-        })
-        .await?;
-        spawn_broadcaster_rfq_stream_task(
-            &config,
-            supervisor_cfg.clone(),
-            service.clone(),
-            rfq_token_stores,
-        );
-        spawn_heartbeat_task(
-            service.clone(),
-            Duration::from_secs(config.tuning.heartbeat_interval_secs),
-        );
-        Some(service)
-    } else {
-        None
-    };
+    let rfq_service =
+        if let (Some(rfq_cache), Some(rfq_upstream_state)) = (rfq_cache, rfq_upstream_state) {
+            let service = BroadcasterServiceState::with_lifecycle_gate(
+                config.tuning.snapshot_max_payload_bytes,
+                config.tuning.subscriber_buffer_capacity,
+                rfq_cache,
+                rfq_upstream_state,
+                Some(Arc::clone(&redis_publisher)),
+                Arc::clone(&publication_gate),
+            );
+            let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
+                tokens: Arc::clone(&tokens),
+                chain,
+                token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
+                protocols: &config.chain_profile.rfq_protocols,
+                bebop_url: &config.bebop_url,
+                hashflow_filename: &config.hashflow_filename,
+                liquorice_url: config.liquorice_url.as_deref(),
+                liquorice_user: &config.liquorice_user,
+                liquorice_key: &config.liquorice_key,
+            })
+            .await?;
+            spawn_broadcaster_rfq_stream_task(
+                &config,
+                supervisor_cfg.clone(),
+                service.clone(),
+                rfq_token_stores,
+            );
+            spawn_heartbeat_task(
+                service.clone(),
+                Duration::from_secs(config.tuning.heartbeat_interval_secs),
+            );
+            Some(service)
+        } else {
+            None
+        };
     spawn_heartbeat_task(
         raw_service.clone(),
         Duration::from_secs(config.tuning.heartbeat_interval_secs),
     );
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
+    let app_state = build_app_state(
+        raw_service,
+        rfq_service,
+        redis_publisher,
+        tokens,
+        chain.id(),
+        snapshot_session_ttl,
+    );
+
+    Ok(BroadcasterServiceParts { config, app_state })
+}
+
+fn build_app_state(
+    raw_service: BroadcasterServiceState,
+    rfq_service: Option<BroadcasterServiceState>,
+    redis_publisher: Arc<BroadcasterRedisPublisher>,
+    tokens: Arc<TokenStore>,
+    chain_id: u64,
+    snapshot_session_ttl: Duration,
+) -> BroadcasterAppState {
     let app_state = match rfq_service {
         Some(rfq_service) => BroadcasterAppState::with_rfq_snapshot_session_ttl(
             raw_service,
             rfq_service,
             tokens,
-            chain.id(),
+            chain_id,
             snapshot_session_ttl,
         ),
         None => BroadcasterAppState::with_snapshot_session_ttl(
             raw_service,
             tokens,
-            chain.id(),
+            chain_id,
             snapshot_session_ttl,
         ),
     };
+    app_state.with_redis_publisher(redis_publisher)
+}
 
-    Ok(BroadcasterServiceParts { config, app_state })
+fn combine_status_snapshots(
+    mut raw: BroadcasterStatusSnapshot,
+    rfq: BroadcasterStatusSnapshot,
+) -> BroadcasterStatusSnapshot {
+    raw.readiness = combine_readiness(raw.readiness, rfq.readiness);
+    raw.upstream.connected = raw.upstream.connected && rfq.upstream.connected;
+    raw.upstream.restart_count = raw
+        .upstream
+        .restart_count
+        .saturating_add(rfq.upstream.restart_count);
+    raw.upstream.last_error = raw.upstream.last_error.or(rfq.upstream.last_error);
+    raw.upstream.last_disconnect_reason = raw
+        .upstream
+        .last_disconnect_reason
+        .or(rfq.upstream.last_disconnect_reason);
+    raw.upstream.last_update_age_ms = max_optional(
+        raw.upstream.last_update_age_ms,
+        rfq.upstream.last_update_age_ms,
+    );
+    raw.snapshot.ready = raw.snapshot.ready && rfq.snapshot.ready;
+    raw.snapshot
+        .configured_backends
+        .extend(rfq.snapshot.configured_backends);
+    raw.snapshot.configured_backends.sort();
+    raw.snapshot.configured_backends.dedup();
+    raw.snapshot.total_states = raw
+        .snapshot
+        .total_states
+        .saturating_add(rfq.snapshot.total_states);
+    raw.subscribers.active = raw
+        .subscribers
+        .active
+        .saturating_add(rfq.subscribers.active);
+    raw.subscribers.lag_disconnects = raw
+        .subscribers
+        .lag_disconnects
+        .saturating_add(rfq.subscribers.lag_disconnects);
+    raw.subscribers.last_error = raw.subscribers.last_error.or(rfq.subscribers.last_error);
+    raw.backends.extend(rfq.backends);
+    raw
+}
+
+fn combine_readiness(
+    left: BroadcasterReadiness,
+    right: BroadcasterReadiness,
+) -> BroadcasterReadiness {
+    if readiness_severity(left) >= readiness_severity(right) {
+        left
+    } else {
+        right
+    }
+}
+
+fn readiness_severity(readiness: BroadcasterReadiness) -> u8 {
+    match readiness {
+        BroadcasterReadiness::UpstreamDisconnected => 3,
+        BroadcasterReadiness::SnapshotWarmingUp => 2,
+        BroadcasterReadiness::RedisPublisherUnhealthy => 1,
+        BroadcasterReadiness::Ready => 0,
+    }
+}
+
+fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+async fn build_redis_publisher(
+    config: &BroadcasterConfig,
+    chain_id: u64,
+    raw_cache: &BroadcasterSnapshotCache,
+    raw_backends: &[BroadcasterBackend],
+    rfq_source: Option<(&BroadcasterSnapshotCache, &Vec<BroadcasterBackend>)>,
+) -> Result<Arc<BroadcasterRedisPublisher>> {
+    let redis_config = load_broadcaster_redis_config();
+    let writer = Arc::new(TokioRedisStreamWriter::connect(&redis_config.redis_url).await?);
+    let mut sources = vec![BroadcasterRedisSnapshotSource::new(
+        raw_cache.clone(),
+        raw_backends.to_vec(),
+    )];
+    if let Some((rfq_cache, rfq_backends)) = rfq_source {
+        sources.push(BroadcasterRedisSnapshotSource::new(
+            rfq_cache.clone(),
+            rfq_backends.clone(),
+        ));
+    }
+    Ok(Arc::new(BroadcasterRedisPublisher::new(
+        BroadcasterRedisPublisherConfig::from_redis_config(
+            &redis_config,
+            chain_id,
+            config.tuning.snapshot_max_payload_bytes,
+        ),
+        sources,
+        writer,
+    )))
 }
 
 fn log_memory_config(memory: MemoryConfig) {

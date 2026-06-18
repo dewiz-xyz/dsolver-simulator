@@ -547,13 +547,9 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
     reason = "startup config remains fail-fast on invalid Redis URL"
 )]
 fn assert_valid_redis_url(redis_url: &str) {
-    let rest = if let Some(rest) = redis_url.strip_prefix("redis://") {
-        rest
-    } else if let Some(rest) = redis_url.strip_prefix("rediss://") {
-        rest
-    } else {
-        panic!("BROADCASTER_REDIS_URL must start with redis:// or rediss://");
-    };
+    let rest = redis_url
+        .strip_prefix("redis://")
+        .unwrap_or_else(|| panic!("BROADCASTER_REDIS_URL must start with redis://"));
 
     let authority = rest
         .split(['/', '?', '#'])
@@ -919,7 +915,7 @@ mod tests {
 
     fn invalid_broadcaster_redis_scheme() {
         set_required_broadcaster_redis_env();
-        std::env::set_var("BROADCASTER_REDIS_URL", "http://127.0.0.1:6379");
+        std::env::set_var("BROADCASTER_REDIS_URL", "rediss://127.0.0.1:6379");
     }
 
     fn missing_broadcaster_redis_host() {
@@ -1756,7 +1752,7 @@ route_policy = " default "
             fs::write(
                 ".env",
                 [
-                    "BROADCASTER_REDIS_URL=rediss://redis.internal:6380/0",
+                    "BROADCASTER_REDIS_URL=redis://redis.internal:6380/0",
                     "BROADCASTER_REDIS_STREAM_KEY=dsolver:broadcaster:test:8453:events",
                     "BROADCASTER_REDIS_SNAPSHOT_KEY=dsolver:broadcaster:test:8453:snapshot",
                     "BROADCASTER_REDIS_READ_COUNT=256",
@@ -1768,7 +1764,7 @@ route_policy = " default "
             load_broadcaster_redis_config()
         });
 
-        assert_eq!(config.redis_url, "rediss://redis.internal:6380/0");
+        assert_eq!(config.redis_url, "redis://redis.internal:6380/0");
         assert_eq!(config.stream_key, "dsolver:broadcaster:test:8453:events");
         assert_eq!(
             config.snapshot_key,
@@ -1791,7 +1787,7 @@ route_policy = " default "
             RedisConfigFailureCase {
                 name: "invalid scheme",
                 setup: invalid_broadcaster_redis_scheme,
-                expected: "BROADCASTER_REDIS_URL must start with redis:// or rediss://",
+                expected: "BROADCASTER_REDIS_URL must start with redis://",
             },
             RedisConfigFailureCase {
                 name: "missing host",

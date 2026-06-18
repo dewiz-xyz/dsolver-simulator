@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use runtime::broadcaster::redis_publisher::BroadcasterRedisPublisherStatus;
 use runtime::broadcaster::state::{
     BroadcasterBackendStatus, BroadcasterSnapshotStatus, BroadcasterStatusSnapshot,
     BroadcasterSubscriberSnapshot, BroadcasterUpstreamSnapshot,
@@ -16,6 +17,8 @@ pub struct BroadcasterStatusPayload {
     pub snapshot: BroadcasterSnapshotPayload,
     pub subscribers: BroadcasterSubscribersPayload,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis_publisher: Option<BroadcasterRedisPublisherPayload>,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -36,6 +39,48 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                     )
                 })
                 .collect(),
+            redis_publisher: snapshot.redis_publisher.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterRedisPublisherPayload {
+    pub healthy: bool,
+    pub stream_key: String,
+    pub stream_id: String,
+    pub snapshot_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_snapshot_pointer:
+        Option<simulator_core::broadcaster::BroadcasterRedisSnapshotPointer>,
+    pub append_success_count: u64,
+    pub append_failure_count: u64,
+    pub pointer_write_success_count: u64,
+    pub pointer_write_failure_count: u64,
+    pub generation_reset_count: u64,
+    pub retry_exhaustion_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<BroadcasterRedisPublisherStatus> for BroadcasterRedisPublisherPayload {
+    fn from(status: BroadcasterRedisPublisherStatus) -> Self {
+        Self {
+            healthy: status.healthy,
+            stream_key: status.stream_key,
+            stream_id: status.stream_id,
+            snapshot_id: status.snapshot_id,
+            latest_entry_id: status.latest_entry_id,
+            latest_snapshot_pointer: status.latest_snapshot_pointer,
+            append_success_count: status.append_success_count,
+            append_failure_count: status.append_failure_count,
+            pointer_write_success_count: status.pointer_write_success_count,
+            pointer_write_failure_count: status.pointer_write_failure_count,
+            generation_reset_count: status.generation_reset_count,
+            retry_exhaustion_count: status.retry_exhaustion_count,
+            last_error: status.last_error,
         }
     }
 }

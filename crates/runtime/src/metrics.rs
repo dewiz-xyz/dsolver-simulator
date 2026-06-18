@@ -9,6 +9,10 @@ const METRIC_NAMESPACE: &str = "Tycho/Simulation";
 const METRIC_SIMULATE_COMPLETION: &str = "SimulateCompletion";
 const METRIC_SIMULATE_RESULT_QUALITY: &str = "SimulateResultQuality";
 const METRIC_SIMULATE_TIMEOUT: &str = "SimulateRequestTimeout";
+const METRIC_BROADCASTER_REDIS_APPEND_FAILURE: &str = "BroadcasterRedisAppendFailure";
+const METRIC_BROADCASTER_REDIS_POINTER_WRITE_SUCCESS: &str = "BroadcasterRedisPointerWriteSuccess";
+const METRIC_BROADCASTER_REDIS_POINTER_WRITE_FAILURE: &str = "BroadcasterRedisPointerWriteFailure";
+const METRIC_BROADCASTER_REDIS_GENERATION_RESET: &str = "BroadcasterRedisGenerationReset";
 const METRIC_JEMALLOC_ALLOCATED_BYTES: &str = "JemallocAllocatedBytes";
 const METRIC_JEMALLOC_RESIDENT_BYTES: &str = "JemallocResidentBytes";
 const DIM_STATUS: &str = "Status";
@@ -57,6 +61,22 @@ pub fn emit_simulate_result_quality(quality: QuoteResultQuality) {
         METRIC_SIMULATE_RESULT_QUALITY,
         &[(DIM_RESULT_QUALITY, json!(quality))],
     );
+}
+
+pub fn emit_broadcaster_redis_append_failure() {
+    emit_count_metric(METRIC_BROADCASTER_REDIS_APPEND_FAILURE, &[]);
+}
+
+pub fn emit_broadcaster_redis_pointer_write_success() {
+    emit_count_metric(METRIC_BROADCASTER_REDIS_POINTER_WRITE_SUCCESS, &[]);
+}
+
+pub fn emit_broadcaster_redis_pointer_write_failure() {
+    emit_count_metric(METRIC_BROADCASTER_REDIS_POINTER_WRITE_FAILURE, &[]);
+}
+
+pub fn emit_broadcaster_redis_generation_reset() {
+    emit_count_metric(METRIC_BROADCASTER_REDIS_GENERATION_RESET, &[]);
 }
 
 pub fn emit_jemalloc_snapshot(label: &str, allocated_bytes: usize, resident_bytes: usize) {

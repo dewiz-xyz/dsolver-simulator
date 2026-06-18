@@ -20,10 +20,13 @@ use simulator_core::broadcaster::{
     BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
 
+use super::redis_publisher::BroadcasterRedisPublisherStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcasterReadiness {
     UpstreamDisconnected,
     SnapshotWarmingUp,
+    RedisPublisherUnhealthy,
     Ready,
 }
 
@@ -32,6 +35,7 @@ impl BroadcasterReadiness {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
+            Self::RedisPublisherUnhealthy => "redis_publisher_unhealthy",
             Self::Ready => "ready",
         }
     }
@@ -45,6 +49,7 @@ pub struct BroadcasterStatusSnapshot {
     pub snapshot: BroadcasterSnapshotStatus,
     pub subscribers: BroadcasterSubscriberSnapshot,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
+    pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +312,11 @@ impl BroadcasterSnapshotCache {
         }
     }
 
+    pub async fn is_ready(&self) -> bool {
+        let guard = self.inner.read().await;
+        self.is_ready_locked(&guard)
+    }
+
     pub async fn status_snapshot(
         &self,
         max_payload_bytes: usize,
@@ -357,6 +367,7 @@ impl BroadcasterSnapshotCache {
             },
             subscribers,
             backends,
+            redis_publisher: None,
         }
     }
 
