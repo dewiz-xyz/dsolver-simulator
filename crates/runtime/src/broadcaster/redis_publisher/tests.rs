@@ -550,6 +550,16 @@ fn redis_entry_id_uses_generation_and_message_sequence() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn redis_client_accepts_tls_url_before_connecting() {
+    let result = redis::Client::open("rediss://redis.internal:6380/0");
+
+    assert!(
+        result.is_ok(),
+        "rediss:// URLs must be supported before broadcaster startup connects: {result:?}"
+    );
+}
+
 #[derive(Debug, Clone)]
 struct CapturedAppend {
     entry: BroadcasterRedisStreamEntry,
