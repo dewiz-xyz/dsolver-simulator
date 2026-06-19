@@ -27,32 +27,11 @@ pub async fn create_snapshot_session(State(state): State<BroadcasterAppState>) -
     snapshot_session_create_response(state.create_snapshot_session().await, &state).await
 }
 
-pub async fn create_rfq_snapshot_session(State(state): State<BroadcasterAppState>) -> Response {
-    if !state.has_rfq_snapshot_service() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "rfq snapshot sessions are not configured" })),
-        )
-            .into_response();
-    }
-    snapshot_session_create_response(state.create_rfq_snapshot_session().await, &state).await
-}
-
 pub async fn snapshot_session_payload(
     State(state): State<BroadcasterAppState>,
     Path((session_id, index)): Path<(u64, u32)>,
 ) -> Response {
     match state.snapshot_session_payload(session_id, index).await {
-        Ok(envelope) => (StatusCode::OK, Json(envelope)).into_response(),
-        Err(error) => snapshot_session_error_response(error),
-    }
-}
-
-pub async fn rfq_snapshot_session_payload(
-    State(state): State<BroadcasterAppState>,
-    Path((session_id, index)): Path<(u64, u32)>,
-) -> Response {
-    match state.rfq_snapshot_session_payload(session_id, index).await {
         Ok(envelope) => (StatusCode::OK, Json(envelope)).into_response(),
         Err(error) => snapshot_session_error_response(error),
     }

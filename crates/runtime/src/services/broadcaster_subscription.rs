@@ -942,11 +942,8 @@ async fn fetch_broadcaster_snapshot_payload(
     decode_success_json(response, &payload_url, "fetch broadcaster snapshot payload").await
 }
 
-fn broadcaster_snapshot_sessions_path(backend: BroadcasterBackend) -> &'static str {
-    match backend {
-        BroadcasterBackend::Rfq => "rfq/snapshot-sessions",
-        BroadcasterBackend::Native | BroadcasterBackend::Vm => "snapshot-sessions",
-    }
+fn broadcaster_snapshot_sessions_path(_backend: BroadcasterBackend) -> &'static str {
+    "snapshot-sessions"
 }
 
 fn broadcaster_snapshot_payload_path(
@@ -1800,6 +1797,13 @@ mod tests {
                     "sessionId": 7,
                     "streamId": "stream-1",
                     "snapshotId": "snapshot-1",
+                    "redisReplayBoundary": {
+                        "streamKey": "dsolver:broadcaster:test:events",
+                        "streamId": "stream-1",
+                        "snapshotId": "snapshot-1",
+                        "generation": 1,
+                        "exclusiveMessageSeq": 0
+                    },
                     "payloadCount": payloads.len(),
                     "snapshotChunkCount": payloads
                         .iter()
@@ -1861,6 +1865,30 @@ mod tests {
         let mut decoder = TychoStreamDecoder::new();
         decoder.register_decoder::<DummySim>("vm:curve");
         Arc::new(decoder)
+    }
+
+    #[test]
+    fn rfq_subscription_uses_root_snapshot_session_path() {
+        assert_eq!(
+            super::broadcaster_snapshot_sessions_path(BroadcasterBackend::Rfq),
+            "snapshot-sessions"
+        );
+        assert_eq!(
+            super::broadcaster_snapshot_payload_path(BroadcasterBackend::Rfq, 7, 2),
+            "snapshot-sessions/7/payloads/2"
+        );
+    }
+
+    #[test]
+    fn native_and_vm_subscription_paths_remain_root_snapshot_paths() {
+        assert_eq!(
+            super::broadcaster_snapshot_sessions_path(BroadcasterBackend::Native),
+            "snapshot-sessions"
+        );
+        assert_eq!(
+            super::broadcaster_snapshot_payload_path(BroadcasterBackend::Vm, 8, 3),
+            "snapshot-sessions/8/payloads/3"
+        );
     }
 
     #[test]

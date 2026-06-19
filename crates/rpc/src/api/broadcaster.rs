@@ -6,8 +6,7 @@ use axum::{
 use runtime::broadcaster_service::BroadcasterAppState;
 
 use crate::handlers::broadcaster::{
-    create_rfq_snapshot_session, create_snapshot_session, rfq_snapshot_session_payload,
-    snapshot_session_payload, status, token_lookup, token_snapshot,
+    create_snapshot_session, snapshot_session_payload, status, token_lookup, token_snapshot,
 };
 
 pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
@@ -17,11 +16,6 @@ pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
         .route(
             "/snapshot-sessions/:session_id/payloads/:index",
             get(snapshot_session_payload),
-        )
-        .route("/rfq/snapshot-sessions", post(create_rfq_snapshot_session))
-        .route(
-            "/rfq/snapshot-sessions/:session_id/payloads/:index",
-            get(rfq_snapshot_session_payload),
         )
         .route("/tokens/snapshot", get(token_snapshot))
         .route("/tokens/lookup", post(token_lookup))
@@ -283,8 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_status_reports_warming_rfq_while_snapshot_sessions_remain_native_only(
-    ) -> Result<()> {
+    async fn snapshot_session_waits_for_rfq_when_rfq_is_configured() -> Result<()> {
         let app = create_broadcaster_router(
             build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
         );
@@ -298,15 +291,9 @@ mod tests {
         );
         assert!(body["backends"]["rfq"].is_object());
 
-        let (status, body) =
-            post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
-        assert_eq!(status, StatusCode::CREATED);
-        let session_id = body["sessionId"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
-        let (_status, payload) =
-            get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
-        assert_eq!(payload["backends"], serde_json::json!(["native"]));
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         Ok(())
     }
 
@@ -344,40 +331,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_snapshot_session_routes_use_rfq_service() -> Result<()> {
+    async fn snapshot_session_create_serves_all_configured_backends() -> Result<()> {
         let app = create_broadcaster_router(
             build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
         );
 
         let (status, body) =
-            post_json(app.clone(), "/rfq/snapshot-sessions", serde_json::json!({})).await?;
+            post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
 
         assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["chainId"], Chain::Ethereum.id());
+        assert_eq!(body["streamId"], "chain-1-stream-1");
+        assert_eq!(body["snapshotId"], "chain-1-snapshot-1");
+        assert_eq!(body["payloadCount"], 4);
+        assert_eq!(body["snapshotChunkCount"], 2);
         let session_id = body["sessionId"]
             .as_u64()
             .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
-        let (status, payload) = get_json(
-            app,
-            &format!("/rfq/snapshot-sessions/{session_id}/payloads/0"),
+
+        let (status, start) = get_json(
+            app.clone(),
+            &format!("/snapshot-sessions/{session_id}/payloads/0"),
         )
         .await?;
-
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["kind"], "snapshot_start");
-        assert_eq!(payload["backends"], serde_json::json!(["rfq"]));
-        Ok(())
-    }
+        assert_eq!(start["kind"], "snapshot_start");
+        assert_eq!(start["backends"], serde_json::json!(["native", "rfq"]));
+        assert_eq!(start["totalChunks"], 2);
 
-    #[tokio::test]
-    async fn rfq_snapshot_session_create_reports_not_found_when_rfq_is_unconfigured() -> Result<()>
-    {
-        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
+        let (_status, native_chunk) = get_json(
+            app.clone(),
+            &format!("/snapshot-sessions/{session_id}/payloads/1"),
+        )
+        .await?;
+        let (_status, rfq_chunk) = get_json(
+            app.clone(),
+            &format!("/snapshot-sessions/{session_id}/payloads/2"),
+        )
+        .await?;
+        assert_eq!(native_chunk["kind"], "snapshot_chunk");
+        assert_eq!(native_chunk["partitions"][0]["backend"], "native");
+        assert_eq!(rfq_chunk["kind"], "snapshot_chunk");
+        assert_eq!(rfq_chunk["partitions"][0]["backend"], "rfq");
 
-        let (status, body) =
-            post_json(app, "/rfq/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], "rfq snapshot sessions are not configured");
+        let (status, body) = get_json(app, "/status").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["snapshot_sessions"]["active"], 1);
         Ok(())
     }
 

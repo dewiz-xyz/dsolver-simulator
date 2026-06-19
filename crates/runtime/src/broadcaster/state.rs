@@ -425,6 +425,129 @@ impl BroadcasterSnapshotCache {
     }
 }
 
+pub(crate) fn combine_snapshot_exports(
+    chain_id: u64,
+    exports: Vec<BroadcasterSnapshotExport>,
+) -> Result<BroadcasterSnapshotExport> {
+    let mut exports = exports.into_iter();
+    let first = exports
+        .next()
+        .ok_or_else(|| anyhow!("cannot combine empty broadcaster snapshot export set"))?;
+    let stream_id = first.stream_id.clone();
+    let snapshot_id = first.snapshot_id.clone();
+    let max_payload_bytes = first.max_payload_bytes;
+    let mut backends = Vec::new();
+    let mut chunks = Vec::new();
+
+    for export in std::iter::once(first).chain(exports) {
+        collect_snapshot_export_parts(
+            chain_id,
+            &stream_id,
+            &snapshot_id,
+            max_payload_bytes,
+            export,
+            &mut backends,
+            &mut chunks,
+        )?;
+    }
+
+    backends.sort();
+    backends.dedup();
+    let total_chunks = chunks.len() as u32;
+    let mut payloads = Vec::with_capacity(chunks.len().saturating_add(2));
+    payloads.push(BroadcasterPayload::SnapshotStart(
+        BroadcasterSnapshotStart::new(snapshot_id.clone(), chain_id, backends, total_chunks)?,
+    ));
+    for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+        payloads.push(BroadcasterPayload::SnapshotChunk(
+            BroadcasterSnapshotChunk::new(
+                snapshot_id.clone(),
+                chunk_index as u32,
+                chunk.partitions,
+            )?,
+        ));
+    }
+    payloads.push(BroadcasterPayload::SnapshotEnd(
+        BroadcasterSnapshotEnd::new(snapshot_id.clone()),
+    ));
+
+    Ok(BroadcasterSnapshotExport {
+        stream_id,
+        snapshot_id,
+        max_payload_bytes,
+        payloads,
+    })
+}
+
+fn collect_snapshot_export_parts(
+    chain_id: u64,
+    stream_id: &str,
+    snapshot_id: &str,
+    max_payload_bytes: usize,
+    export: BroadcasterSnapshotExport,
+    backends: &mut Vec<BroadcasterBackend>,
+    chunks: &mut Vec<BroadcasterSnapshotChunk>,
+) -> Result<()> {
+    ensure!(
+        export.stream_id == stream_id,
+        "snapshot export stream_id mismatch: expected {stream_id}, found {}",
+        export.stream_id
+    );
+    ensure!(
+        export.snapshot_id == snapshot_id,
+        "snapshot export snapshot_id mismatch: expected {snapshot_id}, found {}",
+        export.snapshot_id
+    );
+    ensure!(
+        export.max_payload_bytes == max_payload_bytes,
+        "snapshot export max_payload_bytes mismatch: expected {max_payload_bytes}, found {}",
+        export.max_payload_bytes
+    );
+
+    for payload in export.payloads {
+        match payload {
+            BroadcasterPayload::SnapshotStart(start) => {
+                ensure!(
+                    start.snapshot_id == snapshot_id,
+                    "snapshot_start id mismatch: expected {snapshot_id}, found {}",
+                    start.snapshot_id
+                );
+                ensure!(
+                    start.chain_id == chain_id,
+                    "snapshot_start chain_id mismatch: expected {chain_id}, found {}",
+                    start.chain_id
+                );
+                backends.extend(start.backends);
+            }
+            BroadcasterPayload::SnapshotChunk(chunk) => {
+                ensure!(
+                    chunk.snapshot_id == snapshot_id,
+                    "snapshot_chunk id mismatch: expected {snapshot_id}, found {}",
+                    chunk.snapshot_id
+                );
+                chunks.push(chunk);
+            }
+            BroadcasterPayload::SnapshotEnd(end) => {
+                ensure!(
+                    end.snapshot_id == snapshot_id,
+                    "snapshot_end id mismatch: expected {snapshot_id}, found {}",
+                    end.snapshot_id
+                );
+            }
+            BroadcasterPayload::Update(_)
+            | BroadcasterPayload::Heartbeat(_)
+            | BroadcasterPayload::Progress(_) => {
+                return Err(anyhow!(
+                    "snapshot export contains non-snapshot payload {}",
+                    payload.kind().as_str()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl BroadcasterPartitionState {
     fn entry_count(&self) -> usize {
         if self.messages.is_empty() {
@@ -1410,6 +1533,83 @@ mod tests {
 
         let heartbeat = cache.heartbeat().await?;
         assert!(matches!(heartbeat, Some(BroadcasterPayload::Heartbeat(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combines_raw_and_rfq_exports_into_one_snapshot_flow() -> Result<()> {
+        let raw_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        raw_cache.apply_update(&native_only_update()).await?;
+        let rfq_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]);
+        rfq_cache
+            .apply_update(&rfq_only_update(12, "rfq-1", 7))
+            .await?;
+
+        let export = super::combine_snapshot_exports(
+            1,
+            vec![
+                raw_cache.export_snapshot(8_388_608).await?,
+                rfq_cache.export_snapshot(8_388_608).await?,
+            ],
+        )?;
+
+        assert_eq!(export.stream_id, "chain-1-stream-1");
+        assert_eq!(export.snapshot_id, "chain-1-snapshot-1");
+        assert_eq!(export.payloads.len(), 4);
+        let BroadcasterPayload::SnapshotStart(start) = &export.payloads[0] else {
+            return Err(anyhow!("expected combined snapshot_start"));
+        };
+        assert_eq!(
+            start.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        );
+        assert_eq!(start.total_chunks, 2);
+        let chunks = snapshot_chunks(&export);
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[0].partitions[0].backend, BroadcasterBackend::Native);
+        assert_eq!(chunks[1].chunk_index, 1);
+        assert_eq!(chunks[1].partitions[0].backend, BroadcasterBackend::Rfq);
+        assert!(matches!(
+            export.payloads.last(),
+            Some(BroadcasterPayload::SnapshotEnd(end)) if end.snapshot_id == "chain-1-snapshot-1"
+        ));
+        assert_payloads_at_most(&export, 8_388_608)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combined_snapshot_export_rejects_mismatched_stream_generation() -> Result<()> {
+        let raw_cache = BroadcasterSnapshotCache::new_with_initial_generation(
+            1,
+            vec![BroadcasterBackend::Native],
+            1,
+        );
+        raw_cache.apply_update(&native_only_update()).await?;
+        let rfq_cache = BroadcasterSnapshotCache::new_with_initial_generation(
+            1,
+            vec![BroadcasterBackend::Rfq],
+            2,
+        );
+        rfq_cache
+            .apply_update(&rfq_only_update(12, "rfq-1", 7))
+            .await?;
+
+        let Err(error) = super::combine_snapshot_exports(
+            1,
+            vec![
+                raw_cache.export_snapshot(8_388_608).await?,
+                rfq_cache.export_snapshot(8_388_608).await?,
+            ],
+        ) else {
+            return Err(anyhow!("mismatched stream generations must fail"));
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot export stream_id mismatch"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 

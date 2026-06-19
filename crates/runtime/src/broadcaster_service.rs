@@ -68,24 +68,15 @@ impl BroadcasterAppState {
     pub async fn create_snapshot_session(
         &self,
     ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
-        self.raw_service
-            .create_snapshot_session(self.snapshot_session_ttl)
-            .await
-    }
-
-    pub async fn create_rfq_snapshot_session(
-        &self,
-    ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
-        let Some(rfq_service) = &self.rfq_service else {
-            return Ok(None);
-        };
-        rfq_service
-            .create_snapshot_session(self.snapshot_session_ttl)
-            .await
-    }
-
-    pub fn has_rfq_snapshot_service(&self) -> bool {
-        self.rfq_service.is_some()
+        let mut services = vec![self.raw_service.clone()];
+        if let Some(rfq_service) = &self.rfq_service {
+            services.push(rfq_service.clone());
+        }
+        BroadcasterServiceState::create_snapshot_session_for_services(
+            &services,
+            self.snapshot_session_ttl,
+        )
+        .await
     }
 
     pub async fn snapshot_session_payload(
@@ -94,16 +85,6 @@ impl BroadcasterAppState {
         index: u32,
     ) -> Result<BroadcasterEnvelope, SnapshotSessionError> {
         self.raw_service
-            .snapshot_session_payload(session_id, index)
-            .await
-    }
-
-    pub async fn rfq_snapshot_session_payload(
-        &self,
-        session_id: u64,
-        index: u32,
-    ) -> Result<BroadcasterEnvelope, SnapshotSessionError> {
-        self.rfq_service()?
             .snapshot_session_payload(session_id, index)
             .await
     }
@@ -155,12 +136,6 @@ impl BroadcasterAppState {
             chain_id: self.chain_id,
             tokens,
         }
-    }
-
-    fn rfq_service(&self) -> Result<&BroadcasterServiceState, SnapshotSessionError> {
-        self.rfq_service
-            .as_ref()
-            .ok_or(SnapshotSessionError::NotFound)
     }
 }
 
@@ -564,6 +539,7 @@ mod tests {
             },
             tuning: BroadcasterTuning {
                 snapshot_max_payload_bytes: 8_388_608,
+                subscriber_buffer_capacity: 128,
                 heartbeat_interval_secs: 5,
                 token_min_quality: 0,
                 snapshot_session_ttl_secs: 300,

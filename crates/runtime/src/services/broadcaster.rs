@@ -11,8 +11,8 @@ use tycho_simulation::{
 
 use crate::broadcaster::redis_publisher::BroadcasterRedisPublisher;
 use crate::broadcaster::state::{
-    BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterStatusSnapshot,
-    BroadcasterUpstreamState,
+    combine_snapshot_exports, BroadcasterReadiness, BroadcasterSnapshotCache,
+    BroadcasterStatusSnapshot, BroadcasterUpstreamState,
 };
 use crate::services::broadcaster_sessions::{
     BroadcasterSnapshotSessionRegistry, SessionCloseReason, SnapshotSessionError,
@@ -141,17 +141,49 @@ impl BroadcasterServiceState {
         &self,
         ttl: Duration,
     ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
-        let _gate = self.lifecycle_gate.lock().await;
-        let status = self.status_snapshot().await;
-        if status.readiness != BroadcasterReadiness::Ready {
-            return Ok(None);
+        Self::create_snapshot_session_for_services(std::slice::from_ref(self), ttl).await
+    }
+
+    pub async fn create_snapshot_session_for_services(
+        services: &[Self],
+        ttl: Duration,
+    ) -> Result<Option<BroadcasterSnapshotSessionResponse>> {
+        anyhow::ensure!(
+            !services.is_empty(),
+            "combined broadcaster snapshot session requires at least one service"
+        );
+        ensure_shared_lifecycle(services, "combined broadcaster snapshot session")?;
+
+        let _gate = services[0].lifecycle_gate.lock().await;
+        let mut chain_id = None;
+        let mut exports = Vec::with_capacity(services.len());
+
+        for service in services {
+            let status = service.status_snapshot().await;
+            if status.readiness != BroadcasterReadiness::Ready {
+                return Ok(None);
+            }
+            match chain_id {
+                Some(expected) => anyhow::ensure!(
+                    status.chain_id == expected,
+                    "combined broadcaster snapshot session chain_id mismatch: expected {expected}, found {}",
+                    status.chain_id
+                ),
+                None => chain_id = Some(status.chain_id),
+            }
+            exports.push(
+                service
+                    .cache
+                    .export_snapshot(service.snapshot_max_payload_bytes)
+                    .await?,
+            );
         }
 
-        let snapshot = self
-            .cache
-            .export_snapshot(self.snapshot_max_payload_bytes)
-            .await?;
-        let redis_replay_boundary = match self.redis_publisher.replay_boundary().await {
+        let chain_id = chain_id.ok_or_else(|| {
+            anyhow::anyhow!("combined broadcaster snapshot session missing chain_id")
+        })?;
+        let snapshot = combine_snapshot_exports(chain_id, exports)?;
+        let redis_replay_boundary = match services[0].redis_publisher.replay_boundary().await {
             Ok(boundary) => boundary,
             Err(error) => {
                 warn!(
@@ -161,9 +193,11 @@ impl BroadcasterServiceState {
                 return Ok(None);
             }
         };
-        self.snapshot_sessions
-            .create_snapshot_session(snapshot, status.chain_id, redis_replay_boundary, ttl)
+        services[0]
+            .snapshot_sessions
+            .create_snapshot_session(snapshot, chain_id, redis_replay_boundary, ttl)
             .await
+            .context("failed to create combined broadcaster snapshot session")
             .map(Some)
     }
 
@@ -211,6 +245,22 @@ impl BroadcasterServiceState {
     pub(crate) async fn lock_lifecycle_gate_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.lifecycle_gate.clone().lock_owned().await
     }
+}
+
+fn ensure_shared_lifecycle(services: &[BroadcasterServiceState], context: &str) -> Result<()> {
+    anyhow::ensure!(
+        services
+            .iter()
+            .all(|service| Arc::ptr_eq(&service.lifecycle_gate, &services[0].lifecycle_gate)),
+        "{context} requires one lifecycle gate"
+    );
+    anyhow::ensure!(
+        services
+            .iter()
+            .all(|service| Arc::ptr_eq(&service.redis_publisher, &services[0].redis_publisher)),
+        "{context} requires one Redis publisher"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -361,6 +411,126 @@ mod tests {
         ));
         assert_eq!(session.redis_replay_boundary.exclusive_message_seq, 1);
         assert_eq!(publisher_boundary.exclusive_message_seq, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_snapshot_session_boundary_is_registered_before_queued_rfq_update() -> Result<()>
+    {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+            publisher_config(),
+            Arc::new(writer),
+            1,
+        ));
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::clone(&lifecycle_gate),
+        );
+        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            lifecycle_gate,
+        );
+        raw_service.mark_upstream_connected().await;
+        rfq_service.mark_upstream_connected().await;
+        raw_service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        rfq_service
+            .apply_update(&rfq_only_update(12, "rfq-1", 7))
+            .await?;
+        let gate = raw_service.lock_lifecycle_gate_for_test().await;
+
+        let services = vec![raw_service.clone(), rfq_service.clone()];
+        let mut subscribe_task = tokio::spawn(async move {
+            BroadcasterServiceState::create_snapshot_session_for_services(
+                &services,
+                Duration::from_secs(300),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        let update_task = tokio::spawn({
+            let rfq_service = rfq_service.clone();
+            async move {
+                rfq_service
+                    .apply_update(&rfq_only_update(13, "rfq-2", 8))
+                    .await
+            }
+        });
+
+        assert!(timeout(Duration::from_millis(25), &mut subscribe_task)
+            .await
+            .is_err());
+        drop(gate);
+
+        let session = subscribe_task
+            .await
+            .map_err(|error| anyhow!("subscribe task failed: {error}"))??
+            .ok_or_else(|| anyhow!("expected combined broadcaster snapshot session"))?;
+        update_task
+            .await
+            .map_err(|error| anyhow!("update task failed: {error}"))??;
+
+        let first_payload = raw_service
+            .snapshot_session_payload(session.session_id, 0)
+            .await
+            .map_err(|error| anyhow!("failed to fetch snapshot payload: {error:?}"))?;
+        let publisher_status = publisher.status_snapshot().await;
+        let publisher_boundary = publisher_status
+            .replay_boundary
+            .ok_or_else(|| anyhow!("expected Redis replay boundary after queued update"))?;
+
+        assert!(matches!(
+            first_payload.payload,
+            BroadcasterPayload::SnapshotStart(_)
+        ));
+        assert_eq!(session.redis_replay_boundary.exclusive_message_seq, 2);
+        assert_eq!(publisher_boundary.exclusive_message_seq, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combined_snapshot_session_rejects_mismatched_lifecycle_gate() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+            publisher_config(),
+            Arc::new(writer),
+            1,
+        ));
+        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+
+        let Err(error) = BroadcasterServiceState::create_snapshot_session_for_services(
+            &[raw_service, rfq_service],
+            Duration::from_secs(300),
+        )
+        .await
+        else {
+            return Err(anyhow!("mismatched lifecycle gates should be rejected"));
+        };
+
+        assert!(format!("{error:#}").contains("one lifecycle gate"));
         Ok(())
     }
 
@@ -745,6 +915,33 @@ mod tests {
                 hash: Bytes::from(vec![1u8; 32]),
                 number: block_number,
                 parent_hash: Bytes::from(vec![2u8; 32]),
+                revert: false,
+                timestamp: block_number * 10,
+                partial_block_index: None,
+            }),
+        )]))
+    }
+
+    fn rfq_only_update(block_number: u64, component_id: &str, seed: u8) -> Update {
+        let protocol = "rfq:hashflow";
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert(
+            component_id.to_string(),
+            protocol_component(component_id, protocol),
+        );
+
+        let mut states = HashMap::new();
+        states.insert(
+            component_id.to_string(),
+            Box::new(DummySim(seed)) as Box<dyn ProtocolSim>,
+        );
+
+        Update::new(block_number, states, new_pairs).set_sync_states(HashMap::from([(
+            protocol.to_string(),
+            SynchronizerState::Ready(BlockHeader {
+                hash: Bytes::from(vec![seed; 32]),
+                number: block_number,
+                parent_hash: Bytes::from(vec![seed.saturating_add(1); 32]),
                 revert: false,
                 timestamp: block_number * 10,
                 partial_block_index: None,
