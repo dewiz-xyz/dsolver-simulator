@@ -539,7 +539,6 @@ mod tests {
             },
             tuning: BroadcasterTuning {
                 snapshot_max_payload_bytes: 8_388_608,
-                subscriber_buffer_capacity: 128,
                 heartbeat_interval_secs: 5,
                 token_min_quality: 0,
                 snapshot_session_ttl_secs: 300,

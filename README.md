@@ -63,7 +63,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Binary | `dsolver-simulator-service` |
 | Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
 | Supported chains | Defined in `simulator-manifest.toml` |
-| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_WS_URL` |
+| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_URL` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
@@ -79,13 +79,14 @@ Use the explicit `-p ... --bin ...` form for local runs and builds so it's alway
 workspace binary you're targeting.
 
 For manual service runs, start `dsolver-tycho-broadcaster-service` first on the port used by
-`TYCHO_BROADCASTER_WS_URL`, then start `dsolver-simulator-service`.
+`TYCHO_BROADCASTER_URL`, then start `dsolver-simulator-service`.
 
 Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
 - `CHAIN_ID` for chain selection from `simulator-manifest.toml`
-- `TYCHO_BROADCASTER_WS_URL` pointing at the broadcaster websocket, for example `ws://127.0.0.1:3001/ws`
+- `TYCHO_BROADCASTER_URL` pointing at the broadcaster HTTP base URL, for example `http://127.0.0.1:3001`
+- `BROADCASTER_REDIS_URL` and `BROADCASTER_REDIS_STREAM_KEY` for the Redis stream that carries broadcaster deltas after each HTTP snapshot replay boundary
 
 Common optional inputs:
 
@@ -97,6 +98,8 @@ Common optional inputs:
 - `BROADCASTER_TOKEN_MIN_QUALITY` to tune the broadcaster's startup Tycho token quality floor
 - `BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES` to cap serialized HTTP snapshot payloads
 - `BROADCASTER_SNAPSHOT_SESSION_TTL_SECS` to set how long an unattached snapshot session can wait before cleanup
+- `BROADCASTER_REDIS_BLOCK_MS`, `BROADCASTER_REDIS_READ_COUNT`, and `BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS` to tune Redis stream reads and append retries
+- `BROADCASTER_REDIS_MAXLEN` to cap retained Redis delta entries and force simulators to fail readiness if replay data is trimmed before catch-up
 - `TOKEN_SNAPSHOT_TIMEOUT_MS` for the simulator's startup load of the full broadcaster token snapshot
 - `TOKEN_REFRESH_TIMEOUT_MS` for RFQ provider token bootstrap and later single-token lookup misses
 - timeout and stream-health knobs from `crates/runtime/src/config/mod.rs`
@@ -220,7 +223,7 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
 cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
-When `TYCHO_BROADCASTER_WS_URL` points at local loopback, the analyzer uses the repo lifecycle
+When `TYCHO_BROADCASTER_URL` points at local loopback, the analyzer uses the repo lifecycle
 helper to start the broadcaster before the simulator. Non-local broadcaster URLs are treated as
 externally managed.
 

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
+use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 
 use crate::models::state::{
     AppState, SimulatorBackendKind, SimulatorBackendStatusSnapshot,
@@ -89,6 +90,13 @@ pub struct BackendSubscriptionPayload {
     stream_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redis_catch_up_cursor: Option<String>,
+    redis_replay_caught_up: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redis_gap_reason: Option<String>,
     restart_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
@@ -101,6 +109,10 @@ impl From<SimulatorBackendSubscriptionSnapshot> for BackendSubscriptionPayload {
             bootstrap_complete: snapshot.bootstrap_complete,
             stream_id: snapshot.stream_id,
             snapshot_id: snapshot.snapshot_id,
+            redis_replay_boundary: snapshot.redis_replay_boundary,
+            redis_catch_up_cursor: snapshot.redis_catch_up_cursor,
+            redis_replay_caught_up: snapshot.redis_replay_caught_up,
+            redis_gap_reason: snapshot.redis_gap_reason,
             restart_count: snapshot.restart_count,
             last_error: snapshot.last_error,
         }
@@ -136,6 +148,7 @@ mod tests {
     use chrono::NaiveDateTime;
     use num_bigint::BigUint;
     use num_traits::Zero;
+    use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
     use tycho_simulation::protocol::models::{ProtocolComponent, Update};
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::models::{token::Token, Chain};
@@ -381,6 +394,88 @@ mod tests {
             subscription.last_error.as_deref(),
             Some("rfq broadcaster dropped")
         );
+    }
+
+    #[tokio::test]
+    async fn status_returns_service_unavailable_for_enabled_backend_redis_gap() {
+        let state = test_state(false, true);
+        seed_native_ready_store(&state).await;
+        state.native_stream_health.record_update(1).await;
+
+        let rfq_component = ProtocolComponent::new(
+            address(31),
+            "rfq:hashflow".to_string(),
+            "hashflow".to_string(),
+            Chain::Ethereum,
+            vec![token(32, "RFQA"), token(33, "RFQB")],
+            Vec::new(),
+            HashMap::new(),
+            Bytes::default(),
+            NaiveDateTime::default(),
+        );
+        state
+            .rfq_state_store
+            .apply_update(Update::new(
+                1,
+                HashMap::from([(
+                    "pool-rfq".to_string(),
+                    Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([("pool-rfq".to_string(), rfq_component)]),
+            ))
+            .await;
+        state.rfq_stream_health.record_update(1).await;
+        state
+            .rfq_broadcaster_subscription
+            .mark_redis_gap("RFQ Redis replay gap")
+            .await;
+
+        let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+
+        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(payload.status, "warming_up");
+        assert_eq!(payload.backends["native"].status, "ready");
+        assert_eq!(payload.backends["rfq"].status, "warming_up");
+        assert_eq!(payload.backends["rfq"].reason, Some("redis_replay_gap"));
+        assert_eq!(
+            payload.backends["rfq"]
+                .subscription
+                .as_ref()
+                .and_then(|subscription| subscription.redis_gap_reason.as_deref()),
+            Some("RFQ Redis replay gap")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_redis_replay_boundary_and_cursor() {
+        let state = test_state(false, false);
+        let boundary = BroadcasterRedisReplayBoundary::new(
+            "dsolver:broadcaster:test:1:events",
+            "stream-test",
+            "snapshot-test",
+            2,
+            12,
+        )
+        .unwrap_or_else(|err| unreachable!("valid replay boundary: {err}"));
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete_with_redis_boundary(boundary.clone())
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_redis_catch_up_cursor("2-14")
+            .await;
+
+        let (_status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+        let subscription = payload.backends["native"]
+            .subscription
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("native status must include subscription"));
+
+        assert_eq!(subscription.redis_replay_boundary, Some(boundary));
+        assert_eq!(subscription.redis_catch_up_cursor.as_deref(), Some("2-14"));
+        assert!(subscription.redis_replay_caught_up);
+        assert!(subscription.redis_gap_reason.is_none());
     }
 
     #[tokio::test]

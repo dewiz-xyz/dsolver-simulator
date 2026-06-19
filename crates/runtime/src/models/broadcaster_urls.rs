@@ -22,61 +22,33 @@ impl fmt::Display for BroadcasterUrlError {
 impl std::error::Error for BroadcasterUrlError {}
 
 pub fn derive_broadcaster_http_url(
-    ws_url: &str,
+    base_url: &str,
     relative_path: &str,
 ) -> Result<String, BroadcasterUrlError> {
-    let mut url = parse_broadcaster_ws_url(ws_url)?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
+    let mut url = parse_broadcaster_url(base_url)?;
+    match url.scheme() {
+        "http" | "https" => {}
         other => {
             return Err(BroadcasterUrlError::new(format!(
-                "TYCHO_BROADCASTER_WS_URL must use ws or wss, got {other}"
+                "TYCHO_BROADCASTER_URL must use http or https, got {other}"
             )))
         }
     };
-    let prefix = websocket_path_prefix(&url)?;
+    let prefix = broadcaster_path_prefix(&url);
     let http_path = prefixed_path(prefix, relative_path);
 
-    url.set_scheme(scheme)
-        .map_err(|_| BroadcasterUrlError::new("invalid broadcaster URL scheme"))?;
     url.set_path(&http_path);
     url.set_query(None);
     Ok(url.to_string())
 }
 
-pub fn derive_broadcaster_session_ws_url(
-    ws_url: &str,
-    session_id: u64,
-) -> Result<String, BroadcasterUrlError> {
-    let mut url = parse_broadcaster_ws_url(ws_url)?;
-    websocket_path_prefix(&url)?;
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("sessionId", &session_id.to_string());
-    Ok(url.to_string())
-}
-
-pub fn derive_broadcaster_rfq_session_ws_url(
-    ws_url: &str,
-    session_id: u64,
-) -> Result<String, BroadcasterUrlError> {
-    let mut url = parse_broadcaster_ws_url(ws_url)?;
-    let prefix = websocket_path_prefix(&url)?;
-    let rfq_ws_path = prefixed_path(prefix, "rfq/ws");
-    url.set_path(&rfq_ws_path);
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("sessionId", &session_id.to_string());
-    Ok(url.to_string())
-}
-
-fn parse_broadcaster_ws_url(ws_url: &str) -> Result<reqwest::Url, BroadcasterUrlError> {
-    reqwest::Url::parse(ws_url)
-        .map_err(|err| BroadcasterUrlError::new(format!("invalid TYCHO_BROADCASTER_WS_URL: {err}")))
+fn parse_broadcaster_url(base_url: &str) -> Result<reqwest::Url, BroadcasterUrlError> {
+    reqwest::Url::parse(base_url)
+        .map_err(|err| BroadcasterUrlError::new(format!("invalid TYCHO_BROADCASTER_URL: {err}")))
 }
 
 fn prefixed_path(prefix: &str, relative_path: &str) -> String {
+    let relative_path = relative_path.trim_start_matches('/');
     if prefix.is_empty() {
         format!("/{relative_path}")
     } else {
@@ -84,30 +56,28 @@ fn prefixed_path(prefix: &str, relative_path: &str) -> String {
     }
 }
 
-fn websocket_path_prefix(url: &reqwest::Url) -> Result<&str, BroadcasterUrlError> {
-    url.path()
-        .strip_suffix("/ws")
-        .ok_or_else(|| BroadcasterUrlError::new("TYCHO_BROADCASTER_WS_URL must end with /ws"))
+fn broadcaster_path_prefix(url: &reqwest::Url) -> &str {
+    match url.path().trim_end_matches('/') {
+        "" => "",
+        path => path,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
 
-    use super::{
-        derive_broadcaster_http_url, derive_broadcaster_rfq_session_ws_url,
-        derive_broadcaster_session_ws_url,
-    };
+    use super::derive_broadcaster_http_url;
 
     #[test]
-    fn derives_http_url_from_broadcaster_websocket_url() -> Result<()> {
+    fn derives_http_url_from_broadcaster_base_url() -> Result<()> {
         assert_eq!(
-            derive_broadcaster_http_url("ws://127.0.0.1:3001/ws", "snapshot-sessions")?,
+            derive_broadcaster_http_url("http://127.0.0.1:3001", "snapshot-sessions")?,
             "http://127.0.0.1:3001/snapshot-sessions"
         );
         assert_eq!(
             derive_broadcaster_http_url(
-                "wss://broadcaster.example/prod/base/ws",
+                "https://broadcaster.example/prod/base",
                 "snapshot-sessions/7/payloads/2"
             )?,
             "https://broadcaster.example/prod/base/snapshot-sessions/7/payloads/2"
@@ -116,48 +86,21 @@ mod tests {
     }
 
     #[test]
-    fn derives_session_websocket_url_from_broadcaster_websocket_url() -> Result<()> {
-        assert_eq!(
-            derive_broadcaster_session_ws_url("ws://127.0.0.1:3001/ws", 42)?,
-            "ws://127.0.0.1:3001/ws?sessionId=42"
-        );
-        assert_eq!(
-            derive_broadcaster_session_ws_url("wss://broadcaster.example/prod/base/ws", 9)?,
-            "wss://broadcaster.example/prod/base/ws?sessionId=9"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn derives_rfq_session_websocket_url_from_broadcaster_websocket_url() -> Result<()> {
-        assert_eq!(
-            derive_broadcaster_rfq_session_ws_url("ws://127.0.0.1:3001/ws", 42)?,
-            "ws://127.0.0.1:3001/rfq/ws?sessionId=42"
-        );
-        assert_eq!(
-            derive_broadcaster_rfq_session_ws_url("wss://broadcaster.example/prod/base/ws", 9)?,
-            "wss://broadcaster.example/prod/base/rfq/ws?sessionId=9"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_non_websocket_url() {
-        let Err(error) =
-            derive_broadcaster_http_url("http://127.0.0.1:3001/ws", "snapshot-sessions")
+    fn rejects_non_http_url() {
+        let Err(error) = derive_broadcaster_http_url("ws://127.0.0.1:3001/ws", "snapshot-sessions")
         else {
-            unreachable!("non-websocket URL should fail");
+            unreachable!("non-http URL should fail");
         };
 
-        assert!(error.to_string().contains("must use ws or wss"));
+        assert!(error.to_string().contains("must use http or https"));
     }
 
     #[test]
-    fn rejects_urls_without_ws_suffix() {
-        let Err(error) = derive_broadcaster_session_ws_url("ws://127.0.0.1:3001/socket", 1) else {
-            unreachable!("non-/ws URL should fail");
-        };
-
-        assert!(error.to_string().contains("must end with /ws"));
+    fn trims_base_url_trailing_slash() -> Result<()> {
+        assert_eq!(
+            derive_broadcaster_http_url("http://127.0.0.1:3001/prod/base/", "/tokens/lookup")?,
+            "http://127.0.0.1:3001/prod/base/tokens/lookup"
+        );
+        Ok(())
     }
 }

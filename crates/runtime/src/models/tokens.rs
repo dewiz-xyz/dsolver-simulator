@@ -454,16 +454,16 @@ fn map_fetch_error(
     }
 }
 
-pub fn derive_broadcaster_token_lookup_url(ws_url: &str) -> Result<String, TokenStoreError> {
-    derive_broadcaster_token_url(ws_url, "lookup")
+pub fn derive_broadcaster_token_lookup_url(base_url: &str) -> Result<String, TokenStoreError> {
+    derive_broadcaster_token_url(base_url, "lookup")
 }
 
-pub fn derive_broadcaster_token_snapshot_url(ws_url: &str) -> Result<String, TokenStoreError> {
-    derive_broadcaster_token_url(ws_url, "snapshot")
+pub fn derive_broadcaster_token_snapshot_url(base_url: &str) -> Result<String, TokenStoreError> {
+    derive_broadcaster_token_url(base_url, "snapshot")
 }
 
-fn derive_broadcaster_token_url(ws_url: &str, endpoint: &str) -> Result<String, TokenStoreError> {
-    derive_broadcaster_http_url(ws_url, &format!("tokens/{endpoint}"))
+fn derive_broadcaster_token_url(base_url: &str, endpoint: &str) -> Result<String, TokenStoreError> {
+    derive_broadcaster_http_url(base_url, &format!("tokens/{endpoint}"))
         .map_err(|error| TokenStoreError::RequestFailed(error.to_string()))
 }
 
@@ -672,41 +672,41 @@ mod tests {
     }
 
     #[test]
-    fn derives_token_lookup_url_from_broadcaster_websocket_url() -> Result<()> {
+    fn derives_token_lookup_url_from_broadcaster_base_url() -> Result<()> {
         assert_eq!(
-            derive_broadcaster_token_lookup_url("ws://127.0.0.1:3001/ws")?,
+            derive_broadcaster_token_lookup_url("http://127.0.0.1:3001")?,
             "http://127.0.0.1:3001/tokens/lookup"
         );
         assert_eq!(
-            derive_broadcaster_token_lookup_url("wss://broadcaster.example/ws")?,
+            derive_broadcaster_token_lookup_url("https://broadcaster.example")?,
             "https://broadcaster.example/tokens/lookup"
         );
         assert_eq!(
-            derive_broadcaster_token_lookup_url("wss://broadcaster.example/prod/base/ws")?,
+            derive_broadcaster_token_lookup_url("https://broadcaster.example/prod/base")?,
             "https://broadcaster.example/prod/base/tokens/lookup"
         );
         Ok(())
     }
 
     #[test]
-    fn derives_token_snapshot_url_from_broadcaster_websocket_url() -> Result<()> {
+    fn derives_token_snapshot_url_from_broadcaster_base_url() -> Result<()> {
         assert_eq!(
-            derive_broadcaster_token_snapshot_url("ws://127.0.0.1:3001/ws")?,
+            derive_broadcaster_token_snapshot_url("http://127.0.0.1:3001")?,
             "http://127.0.0.1:3001/tokens/snapshot"
         );
         assert_eq!(
-            derive_broadcaster_token_snapshot_url("wss://broadcaster.example/prod/base/ws")?,
+            derive_broadcaster_token_snapshot_url("https://broadcaster.example/prod/base")?,
             "https://broadcaster.example/prod/base/tokens/snapshot"
         );
         Ok(())
     }
 
     #[test]
-    fn derives_token_lookup_url_rejects_non_websocket_url() {
-        let Err(err) = derive_broadcaster_token_lookup_url("http://127.0.0.1:3001/ws") else {
-            unreachable!("non-websocket URL should fail");
+    fn derives_token_lookup_url_rejects_non_http_url() {
+        let Err(err) = derive_broadcaster_token_lookup_url("ws://127.0.0.1:3001/ws") else {
+            unreachable!("non-http URL should fail");
         };
 
-        assert!(err.to_string().contains("must use ws or wss"));
+        assert!(err.to_string().contains("must use http or https"));
     }
 }

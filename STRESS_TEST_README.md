@@ -31,7 +31,7 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ## What the analyzer does
 
 - reuses the existing local simulator if it is already responding, otherwise starts the local stack with the repo lifecycle helper
-- starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_WS_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed
+- starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed, and Redis carries broadcaster deltas after each HTTP snapshot replay boundary
 - waits for `/status` service health, then confirms native readiness first and includes VM and RFQ readiness when those backends are enabled
 - allows longer VM or RFQ warmups on fresh starts; budget up to about 10 minutes before assuming either backend is stuck
 - runs a balanced `/simulate` sweep across representative pairs

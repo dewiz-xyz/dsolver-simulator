@@ -4,16 +4,14 @@ use std::collections::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use rand::Rng;
+use redis::streams::{StreamId, StreamInfoStreamReply, StreamReadOptions, StreamReadReply};
+use redis::AsyncCommands;
 use reqwest::{Client, StatusCode};
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
-use tokio::time::{timeout, Instant};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Error as WsError, Message},
-};
+use tokio::time::Instant;
 use tracing::{info, warn};
 use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
@@ -25,15 +23,14 @@ use tycho_simulation::{
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterProtocolMessage, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
+    BroadcasterProtocolMessage, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse, BroadcasterSnapshotStart,
     BroadcasterSubscriptionTracker, BroadcasterUpdatePartition,
 };
 
+use crate::config::BroadcasterRedisConfig;
 use crate::memory::maybe_purge_allocator;
-use crate::models::broadcaster_urls::{
-    derive_broadcaster_http_url, derive_broadcaster_rfq_session_ws_url,
-    derive_broadcaster_session_ws_url,
-};
+use crate::models::broadcaster_urls::derive_broadcaster_http_url;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
@@ -133,55 +130,64 @@ impl BroadcasterSubscriptionControls {
     }
 }
 
-pub async fn supervise_broadcaster_subscription(
-    ws_url: String,
+pub async fn supervise_broadcaster_redis_subscription(
+    broadcaster_url: String,
     expected_chain_id: u64,
+    redis_config: BroadcasterRedisConfig,
     cfg: StreamSupervisorConfig,
-    controls: BroadcasterSubscriptionControls,
+    controls: Vec<BroadcasterSubscriptionControls>,
 ) {
-    let mut backoff = cfg.restart_backoff_min;
-    let mut rebuild = None;
+    if controls.is_empty() {
+        warn!("Broadcaster Redis subscription supervisor has no enabled backends");
+        return;
+    }
+
     let client = Client::new();
+    let mut backoff = cfg.restart_backoff_min;
+    let mut rebuilds = empty_rebuilds(controls.len());
 
     loop {
-        let bootstrap = match prepare_broadcaster_subscription(
-            &client,
-            &ws_url,
-            expected_chain_id,
-            &cfg,
-            &controls,
-            rebuild,
-        )
-        .await
-        {
-            Ok(bootstrap) => bootstrap,
+        let reader = match TokioRedisStreamReader::connect(&redis_config.redis_url).await {
+            Ok(reader) => reader,
             Err(error) => {
-                (rebuild, backoff) = reset_subscription_after_error(
+                let message = format!("Failed to connect to broadcaster Redis: {error:#}");
+                (rebuilds, backoff) = reset_redis_subscription_after_error(
                     &controls,
                     &cfg,
                     backoff,
-                    error.rebuild,
-                    error.message,
-                    error.event,
-                    error.detail,
+                    rebuilds,
+                    message,
+                    false,
+                    (
+                        "broadcaster_redis_subscription_connect_failed",
+                        "Failed to connect to broadcaster Redis",
+                    ),
                 )
                 .await;
                 continue;
             }
         };
 
-        let stream = match connect_async(bootstrap.session_ws_url.as_str()).await {
-            Ok((stream, _response)) => stream,
+        let prepared = match prepare_broadcaster_redis_subscription(
+            &client,
+            &broadcaster_url,
+            expected_chain_id,
+            &cfg,
+            &controls,
+            rebuilds,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
             Err(error) => {
-                let message = format!("Failed to connect to broadcaster websocket: {error}");
-                (rebuild, backoff) = reset_subscription_after_error(
+                (rebuilds, backoff) = reset_redis_subscription_after_error(
                     &controls,
                     &cfg,
                     backoff,
-                    bootstrap.processor.rebuild,
-                    message,
-                    "broadcaster_subscription_connect_failed",
-                    "Failed to connect to broadcaster subscription",
+                    error.rebuilds,
+                    error.message,
+                    false,
+                    (error.event, error.detail),
                 )
                 .await;
                 continue;
@@ -189,176 +195,828 @@ pub async fn supervise_broadcaster_subscription(
         };
 
         info!(
-            ws_url = bootstrap.session_ws_url,
-            session_id = bootstrap.session.session_id,
-            backend = controls.backend_label(),
-            "Connected to broadcaster subscription"
+            stream_key = prepared.replay_boundary.stream_key.as_str(),
+            stream_id = prepared.replay_boundary.stream_id.as_str(),
+            exclusive_entry_id = prepared.replay_boundary.exclusive_entry_id(),
+            "Connected to broadcaster Redis subscription"
         );
-        let (exit, next_rebuild) =
-            process_broadcaster_subscription(stream, bootstrap.processor, &cfg).await;
-        (rebuild, backoff) =
-            restart_after_subscription_exit(&controls, &cfg, backoff, exit, next_rebuild).await;
+
+        let (exit, next_rebuilds) =
+            process_broadcaster_redis_subscription(reader, prepared, &redis_config).await;
+        (rebuilds, backoff) = reset_redis_subscription_after_error(
+            &controls,
+            &cfg,
+            backoff,
+            next_rebuilds,
+            exit.message,
+            exit.redis_gap,
+            (
+                "broadcaster_redis_subscription_restart",
+                "Restarting broadcaster Redis subscription",
+            ),
+        )
+        .await;
     }
 }
 
-struct PreparedBroadcasterSubscription {
-    processor: BroadcasterSubscriptionProcessor,
-    session: BroadcasterSnapshotSessionResponse,
-    session_ws_url: String,
+fn empty_rebuilds(count: usize) -> Vec<Option<SubscriptionRebuildState>> {
+    std::iter::repeat_with(|| None).take(count).collect()
 }
 
-struct PrepareBroadcasterSubscriptionError {
+struct PreparedBroadcasterRedisSubscription {
+    processors: Vec<PreparedRedisProcessor>,
+    replay_boundary: BroadcasterRedisReplayBoundary,
+    required_catch_up_message_seq: u64,
+    expected_chain_id: u64,
+}
+
+struct PreparedRedisProcessor {
+    index: usize,
+    processor: BroadcasterSubscriptionProcessor,
+    replay_boundary: BroadcasterRedisReplayBoundary,
+}
+
+struct PrepareBroadcasterRedisSubscriptionError {
     message: String,
     event: &'static str,
     detail: &'static str,
-    rebuild: Option<SubscriptionRebuildState>,
+    rebuilds: Vec<Option<SubscriptionRebuildState>>,
 }
 
-impl PrepareBroadcasterSubscriptionError {
+impl PrepareBroadcasterRedisSubscriptionError {
     fn new(
         message: String,
         event: &'static str,
         detail: &'static str,
-        rebuild: Option<SubscriptionRebuildState>,
+        rebuilds: Vec<Option<SubscriptionRebuildState>>,
     ) -> Self {
         Self {
             message,
             event,
             detail,
-            rebuild,
+            rebuilds,
         }
     }
 }
 
-async fn prepare_broadcaster_subscription(
+async fn prepare_broadcaster_redis_subscription(
     client: &Client,
-    ws_url: &str,
+    broadcaster_url: &str,
     expected_chain_id: u64,
     cfg: &StreamSupervisorConfig,
-    controls: &BroadcasterSubscriptionControls,
-    rebuild: Option<SubscriptionRebuildState>,
-) -> std::result::Result<PreparedBroadcasterSubscription, PrepareBroadcasterSubscriptionError> {
-    let snapshot_sessions_url = match derive_broadcaster_http_url(
-        ws_url,
-        broadcaster_snapshot_sessions_path(controls.backend()),
-    ) {
-        Ok(url) => url,
-        Err(error) => {
-            return Err(PrepareBroadcasterSubscriptionError::new(
-                format!("Invalid broadcaster websocket URL: {error}"),
-                "broadcaster_subscription_url_invalid",
-                "Failed to derive broadcaster snapshot session URL",
-                rebuild,
-            ));
+    controls: &[BroadcasterSubscriptionControls],
+    mut rebuilds: Vec<Option<SubscriptionRebuildState>>,
+) -> std::result::Result<
+    PreparedBroadcasterRedisSubscription,
+    PrepareBroadcasterRedisSubscriptionError,
+> {
+    let mut processors = Vec::with_capacity(controls.len());
+    let mut last_backend_error = None;
+
+    for (index, controls) in controls.iter().enumerate() {
+        let snapshot_sessions_url = match derive_broadcaster_http_url(
+            broadcaster_url,
+            broadcaster_snapshot_sessions_path(controls.backend()),
+        ) {
+            Ok(url) => url,
+            Err(error) => {
+                return Err(PrepareBroadcasterRedisSubscriptionError::new(
+                    format!("Invalid broadcaster URL: {error}"),
+                    "broadcaster_redis_subscription_url_invalid",
+                    "Failed to derive broadcaster snapshot session URL",
+                    rebuilds,
+                ));
+            }
+        };
+        let decoder = match build_broadcaster_subscription_decoder(
+            controls.tokens(),
+            controls.backend(),
+            controls.protocols(),
+        )
+        .await
+        {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                let message = error.to_string();
+                last_backend_error = Some(message.clone());
+                let rebuild = rebuilds.get_mut(index).and_then(Option::take);
+                rebuilds[index] = handle_subscription_reset(controls, Some(message), rebuild).await;
+                continue;
+            }
+        };
+        let rebuild = rebuilds.get_mut(index).and_then(Option::take);
+        let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+            expected_chain_id,
+            controls.clone(),
+            decoder,
+            rebuild,
+        );
+        let session = match bootstrap_broadcaster_snapshot(
+            client,
+            broadcaster_url,
+            &snapshot_sessions_url,
+            &mut processor,
+            controls,
+            cfg,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let message = error.to_string();
+                last_backend_error = Some(message.clone());
+                rebuilds[index] =
+                    handle_subscription_reset(controls, Some(message), processor.rebuild).await;
+                continue;
+            }
+        };
+        if let Err(error) = processor.align_redis_replay_boundary(&session.redis_replay_boundary) {
+            let message = error.to_string();
+            last_backend_error = Some(message.clone());
+            rebuilds[index] =
+                handle_subscription_reset(controls, Some(message), processor.rebuild).await;
+            continue;
         }
-    };
-    let decoder = match build_broadcaster_subscription_decoder(
-        controls.tokens(),
-        controls.backend(),
-        controls.protocols(),
-    )
-    .await
-    {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            return Err(PrepareBroadcasterSubscriptionError::new(
-                error.to_string(),
-                "broadcaster_subscription_decoder_failed",
-                "Failed to build broadcaster subscription decoder",
-                rebuild,
-            ));
-        }
-    };
-    let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+
+        processors.push(PreparedRedisProcessor {
+            index,
+            processor,
+            replay_boundary: session.redis_replay_boundary,
+        });
+    }
+
+    finish_prepared_broadcaster_redis_subscription(
+        processors,
+        rebuilds,
+        last_backend_error,
         expected_chain_id,
-        controls.clone(),
-        decoder,
-        rebuild,
-    );
-    let session = match bootstrap_broadcaster_snapshot(
-        client,
-        ws_url,
-        &snapshot_sessions_url,
-        &mut processor,
-        controls,
-        cfg,
     )
-    .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            return Err(PrepareBroadcasterSubscriptionError::new(
-                error.to_string(),
-                "broadcaster_subscription_bootstrap_failed",
-                "Failed to bootstrap broadcaster subscription from HTTP snapshot",
-                processor.rebuild,
-            ));
-        }
-    };
-    let session_ws_url = match derive_broadcaster_subscription_ws_url(
-        ws_url,
-        controls.backend(),
-        session.session_id,
+}
+
+fn finish_prepared_broadcaster_redis_subscription(
+    processors: Vec<PreparedRedisProcessor>,
+    rebuilds: Vec<Option<SubscriptionRebuildState>>,
+    last_backend_error: Option<String>,
+    expected_chain_id: u64,
+) -> std::result::Result<
+    PreparedBroadcasterRedisSubscription,
+    PrepareBroadcasterRedisSubscriptionError,
+> {
+    if let Some(message) = last_backend_error {
+        let rebuilds = merge_redis_processor_rebuilds(processors, rebuilds);
+        return Err(PrepareBroadcasterRedisSubscriptionError::new(
+            message,
+            "broadcaster_redis_subscription_bootstrap_failed",
+            "Failed to bootstrap broadcaster subscription from HTTP snapshot",
+            rebuilds,
+        ));
+    }
+
+    if processors.is_empty() {
+        return Err(PrepareBroadcasterRedisSubscriptionError::new(
+            "no broadcaster backends were prepared".to_string(),
+            "broadcaster_redis_subscription_bootstrap_failed",
+            "Failed to bootstrap broadcaster subscription from HTTP snapshot",
+            rebuilds,
+        ));
+    }
+
+    let required_catch_up_message_seq = processors
+        .iter()
+        .map(|processor| processor.replay_boundary.exclusive_message_seq)
+        .max()
+        .unwrap_or(0);
+    let replay_boundary = match coalesce_redis_replay_boundary(
+        processors
+            .iter()
+            .map(|processor| processor.replay_boundary.clone())
+            .collect(),
     ) {
-        Ok(url) => url,
+        Ok(replay_boundary) => replay_boundary,
         Err(error) => {
-            return Err(PrepareBroadcasterSubscriptionError::new(
-                format!("Invalid broadcaster websocket URL: {error}"),
-                "broadcaster_subscription_url_invalid",
-                "Failed to derive broadcaster session websocket URL",
-                processor.rebuild,
+            return Err(PrepareBroadcasterRedisSubscriptionError::new(
+                error.to_string(),
+                "broadcaster_redis_subscription_boundary_invalid",
+                "Failed to derive process Redis replay boundary",
+                merge_redis_processor_rebuilds(processors, rebuilds),
             ));
         }
     };
 
-    Ok(PreparedBroadcasterSubscription {
-        processor,
-        session,
-        session_ws_url,
+    Ok(PreparedBroadcasterRedisSubscription {
+        processors,
+        replay_boundary,
+        required_catch_up_message_seq,
+        expected_chain_id,
     })
 }
 
-async fn reset_subscription_after_error(
-    controls: &BroadcasterSubscriptionControls,
-    cfg: &StreamSupervisorConfig,
-    backoff: Duration,
-    rebuild: Option<SubscriptionRebuildState>,
-    message: String,
-    event: &'static str,
-    detail: &'static str,
-) -> (Option<SubscriptionRebuildState>, Duration) {
-    let rebuild = handle_subscription_reset(controls, Some(message.clone()), rebuild).await;
-    let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-    warn!(
-        event = event,
-        backend = controls.backend_label(),
-        backoff_ms,
-        error = %message,
-        "{detail}"
-    );
-    sleep_backoff(backoff_ms, cfg.memory).await;
-    (rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+async fn process_broadcaster_redis_subscription(
+    reader: TokioRedisStreamReader,
+    mut prepared: PreparedBroadcasterRedisSubscription,
+    redis_config: &BroadcasterRedisConfig,
+) -> (SubscriptionExit, Vec<Option<SubscriptionRebuildState>>) {
+    let mut cursor =
+        RedisReplayCursor::new(prepared.replay_boundary.clone(), prepared.expected_chain_id);
+
+    loop {
+        let messages = match reader
+            .read_after(
+                &prepared.replay_boundary.stream_key,
+                cursor.cursor_entry_id(),
+                redis_config.block_ms,
+                redis_config.read_count,
+            )
+            .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                return (
+                    SubscriptionExit::error(format!(
+                        "failed to read broadcaster Redis stream: {error:#}"
+                    )),
+                    redis_processor_rebuilds(prepared.processors),
+                );
+            }
+        };
+
+        let caught_up_after_batch = messages.len() < redis_config.read_count as usize;
+        if messages.is_empty() {
+            if let Err(exit) = handle_empty_redis_poll(&reader, &cursor, &prepared).await {
+                return (exit, redis_processor_rebuilds(prepared.processors));
+            }
+            continue;
+        }
+
+        if let Err(exit) = apply_redis_message_batch(&mut prepared, &mut cursor, messages).await {
+            return (exit, redis_processor_rebuilds(prepared.processors));
+        }
+
+        if caught_up_after_batch {
+            if let Err(error) =
+                cursor.ensure_reached_required_boundary(prepared.required_catch_up_message_seq)
+            {
+                return (
+                    SubscriptionExit::redis_gap(error.to_string()),
+                    redis_processor_rebuilds(prepared.processors),
+                );
+            }
+            mark_redis_catch_up_cursors(&prepared.processors, cursor.cursor_entry_id()).await;
+        }
+    }
 }
 
-async fn restart_after_subscription_exit(
-    controls: &BroadcasterSubscriptionControls,
+async fn handle_empty_redis_poll(
+    reader: &TokioRedisStreamReader,
+    cursor: &RedisReplayCursor,
+    prepared: &PreparedBroadcasterRedisSubscription,
+) -> std::result::Result<(), SubscriptionExit> {
+    let stream_info = match reader
+        .stream_info(&prepared.replay_boundary.stream_key)
+        .await
+    {
+        Ok(stream_info) => stream_info,
+        Err(error) => {
+            return Err(SubscriptionExit::error(format!(
+                "failed to inspect broadcaster Redis stream: {error:#}"
+            )));
+        }
+    };
+
+    match redis_empty_poll_action(
+        cursor,
+        stream_info.as_ref(),
+        prepared.required_catch_up_message_seq,
+    ) {
+        Ok(RedisEmptyPollAction::CaughtUp) => {
+            mark_redis_catch_up_cursors(&prepared.processors, cursor.cursor_entry_id()).await;
+        }
+        Ok(RedisEmptyPollAction::Pending) => {}
+        Err(error) => return Err(SubscriptionExit::redis_gap(error.to_string())),
+    }
+    Ok(())
+}
+
+async fn apply_redis_message_batch(
+    prepared: &mut PreparedBroadcasterRedisSubscription,
+    cursor: &mut RedisReplayCursor,
+    messages: Vec<RedisStreamMessage>,
+) -> std::result::Result<(), SubscriptionExit> {
+    let mut last_applied_entry_id = None;
+    for message in messages {
+        if let Err(error) = cursor.ensure_next_message(&message) {
+            return Err(SubscriptionExit::redis_gap(error.to_string()));
+        }
+
+        let envelope: BroadcasterEnvelope = serde_json::from_str(&message.entry.payload_json)
+            .map_err(|error| {
+                SubscriptionExit::error(format!(
+                    "failed to decode broadcaster Redis payload: {error}"
+                ))
+            })?;
+
+        for prepared_processor in &mut prepared.processors {
+            if message.entry.message_seq <= prepared_processor.replay_boundary.exclusive_message_seq
+            {
+                continue;
+            }
+            prepared_processor
+                .processor
+                .observe_redis_delta(&message.entry, &envelope)
+                .await
+                .map_err(|error| SubscriptionExit::error(error.to_string()))?;
+        }
+
+        cursor.mark_applied(&message);
+        last_applied_entry_id = Some(message.entry_id);
+    }
+    if let Some(entry_id) = last_applied_entry_id {
+        mark_redis_replay_cursors(&prepared.processors, &entry_id, cursor.last_message_seq).await;
+    }
+    Ok(())
+}
+
+async fn mark_redis_replay_cursors(
+    processors: &[PreparedRedisProcessor],
+    entry_id: &str,
+    message_seq: u64,
+) {
+    for prepared in processors {
+        let cursor = if message_seq < prepared.replay_boundary.exclusive_message_seq {
+            prepared.replay_boundary.exclusive_entry_id()
+        } else {
+            entry_id.to_string()
+        };
+        prepared
+            .processor
+            .controls
+            .broadcaster_subscription()
+            .mark_redis_replay_cursor(cursor)
+            .await;
+    }
+}
+
+async fn mark_redis_catch_up_cursors(processors: &[PreparedRedisProcessor], cursor_entry_id: &str) {
+    for prepared in processors {
+        prepared
+            .processor
+            .controls
+            .broadcaster_subscription()
+            .mark_redis_catch_up_cursor(cursor_entry_id.to_string())
+            .await;
+    }
+}
+
+fn redis_processor_rebuilds(
+    processors: Vec<PreparedRedisProcessor>,
+) -> Vec<Option<SubscriptionRebuildState>> {
+    let mut rebuilds = empty_rebuilds(processors.len());
+    for prepared in processors {
+        rebuilds[prepared.index] = prepared.processor.rebuild;
+    }
+    rebuilds
+}
+
+fn merge_redis_processor_rebuilds(
+    processors: Vec<PreparedRedisProcessor>,
+    mut rebuilds: Vec<Option<SubscriptionRebuildState>>,
+) -> Vec<Option<SubscriptionRebuildState>> {
+    for prepared in processors {
+        rebuilds[prepared.index] = prepared.processor.rebuild;
+    }
+    rebuilds
+}
+
+async fn reset_redis_subscription_after_error(
+    controls: &[BroadcasterSubscriptionControls],
     cfg: &StreamSupervisorConfig,
     backoff: Duration,
-    exit: SubscriptionExit,
-    rebuild: Option<SubscriptionRebuildState>,
-) -> (Option<SubscriptionRebuildState>, Duration) {
-    let rebuild = handle_subscription_reset(controls, exit.last_error.clone(), rebuild).await;
+    rebuilds: Vec<Option<SubscriptionRebuildState>>,
+    message: String,
+    is_gap: bool,
+    (event, detail): (&'static str, &'static str),
+) -> (Vec<Option<SubscriptionRebuildState>>, Duration) {
+    let mut next_rebuilds = Vec::with_capacity(controls.len());
+    for (controls, rebuild) in controls.iter().zip(rebuilds) {
+        let rebuild = handle_subscription_reset(controls, Some(message.clone()), rebuild).await;
+        if is_gap {
+            controls
+                .broadcaster_subscription()
+                .mark_redis_gap(message.clone())
+                .await;
+        }
+        next_rebuilds.push(rebuild);
+    }
     let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
     warn!(
-        event = "broadcaster_subscription_restart",
-        backend = controls.backend_label(),
-        reason = exit.reason,
+        event,
         backoff_ms,
-        last_error = exit.last_error.as_deref(),
-        "Restarting broadcaster subscription"
+        error = %message,
+        "{}", detail
     );
     sleep_backoff(backoff_ms, cfg.memory).await;
-    (rebuild, next_backoff(backoff, cfg.restart_backoff_max))
+    (
+        next_rebuilds,
+        next_backoff(backoff, cfg.restart_backoff_max),
+    )
+}
+
+struct TokioRedisStreamReader {
+    blocking_read_connection: redis::aio::ConnectionManager,
+    inspection_connection: redis::aio::ConnectionManager,
+}
+
+impl TokioRedisStreamReader {
+    async fn connect(redis_url: &str) -> Result<Self> {
+        let client = redis::Client::open(redis_url)
+            .context("failed to create Redis client from BROADCASTER_REDIS_URL")?;
+        // Keep blocking XREAD calls away from XINFO. If a blocking read times out locally, Redis
+        // can still hold that command on its socket until the BLOCK window expires.
+        let blocking_read_connection = client
+            .get_connection_manager()
+            .await
+            .context("failed to connect to broadcaster Redis read connection")?;
+        let inspection_connection = client
+            .get_connection_manager()
+            .await
+            .context("failed to connect to broadcaster Redis inspection connection")?;
+        Ok(Self {
+            blocking_read_connection,
+            inspection_connection,
+        })
+    }
+
+    async fn read_after(
+        &self,
+        stream_key: &str,
+        cursor_entry_id: &str,
+        block_ms: u64,
+        read_count: u64,
+    ) -> Result<Vec<RedisStreamMessage>> {
+        let options = StreamReadOptions::default()
+            .block(block_ms as usize)
+            .count(read_count as usize);
+        let mut connection = self.blocking_read_connection.clone();
+        let reply = connection
+            .xread_options(&[stream_key], &[cursor_entry_id], &options)
+            .await;
+        redis_xread_messages(stream_key, reply)
+    }
+
+    async fn stream_info(&self, stream_key: &str) -> Result<Option<RedisStreamInfo>> {
+        let mut connection = self.inspection_connection.clone();
+        let reply = redis::cmd("XINFO")
+            .arg("STREAM")
+            .arg(stream_key)
+            .query_async::<StreamInfoStreamReply>(&mut connection)
+            .await;
+        redis_stream_info(reply)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RedisStreamMessage {
+    entry_id: String,
+    entry: BroadcasterRedisStreamEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedisStreamInfo {
+    last_generated_entry_id: String,
+    first_entry_id: Option<String>,
+    last_entry_id: Option<String>,
+}
+
+fn redis_stream_messages(
+    expected_stream_key: &str,
+    reply: StreamReadReply,
+) -> Result<Vec<RedisStreamMessage>> {
+    let mut messages = Vec::new();
+    for key in reply.keys {
+        if key.key != expected_stream_key {
+            return Err(anyhow!(
+                "Redis XREAD returned stream key {}, expected {}",
+                key.key,
+                expected_stream_key
+            ));
+        }
+        for stream_id in key.ids {
+            messages.push(redis_stream_message(stream_id)?);
+        }
+    }
+    Ok(messages)
+}
+
+fn redis_xread_messages(
+    expected_stream_key: &str,
+    reply: std::result::Result<Option<StreamReadReply>, redis::RedisError>,
+) -> Result<Vec<RedisStreamMessage>> {
+    match reply {
+        Ok(Some(reply)) => redis_stream_messages(expected_stream_key, reply),
+        Ok(None) => Ok(Vec::new()),
+        Err(error) if error.is_timeout() => Ok(Vec::new()),
+        Err(error) => Err(anyhow!(error).context("Redis XREAD failed")),
+    }
+}
+
+fn redis_stream_info(
+    reply: std::result::Result<StreamInfoStreamReply, redis::RedisError>,
+) -> Result<Option<RedisStreamInfo>> {
+    match reply {
+        Ok(reply) => redis_stream_info_from_reply(reply).map(Some),
+        Err(error) if redis_stream_missing_key(&error) => Ok(None),
+        Err(error) => Err(anyhow!(error).context("Redis XINFO STREAM failed")),
+    }
+}
+
+fn redis_stream_info_from_reply(reply: StreamInfoStreamReply) -> Result<RedisStreamInfo> {
+    let first_entry_id = redis_stream_info_entry_id(reply.length, reply.first_entry.id)?;
+    let last_entry_id = redis_stream_info_entry_id(reply.length, reply.last_entry.id)?;
+    Ok(RedisStreamInfo {
+        last_generated_entry_id: reply.last_generated_id,
+        first_entry_id,
+        last_entry_id,
+    })
+}
+
+fn redis_stream_info_entry_id(length: usize, entry_id: String) -> Result<Option<String>> {
+    match (length, entry_id.is_empty()) {
+        (0, _) => Ok(None),
+        (_, false) => Ok(Some(entry_id)),
+        (_, true) => Err(anyhow!("Redis XINFO STREAM omitted a retained entry id")),
+    }
+}
+
+fn redis_stream_missing_key(error: &redis::RedisError) -> bool {
+    error
+        .detail()
+        .is_some_and(|detail| detail.contains("no such key"))
+}
+
+fn redis_stream_message(stream_id: StreamId) -> Result<RedisStreamMessage> {
+    let entry_id = stream_id.id;
+    let mut value = serde_json::Map::new();
+    for (field, redis_value) in stream_id.map {
+        let field_value: String = redis::from_redis_value(redis_value)
+            .with_context(|| format!("Redis stream field {field} is not a string"))?;
+        value.insert(field, serde_json::Value::String(field_value));
+    }
+    let entry = serde_json::from_value(serde_json::Value::Object(value))
+        .context("failed to decode Redis stream entry")?;
+    Ok(RedisStreamMessage { entry_id, entry })
+}
+
+fn redis_entry_scope_contains(
+    entry: &BroadcasterRedisStreamEntry,
+    backend: BroadcasterBackend,
+) -> bool {
+    entry
+        .backend_scope
+        .split(',')
+        .any(|scope| scope == backend.as_str())
+}
+
+fn coalesce_redis_replay_boundary(
+    boundaries: Vec<BroadcasterRedisReplayBoundary>,
+) -> Result<BroadcasterRedisReplayBoundary> {
+    let mut boundaries = boundaries.into_iter();
+    let Some(mut earliest) = boundaries.next() else {
+        return Err(anyhow!("no Redis replay boundaries were captured"));
+    };
+
+    for boundary in boundaries {
+        ensure_same_redis_stream_boundary(&earliest, &boundary)?;
+        if boundary.exclusive_message_seq < earliest.exclusive_message_seq {
+            earliest = boundary;
+        }
+    }
+
+    Ok(earliest)
+}
+
+fn ensure_same_redis_stream_boundary(
+    left: &BroadcasterRedisReplayBoundary,
+    right: &BroadcasterRedisReplayBoundary,
+) -> Result<()> {
+    if left.stream_key != right.stream_key
+        || left.stream_id != right.stream_id
+        || left.snapshot_id != right.snapshot_id
+        || left.generation != right.generation
+    {
+        return Err(anyhow!(
+            "backend HTTP snapshots returned different Redis replay boundaries: left stream_id={} generation={} snapshot_id={}, right stream_id={} generation={} snapshot_id={}",
+            left.stream_id,
+            left.generation,
+            left.snapshot_id,
+            right.stream_id,
+            right.generation,
+            right.snapshot_id
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedisEmptyPollAction {
+    CaughtUp,
+    Pending,
+}
+
+fn redis_empty_poll_action(
+    cursor: &RedisReplayCursor,
+    stream_info: Option<&RedisStreamInfo>,
+    required_message_seq: u64,
+) -> Result<RedisEmptyPollAction> {
+    cursor.ensure_reached_required_boundary(required_message_seq)?;
+    let Some(stream_info) = stream_info else {
+        if cursor.last_message_seq == 0 {
+            return Ok(RedisEmptyPollAction::CaughtUp);
+        }
+        return Err(anyhow!(
+            "Redis replay gap: stream disappeared after cursor {}",
+            cursor.cursor_entry_id
+        ));
+    };
+
+    let cursor_entry_id = parse_redis_entry_id(&cursor.cursor_entry_id)?;
+    let last_generated_entry_id = parse_redis_entry_id(&stream_info.last_generated_entry_id)?;
+    if last_generated_entry_id < cursor_entry_id {
+        return Err(anyhow!(
+            "Redis replay gap: stream moved backwards from cursor {} to last generated {}",
+            cursor.cursor_entry_id,
+            stream_info.last_generated_entry_id
+        ));
+    }
+    if last_generated_entry_id == cursor_entry_id {
+        return Ok(RedisEmptyPollAction::CaughtUp);
+    }
+
+    let expected_seq = cursor
+        .last_message_seq
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Redis replay message_seq overflow"))?;
+    let expected_entry_id = redis_entry_id(cursor.boundary.generation, expected_seq);
+    let expected_entry_id_parts = parse_redis_entry_id(&expected_entry_id)?;
+    let Some(first_entry_id) = &stream_info.first_entry_id else {
+        return Err(anyhow!(
+            "Redis replay gap: stream generated {} after cursor {} but retained no entries",
+            stream_info.last_generated_entry_id,
+            cursor.cursor_entry_id
+        ));
+    };
+    let Some(last_entry_id) = &stream_info.last_entry_id else {
+        return Err(anyhow!(
+            "Redis replay gap: stream generated {} after cursor {} but retained no last entry",
+            stream_info.last_generated_entry_id,
+            cursor.cursor_entry_id
+        ));
+    };
+
+    let first_entry_id_parts = parse_redis_entry_id(first_entry_id)?;
+    if first_entry_id_parts > expected_entry_id_parts {
+        return Err(anyhow!(
+            "Redis replay gap: first retained entry {} is after expected entry {}",
+            first_entry_id,
+            expected_entry_id
+        ));
+    }
+
+    let last_entry_id_parts = parse_redis_entry_id(last_entry_id)?;
+    if last_entry_id_parts <= cursor_entry_id {
+        return Err(anyhow!(
+            "Redis replay gap: stream generated {} after cursor {} but last retained entry is {}",
+            stream_info.last_generated_entry_id,
+            cursor.cursor_entry_id,
+            last_entry_id
+        ));
+    }
+
+    Ok(RedisEmptyPollAction::Pending)
+}
+
+struct RedisReplayCursor {
+    boundary: BroadcasterRedisReplayBoundary,
+    cursor_entry_id: String,
+    last_message_seq: u64,
+    expected_chain_id: u64,
+}
+
+impl RedisReplayCursor {
+    fn new(boundary: BroadcasterRedisReplayBoundary, expected_chain_id: u64) -> Self {
+        Self {
+            cursor_entry_id: boundary.exclusive_entry_id(),
+            last_message_seq: boundary.exclusive_message_seq,
+            boundary,
+            expected_chain_id,
+        }
+    }
+
+    fn cursor_entry_id(&self) -> &str {
+        &self.cursor_entry_id
+    }
+
+    fn ensure_next_message(&self, message: &RedisStreamMessage) -> Result<()> {
+        if message.entry.stream_id != self.boundary.stream_id {
+            return Err(anyhow!(
+                "Redis replay gap: expected stream_id {}, got {}",
+                self.boundary.stream_id,
+                message.entry.stream_id
+            ));
+        }
+        if message.entry.chain_id != self.expected_chain_id {
+            return Err(anyhow!(
+                "Redis replay gap: expected chain_id {}, got {}",
+                self.expected_chain_id,
+                message.entry.chain_id
+            ));
+        }
+
+        if message.entry.message_seq <= self.last_message_seq {
+            return Err(anyhow!(
+                "Redis replay gap: got stale message_seq {} after {} at {}",
+                message.entry.message_seq,
+                self.cursor_entry_id,
+                message.entry_id
+            ));
+        }
+
+        let expected_seq = self
+            .last_message_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Redis replay message_seq overflow"))?;
+        if message.entry.message_seq != expected_seq {
+            return Err(anyhow!(
+                "Redis replay gap: expected message_seq {} after {}, got {} at {}",
+                expected_seq,
+                self.cursor_entry_id,
+                message.entry.message_seq,
+                message.entry_id
+            ));
+        }
+
+        let expected_entry_id = redis_entry_id(self.boundary.generation, expected_seq);
+        if message.entry_id != expected_entry_id {
+            return Err(anyhow!(
+                "Redis replay gap: expected entry id {}, got {}",
+                expected_entry_id,
+                message.entry_id
+            ));
+        }
+
+        if let Some(snapshot_id) = &message.entry.snapshot_id {
+            if snapshot_id != &self.boundary.snapshot_id {
+                return Err(anyhow!(
+                    "Redis replay gap: expected snapshot_id {}, got {}",
+                    self.boundary.snapshot_id,
+                    snapshot_id
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_reached_required_boundary(&self, required_message_seq: u64) -> Result<()> {
+        if self.last_message_seq >= required_message_seq {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "Redis replay gap: stream ended at message_seq {} ({}) before required snapshot replay boundary {}",
+            self.last_message_seq,
+            self.cursor_entry_id,
+            required_message_seq
+        ))
+    }
+
+    fn mark_applied(&mut self, message: &RedisStreamMessage) {
+        self.cursor_entry_id = message.entry_id.clone();
+        self.last_message_seq = message.entry.message_seq;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RedisEntryIdParts {
+    millis: u64,
+    sequence: u64,
+}
+
+fn parse_redis_entry_id(entry_id: &str) -> Result<RedisEntryIdParts> {
+    let Some((millis, sequence)) = entry_id.split_once('-') else {
+        return Err(anyhow!("invalid Redis stream entry id: {entry_id}"));
+    };
+    Ok(RedisEntryIdParts {
+        millis: millis
+            .parse()
+            .with_context(|| format!("invalid Redis stream entry id: {entry_id}"))?,
+        sequence: sequence
+            .parse()
+            .with_context(|| format!("invalid Redis stream entry id: {entry_id}"))?,
+    })
+}
+
+fn redis_entry_id(generation: u64, message_seq: u64) -> String {
+    format!("{generation}-{message_seq}")
 }
 
 #[derive(Default)]
@@ -603,6 +1261,7 @@ struct BroadcasterSubscriptionProcessor {
     tracker: BroadcasterSubscriptionTracker,
     raw_snapshot: RawSnapshotReassembly,
     bootstrap_block: Option<u64>,
+    bootstrap_redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
     rebuild: Option<SubscriptionRebuildState>,
 }
 
@@ -613,12 +1272,14 @@ impl BroadcasterSubscriptionProcessor {
         controls: BroadcasterSubscriptionControls,
         rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
-        Self::with_decoder(
+        let mut processor = Self::with_decoder(
             expected_chain_id,
             controls,
             Arc::new(TychoStreamDecoder::new()),
             rebuild,
-        )
+        );
+        processor.set_bootstrap_redis_replay_boundary(default_test_redis_replay_boundary());
+        processor
     }
 
     fn with_decoder(
@@ -634,8 +1295,13 @@ impl BroadcasterSubscriptionProcessor {
             tracker: BroadcasterSubscriptionTracker::new(),
             raw_snapshot: RawSnapshotReassembly::default(),
             bootstrap_block: None,
+            bootstrap_redis_replay_boundary: None,
             rebuild,
         }
+    }
+
+    fn set_bootstrap_redis_replay_boundary(&mut self, boundary: BroadcasterRedisReplayBoundary) {
+        self.bootstrap_redis_replay_boundary = Some(boundary);
     }
 
     fn bootstrap_complete(&self) -> bool {
@@ -645,9 +1311,19 @@ impl BroadcasterSubscriptionProcessor {
         )
     }
 
+    fn align_redis_replay_boundary(
+        &mut self,
+        boundary: &BroadcasterRedisReplayBoundary,
+    ) -> Result<()> {
+        self.tracker
+            .align_live_replay_boundary(boundary)
+            .map_err(|error| anyhow!("invalid broadcaster Redis replay boundary: {error}"))
+    }
+
     async fn observe(&mut self, envelope: BroadcasterEnvelope) -> Result<()> {
         if let BroadcasterPayload::SnapshotStart(start) = &envelope.payload {
             self.ensure_snapshot_chain_id(start.chain_id)?;
+            self.ensure_snapshot_includes_backend(start)?;
         }
 
         self.tracker
@@ -674,9 +1350,15 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::SnapshotEnd(_end) => {
                 self.apply_reassembled_snapshot_messages().await?;
                 self.refresh_bootstrap_health().await;
+                let boundary = self
+                    .bootstrap_redis_replay_boundary
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow!("HTTP snapshot completed without Redis replay boundary")
+                    })?;
                 self.controls
                     .broadcaster_subscription()
-                    .mark_bootstrap_complete()
+                    .mark_bootstrap_complete_with_redis_boundary(boundary)
                     .await;
                 self.finish_rebuild().await;
             }
@@ -694,9 +1376,35 @@ impl BroadcasterSubscriptionProcessor {
                     }
                 }
             }
-            BroadcasterPayload::Progress(_) => {}
+            BroadcasterPayload::Progress(_progress) => {}
         }
 
+        Ok(())
+    }
+
+    async fn observe_redis_delta(
+        &mut self,
+        entry: &BroadcasterRedisStreamEntry,
+        envelope: &BroadcasterEnvelope,
+    ) -> Result<()> {
+        if redis_entry_scope_contains(entry, self.controls.backend()) {
+            return self.observe(envelope.clone()).await;
+        }
+
+        self.tracker
+            .skip_live_delta(envelope)
+            .map_err(|error| anyhow!("invalid skipped broadcaster Redis envelope: {error}"))
+    }
+
+    fn ensure_snapshot_includes_backend(&self, start: &BroadcasterSnapshotStart) -> Result<()> {
+        let backend = self.controls.backend();
+        if !start.backends.contains(&backend) {
+            return Err(anyhow!(
+                "broadcaster snapshot start {} does not include {} backend",
+                start.snapshot_id,
+                backend
+            ));
+        }
         Ok(())
     }
 
@@ -847,9 +1555,23 @@ impl BroadcasterSubscriptionProcessor {
     }
 }
 
+#[cfg(test)]
+fn default_test_redis_replay_boundary() -> BroadcasterRedisReplayBoundary {
+    match BroadcasterRedisReplayBoundary::new(
+        "stream:test".to_string(),
+        "stream-1".to_string(),
+        "snapshot-1".to_string(),
+        1,
+        0,
+    ) {
+        Ok(boundary) => boundary,
+        Err(error) => unreachable!("test Redis replay boundary should be valid: {error}"),
+    }
+}
+
 async fn bootstrap_broadcaster_snapshot(
     client: &Client,
-    ws_url: &str,
+    broadcaster_url: &str,
     snapshot_sessions_url: &str,
     processor: &mut BroadcasterSubscriptionProcessor,
     controls: &BroadcasterSubscriptionControls,
@@ -858,6 +1580,7 @@ async fn bootstrap_broadcaster_snapshot(
     let session =
         create_broadcaster_snapshot_session(client, snapshot_sessions_url, cfg.readiness_stale)
             .await?;
+    processor.set_bootstrap_redis_replay_boundary(session.redis_replay_boundary.clone());
     controls.stream_health().mark_started().await;
 
     {
@@ -867,7 +1590,7 @@ async fn bootstrap_broadcaster_snapshot(
                 async move {
                     fetch_broadcaster_snapshot_payload(
                         client,
-                        ws_url,
+                        broadcaster_url,
                         controls.backend(),
                         &session,
                         index,
@@ -918,14 +1641,14 @@ async fn create_broadcaster_snapshot_session(
 
 async fn fetch_broadcaster_snapshot_payload(
     client: &Client,
-    ws_url: &str,
+    broadcaster_url: &str,
     backend: BroadcasterBackend,
     session: &BroadcasterSnapshotSessionResponse,
     index: u32,
     request_timeout: Duration,
 ) -> Result<BroadcasterEnvelope> {
     let payload_url = derive_broadcaster_http_url(
-        ws_url,
+        broadcaster_url,
         &broadcaster_snapshot_payload_path(backend, session.session_id, index),
     )
     .map_err(|error| anyhow!("failed to derive broadcaster snapshot payload URL: {error}"))?;
@@ -957,19 +1680,6 @@ fn broadcaster_snapshot_payload_path(
     )
 }
 
-fn derive_broadcaster_subscription_ws_url(
-    ws_url: &str,
-    backend: BroadcasterBackend,
-    session_id: u64,
-) -> std::result::Result<String, crate::models::broadcaster_urls::BroadcasterUrlError> {
-    match backend {
-        BroadcasterBackend::Rfq => derive_broadcaster_rfq_session_ws_url(ws_url, session_id),
-        BroadcasterBackend::Native | BroadcasterBackend::Vm => {
-            derive_broadcaster_session_ws_url(ws_url, session_id)
-        }
-    }
-}
-
 async fn decode_success_json<T>(
     response: reqwest::Response,
     url: &str,
@@ -992,77 +1702,6 @@ where
 
 fn http_status_error(operation: &str, url: &str, status: StatusCode) -> anyhow::Error {
     anyhow!("{operation} at {url} failed with HTTP {status}")
-}
-
-async fn process_broadcaster_subscription(
-    mut stream: impl futures::Stream<Item = Result<Message, WsError>> + Unpin,
-    mut processor: BroadcasterSubscriptionProcessor,
-    cfg: &StreamSupervisorConfig,
-) -> (SubscriptionExit, Option<SubscriptionRebuildState>) {
-    loop {
-        let next_timeout = if processor.bootstrap_complete() {
-            cfg.stream_stale
-        } else {
-            cfg.readiness_stale
-        };
-
-        let Ok(next_message) = timeout(next_timeout, stream.next()).await else {
-            let reason = if processor.bootstrap_complete() {
-                "live message timeout from broadcaster"
-            } else {
-                "bootstrap timeout from broadcaster"
-            };
-            return (SubscriptionExit::error(reason), processor.rebuild);
-        };
-
-        match next_message {
-            None => {
-                return (
-                    SubscriptionExit::error("broadcaster websocket ended"),
-                    processor.rebuild,
-                )
-            }
-            Some(Ok(Message::Text(text))) => {
-                let envelope: BroadcasterEnvelope = match serde_json::from_str(text.as_ref()) {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        return (
-                            SubscriptionExit::error(format!(
-                                "failed to decode broadcaster payload: {error}"
-                            )),
-                            processor.rebuild,
-                        )
-                    }
-                };
-
-                if let Err(error) = processor.observe(envelope).await {
-                    return (
-                        SubscriptionExit::error(error.to_string()),
-                        processor.rebuild,
-                    );
-                }
-            }
-            Some(Ok(Message::Binary(_))) => {
-                return (
-                    SubscriptionExit::error("unexpected binary broadcaster payload"),
-                    processor.rebuild,
-                );
-            }
-            Some(Ok(Message::Close(_))) => {
-                return (
-                    SubscriptionExit::error("broadcaster websocket closed"),
-                    processor.rebuild,
-                );
-            }
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                return (
-                    SubscriptionExit::error(error.to_string()),
-                    processor.rebuild,
-                )
-            }
-        }
-    }
 }
 
 async fn handle_subscription_reset(
@@ -1201,15 +1840,22 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 }
 
 struct SubscriptionExit {
-    reason: &'static str,
-    last_error: Option<String>,
+    message: String,
+    redis_gap: bool,
 }
 
 impl SubscriptionExit {
     fn error(message: impl Into<String>) -> Self {
         Self {
-            reason: "error",
-            last_error: Some(message.into()),
+            message: message.into(),
+            redis_gap: false,
+        }
+    }
+
+    fn redis_gap(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            redis_gap: true,
         }
     }
 }
@@ -1223,6 +1869,7 @@ mod tests {
 
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
+    use redis::streams::{StreamKey, StreamReadReply};
     use reqwest::Client;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1254,9 +1901,13 @@ mod tests {
     };
 
     use super::{
-        bootstrap_broadcaster_snapshot, handle_subscription_reset, BroadcasterSubscriptionControls,
-        BroadcasterSubscriptionProcessor, NativeBroadcasterSubscriptionControls,
-        RawSnapshotReassembly, VmBroadcasterSubscriptionControls,
+        bootstrap_broadcaster_snapshot, coalesce_redis_replay_boundary, empty_rebuilds,
+        handle_subscription_reset, mark_redis_replay_cursors,
+        prepare_broadcaster_redis_subscription, redis_empty_poll_action, redis_xread_messages,
+        BroadcasterSubscriptionControls, BroadcasterSubscriptionProcessor,
+        NativeBroadcasterSubscriptionControls, PreparedRedisProcessor, RawSnapshotReassembly,
+        RedisEmptyPollAction, RedisReplayCursor, RedisStreamInfo, RedisStreamMessage,
+        VmBroadcasterSubscriptionControls,
     };
     use crate::config::MemoryConfig;
     use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
@@ -1265,7 +1916,8 @@ mod tests {
     use crate::stream::StreamSupervisorConfig;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
-        BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
+        BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
+        BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk,
         BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
         BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
         BroadcasterUpdatePartition,
@@ -1433,6 +2085,404 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn redis_replay_boundary_for_process_uses_earliest_backend_boundary() -> Result<()> {
+        let boundary = coalesce_redis_replay_boundary(vec![
+            replay_boundary(5)?,
+            replay_boundary(3)?,
+            replay_boundary(7)?,
+        ])?;
+
+        assert_eq!(boundary.exclusive_message_seq, 3);
+        assert_eq!(boundary.exclusive_entry_id(), "1-3");
+        Ok(())
+    }
+
+    #[test]
+    fn redis_replay_boundary_rejects_mixed_generations() -> Result<()> {
+        let first = replay_boundary(3)?;
+        let second = BroadcasterRedisReplayBoundary::new(
+            "dsolver:broadcaster:test:events",
+            "stream-1",
+            "snapshot-1",
+            2,
+            4,
+        )?;
+
+        let Err(error) = coalesce_redis_replay_boundary(vec![first, second]) else {
+            return Err(anyhow!(
+                "mixed Redis replay generations must not be coalesced"
+            ));
+        };
+
+        assert!(error
+            .to_string()
+            .contains("different Redis replay boundaries"));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_replay_cursor_detects_message_sequence_gap() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(0)?, Chain::Ethereum.id());
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            2,
+            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
+                Chain::Ethereum.id(),
+                "snapshot-1",
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 12)],
+            )?),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(
+            Chain::Ethereum.id(),
+            1_710_000_000_123,
+            &envelope,
+        )?;
+
+        let Err(error) = cursor.ensure_next_message(&RedisStreamMessage {
+            entry_id: "1-2".to_string(),
+            entry,
+        }) else {
+            return Err(anyhow!(
+                "message_seq gap should fail before applying the delta"
+            ));
+        };
+
+        assert!(error.to_string().contains("Redis replay gap"));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_replay_cursor_rejects_wrong_chain_id_before_applying_update() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(0)?, Chain::Ethereum.id());
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            1,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Native,
+                    12,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::from([(
+                        "uniswap_v2".to_string(),
+                        BroadcasterProtocolSyncStatus::from_synchronizer_state(
+                            &SynchronizerState::Ready(raw_block_header(12, 1)),
+                        ),
+                    )]),
+                ),
+            ])?),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(
+            Chain::Base.id(),
+            1_710_000_000_123,
+            &envelope,
+        )?;
+
+        let Err(error) = cursor.ensure_next_message(&RedisStreamMessage {
+            entry_id: "1-1".to_string(),
+            entry,
+        }) else {
+            return Err(anyhow!("wrong-chain Redis update should fail"));
+        };
+
+        assert!(error.to_string().contains("expected chain_id"));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_replay_cursor_detects_generation_reset_before_duplicate_sequence() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(18)?, Chain::Ethereum.id());
+        let envelope = BroadcasterEnvelope::new(
+            "stream-2",
+            1,
+            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
+                Chain::Ethereum.id(),
+                "snapshot-2",
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 12)],
+            )?),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(
+            Chain::Ethereum.id(),
+            1_710_000_000_123,
+            &envelope,
+        )?;
+
+        let Err(error) = cursor.ensure_next_message(&RedisStreamMessage {
+            entry_id: "2-1".to_string(),
+            entry,
+        }) else {
+            return Err(anyhow!(
+                "new generation with a low message_seq should fail before being skipped"
+            ));
+        };
+
+        assert!(error.to_string().contains("Redis replay gap"));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_replay_cursor_detects_empty_stream_before_latest_backend_boundary() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(3)?, Chain::Ethereum.id());
+
+        let Err(error) = cursor.ensure_reached_required_boundary(7) else {
+            return Err(anyhow!(
+                "empty Redis poll before the newest backend boundary should fail closed"
+            ));
+        };
+
+        assert!(error.to_string().contains("Redis replay gap"));
+        assert!(error
+            .to_string()
+            .contains("required snapshot replay boundary 7"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_redis_poll_marks_caught_up_when_no_new_entry_was_generated() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(3)?, Chain::Ethereum.id());
+        let stream_info = RedisStreamInfo {
+            last_generated_entry_id: "1-3".to_string(),
+            first_entry_id: Some("1-1".to_string()),
+            last_entry_id: Some("1-3".to_string()),
+        };
+
+        let action = redis_empty_poll_action(&cursor, Some(&stream_info), 3)?;
+
+        assert_eq!(action, RedisEmptyPollAction::CaughtUp);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_redis_poll_detects_stream_recreation_behind_cursor() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(9)?, Chain::Ethereum.id());
+        let stream_info = RedisStreamInfo {
+            last_generated_entry_id: "1-2".to_string(),
+            first_entry_id: Some("1-1".to_string()),
+            last_entry_id: Some("1-2".to_string()),
+        };
+
+        let Err(error) = redis_empty_poll_action(&cursor, Some(&stream_info), 9) else {
+            return Err(anyhow!(
+                "Redis stream recreation behind the cursor should fail closed"
+            ));
+        };
+
+        assert!(error.to_string().contains("Redis replay gap"));
+        assert!(error.to_string().contains("moved backwards"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_redis_poll_detects_fully_trimmed_generated_entries() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(3)?, Chain::Ethereum.id());
+        let stream_info = RedisStreamInfo {
+            last_generated_entry_id: "1-5".to_string(),
+            first_entry_id: None,
+            last_entry_id: None,
+        };
+
+        let Err(error) = redis_empty_poll_action(&cursor, Some(&stream_info), 3) else {
+            return Err(anyhow!(
+                "trimmed Redis entries after the cursor should be a gap"
+            ));
+        };
+
+        assert!(error.to_string().contains("Redis replay gap"));
+        assert!(error.to_string().contains("retained no entries"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_redis_poll_detects_retention_gap_before_next_expected_entry() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(3)?, Chain::Ethereum.id());
+        let stream_info = RedisStreamInfo {
+            last_generated_entry_id: "1-5".to_string(),
+            first_entry_id: Some("1-5".to_string()),
+            last_entry_id: Some("1-5".to_string()),
+        };
+
+        let Err(error) = redis_empty_poll_action(&cursor, Some(&stream_info), 3) else {
+            return Err(anyhow!(
+                "first retained Redis entry after the expected cursor should be a gap"
+            ));
+        };
+
+        assert!(error.to_string().contains("Redis replay gap"));
+        assert!(error.to_string().contains("first retained entry 1-5"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_redis_poll_waits_when_new_entry_arrives_after_timeout() -> Result<()> {
+        let cursor = RedisReplayCursor::new(replay_boundary(3)?, Chain::Ethereum.id());
+        let stream_info = RedisStreamInfo {
+            last_generated_entry_id: "1-4".to_string(),
+            first_entry_id: Some("1-4".to_string()),
+            last_entry_id: Some("1-4".to_string()),
+        };
+
+        let action = redis_empty_poll_action(&cursor, Some(&stream_info), 3)?;
+
+        assert_eq!(action, RedisEmptyPollAction::Pending);
+        Ok(())
+    }
+
+    #[test]
+    fn redis_xread_timeout_returns_empty_poll() -> Result<()> {
+        let timeout: redis::RedisError = std::io::Error::from(std::io::ErrorKind::TimedOut).into();
+
+        let messages =
+            redis_xread_messages("stream", Err(timeout)).map_err(|error| anyhow!("{error:?}"))?;
+
+        assert!(messages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn redis_xread_broken_pipe_includes_command_context() -> Result<()> {
+        let broken_pipe: redis::RedisError =
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe).into();
+
+        let error = redis_xread_messages("stream", Err(broken_pipe))
+            .err()
+            .ok_or_else(|| anyhow!("broken pipe should fail"))?;
+
+        assert!(format!("{error:#}").contains("Redis XREAD failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_xread_malformed_reply_reports_stream_key_mismatch() -> Result<()> {
+        let reply = StreamReadReply {
+            keys: vec![StreamKey {
+                key: "other-stream".to_string(),
+                ids: Vec::new(),
+            }],
+        };
+
+        let error = redis_xread_messages("stream", Ok(Some(reply)))
+            .err()
+            .ok_or_else(|| anyhow!("malformed stream reply should fail"))?;
+
+        assert!(error.to_string().contains("expected stream"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redis_replay_boundary_rebases_processor_after_http_snapshot() -> Result<()> {
+        let controls = TestControls::new();
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        bootstrap(&mut processor).await?;
+
+        processor.align_redis_replay_boundary(&replay_boundary(18)?)?;
+        processor.observe(heartbeat_envelope_at(19)?).await?;
+
+        let snapshot = controls.native_subscription.snapshot().await;
+        assert!(snapshot.redis_gap_reason.is_none());
+        assert_eq!(controls.native_state_store.current_block().await, 14);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redis_replay_skips_foreign_backend_scope_without_sequence_gap() -> Result<()> {
+        let controls = TestControls::new();
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+        bootstrap(&mut processor).await?;
+
+        let rfq_envelope = rfq_heartbeat_envelope_at(4)?;
+        let rfq_entry = redis_entry_for_scope(&rfq_envelope, "rfq");
+        processor
+            .observe_redis_delta(&rfq_entry, &rfq_envelope)
+            .await?;
+
+        processor.observe(heartbeat_envelope_at(5)?).await?;
+
+        assert_eq!(controls.native_state_store.current_block().await, 14);
+        assert_eq!(controls.native_state_store.total_states().await, 1);
+        assert_eq!(controls.rfq_state_store.total_states().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redis_replay_status_cursor_does_not_move_behind_backend_boundary() -> Result<()> {
+        let controls = TestControls::new();
+        let native_boundary = replay_boundary(3)?;
+        let vm_boundary = replay_boundary(7)?;
+        controls
+            .native_subscription
+            .mark_bootstrap_complete_with_redis_boundary(native_boundary.clone())
+            .await;
+        controls
+            .vm_subscription
+            .mark_bootstrap_complete_with_redis_boundary(vm_boundary.clone())
+            .await;
+        let processors = vec![
+            PreparedRedisProcessor {
+                index: 0,
+                processor: BroadcasterSubscriptionProcessor::new(
+                    Chain::Ethereum.id(),
+                    controls.native(),
+                    None,
+                ),
+                replay_boundary: native_boundary,
+            },
+            PreparedRedisProcessor {
+                index: 1,
+                processor: BroadcasterSubscriptionProcessor::new(
+                    Chain::Ethereum.id(),
+                    controls.vm(),
+                    None,
+                ),
+                replay_boundary: vm_boundary,
+            },
+        ];
+
+        mark_redis_replay_cursors(&processors, "1-5", 5).await;
+
+        assert_eq!(
+            controls
+                .native_subscription
+                .snapshot()
+                .await
+                .redis_catch_up_cursor
+                .as_deref(),
+            Some("1-5")
+        );
+        assert_eq!(
+            controls
+                .vm_subscription
+                .snapshot()
+                .await
+                .redis_catch_up_cursor
+                .as_deref(),
+            Some("1-7")
+        );
+        Ok(())
+    }
+
+    fn redis_entry_for_scope(
+        envelope: &BroadcasterEnvelope,
+        backend_scope: &str,
+    ) -> BroadcasterRedisStreamEntry {
+        BroadcasterRedisStreamEntry {
+            schema_version: "1".to_string(),
+            chain_id: Chain::Ethereum.id(),
+            stream_id: envelope.stream_id.clone(),
+            message_seq: envelope.message_seq,
+            kind: envelope.kind(),
+            snapshot_id: Some("snapshot-1".to_string()),
+            backend_scope: backend_scope.to_string(),
+            block_number: None,
+            observed_timestamp_ms: None,
+            event_time_ms: 1_710_000_000_123,
+            payload_json: String::new(),
+        }
+    }
+
     fn native_component() -> ProtocolComponent {
         ProtocolComponent::new(
             Bytes::from([1u8; 20]),
@@ -1447,6 +2497,17 @@ mod tests {
                 .unwrap_or_else(|| unreachable!("valid timestamp"))
                 .naive_utc(),
         )
+    }
+
+    fn replay_boundary(exclusive_message_seq: u64) -> Result<BroadcasterRedisReplayBoundary> {
+        BroadcasterRedisReplayBoundary::new(
+            "dsolver:broadcaster:test:events",
+            "stream-1",
+            "snapshot-1",
+            1,
+            exclusive_message_seq,
+        )
+        .map_err(Into::into)
     }
 
     fn vm_component() -> ProtocolComponent {
@@ -1621,9 +2682,13 @@ mod tests {
     }
 
     fn update_envelope() -> Result<BroadcasterEnvelope> {
+        update_envelope_at(4)
+    }
+
+    fn update_envelope_at(message_seq: u64) -> Result<BroadcasterEnvelope> {
         Ok(BroadcasterEnvelope::new(
             "stream-1",
-            4,
+            message_seq,
             BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
                 BroadcasterUpdatePartition::new(
                     BroadcasterBackend::Native,
@@ -1689,9 +2754,13 @@ mod tests {
     }
 
     fn heartbeat_envelope() -> Result<BroadcasterEnvelope> {
+        heartbeat_envelope_at(4)
+    }
+
+    fn heartbeat_envelope_at(message_seq: u64) -> Result<BroadcasterEnvelope> {
         Ok(BroadcasterEnvelope::new(
             "stream-1",
-            4,
+            message_seq,
             BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
                 1,
                 "snapshot-1",
@@ -1699,6 +2768,18 @@ mod tests {
                     BroadcasterBackendHead::new(BroadcasterBackend::Native, 14),
                     BroadcasterBackendHead::new(BroadcasterBackend::Vm, 15),
                 ],
+            )?),
+        ))
+    }
+
+    fn rfq_heartbeat_envelope_at(message_seq: u64) -> Result<BroadcasterEnvelope> {
+        Ok(BroadcasterEnvelope::new(
+            "stream-1",
+            message_seq,
+            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
+                1,
+                "snapshot-1",
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 21)],
             )?),
         ))
     }
@@ -1782,7 +2863,7 @@ mod tests {
         });
 
         Ok((
-            format!("ws://{addr}/ws"),
+            format!("http://{addr}"),
             format!("http://{addr}/snapshot-sessions"),
             server_task,
         ))
@@ -1809,6 +2890,13 @@ mod tests {
                         .iter()
                         .filter(|payload| payload.contains("\"kind\":\"snapshot_chunk\""))
                         .count(),
+                    "redisReplayBoundary": {
+                        "streamKey": "dsolver:broadcaster:test:1:events",
+                        "streamId": "stream-1",
+                        "snapshotId": "snapshot-1",
+                        "generation": 1,
+                        "exclusiveMessageSeq": 0
+                    },
                     "expiresInMs": 300000
                 })
                 .to_string(),
@@ -2197,12 +3285,12 @@ mod tests {
             empty_snapshot_chunk_envelope()?,
             snapshot_end_envelope(),
         ];
-        let (ws_url, snapshot_sessions_url, server_task) =
+        let (broadcaster_url, snapshot_sessions_url, server_task) =
             spawn_snapshot_session_server(payloads).await?;
 
         let session = bootstrap_broadcaster_snapshot(
             &Client::new(),
-            &ws_url,
+            &broadcaster_url,
             &snapshot_sessions_url,
             &mut processor,
             &native_controls,
@@ -2225,6 +3313,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_redis_subscription_retries_all_backends_when_snapshot_omits_rfq_backend(
+    ) -> Result<()> {
+        let controls = TestControls::new();
+        let native_controls = controls.native();
+        let rfq_controls = controls.rfq();
+        let payloads = vec![
+            snapshot_start_envelope()?,
+            empty_snapshot_chunk_envelope()?,
+            snapshot_end_envelope(),
+        ];
+        let (broadcaster_url, _snapshot_sessions_url, server_task) =
+            spawn_snapshot_session_server(payloads).await?;
+
+        let Err(error) = prepare_broadcaster_redis_subscription(
+            &Client::new(),
+            &broadcaster_url,
+            Chain::Ethereum.id(),
+            &test_supervisor_config(),
+            &[native_controls, rfq_controls],
+            empty_rebuilds(2),
+        )
+        .await
+        else {
+            return Err(anyhow!(
+                "RFQ snapshot omission should abort this supervisor iteration"
+            ));
+        };
+        server_task.abort();
+
+        assert!(
+            error.message.contains("does not include rfq backend"),
+            "unexpected error: {}",
+            error.message
+        );
+        assert_eq!(error.rebuilds.len(), 2);
+        let rfq = controls.rfq_subscription.snapshot().await;
+        assert!(!rfq.bootstrap_complete);
+        assert!(
+            rfq.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("does not include rfq backend")),
+            "unexpected RFQ error: {:?}",
+            rfq.last_error
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> Result<()> {
         let controls = TestControls::new();
         let vm_controls = controls.vm();
@@ -2234,6 +3370,7 @@ mod tests {
             raw_decoder(),
             None,
         );
+        processor.set_bootstrap_redis_replay_boundary(super::default_test_redis_replay_boundary());
         let header = raw_block_header(21, 9);
         let sync_state = SynchronizerState::Ready(header.clone());
 
@@ -2351,12 +3488,12 @@ mod tests {
             )?,
             snapshot_end_envelope_at(3),
         ];
-        let (ws_url, snapshot_sessions_url, server_task) =
+        let (broadcaster_url, snapshot_sessions_url, server_task) =
             spawn_snapshot_session_server(payloads).await?;
 
         let session = bootstrap_broadcaster_snapshot(
             &Client::new(),
-            &ws_url,
+            &broadcaster_url,
             &snapshot_sessions_url,
             &mut processor,
             &vm_controls,

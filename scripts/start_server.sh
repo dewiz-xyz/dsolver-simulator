@@ -66,13 +66,13 @@ read_metadata_value() {
 
 broadcaster_metadata_matches() {
   local metadata_file="$1"
-  local ws_url="$2"
+  local broadcaster_url="$2"
   local bind_host="$3"
   local bind_port="$4"
   local status_url="$5"
 
   [[ -f "$metadata_file" ]] \
-    && [[ "$(read_metadata_value "$metadata_file" "ws_url")" == "$ws_url" ]] \
+    && [[ "$(read_metadata_value "$metadata_file" "broadcaster_url")" == "$broadcaster_url" ]] \
     && [[ "$(read_metadata_value "$metadata_file" "bind_host")" == "$bind_host" ]] \
     && [[ "$(read_metadata_value "$metadata_file" "bind_port")" == "$bind_port" ]] \
     && [[ "$(read_metadata_value "$metadata_file" "status_url")" == "$status_url" ]]
@@ -80,13 +80,13 @@ broadcaster_metadata_matches() {
 
 write_broadcaster_metadata() {
   local metadata_file="$1"
-  local ws_url="$2"
+  local broadcaster_url="$2"
   local bind_host="$3"
   local bind_port="$4"
   local status_url="$5"
 
   {
-    printf 'ws_url=%s\n' "$ws_url"
+    printf 'broadcaster_url=%s\n' "$broadcaster_url"
     printf 'bind_host=%s\n' "$bind_host"
     printf 'bind_port=%s\n' "$bind_port"
     printf 'status_url=%s\n' "$status_url"
@@ -132,7 +132,7 @@ stop_broadcaster_pid() {
 }
 
 resolve_local_broadcaster() {
-  python3 - "$TYCHO_BROADCASTER_WS_URL" <<'PY'
+  python3 - "$TYCHO_BROADCASTER_URL" <<'PY'
 import sys
 from urllib.parse import urlparse
 
@@ -140,30 +140,30 @@ raw_url = sys.argv[1]
 url = urlparse(raw_url)
 scheme = url.scheme.lower()
 
-if scheme not in {"ws", "wss"}:
-    print("TYCHO_BROADCASTER_WS_URL must use ws:// or wss://", file=sys.stderr)
+if scheme not in {"http", "https"}:
+    print("TYCHO_BROADCASTER_URL must use http:// or https://", file=sys.stderr)
     raise SystemExit(2)
 
 host = url.hostname or ""
 local_hosts = {"localhost", "127.0.0.1", "::1"}
 
-if scheme != "ws" or host not in local_hosts:
+if scheme != "http" or host not in local_hosts:
     print("false\t\t\t")
     raise SystemExit(0)
 
 try:
     port = url.port
 except ValueError as error:
-    print(f"invalid TYCHO_BROADCASTER_WS_URL port: {error}", file=sys.stderr)
+    print(f"invalid TYCHO_BROADCASTER_URL port: {error}", file=sys.stderr)
     raise SystemExit(2)
 
 if port is None:
-    print("local TYCHO_BROADCASTER_WS_URL must include an explicit port", file=sys.stderr)
+    print("local TYCHO_BROADCASTER_URL must include an explicit port", file=sys.stderr)
     raise SystemExit(2)
 
-if url.path != "/ws":
+if url.path not in {"", "/"}:
     actual_path = url.path or "/"
-    print(f"local TYCHO_BROADCASTER_WS_URL must use /ws path, got {actual_path}", file=sys.stderr)
+    print(f"local TYCHO_BROADCASTER_URL must use the HTTP base path, got {actual_path}", file=sys.stderr)
     raise SystemExit(2)
 
 bind_host = "127.0.0.1" if host == "localhost" else host
@@ -179,7 +179,7 @@ start_broadcaster_if_local() {
   IFS=$'\t' read -r managed bind_host bind_port status_url < <(resolve_local_broadcaster)
 
   if [[ "$managed" != "true" ]]; then
-    echo "Broadcaster URL is not loopback ws://; assuming broadcaster is externally managed."
+    echo "Broadcaster URL is not loopback http://; assuming broadcaster is externally managed."
     return 0
   fi
 
@@ -194,8 +194,8 @@ start_broadcaster_if_local() {
     status_check="$(broadcaster_status_check "$status_url" "$CHAIN_ID")"
     read -r status_state status_code actual_chain <<<"$status_check"
     if [[ "$status_state" == "ok" ]]; then
-      if ! broadcaster_metadata_matches "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_WS_URL" "$bind_host" "$bind_port" "$status_url"; then
-        write_broadcaster_metadata "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_WS_URL" "$bind_host" "$bind_port" "$status_url"
+      if ! broadcaster_metadata_matches "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"; then
+        write_broadcaster_metadata "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"
       fi
       echo "Broadcaster service already running (pid $broadcaster_pid)."
       return 0
@@ -205,7 +205,7 @@ start_broadcaster_if_local() {
       return 1
     fi
 
-    if broadcaster_metadata_matches "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_WS_URL" "$bind_host" "$bind_port" "$status_url"; then
+    if broadcaster_metadata_matches "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"; then
       echo "Broadcaster service already running (pid $broadcaster_pid)."
       wait_for_broadcaster_http "$status_url" "$broadcaster_pid_file" "$broadcaster_log_file"
       return 0
@@ -240,11 +240,11 @@ start_broadcaster_if_local() {
     HOST="$bind_host" PORT="$bind_port" nohup cargo run -p apps --bin dsolver-tycho-broadcaster-service --release > "$broadcaster_log_file" 2>&1 &
     echo $! > "$broadcaster_pid_file"
   )
-  write_broadcaster_metadata "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_WS_URL" "$bind_host" "$bind_port" "$status_url"
+  write_broadcaster_metadata "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"
 
   echo "Started dsolver-tycho-broadcaster-service."
   echo "Broadcaster PID: $(cat "$broadcaster_pid_file")"
-  echo "Broadcaster URL: $TYCHO_BROADCASTER_WS_URL"
+  echo "Broadcaster URL: $TYCHO_BROADCASTER_URL"
   echo "Broadcaster log: $broadcaster_log_file"
 
   wait_for_broadcaster_http "$status_url" "$broadcaster_pid_file" "$broadcaster_log_file"
@@ -323,7 +323,7 @@ if (
     and isinstance(payload.get("chain_id"), int)
     and isinstance(payload.get("upstream"), dict)
     and isinstance(payload.get("snapshot"), dict)
-    and isinstance(payload.get("subscribers"), dict)
+    and isinstance(payload.get("snapshot_sessions"), dict)
     and isinstance(payload.get("backends"), dict)
 ):
     actual_chain_id = payload["chain_id"]
@@ -409,8 +409,8 @@ if [[ -n "$chain_id_arg" ]]; then
 fi
 
 if [[ "$simulator_already_running" == "true" ]]; then
-  if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
-    echo "TYCHO_BROADCASTER_WS_URL not set; skipping broadcaster startup for running simulator."
+  if [[ -z "${TYCHO_BROADCASTER_URL:-}" ]]; then
+    echo "TYCHO_BROADCASTER_URL not set; skipping broadcaster startup for running simulator."
   elif [[ -z "${CHAIN_ID:-}" ]]; then
     echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
     exit 2
@@ -420,8 +420,8 @@ if [[ "$simulator_already_running" == "true" ]]; then
   exit 0
 fi
 
-if [[ -z "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
-  echo "Error: TYCHO_BROADCASTER_WS_URL is required for simulator startup." >&2
+if [[ -z "${TYCHO_BROADCASTER_URL:-}" ]]; then
+  echo "Error: TYCHO_BROADCASTER_URL is required for simulator startup." >&2
   exit 2
 fi
 
@@ -435,7 +435,7 @@ if [[ -z "$log_file" ]]; then
   log_file="$repo/logs/tycho-sim-server.log"
 fi
 
-if [[ -n "${TYCHO_BROADCASTER_WS_URL:-}" ]]; then
+if [[ -n "${TYCHO_BROADCASTER_URL:-}" ]]; then
   start_broadcaster_if_local
 fi
 

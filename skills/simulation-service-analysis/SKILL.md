@@ -10,8 +10,8 @@ metadata:
 ## Quick start
 
 1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
-2. Ensure `.env` exists and contains `TYCHO_API_KEY` plus `TYCHO_BROADCASTER_WS_URL`.
-   The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator.
+2. Ensure `.env` exists and contains `TYCHO_API_KEY`, `TYCHO_BROADCASTER_URL`, `BROADCASTER_REDIS_URL`, and `BROADCASTER_REDIS_STREAM_KEY`.
+   The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator, while Redis carries deltas after each HTTP snapshot replay boundary.
    RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently need the Bebop and Hashflow credential pairs; Liquorice credentials are only needed after `rfq:liquorice` is added to an active chain profile.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
@@ -25,7 +25,7 @@ metadata:
 ## What the analyzer does
 
 - Reuses the existing local simulator if it is already responding, otherwise starts the local broadcaster plus simulator stack with the repo lifecycle scripts.
-- Starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_WS_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed.
+- Starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed.
 - Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.

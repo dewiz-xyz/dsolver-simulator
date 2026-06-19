@@ -2563,6 +2563,8 @@ mod tests {
     };
     use tycho_simulation::tycho_common::Bytes;
 
+    use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+
     use crate::models::state::{
         BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
@@ -3124,6 +3126,26 @@ mod tests {
         }
     }
 
+    async fn mark_broadcaster_subscription_redis_ready(
+        subscription: &BroadcasterSubscriptionStatus,
+    ) {
+        subscription
+            .mark_bootstrap_complete_with_redis_boundary(test_replay_boundary())
+            .await;
+        subscription.mark_redis_catch_up_cursor("1-1").await;
+    }
+
+    fn test_replay_boundary() -> BroadcasterRedisReplayBoundary {
+        BroadcasterRedisReplayBoundary::new(
+            "stream:test".to_string(),
+            "chain-1-stream-1".to_string(),
+            "chain-1-snapshot-1".to_string(),
+            1,
+            1,
+        )
+        .unwrap_or_else(|_| unreachable!("test replay boundary literals are valid"))
+    }
+
     fn make_test_state_stores(
         token_store: Arc<TokenStore>,
     ) -> (Arc<StateStore>, Arc<StateStore>, Arc<StateStore>) {
@@ -3520,10 +3542,7 @@ mod tests {
         ));
         assert_eq!(quote_calls.load(Ordering::SeqCst), 0);
 
-        app_state
-            .native_broadcaster_subscription
-            .mark_bootstrap_complete()
-            .await;
+        mark_broadcaster_subscription_redis_ready(&app_state.native_broadcaster_subscription).await;
 
         let ready = get_amounts_out(
             app_state,
@@ -3560,10 +3579,10 @@ mod tests {
         let bootstrap_state = app_state.clone();
         let bootstrap_task = tokio::spawn(async move {
             sleep(Duration::from_millis(60)).await;
-            bootstrap_state
-                .native_broadcaster_subscription
-                .mark_bootstrap_complete()
-                .await;
+            mark_broadcaster_subscription_redis_ready(
+                &bootstrap_state.native_broadcaster_subscription,
+            )
+            .await;
         });
 
         let ready = get_amounts_out(
