@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context, Result};
@@ -20,11 +20,14 @@ use simulator_core::broadcaster::{
     BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use super::redis_publisher::BroadcasterRedisPublisherStatus;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BroadcasterReadiness {
-    UpstreamDisconnected,
-    SnapshotWarmingUp,
     Ready,
+    RedisPublisherUnhealthy,
+    SnapshotWarmingUp,
+    UpstreamDisconnected,
 }
 
 impl BroadcasterReadiness {
@@ -32,6 +35,7 @@ impl BroadcasterReadiness {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
+            Self::RedisPublisherUnhealthy => "redis_publisher_unhealthy",
             Self::Ready => "ready",
         }
     }
@@ -43,8 +47,9 @@ pub struct BroadcasterStatusSnapshot {
     pub chain_id: u64,
     pub upstream: BroadcasterUpstreamSnapshot,
     pub snapshot: BroadcasterSnapshotStatus,
-    pub subscribers: BroadcasterSubscriberSnapshot,
+    pub snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
+    pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,9 +72,8 @@ pub struct BroadcasterSnapshotStatus {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BroadcasterSubscriberSnapshot {
+pub struct BroadcasterSnapshotSessionsSnapshot {
     pub active: usize,
-    pub lag_disconnects: u64,
     pub last_error: Option<String>,
 }
 
@@ -88,10 +92,22 @@ pub struct BroadcasterSnapshotExport {
     pub payloads: Vec<BroadcasterPayload>,
 }
 
-#[derive(Debug, Clone)]
-pub struct BroadcasterLiveState {
-    pub stream_id: String,
-    pub snapshot_id: String,
+#[derive(Debug)]
+pub(crate) struct BroadcasterStagedUpdate {
+    message: BroadcasterUpdateMessage,
+    apply_mode: BroadcasterStagedUpdateApplyMode,
+}
+
+impl BroadcasterStagedUpdate {
+    pub(crate) fn message(&self) -> &BroadcasterUpdateMessage {
+        &self.message
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BroadcasterStagedUpdateApplyMode {
+    Decoded,
+    Raw,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -178,10 +194,18 @@ struct BroadcasterPartitionState {
 }
 
 impl BroadcasterSnapshotCache {
-    pub fn new(chain_id: u64, mut configured_backends: Vec<BroadcasterBackend>) -> Self {
+    pub fn new(chain_id: u64, configured_backends: Vec<BroadcasterBackend>) -> Self {
+        Self::new_with_initial_generation(chain_id, configured_backends, 1)
+    }
+
+    pub(crate) fn new_with_initial_generation(
+        chain_id: u64,
+        mut configured_backends: Vec<BroadcasterBackend>,
+        generation: u64,
+    ) -> Self {
         configured_backends.sort();
         configured_backends.dedup();
-        let generation = 1;
+        let generation = generation.max(1);
 
         Self {
             chain_id,
@@ -196,29 +220,19 @@ impl BroadcasterSnapshotCache {
         }
     }
 
-    pub async fn reset_generation(&self) -> BroadcasterLiveState {
+    pub async fn reset_generation(&self) {
         let mut guard = self.inner.write().await;
         guard.generation = guard.generation.saturating_add(1);
         guard.stream_id = format_stream_id(self.chain_id, guard.generation);
         guard.snapshot_id = format_snapshot_id(self.chain_id, guard.generation);
         guard.partitions.clear();
         guard.known_backends.clear();
-
-        BroadcasterLiveState {
-            stream_id: guard.stream_id.clone(),
-            snapshot_id: guard.snapshot_id.clone(),
-        }
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<BroadcasterUpdateMessage> {
-        let known_backends = {
-            let guard = self.inner.read().await;
-            guard.known_backends.clone()
-        };
-        let message = BroadcasterUpdateMessage::from_tycho_update(update, &known_backends)?;
-        ensure_configured_update_backends(&message, &self.configured_backends)?;
-        let mut guard = self.inner.write().await;
-        apply_update_message(&mut guard, &message)?;
+        let staged = self.stage_update(update).await?;
+        let message = staged.message.clone();
+        self.commit_staged_update(staged).await?;
         Ok(message)
     }
 
@@ -226,11 +240,49 @@ impl BroadcasterSnapshotCache {
         &self,
         feed: &FeedMessage<BlockHeader>,
     ) -> Result<BroadcasterUpdateMessage> {
+        let staged = self.stage_feed_message(feed)?;
+        let message = staged.message.clone();
+        self.commit_staged_update(staged).await?;
+        Ok(message)
+    }
+
+    pub(crate) async fn stage_update(
+        &self,
+        update: &TychoUpdate,
+    ) -> Result<BroadcasterStagedUpdate> {
+        let guard = self.inner.read().await;
+        let message = BroadcasterUpdateMessage::from_tycho_update(update, &guard.known_backends)?;
+        ensure_configured_update_backends(&message, &self.configured_backends)?;
+        validate_update_message_applicable(&guard, &message)?;
+        Ok(BroadcasterStagedUpdate {
+            message,
+            apply_mode: BroadcasterStagedUpdateApplyMode::Decoded,
+        })
+    }
+
+    pub(crate) fn stage_feed_message(
+        &self,
+        feed: &FeedMessage<BlockHeader>,
+    ) -> Result<BroadcasterStagedUpdate> {
         let message = BroadcasterUpdateMessage::from_tycho_feed_message(feed)?;
         ensure_configured_update_backends(&message, &self.configured_backends)?;
+        Ok(BroadcasterStagedUpdate {
+            message,
+            apply_mode: BroadcasterStagedUpdateApplyMode::Raw,
+        })
+    }
+
+    pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) -> Result<()> {
         let mut guard = self.inner.write().await;
-        apply_raw_update_message(&mut guard, &message);
-        Ok(message)
+        match staged.apply_mode {
+            BroadcasterStagedUpdateApplyMode::Decoded => {
+                apply_update_message(&mut guard, &staged.message)
+            }
+            BroadcasterStagedUpdateApplyMode::Raw => {
+                apply_raw_update_message(&mut guard, &staged.message);
+                Ok(())
+            }
+        }
     }
 
     pub async fn export_snapshot(
@@ -299,19 +351,20 @@ impl BroadcasterSnapshotCache {
         )))
     }
 
-    pub async fn live_state(&self) -> BroadcasterLiveState {
+    pub fn configured_backends(&self) -> Vec<BroadcasterBackend> {
+        self.configured_backends.clone()
+    }
+
+    pub async fn is_ready(&self) -> bool {
         let guard = self.inner.read().await;
-        BroadcasterLiveState {
-            stream_id: guard.stream_id.clone(),
-            snapshot_id: guard.snapshot_id.clone(),
-        }
+        self.is_ready_locked(&guard)
     }
 
     pub async fn status_snapshot(
         &self,
         max_payload_bytes: usize,
         upstream: BroadcasterUpstreamSnapshot,
-        subscribers: BroadcasterSubscriberSnapshot,
+        snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     ) -> BroadcasterStatusSnapshot {
         let guard = self.inner.read().await;
         let ready = self.is_ready_locked(&guard);
@@ -355,8 +408,9 @@ impl BroadcasterSnapshotCache {
                     .sum(),
                 max_payload_bytes,
             },
-            subscribers,
+            snapshot_sessions,
             backends,
+            redis_publisher: None,
         }
     }
 
@@ -409,6 +463,43 @@ fn ensure_configured_update_backends(
             partition.backend.as_str()
         );
     }
+    Ok(())
+}
+
+fn validate_update_message_applicable(
+    guard: &BroadcasterSnapshotCacheData,
+    message: &BroadcasterUpdateMessage,
+) -> Result<()> {
+    for partition in &message.partitions {
+        let new_pair_ids = partition
+            .new_pairs
+            .iter()
+            .map(|entry| entry.component_id.as_str())
+            .collect::<HashSet<_>>();
+        let partition_state = guard.partitions.get(&partition.backend);
+        for delta in &partition.updated_states {
+            if delta.backend != partition.backend {
+                return Err(anyhow!(
+                    "backend mismatch for {}: expected {}, found {}",
+                    delta.component_id,
+                    partition.backend,
+                    delta.backend
+                ));
+            }
+
+            let is_known = partition_state
+                .is_some_and(|state| state.states.contains_key(&delta.component_id))
+                || new_pair_ids.contains(delta.component_id.as_str());
+            if !is_known {
+                return Err(anyhow!(
+                    "missing tracked broadcaster state for {} on backend {}",
+                    delta.component_id,
+                    partition.backend
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1050,7 +1141,7 @@ mod tests {
 
     use super::{
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
-        BroadcasterSubscriberSnapshot, BroadcasterUpstreamState,
+        BroadcasterSnapshotSessionsSnapshot, BroadcasterUpstreamState,
     };
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
@@ -1717,7 +1808,7 @@ mod tests {
             .status_snapshot(
                 8_388_608,
                 connected_upstream().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         let rfq_status = status
@@ -1742,7 +1833,7 @@ mod tests {
             .status_snapshot(
                 8_388_608,
                 connected_upstream().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(status.readiness, BroadcasterReadiness::Ready);
@@ -1780,12 +1871,13 @@ mod tests {
     async fn cache_resets_generation_on_reset() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         cache.apply_update(&native_only_update()).await?;
-        let live_before = cache.live_state().await;
-        assert_eq!(live_before.snapshot_id, "chain-1-snapshot-1");
+        let snapshot_before = cache.export_snapshot(8_388_608).await?;
+        assert_eq!(snapshot_before.snapshot_id, "chain-1-snapshot-1");
 
-        let live_after = cache.reset_generation().await;
-        assert_eq!(live_after.stream_id, "chain-1-stream-2");
-        assert_eq!(live_after.snapshot_id, "chain-1-snapshot-2");
+        cache.reset_generation().await;
+        let snapshot_after = cache.export_snapshot(8_388_608).await?;
+        assert_eq!(snapshot_after.stream_id, "chain-1-stream-2");
+        assert_eq!(snapshot_after.snapshot_id, "chain-1-snapshot-2");
         assert!(cache.heartbeat().await?.is_none());
         Ok(())
     }
@@ -1798,7 +1890,7 @@ mod tests {
             .status_snapshot(
                 500,
                 upstream_state.snapshot().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(
@@ -1811,7 +1903,7 @@ mod tests {
             .status_snapshot(
                 500,
                 upstream_state.snapshot().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(warming.readiness, BroadcasterReadiness::SnapshotWarmingUp);
@@ -1822,7 +1914,7 @@ mod tests {
             .status_snapshot(
                 500,
                 upstream_state.snapshot().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(ready.readiness, BroadcasterReadiness::Ready);

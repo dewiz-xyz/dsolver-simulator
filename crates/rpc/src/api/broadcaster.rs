@@ -6,8 +6,8 @@ use axum::{
 use runtime::broadcaster_service::BroadcasterAppState;
 
 use crate::handlers::broadcaster::{
-    create_rfq_snapshot_session, create_snapshot_session, rfq_snapshot_session_payload, rfq_status,
-    rfq_ws, snapshot_session_payload, status, token_lookup, token_snapshot, ws,
+    create_rfq_snapshot_session, create_snapshot_session, rfq_snapshot_session_payload,
+    snapshot_session_payload, status, token_lookup, token_snapshot,
 };
 
 pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
@@ -18,14 +18,11 @@ pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
             "/snapshot-sessions/:session_id/payloads/:index",
             get(snapshot_session_payload),
         )
-        .route("/ws", get(ws))
-        .route("/rfq/status", get(rfq_status))
         .route("/rfq/snapshot-sessions", post(create_rfq_snapshot_session))
         .route(
             "/rfq/snapshot-sessions/:session_id/payloads/:index",
             get(rfq_snapshot_session_payload),
         )
-        .route("/rfq/ws", get(rfq_ws))
         .route("/tokens/snapshot", get(token_snapshot))
         .route("/tokens/lookup", post(token_lookup))
         .with_state(app_state)
@@ -48,22 +45,23 @@ mod tests {
         routing::post,
         Json, Router,
     };
-    use futures::StreamExt;
     use num_bigint::BigUint;
     use num_traits::Zero;
     use runtime::{
+        broadcaster::redis_publisher::{
+            BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
+        },
         broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         broadcaster_service::BroadcasterAppState,
         models::tokens::TokenStore,
         services::broadcaster::BroadcasterServiceState,
     };
-    use simulator_core::broadcaster::BroadcasterBackend;
+    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterRedisStreamEntry};
     use tokio::{
-        sync::Barrier,
+        sync::{Barrier, Mutex},
         task::JoinHandle,
-        time::{sleep, timeout},
+        time::sleep,
     };
-    use tokio_tungstenite::{connect_async, tungstenite};
     use tower::ServiceExt;
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
@@ -194,12 +192,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_includes_redis_publisher_when_attached() -> Result<()> {
+        let app =
+            create_broadcaster_router(build_state_with_redis(RpcFakeRedisWriter::healthy()).await?);
+
+        let (status, body) = get_json(app, "/status").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["redis_publisher"]["healthy"], true);
+        let Some(stream_id) = body["redis_publisher"]["stream_id"].as_str() else {
+            bail!("expected redis publisher stream_id");
+        };
+        assert!(stream_id.starts_with("chain-1-stream-"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_reports_503_when_redis_publisher_is_unhealthy() -> Result<()> {
+        let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
+
+        let (status, body) = get_json(app, "/status").await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_unhealthy");
+        assert_eq!(body["redis_publisher"]["healthy"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_preserves_snapshot_warming_with_healthy_redis_publisher() -> Result<()> {
+        let app = create_broadcaster_router(build_warming_state_with_redis().await?);
+
+        let (status, body) = get_json(app, "/status").await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
+        assert_eq!(body["redis_publisher"]["healthy"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn snapshot_session_create_rejects_until_ready() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
         let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "snapshot_warming_up");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_session_create_rejects_when_redis_boundary_is_unavailable() -> Result<()> {
+        let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_unhealthy");
+        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 
@@ -213,6 +264,7 @@ mod tests {
         assert_eq!(body["chainId"], Chain::Ethereum.id());
         assert_eq!(body["streamId"], "chain-1-stream-1");
         assert_eq!(body["snapshotId"], "chain-1-snapshot-1");
+        assert!(body["redisReplayBoundary"].is_object());
         assert_eq!(body["payloadCount"], 3);
         assert_eq!(body["snapshotChunkCount"], 1);
         assert_eq!(body["expiresInMs"], 300_000);
@@ -231,17 +283,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_snapshot_session_ignores_warming_rfq_service() -> Result<()> {
+    async fn root_status_reports_warming_rfq_while_snapshot_sessions_remain_native_only(
+    ) -> Result<()> {
         let app = create_broadcaster_router(
             build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
         );
         let (status, body) = get_json(app.clone(), "/status").await?;
 
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(
             body["snapshot"]["configured_backends"],
-            serde_json::json!(["native"])
+            serde_json::json!(["native", "rfq"])
         );
+        assert!(body["backends"]["rfq"].is_object());
 
         let (status, body) =
             post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
@@ -256,55 +311,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_snapshot_session_uses_rfq_service() -> Result<()> {
-        let app = create_broadcaster_router(
-            build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
-        );
-        let (status, body) =
-            post_json(app.clone(), "/rfq/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::CREATED);
-        let session_id = body["sessionId"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
-        let (_status, payload) = get_json(
-            app,
-            &format!("/rfq/snapshot-sessions/{session_id}/payloads/0"),
-        )
-        .await?;
-        assert_eq!(payload["backends"], serde_json::json!(["rfq"]));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rfq_status_reports_rfq_service_independently() -> Result<()> {
+    async fn root_status_reports_rfq_backend_readiness() -> Result<()> {
         let app = create_broadcaster_router(
             build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
         );
 
-        let (root_status, root_body) = get_json(app.clone(), "/status").await?;
-        assert_eq!(root_status, StatusCode::OK);
-        assert_eq!(root_body["status"], "ready");
-
-        let (rfq_status, rfq_body) = get_json(app, "/rfq/status").await?;
-        assert_eq!(rfq_status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(rfq_body["status"], "snapshot_warming_up");
+        let (status, body) = get_json(app, "/status").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(
-            rfq_body["snapshot"]["configured_backends"],
-            serde_json::json!(["rfq"])
+            body["snapshot"]["configured_backends"],
+            serde_json::json!(["native", "rfq"])
         );
-        assert!(rfq_body["upstream"]["connected"].as_bool().unwrap_or(false));
-        assert!(!rfq_body["snapshot"]["ready"].as_bool().unwrap_or(true));
+        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
+        assert!(!body["snapshot"]["ready"].as_bool().unwrap_or(true));
         Ok(())
     }
 
     #[tokio::test]
-    async fn rfq_status_reports_update_timestamp_without_block_number() -> Result<()> {
+    async fn root_status_reports_rfq_update_timestamp_without_block_number() -> Result<()> {
         let app = create_broadcaster_router(
             build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
         );
 
-        let (status, body) = get_json(app, "/rfq/status").await?;
+        let (status, body) = get_json(app, "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
@@ -314,13 +344,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_status_returns_not_found_when_disabled() -> Result<()> {
+    async fn rfq_snapshot_session_routes_use_rfq_service() -> Result<()> {
+        let app = create_broadcaster_router(
+            build_state_with_rfq(SeedMode::Ready, SeedMode::Ready).await?,
+        );
+
+        let (status, body) =
+            post_json(app.clone(), "/rfq/snapshot-sessions", serde_json::json!({})).await?;
+
+        assert_eq!(status, StatusCode::CREATED);
+        let session_id = body["sessionId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("expected numeric sessionId"))?;
+        let (status, payload) = get_json(
+            app,
+            &format!("/rfq/snapshot-sessions/{session_id}/payloads/0"),
+        )
+        .await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["kind"], "snapshot_start");
+        assert_eq!(payload["backends"], serde_json::json!(["rfq"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_snapshot_session_create_reports_not_found_when_rfq_is_unconfigured() -> Result<()>
+    {
         let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
 
-        let (status, body) = get_json(app, "/rfq/status").await?;
+        let (status, body) =
+            post_json(app, "/rfq/snapshot-sessions", serde_json::json!({})).await?;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], "rfq broadcaster disabled");
+        assert_eq!(body["error"], "rfq snapshot sessions are not configured");
         Ok(())
     }
 
@@ -338,76 +395,6 @@ mod tests {
 
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(body["error"], "snapshot payload index out of range");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn websocket_upgrade_requires_session_id() -> Result<()> {
-        let (url, server_task) = spawn_server(
-            create_broadcaster_router(build_state(SeedMode::Ready).await?),
-            "/ws",
-        )
-        .await?;
-        let result = connect_async(url).await;
-        server_task.abort();
-
-        match result {
-            Err(tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            }
-            Err(error) => bail!("unexpected websocket error: {error}"),
-            Ok(_) => bail!("expected websocket handshake rejection"),
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn websocket_upgrade_rejects_unknown_session_id() -> Result<()> {
-        let (url, server_task) = spawn_server(
-            create_broadcaster_router(build_state(SeedMode::Ready).await?),
-            "/ws?sessionId=404",
-        )
-        .await?;
-        let result = connect_async(url).await;
-        server_task.abort();
-
-        match result {
-            Err(tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            }
-            Err(error) => bail!("unexpected websocket error: {error}"),
-            Ok(_) => bail!("expected websocket handshake rejection"),
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn websocket_upgrade_attaches_snapshot_session_without_replaying_snapshot() -> Result<()>
-    {
-        let state = build_state(SeedMode::Ready).await?;
-        let session = state
-            .create_snapshot_session()
-            .await?
-            .ok_or_else(|| anyhow!("expected ready snapshot session"))?;
-        let (url, server_task) = spawn_server(
-            create_broadcaster_router(state),
-            &format!("/ws?sessionId={}", session.session_id),
-        )
-        .await?;
-        let result = connect_async(url).await;
-
-        let (mut stream, response) = match result {
-            Ok(result) => result,
-            Err(error) => bail!("expected websocket handshake success: {error}"),
-        };
-        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
-        assert!(
-            timeout(Duration::from_millis(25), stream.next())
-                .await
-                .is_err(),
-            "websocket attach should wait for live messages instead of replaying snapshot"
-        );
-        server_task.abort();
         Ok(())
     }
 
@@ -658,14 +645,24 @@ mod tests {
         rfq_mode: SeedMode,
     ) -> Result<BroadcasterAppState> {
         let tokens = token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum);
-        let raw_service = service_with_backend(raw_mode, BroadcasterBackend::Native).await?;
-        let rfq_service = service_with_backend(rfq_mode, BroadcasterBackend::Rfq).await?;
-        Ok(BroadcasterAppState::with_rfq_snapshot_session_ttl(
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        let raw_service = service_with_backend(
+            raw_mode,
+            BroadcasterBackend::Native,
+            publisher.clone(),
+            gate.clone(),
+        )
+        .await?;
+        let rfq_service =
+            service_with_backend(rfq_mode, BroadcasterBackend::Rfq, publisher.clone(), gate)
+                .await?;
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
             raw_service,
-            rfq_service,
+            Some(rfq_service),
             tokens,
             Chain::Ethereum.id(),
             Duration::from_secs(300),
+            publisher,
         ))
     }
 
@@ -676,7 +673,14 @@ mod tests {
     ) -> Result<BroadcasterAppState> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let upstream = BroadcasterUpstreamState::default();
-        let service = BroadcasterServiceState::new(8_388_608, 8, cache, upstream);
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            publisher.clone(),
+            gate,
+        );
 
         match mode {
             SeedMode::Disconnected => {}
@@ -687,16 +691,103 @@ mod tests {
             }
         }
 
-        Ok(BroadcasterAppState::new(service, tokens, chain.id()))
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            tokens,
+            chain.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_state_with_redis(writer: RpcFakeRedisWriter) -> Result<BroadcasterAppState> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let upstream = BroadcasterUpstreamState::default();
+        let (publisher, gate) = publisher_and_gate(writer);
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            publisher.clone(),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service.apply_update(&native_only_update()).await?;
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum),
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_state_with_unhealthy_redis() -> Result<BroadcasterAppState> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let upstream = BroadcasterUpstreamState::default();
+        let (publisher, gate) =
+            publisher_and_gate(RpcFakeRedisWriter::failing_after_first_append());
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            publisher.clone(),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service.apply_update(&native_only_update()).await?;
+        let Err(_error) = service.broadcast_heartbeat().await else {
+            bail!("expected heartbeat to mark Redis publisher unhealthy");
+        };
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum),
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_warming_state_with_redis() -> Result<BroadcasterAppState> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let upstream = BroadcasterUpstreamState::default();
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            publisher.clone(),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum),
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
     }
 
     async fn service_with_backend(
         mode: SeedMode,
         backend: BroadcasterBackend,
+        publisher: Arc<BroadcasterRedisPublisher>,
+        lifecycle_gate: Arc<Mutex<()>>,
     ) -> Result<BroadcasterServiceState> {
         let cache = BroadcasterSnapshotCache::new(1, vec![backend]);
         let upstream = BroadcasterUpstreamState::default();
-        let service = BroadcasterServiceState::new(8_388_608, 8, cache, upstream);
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            publisher,
+            lifecycle_gate,
+        );
 
         match mode {
             SeedMode::Disconnected => {}
@@ -714,6 +805,72 @@ mod tests {
         }
 
         Ok(service)
+    }
+
+    fn publisher_and_gate(
+        writer: RpcFakeRedisWriter,
+    ) -> (Arc<BroadcasterRedisPublisher>, Arc<Mutex<()>>) {
+        (
+            Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+                redis_publisher_config(),
+                Arc::new(writer),
+                1,
+            )),
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    #[derive(Debug, Clone)]
+    struct RpcFakeRedisWriter {
+        fail_after_successes: Option<usize>,
+        append_count: Arc<Mutex<usize>>,
+    }
+
+    impl RpcFakeRedisWriter {
+        fn healthy() -> Self {
+            Self {
+                fail_after_successes: None,
+                append_count: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn failing_after_first_append() -> Self {
+            Self {
+                fail_after_successes: Some(1),
+                append_count: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl RedisStreamWriter for RpcFakeRedisWriter {
+        fn append<'a>(
+            &'a self,
+            _stream_key: &'a str,
+            _maxlen: Option<u64>,
+            _entry: &'a BroadcasterRedisStreamEntry,
+        ) -> futures::future::BoxFuture<'a, Result<String>> {
+            Box::pin(async move {
+                let mut append_count = self.append_count.lock().await;
+                if self
+                    .fail_after_successes
+                    .is_some_and(|threshold| *append_count >= threshold)
+                {
+                    bail!("planned append failure");
+                }
+                let entry_id = format!("1000-{append_count}");
+                *append_count = append_count.saturating_add(1);
+                Ok(entry_id)
+            })
+        }
+    }
+
+    fn redis_publisher_config() -> BroadcasterRedisPublisherConfig {
+        BroadcasterRedisPublisherConfig {
+            stream_key: "dsolver:broadcaster:test:events".to_string(),
+            chain_id: Chain::Ethereum.id(),
+            append_retry_window: Duration::from_millis(1),
+            maxlen: None,
+        }
     }
 
     async fn get_json(app: Router, uri: &str) -> Result<(StatusCode, serde_json::Value)> {
@@ -744,15 +901,6 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
         Ok((status, body))
-    }
-
-    async fn spawn_server(app: Router, path: &str) -> Result<(String, JoinHandle<()>)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app.into_make_service()).await;
-        });
-        Ok((format!("ws://{addr}{path}"), server_task))
     }
 
     fn native_only_update() -> Update {

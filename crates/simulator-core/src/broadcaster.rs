@@ -55,6 +55,7 @@ pub struct BroadcasterSnapshotSessionResponse {
     pub session_id: u64,
     pub stream_id: String,
     pub snapshot_id: String,
+    pub redis_replay_boundary: BroadcasterRedisReplayBoundary,
     pub payload_count: u32,
     pub snapshot_chunk_count: u32,
     pub expires_in_ms: u64,
@@ -2434,6 +2435,13 @@ mod tests {
             session_id: 9,
             stream_id: "stream-1".to_string(),
             snapshot_id: "snapshot-1".to_string(),
+            redis_replay_boundary: BroadcasterRedisReplayBoundary::new(
+                "dsolver:broadcaster:test:events",
+                "stream-1",
+                "snapshot-1",
+                1,
+                7,
+            )?,
             payload_count: 4,
             snapshot_chunk_count: 2,
             expires_in_ms: 300_000,
@@ -2444,6 +2452,14 @@ mod tests {
         assert_eq!(json["sessionId"], 9);
         assert_eq!(json["streamId"], "stream-1");
         assert_eq!(json["snapshotId"], "snapshot-1");
+        assert_eq!(
+            json["redisReplayBoundary"]["streamKey"],
+            "dsolver:broadcaster:test:events"
+        );
+        assert!(json["redisReplayBoundary"]
+            .get("exclusiveEntryId")
+            .is_none());
+        assert_eq!(json["redisReplayBoundary"]["exclusiveMessageSeq"], 7);
         assert_eq!(json["payloadCount"], 4);
         assert_eq!(json["snapshotChunkCount"], 2);
         assert_eq!(json["expiresInMs"], 300_000);

@@ -90,6 +90,18 @@ pub struct VmStreamControls {
 #[derive(Debug, Clone)]
 pub struct BroadcasterStreamControls {
     pub service: BroadcasterServiceState,
+    pub reset_services: Vec<BroadcasterServiceState>,
+}
+
+impl BroadcasterStreamControls {
+    async fn reset_generation(&self, reason: &str, last_error: Option<String>) {
+        BroadcasterServiceState::handle_shared_generation_reset(
+            &self.reset_services,
+            reason,
+            last_error,
+        )
+        .await;
+    }
 }
 
 enum StreamMessage {
@@ -797,8 +809,7 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
         );
 
         controls
-            .service
-            .handle_generation_reset(exit.reason.as_str(), exit.last_error.clone())
+            .reset_generation(exit.reason.as_str(), exit.last_error.clone())
             .await;
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
@@ -876,8 +887,7 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
         );
 
         controls
-            .service
-            .handle_generation_reset(exit.reason.as_str(), exit.last_error.clone())
+            .reset_generation(exit.reason.as_str(), exit.last_error.clone())
             .await;
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
@@ -1091,12 +1101,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::RwLock;
+    use tokio::sync::{Mutex, RwLock};
     use tycho_simulation::protocol::models::Update;
 
     use super::{
         begin_vm_rebuild, classify_stream_error, handle_broadcaster_update, StreamRestartReason,
         StreamSupervisorConfig, VmStreamControls,
+    };
+    use crate::broadcaster::redis_publisher::{
+        BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
     };
     use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
     use crate::config::MemoryConfig;
@@ -1104,7 +1117,7 @@ mod tests {
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use crate::services::broadcaster::BroadcasterServiceState;
-    use simulator_core::broadcaster::BroadcasterBackend;
+    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterRedisStreamEntry};
     use tycho_simulation::tycho_common::models::Chain;
 
     #[test]
@@ -1134,11 +1147,12 @@ mod tests {
     #[tokio::test]
     async fn empty_decoded_broadcaster_update_is_ignored_without_restart(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let service = BroadcasterServiceState::new(
+        let service = BroadcasterServiceState::with_lifecycle_gate(
             1024,
-            16,
             BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Rfq]),
             BroadcasterUpstreamState::default(),
+            test_redis_publisher(8453),
+            Arc::new(Mutex::new(())),
         );
         service.mark_upstream_connected().await;
         let health = StreamHealth::new();
@@ -1160,6 +1174,33 @@ mod tests {
         assert!(status.upstream.last_error.is_none());
         assert!(!status.snapshot.ready);
         Ok(())
+    }
+
+    #[derive(Debug)]
+    struct StreamTestRedisWriter;
+
+    impl RedisStreamWriter for StreamTestRedisWriter {
+        fn append<'a>(
+            &'a self,
+            _stream_key: &'a str,
+            _maxlen: Option<u64>,
+            entry: &'a BroadcasterRedisStreamEntry,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async move { Ok(format!("1-{}", entry.message_seq)) })
+        }
+    }
+
+    fn test_redis_publisher(chain_id: u64) -> Arc<BroadcasterRedisPublisher> {
+        Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+            BroadcasterRedisPublisherConfig {
+                stream_key: "stream:test".to_string(),
+                chain_id,
+                append_retry_window: Duration::from_millis(10),
+                maxlen: None,
+            },
+            Arc::new(StreamTestRedisWriter),
+            1,
+        ))
     }
 
     #[tokio::test]
