@@ -694,6 +694,7 @@ impl BroadcasterSubscriptionProcessor {
                     }
                 }
             }
+            BroadcasterPayload::Progress(_) => {}
         }
 
         Ok(())
