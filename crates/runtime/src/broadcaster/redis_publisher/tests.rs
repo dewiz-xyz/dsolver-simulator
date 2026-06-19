@@ -18,11 +18,9 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
 use tycho_simulation::tycho_common::Bytes;
 
 use super::{
-    writer::{
-        next_generation_after_entry_id, redis_entry_fields, redis_entry_id,
-        redis_stream_entry_matches_reply, redis_xadd_command,
-    },
-    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
+    next_generation_after_entry_id, redis_entry_fields, redis_entry_id,
+    redis_stream_entry_matches_reply, redis_xadd_command, BroadcasterRedisPublisher,
+    BroadcasterRedisPublisherConfig, RedisStreamWriter,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{

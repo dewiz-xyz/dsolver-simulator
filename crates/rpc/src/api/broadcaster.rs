@@ -3,7 +3,7 @@ use axum::{
     Router,
 };
 
-use runtime::broadcaster_service::BroadcasterAppState;
+use runtime::broadcaster::app::BroadcasterAppState;
 
 use crate::handlers::broadcaster::{
     create_snapshot_session, snapshot_session_payload, status, token_lookup, token_snapshot,
@@ -42,13 +42,13 @@ mod tests {
     use num_bigint::BigUint;
     use num_traits::Zero;
     use runtime::{
+        broadcaster::app::BroadcasterAppState,
         broadcaster::redis_publisher::{
             BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
         },
+        broadcaster::service::BroadcasterServiceState,
         broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
-        broadcaster_service::BroadcasterAppState,
         models::tokens::TokenStore,
-        services::broadcaster::BroadcasterServiceState,
     };
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterRedisStreamEntry};
     use tokio::{

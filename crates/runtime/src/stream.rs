@@ -12,6 +12,7 @@ use tycho_simulation::{
     tycho_client::feed::{BlockHeader, FeedMessage, HeaderLike, SynchronizerState},
 };
 
+use crate::broadcaster::service::BroadcasterServiceState;
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::{
@@ -19,7 +20,6 @@ use crate::models::{
     state::{StateStore, VmStreamStatus},
     stream_health::StreamHealth,
 };
-use crate::services::broadcaster::BroadcasterServiceState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -1111,12 +1111,12 @@ mod tests {
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
     };
+    use crate::broadcaster::service::BroadcasterServiceState;
     use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
     use crate::config::MemoryConfig;
     use crate::models::state::{StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
-    use crate::services::broadcaster::BroadcasterServiceState;
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterRedisStreamEntry};
     use tycho_simulation::tycho_common::models::Chain;
 

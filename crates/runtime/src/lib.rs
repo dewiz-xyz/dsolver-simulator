@@ -1,5 +1,4 @@
 pub mod broadcaster;
-pub mod broadcaster_service;
 pub mod config;
 pub mod memory;
 pub mod metrics;

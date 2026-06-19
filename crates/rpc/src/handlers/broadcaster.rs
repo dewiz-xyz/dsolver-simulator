@@ -4,9 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use runtime::{
-    broadcaster::state::BroadcasterReadiness, broadcaster_service::BroadcasterAppState,
-    services::broadcaster_sessions::SnapshotSessionError,
+use runtime::broadcaster::{
+    app::BroadcasterAppState, service::SnapshotSessionError, state::BroadcasterReadiness,
 };
 use serde_json::json;
 use simulator_core::broadcaster::BroadcasterTokenLookupRequest;

@@ -9,7 +9,7 @@ use futures::StreamExt;
 use rand::Rng;
 use redis::streams::{StreamId, StreamInfoStreamReply, StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -40,14 +40,14 @@ use crate::stream::StreamSupervisorConfig;
 const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
-pub enum BroadcasterSubscriptionControls {
+pub(crate) enum BroadcasterSubscriptionControls {
     Native(NativeBroadcasterSubscriptionControls),
     Vm(VmBroadcasterSubscriptionControls),
     Rfq(RfqBroadcasterSubscriptionControls),
 }
 
 #[derive(Clone)]
-pub struct NativeBroadcasterSubscriptionControls {
+pub(crate) struct NativeBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
@@ -56,7 +56,7 @@ pub struct NativeBroadcasterSubscriptionControls {
 }
 
 #[derive(Clone)]
-pub struct VmBroadcasterSubscriptionControls {
+pub(crate) struct VmBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
@@ -67,7 +67,7 @@ pub struct VmBroadcasterSubscriptionControls {
 }
 
 #[derive(Clone)]
-pub struct RfqBroadcasterSubscriptionControls {
+pub(crate) struct RfqBroadcasterSubscriptionControls {
     pub broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
@@ -130,7 +130,7 @@ impl BroadcasterSubscriptionControls {
     }
 }
 
-pub async fn supervise_broadcaster_redis_subscription(
+pub(crate) async fn supervise_broadcaster_redis_subscription(
     broadcaster_url: String,
     expected_chain_id: u64,
     redis_config: BroadcasterRedisConfig,
@@ -276,7 +276,7 @@ async fn prepare_broadcaster_redis_subscription(
     for (index, controls) in controls.iter().enumerate() {
         let snapshot_sessions_url = match derive_broadcaster_http_url(
             broadcaster_url,
-            broadcaster_snapshot_sessions_path(controls.backend()),
+            BROADCASTER_SNAPSHOT_SESSIONS_PATH,
         ) {
             Ok(url) => url,
             Err(error) => {
@@ -1591,7 +1591,6 @@ async fn bootstrap_broadcaster_snapshot(
                     fetch_broadcaster_snapshot_payload(
                         client,
                         broadcaster_url,
-                        controls.backend(),
                         &session,
                         index,
                         cfg.readiness_stale,
@@ -1642,14 +1641,13 @@ async fn create_broadcaster_snapshot_session(
 async fn fetch_broadcaster_snapshot_payload(
     client: &Client,
     broadcaster_url: &str,
-    backend: BroadcasterBackend,
     session: &BroadcasterSnapshotSessionResponse,
     index: u32,
     request_timeout: Duration,
 ) -> Result<BroadcasterEnvelope> {
     let payload_url = derive_broadcaster_http_url(
         broadcaster_url,
-        &broadcaster_snapshot_payload_path(backend, session.session_id, index),
+        &broadcaster_snapshot_payload_path(session.session_id, index),
     )
     .map_err(|error| anyhow!("failed to derive broadcaster snapshot payload URL: {error}"))?;
     let response = client
@@ -1665,19 +1663,10 @@ async fn fetch_broadcaster_snapshot_payload(
     decode_success_json(response, &payload_url, "fetch broadcaster snapshot payload").await
 }
 
-fn broadcaster_snapshot_sessions_path(_backend: BroadcasterBackend) -> &'static str {
-    "snapshot-sessions"
-}
+const BROADCASTER_SNAPSHOT_SESSIONS_PATH: &str = "snapshot-sessions";
 
-fn broadcaster_snapshot_payload_path(
-    backend: BroadcasterBackend,
-    session_id: u64,
-    index: u32,
-) -> String {
-    format!(
-        "{}/{session_id}/payloads/{index}",
-        broadcaster_snapshot_sessions_path(backend)
-    )
+fn broadcaster_snapshot_payload_path(session_id: u64, index: u32) -> String {
+    format!("{BROADCASTER_SNAPSHOT_SESSIONS_PATH}/{session_id}/payloads/{index}")
 }
 
 async fn decode_success_json<T>(
@@ -1690,7 +1679,7 @@ where
 {
     let status = response.status();
     if !status.is_success() {
-        return Err(http_status_error(operation, url, status));
+        return Err(anyhow!("{operation} at {url} failed with HTTP {status}"));
     }
     let body = response
         .bytes()
@@ -1698,10 +1687,6 @@ where
         .map_err(|error| anyhow!("failed to read {operation} response from {url}: {error}"))?;
     serde_json::from_slice(&body)
         .map_err(|error| anyhow!("failed to decode {operation} response from {url}: {error}"))
-}
-
-fn http_status_error(operation: &str, url: &str, status: StatusCode) -> anyhow::Error {
-    anyhow!("{operation} at {url} failed with HTTP {status}")
 }
 
 async fn handle_subscription_reset(
@@ -2953,30 +2938,6 @@ mod tests {
         let mut decoder = TychoStreamDecoder::new();
         decoder.register_decoder::<DummySim>("vm:curve");
         Arc::new(decoder)
-    }
-
-    #[test]
-    fn rfq_subscription_uses_root_snapshot_session_path() {
-        assert_eq!(
-            super::broadcaster_snapshot_sessions_path(BroadcasterBackend::Rfq),
-            "snapshot-sessions"
-        );
-        assert_eq!(
-            super::broadcaster_snapshot_payload_path(BroadcasterBackend::Rfq, 7, 2),
-            "snapshot-sessions/7/payloads/2"
-        );
-    }
-
-    #[test]
-    fn native_and_vm_subscription_paths_remain_root_snapshot_paths() {
-        assert_eq!(
-            super::broadcaster_snapshot_sessions_path(BroadcasterBackend::Native),
-            "snapshot-sessions"
-        );
-        assert_eq!(
-            super::broadcaster_snapshot_payload_path(BroadcasterBackend::Vm, 8, 3),
-            "snapshot-sessions/8/payloads/3"
-        );
     }
 
     #[test]
