@@ -25,12 +25,14 @@ logs/
 .tycho-sim-server.pid
 .tycho-broadcaster-service.pid
 .tycho-broadcaster-service.meta
+.tycho-redis-service.meta
 .cursorrules
 AGENTS.md
 CLAUDE.md
 tycho_node.log
 review_guide.md
 review-viewer/
+docs/superpowers/
 
 # Environment
 .env
