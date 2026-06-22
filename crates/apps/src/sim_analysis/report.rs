@@ -72,6 +72,22 @@ pub struct ReadinessBackendSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessRedisReplayBoundarySnapshot {
+    pub stream_key: String,
+    pub stream_id: String,
+    pub snapshot_id: String,
+    pub generation: u64,
+    pub exclusive_message_seq: u64,
+}
+
+impl ReadinessRedisReplayBoundarySnapshot {
+    fn exclusive_entry_id(&self) -> String {
+        format!("{}-{}", self.generation, self.exclusive_message_seq)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReadinessSubscriptionSnapshot {
     pub connected: bool,
     pub bootstrap_complete: bool,
@@ -79,6 +95,14 @@ pub struct ReadinessSubscriptionSnapshot {
     pub stream_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_replay_boundary: Option<ReadinessRedisReplayBoundarySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_catch_up_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_replay_caught_up: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_gap_reason: Option<String>,
     pub restart_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -505,6 +529,29 @@ fn append_readiness_snapshot(lines: &mut Vec<String>, label: &str, snapshot: &Re
             snapshot.backend_status("rfq")
         )
     ));
+    append_redis_replay_status(lines, snapshot);
+}
+
+fn append_redis_replay_status(lines: &mut Vec<String>, snapshot: &ReadinessSnapshot) {
+    for (kind, backend) in &snapshot.backends {
+        let Some(subscription) = &backend.subscription else {
+            continue;
+        };
+        if !subscription.has_redis_replay_status() {
+            continue;
+        }
+        lines.push(format!(
+            "  redis {}: boundary={} cursor={} caught_up={} gap={}",
+            kind,
+            subscription.redis_boundary_label(),
+            subscription
+                .redis_catch_up_cursor
+                .as_deref()
+                .unwrap_or("unknown"),
+            fmt_optional_bool(subscription.redis_replay_caught_up),
+            subscription.redis_gap_reason.as_deref().unwrap_or("none")
+        ));
+    }
 }
 
 fn append_evidence_section(lines: &mut Vec<String>, report: &AnalysisReport) {
@@ -573,6 +620,14 @@ fn fmt_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
+fn fmt_optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
 fn display_status(value: Option<&str>) -> &str {
     value.unwrap_or("unknown")
 }
@@ -598,13 +653,32 @@ fn readiness_component_status(enabled: bool, status: Option<&str>) -> &str {
     }
 }
 
+impl ReadinessSubscriptionSnapshot {
+    fn has_redis_replay_status(&self) -> bool {
+        self.redis_replay_boundary.is_some()
+            || self.redis_catch_up_cursor.is_some()
+            || self.redis_replay_caught_up.is_some()
+            || self.redis_gap_reason.is_some()
+    }
+
+    fn redis_boundary_label(&self) -> String {
+        self.redis_replay_boundary
+            .as_ref()
+            .map(ReadinessRedisReplayBoundarySnapshot::exclusive_entry_id)
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSourceSummary,
         LogSummary, ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
-    use super::{ReadinessBackendSnapshot, ReadinessSnapshot, RunMetadata, ScenarioReport};
+    use super::{
+        ReadinessBackendSnapshot, ReadinessSnapshot, ReadinessSubscriptionSnapshot, RunMetadata,
+        ScenarioReport,
+    };
     use std::collections::BTreeMap;
 
     fn scenario(label: &str, degraded_count: usize, error_count: usize) -> ScenarioReport {
@@ -768,6 +842,38 @@ mod tests {
     }
 
     #[test]
+    fn readiness_subscription_snapshot_preserves_redis_replay_fields() -> serde_json::Result<()> {
+        let snapshot: ReadinessSubscriptionSnapshot = serde_json::from_value(serde_json::json!({
+            "connected": true,
+            "bootstrap_complete": true,
+            "stream_id": "chain-8453-stream-2",
+            "snapshot_id": "chain-8453-snapshot-2",
+            "redis_replay_boundary": {
+                "streamKey": "dsolver:broadcaster:local:8453:events",
+                "streamId": "chain-8453-stream-2",
+                "snapshotId": "chain-8453-snapshot-2",
+                "generation": 2,
+                "exclusiveMessageSeq": 14
+            },
+            "redis_catch_up_cursor": "2-16",
+            "redis_replay_caught_up": true,
+            "restart_count": 0
+        }))?;
+
+        let value = serde_json::to_value(snapshot)?;
+
+        assert_eq!(
+            value["redis_replay_boundary"]["streamKey"],
+            "dsolver:broadcaster:local:8453:events"
+        );
+        assert_eq!(value["redis_replay_boundary"]["exclusiveMessageSeq"], 14);
+        assert_eq!(value["redis_catch_up_cursor"], "2-16");
+        assert!(value["redis_replay_caught_up"].as_bool().unwrap_or(false));
+        assert!(value.get("redis_gap_reason").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn build_findings_marks_broadcaster_log_matches() {
         let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
         let broadcaster = analysis
@@ -833,6 +939,38 @@ mod tests {
         assert!(summary.contains("vm=disabled rfq=ready"));
         assert!(summary.contains("native=ready"));
         assert!(summary.contains("vm=disabled rfq=rebuilding"));
+    }
+
+    #[test]
+    fn render_summary_includes_redis_replay_state() -> serde_json::Result<()> {
+        let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+        let native = analysis
+            .readiness
+            .initial
+            .backends
+            .get_mut("native")
+            .unwrap_or_else(|| unreachable!("test report includes native backend"));
+        native.subscription = Some(serde_json::from_value(serde_json::json!({
+            "connected": true,
+            "bootstrap_complete": true,
+            "stream_id": "chain-8453-stream-2",
+            "snapshot_id": "chain-8453-snapshot-2",
+            "redis_replay_boundary": {
+                "streamKey": "dsolver:broadcaster:local:8453:events",
+                "streamId": "chain-8453-stream-2",
+                "snapshotId": "chain-8453-snapshot-2",
+                "generation": 2,
+                "exclusiveMessageSeq": 14
+            },
+            "redis_catch_up_cursor": "2-16",
+            "redis_replay_caught_up": true,
+            "restart_count": 0
+        }))?);
+
+        let summary = render_summary(&analysis);
+
+        assert!(summary.contains("redis native: boundary=2-14 cursor=2-16 caught_up=true gap=none"));
+        Ok(())
     }
 
     #[test]
