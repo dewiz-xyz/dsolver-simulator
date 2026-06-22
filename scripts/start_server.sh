@@ -6,6 +6,8 @@ usage() {
 Usage: start_server.sh [--repo <path>] [--log-file <path>] [--chain-id <id>] [--env KEY=VALUE] [--enable-vm-pools]
 
 Start the local DSolver simulator service stack from a repo checkout.
+When the broadcaster and Redis URLs point at loopback, the helper starts Redis first,
+then the broadcaster, then the simulator.
 
 Options:
   --repo             Path to repo root (default: current directory)
@@ -22,6 +24,7 @@ log_file=""
 chain_id_arg=""
 env_overrides=()
 local_broadcaster_start_timeout=300
+local_redis_start_timeout=60
 
 pid_is_running() {
   local pid="$1"
@@ -62,6 +65,22 @@ read_metadata_value() {
       exit
     }
   ' "$metadata_file" 2>/dev/null || true
+}
+
+redis_compose_project_name() {
+  python3 - "$repo" <<'PY'
+import hashlib
+import os
+import re
+import sys
+
+repo = os.path.realpath(sys.argv[1])
+name = re.sub(r"[^a-z0-9_-]+", "-", os.path.basename(repo).lower()).strip("-_")
+if not name:
+    name = "dsolver-simulator"
+digest = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:12]
+print(f"{name}-redis-{digest}")
+PY
 }
 
 broadcaster_metadata_matches() {
@@ -174,6 +193,145 @@ print(f"true\t{bind_host}\t{port}\t{status_url}")
 PY
 }
 
+resolve_local_redis() {
+  python3 - "${BROADCASTER_REDIS_URL:-}" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+raw_url = sys.argv[1]
+if not raw_url:
+    print("BROADCASTER_REDIS_URL is required when starting the local broadcaster", file=sys.stderr)
+    raise SystemExit(2)
+
+url = urlparse(raw_url)
+scheme = url.scheme.lower()
+
+if scheme not in {"redis", "rediss"}:
+    print("BROADCASTER_REDIS_URL must use redis:// or rediss://", file=sys.stderr)
+    raise SystemExit(2)
+
+if scheme == "rediss":
+    print("false\t\t")
+    raise SystemExit(0)
+
+host = url.hostname or ""
+local_hosts = {"localhost", "127.0.0.1", "::1"}
+
+if host not in local_hosts:
+    print("false\t\t")
+    raise SystemExit(0)
+
+try:
+    port = url.port or 6379
+except ValueError as error:
+    print(f"invalid BROADCASTER_REDIS_URL port: {error}", file=sys.stderr)
+    raise SystemExit(2)
+
+bind_host = "127.0.0.1" if host == "localhost" else host
+print(f"true\t{bind_host}\t{port}")
+PY
+}
+
+redis_tcp_ready() {
+  local host="$1"
+  local port="$2"
+
+  python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+try:
+    with socket.create_connection((host, port), timeout=1):
+        raise SystemExit(0)
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+write_redis_metadata() {
+  local metadata_file="$1"
+  local redis_url="$2"
+  local bind_host="$3"
+  local bind_port="$4"
+  local compose_file="$5"
+  local compose_project="$6"
+
+  {
+    printf 'redis_url=%s\n' "$redis_url"
+    printf 'bind_host=%s\n' "$bind_host"
+    printf 'bind_port=%s\n' "$bind_port"
+    printf 'compose_file=%s\n' "$compose_file"
+    printf 'compose_project=%s\n' "$compose_project"
+  } > "$metadata_file"
+}
+
+wait_for_redis_tcp() {
+  local bind_host="$1"
+  local bind_port="$2"
+  local start_time
+  start_time="$(date +%s)"
+
+  while true; do
+    if redis_tcp_ready "$bind_host" "$bind_port"; then
+      echo "Redis is reachable at $bind_host:$bind_port."
+      return 0
+    fi
+
+    local now
+    now="$(date +%s)"
+    if ((now - start_time >= local_redis_start_timeout)); then
+      echo "Timed out waiting for Redis at $bind_host:$bind_port." >&2
+      return 1
+    fi
+
+    sleep 1
+  done
+}
+
+start_redis_if_local() {
+  local managed bind_host bind_port
+  IFS=$'\t' read -r managed bind_host bind_port < <(resolve_local_redis)
+
+  if [[ "$managed" != "true" ]]; then
+    echo "Redis URL is not loopback redis://; assuming Redis is externally managed."
+    return 0
+  fi
+
+  if redis_tcp_ready "$bind_host" "$bind_port"; then
+    echo "Redis already reachable at $bind_host:$bind_port."
+    return 0
+  fi
+
+  local compose_file="$repo/docker-compose.redis.yml"
+  local redis_metadata_file="$repo/.tycho-redis-service.meta"
+  local compose_project
+  compose_project="$(redis_compose_project_name)"
+
+  if [[ ! -f "$compose_file" ]]; then
+    echo "Local Redis compose file not found at $compose_file." >&2
+    return 1
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is required to start local Redis for BROADCASTER_REDIS_URL." >&2
+    return 1
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "Docker Compose v2 is required to start local Redis." >&2
+    return 1
+  fi
+
+  echo "Starting local Redis on $bind_host:$bind_port..."
+  (
+    cd "$repo"
+    LOCAL_REDIS_BIND="$bind_host" LOCAL_REDIS_PORT="$bind_port" docker compose -p "$compose_project" -f "$compose_file" up -d redis
+  )
+  write_redis_metadata "$redis_metadata_file" "$BROADCASTER_REDIS_URL" "$bind_host" "$bind_port" "$compose_file" "$compose_project"
+  wait_for_redis_tcp "$bind_host" "$bind_port"
+}
+
 start_broadcaster_if_local() {
   local managed bind_host bind_port status_url
   IFS=$'\t' read -r managed bind_host bind_port status_url < <(resolve_local_broadcaster)
@@ -186,6 +344,8 @@ start_broadcaster_if_local() {
   local broadcaster_pid_file="$repo/.tycho-broadcaster-service.pid"
   local broadcaster_metadata_file="$repo/.tycho-broadcaster-service.meta"
   local broadcaster_log_file="$repo/logs/tycho-broadcaster-service.log"
+
+  start_redis_if_local
 
   local broadcaster_pid
   broadcaster_pid="$(read_pid_file "$broadcaster_pid_file")"
@@ -203,6 +363,11 @@ start_broadcaster_if_local() {
     if [[ "$status_state" == "chain-mismatch" ]]; then
       echo "Broadcaster already responding at $status_url for chain_id=$actual_chain, expected CHAIN_ID=$CHAIN_ID." >&2
       return 1
+    fi
+    if [[ "$status_state" == "redis-unhealthy" ]]; then
+      echo "Broadcaster service is running but Redis publisher is unhealthy; waiting for recovery."
+      wait_for_broadcaster_http "$status_url" "$broadcaster_pid_file" "$broadcaster_log_file"
+      return 0
     fi
 
     if broadcaster_metadata_matches "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"; then
@@ -231,6 +396,11 @@ start_broadcaster_if_local() {
   if [[ "$status_state" == "chain-mismatch" ]]; then
     echo "Broadcaster already responding at $status_url for chain_id=$actual_chain, expected CHAIN_ID=$CHAIN_ID." >&2
     return 1
+  fi
+  if [[ "$status_state" == "redis-unhealthy" ]]; then
+    echo "Broadcaster already responding at $status_url but Redis publisher is unhealthy; waiting for recovery."
+    wait_for_broadcaster_http "$status_url" "" "$broadcaster_log_file"
+    return 0
   fi
 
   mkdir -p "$repo/logs"
@@ -270,12 +440,14 @@ wait_for_broadcaster_http() {
       return 1
     fi
 
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if ! pid_is_running "$pid"; then
-      echo "Broadcaster service exited before HTTP was reachable. See $log_file." >&2
-      rm -f "$pid_file"
-      return 1
+    if [[ -n "$pid_file" ]]; then
+      local pid
+      pid="$(cat "$pid_file" 2>/dev/null || true)"
+      if ! pid_is_running "$pid"; then
+        echo "Broadcaster service exited before HTTP was reachable. See $log_file." >&2
+        rm -f "$pid_file"
+        return 1
+      fi
     fi
 
     local now
@@ -327,12 +499,18 @@ if (
     and isinstance(payload.get("backends"), dict)
 ):
     actual_chain_id = payload["chain_id"]
-    if actual_chain_id == expected_chain_id:
-        print(f"ok {http_code}")
-    else:
+    if actual_chain_id != expected_chain_id:
         print(f"chain-mismatch {http_code} {actual_chain_id}")
+    elif payload["status"] == "redis_publisher_unhealthy":
+        print(f"redis-unhealthy {http_code}")
+    else:
+        print(f"ok {http_code}")
 PY
 }
+
+if [[ "${DSOLVER_START_SERVER_SOURCE_ONLY:-}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
