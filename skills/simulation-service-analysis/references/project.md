@@ -15,6 +15,7 @@
   ```bash
   scripts/start_server.sh --repo . --chain-id 1
   ```
+- When `BROADCASTER_REDIS_URL` is loopback `redis://`, the lifecycle helper starts Redis from `docker-compose.redis.yml` before the local broadcaster. Use `scripts/verify_broadcaster_redis.sh --repo .` while services are running to confirm the broadcaster replay boundary, Redis stream retention, and simulator catch-up status.
 - Default bind: `127.0.0.1:3000` (override with `HOST`/`PORT`).
 
 ## Readiness
@@ -40,9 +41,10 @@
   - `summary.md` for the narrative overview
   - `report.json` for exact metrics and scenario breakdowns
   - `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts
+- Redis replay fields from simulator `/status` subscriptions are preserved in `report.json` and summarized in `summary.md` when present.
 - RFQ-enabled Ethereum runs should also surface RFQ readiness and any RFQ-visibility findings in `summary.md` and `report.json`.
 - Baseline comparison is meant to be flexible. Use the latest saved run when it helps, disable it with `--baseline none` when you want a clean one-off read.
-- The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so the agent can investigate.
+- The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so a reviewer can investigate.
 
 ## Useful commands
 - Format: `cargo fmt --all`
@@ -53,6 +55,7 @@
 - Manual lifecycle:
   - `scripts/start_server.sh --repo . --chain-id 1`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1`
+  - `scripts/verify_broadcaster_redis.sh --repo .`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600`
   - `scripts/stop_server.sh --repo .`
 

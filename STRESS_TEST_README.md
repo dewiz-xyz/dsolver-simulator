@@ -22,6 +22,12 @@ Keep the helper-managed local services running after the analysis:
 cargo run -p apps --bin sim-analysis -- --chain-id 1
 ```
 
+Verify the broadcaster HTTP snapshot plus Redis delta replay path while services are still running:
+
+```bash
+scripts/verify_broadcaster_redis.sh --repo .
+```
+
 Disable baseline comparison for a one-off run:
 
 ```bash
@@ -31,7 +37,7 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ## What the analyzer does
 
 - reuses the existing local simulator if it is already responding, otherwise starts the local stack with the repo lifecycle helper
-- starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed, and Redis carries broadcaster deltas after each HTTP snapshot replay boundary
+- starts helper-managed Redis first when `BROADCASTER_REDIS_URL` is loopback `redis://`, then starts `dsolver-tycho-broadcaster-service` when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster or Redis URLs are treated as externally managed, and Redis carries broadcaster deltas after each HTTP snapshot replay boundary
 - waits for `/status` service health, then confirms native readiness first and includes VM and RFQ readiness when those backends are enabled
 - allows longer VM or RFQ warmups on fresh starts; budget up to about 10 minutes before assuming either backend is stuck
 - runs a balanced `/simulate` sweep across representative pairs
@@ -53,12 +59,13 @@ Main artifacts:
 - `report.json`: machine-readable run summary
 - `summary.md`: human-readable findings and investigation hints
 - `evidence/`: readiness snapshots, sampled request/response bodies, and simulator/broadcaster log excerpts
+- Redis replay status from simulator `/status` subscriptions is preserved in `report.json` and summarized in `summary.md` when present.
 
 ## Behavior model
 
 - Non-zero exit codes are reserved for harness/runtime failures such as startup failures, readiness timeouts, transport failures that prevent analysis, or report-writing issues.
 - Degraded protocol behavior, request-level failures, odd pool visibility, and latency regressions are reported as findings, not hard failures.
-- The analyzer is meant to help agents investigate, not to decide prod-readiness by itself.
+- The analyzer is meant to help local reviewers investigate, not to decide prod-readiness by itself.
 
 ## Investigation flow
 

@@ -224,8 +224,12 @@ cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 When `TYCHO_BROADCASTER_URL` points at local loopback, the analyzer uses the repo lifecycle
-helper to start the broadcaster before the simulator. Non-local broadcaster URLs are treated as
-externally managed.
+helper to start Redis, the broadcaster, then the simulator. Non-local broadcaster or Redis URLs
+are treated as externally managed. To verify the Redis replay path while services are running:
+
+```bash
+scripts/verify_broadcaster_redis.sh --repo .
+```
 
 Container builds:
 
@@ -238,10 +242,11 @@ Useful helpers:
 
 - `scripts/start_server.sh` to start the local broadcaster plus simulator stack with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
+- `scripts/verify_broadcaster_redis.sh` to check the broadcaster replay boundary, Redis stream retention, and simulator catch-up status
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
-The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so reviewers can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
 
 ## Docs Map
 

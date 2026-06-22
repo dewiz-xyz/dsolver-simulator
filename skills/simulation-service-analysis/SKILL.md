@@ -18,14 +18,20 @@ metadata:
    ```bash
    cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
    ```
-5. Read:
+5. For a Redis replay self-check, keep the services running, verify the replay path, then stop them:
+   ```bash
+   cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none
+   scripts/verify_broadcaster_redis.sh --repo .
+   scripts/stop_server.sh --repo .
+   ```
+6. Read:
    - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/summary.md`
    - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/report.json`
 
 ## What the analyzer does
 
 - Reuses the existing local simulator if it is already responding, otherwise starts the local broadcaster plus simulator stack with the repo lifecycle scripts.
-- Starts `dsolver-tycho-broadcaster-service` first when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster URLs are treated as externally managed.
+- Starts helper-managed Redis first when `BROADCASTER_REDIS_URL` is loopback `redis://`, then starts `dsolver-tycho-broadcaster-service` when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster or Redis URLs are treated as externally managed.
 - Waits for `/status` service health, then confirms native readiness first and adds VM and RFQ readiness checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
@@ -39,7 +45,7 @@ metadata:
 
 - Non-zero exit codes are reserved for harness/runtime failures such as startup failures, readiness timeouts, transport failures that prevent analysis, or report-writing failures.
 - Degraded protocol behavior, request-level failures, odd pool visibility, and latency regressions are reported as findings, not hard failures.
-- The analyzer is meant to help the agent investigate local behavior, not to decide prod-readiness by itself.
+- The analyzer is meant to help local reviewers investigate behavior, not to decide prod-readiness by itself.
 
 ## Useful commands
 
@@ -56,6 +62,11 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1
 Disable baseline comparison:
 ```bash
 cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
+```
+
+Verify the current broadcaster HTTP snapshot plus Redis delta replay path while services are still running:
+```bash
+scripts/verify_broadcaster_redis.sh --repo .
 ```
 
 Manual VM-ready wait when you want to confirm the service itself before rerunning the analyzer:
