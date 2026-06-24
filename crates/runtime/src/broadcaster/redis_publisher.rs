@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
 use rand::Rng;
-use redis::streams::{StreamInfoStreamReply, StreamRangeReply};
+use redis::streams::StreamRangeReply;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Instant};
@@ -23,6 +23,129 @@ use simulator_core::broadcaster::{
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
 const RETRY_BACKOFF_CAP: Duration = Duration::from_millis(200);
+const WRITER_LEASE_TTL: Duration = Duration::from_secs(30);
+const STALE_WRITER_MESSAGE: &str = "stale Redis broadcaster writer";
+pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
+
+// Redis has no native "check active writer, then XADD" command. These small Lua
+// scripts keep the fence and stream mutation in one Redis operation.
+const PROMOTE_WRITER_SCRIPT: &str = r#"
+local stream_key = KEYS[1]
+local writer_key = KEYS[2]
+local generation_key = KEYS[3]
+local writer_token = ARGV[1]
+local lease_ttl_ms = ARGV[2]
+local maxlen = ARGV[3]
+local expected_writer_token = ARGV[4]
+local expected_generation = ARGV[5]
+
+-- Generation resets are only allowed by the current active writer. A passive
+-- promotion passes no expectation and claims the next Redis generation.
+if expected_writer_token ~= "" then
+  if redis.call("GET", writer_key) ~= expected_writer_token then
+    return redis.error_reply("stale Redis broadcaster writer token")
+  end
+  if tostring(redis.call("GET", generation_key) or "") ~= expected_generation then
+    return redis.error_reply("stale Redis broadcaster writer generation")
+  end
+end
+
+local current_generation = tonumber(redis.call("GET", generation_key) or "0")
+local stream_generation = 0
+-- If the generation key was lost but the stream still exists, continue after
+-- the stream's highest generation instead of reusing Redis entry ids.
+local info = redis.pcall("XINFO", "STREAM", stream_key)
+if type(info) == "table" and info["err"] then
+  if not string.find(info["err"], "no such key") then
+    return redis.error_reply(info["err"])
+  end
+elseif type(info) == "table" then
+  for index = 1, #info - 1, 2 do
+    if info[index] == "last-generated-id" then
+      local last_id = tostring(info[index + 1])
+      local generation = string.match(last_id, "^(%d+)-")
+      if generation then
+        stream_generation = tonumber(generation)
+      end
+      break
+    end
+  end
+end
+
+if current_generation < stream_generation then
+  redis.call("SET", generation_key, stream_generation)
+end
+local generation = redis.call("INCR", generation_key)
+-- The new writer token and generation marker move together. A stale writer can
+-- either append before this script runs, or be rejected after it.
+redis.call("SET", writer_key, writer_token, "PX", lease_ttl_ms)
+
+local entry_id = tostring(generation) .. "-1"
+local command = {"XADD", stream_key}
+if maxlen ~= "" then
+  table.insert(command, "MAXLEN")
+  table.insert(command, "~")
+  table.insert(command, maxlen)
+end
+table.insert(command, entry_id)
+
+for index = 6, #ARGV, 2 do
+  table.insert(command, ARGV[index])
+  local value = string.gsub(ARGV[index + 1], "__GENERATION__", tostring(generation))
+  table.insert(command, value)
+end
+
+redis.call(unpack(command))
+return {tostring(generation), entry_id}
+"#;
+
+const APPEND_FENCED_SCRIPT: &str = r#"
+local stream_key = KEYS[1]
+local writer_key = KEYS[2]
+local generation_key = KEYS[3]
+local writer_token = ARGV[1]
+local generation = ARGV[2]
+local lease_ttl_ms = ARGV[3]
+local maxlen = ARGV[4]
+local entry_id = ARGV[5]
+
+-- This is the actual fence. A separate GET before XADD would still leave a
+-- race, so the ownership check and append stay in the same script.
+if redis.call("GET", writer_key) ~= writer_token then
+  return redis.error_reply("stale Redis broadcaster writer token")
+end
+if tostring(redis.call("GET", generation_key) or "") ~= generation then
+  return redis.error_reply("stale Redis broadcaster writer generation")
+end
+
+-- Successful writes keep the lease alive. Idle periods use the renew script.
+redis.call("PEXPIRE", writer_key, lease_ttl_ms)
+local command = {"XADD", stream_key}
+if maxlen ~= "" then
+  table.insert(command, "MAXLEN")
+  table.insert(command, "~")
+  table.insert(command, maxlen)
+end
+table.insert(command, entry_id)
+for index = 6, #ARGV, 2 do
+  table.insert(command, ARGV[index])
+  table.insert(command, ARGV[index + 1])
+end
+return redis.call(unpack(command))
+"#;
+
+const RENEW_WRITER_SCRIPT: &str = r#"
+-- Used by status checks, heartbeats without payloads, and snapshot serving to
+-- prove this process still owns the active writer before exposing state.
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return redis.error_reply("stale Redis broadcaster writer token")
+end
+if tostring(redis.call("GET", KEYS[2]) or "") ~= ARGV[2] then
+  return redis.error_reply("stale Redis broadcaster writer generation")
+end
+redis.call("PEXPIRE", KEYS[1], ARGV[3])
+return "OK"
+"#;
 
 #[derive(Debug, Clone)]
 pub struct BroadcasterRedisPublisherConfig {
@@ -44,12 +167,76 @@ impl BroadcasterRedisPublisherConfig {
 }
 
 pub trait RedisStreamWriter: Send + Sync {
-    fn append<'a>(
+    fn promote<'a>(
         &'a self,
-        stream_key: &'a str,
-        maxlen: Option<u64>,
-        entry: &'a BroadcasterRedisStreamEntry,
-    ) -> BoxFuture<'a, Result<String>>;
+        command: RedisPromotionCommand<'a>,
+    ) -> BoxFuture<'a, Result<RedisPromotionResult>> {
+        Box::pin(async move {
+            let _ = command;
+            Err(anyhow!(
+                "Redis writer does not support active writer promotion"
+            ))
+        })
+    }
+
+    fn append_fenced<'a>(
+        &'a self,
+        command: RedisAppendCommand<'a>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let _ = command;
+            Err(anyhow!("Redis writer does not support fenced appends"))
+        })
+    }
+
+    fn renew_writer<'a>(&'a self, command: RedisRenewCommand<'a>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let _ = command;
+            Err(anyhow!(
+                "Redis writer does not support active writer lease renewal"
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RedisPromotionCommand<'a> {
+    pub stream_key: &'a str,
+    pub writer_key: &'a str,
+    pub writer_generation_key: &'a str,
+    pub maxlen: Option<u64>,
+    pub writer_token: &'a str,
+    pub expected_writer_token: Option<&'a str>,
+    pub expected_generation: Option<u64>,
+    pub lease_ttl: Duration,
+    pub marker_fields: &'a [(String, String)],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RedisAppendCommand<'a> {
+    pub stream_key: &'a str,
+    pub writer_key: &'a str,
+    pub writer_generation_key: &'a str,
+    pub maxlen: Option<u64>,
+    pub writer_token: &'a str,
+    pub generation: u64,
+    pub lease_ttl: Duration,
+    pub entry: &'a BroadcasterRedisStreamEntry,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RedisRenewCommand<'a> {
+    pub writer_key: &'a str,
+    pub writer_generation_key: &'a str,
+    pub writer_token: &'a str,
+    pub generation: u64,
+    pub lease_ttl: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisPromotionResult {
+    pub generation: u64,
+    pub entry_id: String,
 }
 
 pub struct TokioRedisStreamWriter {
@@ -66,35 +253,100 @@ impl TokioRedisStreamWriter {
             .context("failed to connect to broadcaster Redis")?;
         Ok(Self { connection })
     }
-
-    pub async fn next_generation(&self, stream_key: &str) -> Result<u64> {
-        let mut connection = self.connection.clone();
-        let reply = redis::cmd("XINFO")
-            .arg("STREAM")
-            .arg(stream_key)
-            .query_async::<StreamInfoStreamReply>(&mut connection)
-            .await;
-        next_generation_from_xinfo_reply(reply)
-    }
 }
 
 impl RedisStreamWriter for TokioRedisStreamWriter {
-    fn append<'a>(
+    fn promote<'a>(
         &'a self,
-        stream_key: &'a str,
-        maxlen: Option<u64>,
-        entry: &'a BroadcasterRedisStreamEntry,
+        request: RedisPromotionCommand<'a>,
+    ) -> BoxFuture<'a, Result<RedisPromotionResult>> {
+        Box::pin(async move {
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(PROMOTE_WRITER_SCRIPT)
+                .arg(3)
+                .arg(request.stream_key)
+                .arg(request.writer_key)
+                .arg(request.writer_generation_key)
+                .arg(request.writer_token)
+                .arg(lease_ttl_ms(request.lease_ttl))
+                .arg(
+                    request
+                        .maxlen
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                )
+                .arg(request.expected_writer_token.unwrap_or_default())
+                .arg(
+                    request
+                        .expected_generation
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                );
+            for (field, value) in request.marker_fields {
+                command.arg(field).arg(value);
+            }
+
+            let mut connection = self.connection.clone();
+            let reply = command
+                .query_async::<Vec<String>>(&mut connection)
+                .await
+                .context("Redis active writer promotion failed")?;
+            let [generation, entry_id] = reply.as_slice() else {
+                return Err(anyhow!(
+                    "Redis active writer promotion returned invalid reply"
+                ));
+            };
+            Ok(RedisPromotionResult {
+                generation: generation.parse::<u64>().with_context(|| {
+                    format!(
+                        "Redis active writer promotion returned invalid generation: {generation}"
+                    )
+                })?,
+                entry_id: entry_id.clone(),
+            })
+        })
+    }
+
+    fn append_fenced<'a>(
+        &'a self,
+        request: RedisAppendCommand<'a>,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let entry_id = redis_entry_id(entry)?;
-            let fields = redis_entry_fields(entry)?;
-            let command = redis_xadd_command_from_fields(stream_key, maxlen, &entry_id, &fields);
+            let entry_id = redis_entry_id(request.entry)?;
+            let fields = redis_entry_fields(request.entry)?;
             let mut connection = self.connection.clone();
-            match command.query_async::<String>(&mut connection).await {
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(APPEND_FENCED_SCRIPT)
+                .arg(3)
+                .arg(request.stream_key)
+                .arg(request.writer_key)
+                .arg(request.writer_generation_key)
+                .arg(request.writer_token)
+                .arg(request.generation)
+                .arg(lease_ttl_ms(request.lease_ttl))
+                .arg(
+                    request
+                        .maxlen
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                )
+                .arg(&entry_id);
+            for (field, value) in &fields {
+                command.arg(field).arg(value);
+            }
+            let result = command.query_async::<String>(&mut connection).await;
+            match result {
                 Ok(entry_id) => Ok(entry_id),
                 Err(error) => {
-                    if redis_stream_entry_matches(&mut connection, stream_key, &entry_id, &fields)
-                        .await?
+                    if redis_stream_entry_matches(
+                        &mut connection,
+                        request.stream_key,
+                        &entry_id,
+                        &fields,
+                    )
+                    .await?
                     {
                         Ok(entry_id)
                     } else {
@@ -104,11 +356,32 @@ impl RedisStreamWriter for TokioRedisStreamWriter {
             }
         })
     }
+
+    fn renew_writer<'a>(&'a self, request: RedisRenewCommand<'a>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            redis::cmd("EVAL")
+                .arg(RENEW_WRITER_SCRIPT)
+                .arg(2)
+                .arg(request.writer_key)
+                .arg(request.writer_generation_key)
+                .arg(request.writer_token)
+                .arg(request.generation)
+                .arg(lease_ttl_ms(request.lease_ttl))
+                .query_async::<String>(&mut connection)
+                .await
+                .context("Redis active writer lease renewal failed")?;
+            Ok(())
+        })
+    }
 }
 
 pub struct BroadcasterRedisPublisher {
     config: BroadcasterRedisPublisherConfig,
     writer: Arc<dyn RedisStreamWriter>,
+    writer_key: String,
+    writer_generation_key: String,
+    writer_token: String,
     inner: Arc<Mutex<BroadcasterRedisPublisherState>>,
 }
 
@@ -123,6 +396,7 @@ impl fmt::Debug for BroadcasterRedisPublisher {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BroadcasterRedisPublisherStatus {
     pub healthy: bool,
+    pub mode: &'static str,
     pub stream_key: String,
     pub stream_id: String,
     pub snapshot_id: String,
@@ -138,8 +412,32 @@ pub struct BroadcasterRedisPublisherStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcasterRedisPublisherMode {
+    Passive,
+    Active,
+    Retired,
+    Unhealthy,
+}
+
+impl BroadcasterRedisPublisherMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passive => "passive",
+            Self::Active => "active",
+            Self::Retired => "retired",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+
+    const fn is_healthy(self) -> bool {
+        matches!(self, Self::Passive | Self::Active)
+    }
+}
+
 #[derive(Debug)]
 struct BroadcasterRedisPublisherState {
+    mode: BroadcasterRedisPublisherMode,
     generation: u64,
     stream_id: String,
     snapshot_id: String,
@@ -168,36 +466,60 @@ impl BroadcasterRedisPublisherState {
         if retry_exhausted {
             self.retry_exhaustion_count = self.retry_exhaustion_count.saturating_add(1);
         }
+        self.mode = BroadcasterRedisPublisherMode::Unhealthy;
         self.last_error = Some(last_error);
     }
 
-    fn advance_generation(&mut self, chain_id: u64) -> Result<()> {
-        self.generation_reset_count = self.generation_reset_count.saturating_add(1);
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("Redis broadcaster generation overflow"))?;
+    fn record_retired(&mut self, last_error: String) {
+        self.mode = BroadcasterRedisPublisherMode::Retired;
+        self.last_error = Some(last_error);
+    }
+
+    fn activate_generation(
+        &mut self,
+        chain_id: u64,
+        generation: u64,
+        count_generation_reset: bool,
+    ) {
+        if count_generation_reset {
+            self.generation_reset_count = self.generation_reset_count.saturating_add(1);
+        }
+        self.mode = BroadcasterRedisPublisherMode::Active;
+        self.generation = generation;
         self.stream_id = format_redis_stream_id(chain_id, self.generation);
         self.snapshot_id = format_redis_snapshot_id(chain_id, self.generation);
-        self.next_message_seq = 1;
-        self.latest_entry_id = None;
+        self.next_message_seq = 2;
+        self.latest_entry_id = Some(format!("{}-1", self.generation));
         self.last_error = None;
-        Ok(())
     }
 }
 
 impl BroadcasterRedisPublisher {
-    pub fn new_with_initial_generation(
+    pub fn new(
+        config: BroadcasterRedisPublisherConfig,
+        writer: Arc<dyn RedisStreamWriter>,
+    ) -> Self {
+        Self::new_with_mode(config, writer, 1, BroadcasterRedisPublisherMode::Passive)
+    }
+
+    fn new_with_mode(
         config: BroadcasterRedisPublisherConfig,
         writer: Arc<dyn RedisStreamWriter>,
         generation: u64,
+        mode: BroadcasterRedisPublisherMode,
     ) -> Self {
         let stream_id = format_redis_stream_id(config.chain_id, generation);
         let snapshot_id = format_redis_snapshot_id(config.chain_id, generation);
+        let writer_key = redis_writer_key(&config.stream_key);
+        let writer_generation_key = redis_writer_generation_key(&config.stream_key);
         Self {
             config,
             writer,
+            writer_key,
+            writer_generation_key,
+            writer_token: new_writer_token(),
             inner: Arc::new(Mutex::new(BroadcasterRedisPublisherState {
+                mode,
                 generation,
                 stream_id,
                 snapshot_id,
@@ -214,6 +536,24 @@ impl BroadcasterRedisPublisher {
 
     pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
         let mut guard = self.inner.lock().await;
+        match guard.mode {
+            BroadcasterRedisPublisherMode::Passive => return Ok(()),
+            BroadcasterRedisPublisherMode::Retired => {
+                return Err(anyhow!(
+                    "Redis broadcaster publisher is retired; this process is no longer the active writer"
+                ))
+            }
+            BroadcasterRedisPublisherMode::Unhealthy => {
+                let error = guard
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("publisher is unhealthy");
+                return Err(anyhow!(
+                    "Redis broadcaster publisher is unhealthy; shared broadcaster generation reset is required before publishing more deltas: {error}"
+                ));
+            }
+            BroadcasterRedisPublisherMode::Active => {}
+        }
         if let Some(error) = &guard.last_error {
             return Err(anyhow!(
                 "Redis broadcaster publisher is unhealthy; shared broadcaster generation reset is required before publishing more deltas: {error}"
@@ -225,76 +565,89 @@ impl BroadcasterRedisPublisher {
             Ok(_) => Ok(()),
             Err(error) => {
                 let message = format!("{error:#}");
-                let retry_exhausted = guard.append_failure_count > append_failures_before;
-                guard.record_unhealthy(message, retry_exhausted);
+                if is_stale_writer_error(&error) {
+                    guard.record_retired(message);
+                } else {
+                    let retry_exhausted = guard.append_failure_count > append_failures_before;
+                    guard.record_unhealthy(message, retry_exhausted);
+                }
                 Err(error)
             }
         }
     }
 
-    pub async fn replay_boundary(&self) -> Result<BroadcasterRedisReplayBoundary> {
-        let guard = self.inner.lock().await;
-        if let Some(error) = &guard.last_error {
-            return Err(anyhow!(
-                "Redis broadcaster replay boundary is unavailable while publisher is unhealthy: {error}"
-            ));
+    pub async fn promote(
+        &self,
+        backends: Vec<BroadcasterBackend>,
+        reason: impl Into<String>,
+    ) -> Result<BroadcasterRedisReplayBoundary> {
+        self.promote_locked(backends, reason.into(), false, false)
+            .await
+    }
+
+    pub async fn renew_lease(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        if guard.mode == BroadcasterRedisPublisherMode::Passive {
+            return Ok(());
         }
+        self.verify_writer_fence_locked(&mut guard, "active writer lease renewal")
+            .await
+    }
+
+    pub async fn verify_active_writer(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        self.verify_writer_fence_locked(&mut guard, "active writer verification")
+            .await
+    }
+
+    pub async fn replay_boundary(&self) -> Result<BroadcasterRedisReplayBoundary> {
+        let mut guard = self.inner.lock().await;
+        self.verify_writer_fence_locked(&mut guard, "replay boundary")
+            .await?;
         self.replay_boundary_locked(&guard)
     }
 
-    pub async fn reset_generation(
+    pub async fn reset_generation_boundary(
         &self,
         reason: impl Into<String>,
         backends: Vec<BroadcasterBackend>,
-    ) {
-        let mut guard = self.inner.lock().await;
-        let reason = reason.into();
-        if let Err(error) = reset_redis_generation(&mut guard, self.config.chain_id, &reason) {
-            warn!(
-                event = "redis_generation_reset_failed",
-                error = %error,
-                "Redis broadcaster generation reset failed"
-            );
-            return;
-        }
-
-        let marker = match BroadcasterProgress::new(
-            self.config.chain_id,
-            guard.snapshot_id.clone(),
-            backends,
-            reason,
-        ) {
-            Ok(marker) => marker,
-            Err(error) => {
-                guard.record_unhealthy(error.to_string(), false);
-                warn!(
-                    event = "redis_generation_reset_marker_invalid",
-                    error = %error,
-                    "Redis broadcaster generation reset marker was invalid"
-                );
-                return;
-            }
-        };
-        let append_failures_before = guard.append_failure_count;
-        if let Err(error) = self
-            .append_payload_locked(&mut guard, BroadcasterPayload::Progress(marker))
+    ) -> Result<BroadcasterRedisReplayBoundary> {
+        self.promote_locked(backends, reason.into(), true, true)
             .await
-        {
-            let message = format!("{error:#}");
-            let retry_exhausted = guard.append_failure_count > append_failures_before;
-            guard.record_unhealthy(message, retry_exhausted);
-        }
+    }
+
+    pub async fn mode(&self) -> BroadcasterRedisPublisherMode {
+        self.inner.lock().await.mode
     }
 
     pub async fn status_snapshot(&self) -> BroadcasterRedisPublisherStatus {
         let guard = self.inner.lock().await;
-        let replay_boundary = if guard.last_error.is_none() {
-            self.replay_boundary_locked(&guard).ok()
-        } else {
-            None
-        };
+        self.status_snapshot_locked(&guard)
+    }
+
+    pub async fn verified_status_snapshot(&self) -> BroadcasterRedisPublisherStatus {
+        let mut guard = self.inner.lock().await;
+        if guard.mode == BroadcasterRedisPublisherMode::Active && guard.last_error.is_none() {
+            let _ = self
+                .verify_writer_fence_locked(&mut guard, "status snapshot")
+                .await;
+        }
+        self.status_snapshot_locked(&guard)
+    }
+
+    fn status_snapshot_locked(
+        &self,
+        guard: &BroadcasterRedisPublisherState,
+    ) -> BroadcasterRedisPublisherStatus {
+        let replay_boundary =
+            if guard.mode == BroadcasterRedisPublisherMode::Active && guard.last_error.is_none() {
+                self.replay_boundary_locked(guard).ok()
+            } else {
+                None
+            };
         BroadcasterRedisPublisherStatus {
-            healthy: guard.last_error.is_none(),
+            healthy: guard.mode.is_healthy() && guard.last_error.is_none(),
+            mode: guard.mode.as_str(),
             stream_key: self.config.stream_key.clone(),
             stream_id: guard.stream_id.clone(),
             snapshot_id: guard.snapshot_id.clone(),
@@ -306,6 +659,142 @@ impl BroadcasterRedisPublisher {
             retry_exhaustion_count: guard.retry_exhaustion_count,
             last_error: guard.last_error.clone(),
         }
+    }
+
+    async fn verify_writer_fence_locked(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+        context: &str,
+    ) -> Result<()> {
+        match guard.mode {
+            BroadcasterRedisPublisherMode::Active => {}
+            BroadcasterRedisPublisherMode::Passive => {
+                return Err(anyhow!(
+                    "Redis broadcaster {context} is unavailable while publisher mode is passive"
+                ));
+            }
+            BroadcasterRedisPublisherMode::Retired => {
+                return Err(anyhow!(
+                    "Redis broadcaster publisher is retired; this process is no longer the active writer"
+                ));
+            }
+            BroadcasterRedisPublisherMode::Unhealthy => {
+                let error = guard
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("publisher is unhealthy");
+                return Err(anyhow!(
+                    "Redis broadcaster publisher is unhealthy; {context} is unavailable: {error}"
+                ));
+            }
+        }
+        if let Some(error) = &guard.last_error {
+            return Err(anyhow!(
+                "Redis broadcaster {context} is unavailable while publisher is unhealthy: {error}"
+            ));
+        }
+
+        if let Err(error) = self
+            .writer
+            .renew_writer(RedisRenewCommand {
+                writer_key: &self.writer_key,
+                writer_generation_key: &self.writer_generation_key,
+                writer_token: &self.writer_token,
+                generation: guard.generation,
+                lease_ttl: WRITER_LEASE_TTL,
+            })
+            .await
+        {
+            let message = format!("{error:#}");
+            if is_stale_writer_error(&error) {
+                guard.record_retired(message);
+            } else {
+                guard.record_unhealthy(message, false);
+            }
+            return Err(error);
+        }
+
+        guard.last_error = None;
+        Ok(())
+    }
+
+    async fn promote_locked(
+        &self,
+        backends: Vec<BroadcasterBackend>,
+        reason: String,
+        count_generation_reset: bool,
+        require_current_writer: bool,
+    ) -> Result<BroadcasterRedisReplayBoundary> {
+        let mut guard = self.inner.lock().await;
+        if guard.mode == BroadcasterRedisPublisherMode::Retired {
+            return Err(anyhow!(
+                "Redis broadcaster publisher is retired; this process cannot promote a writer generation"
+            ));
+        }
+        if require_current_writer {
+            match guard.mode {
+                BroadcasterRedisPublisherMode::Active
+                | BroadcasterRedisPublisherMode::Unhealthy => {}
+                BroadcasterRedisPublisherMode::Passive => {
+                    return Err(anyhow!(
+                        "Redis broadcaster publisher is passive; this process cannot reset a writer generation"
+                    ));
+                }
+                BroadcasterRedisPublisherMode::Retired => {
+                    unreachable!("retired publisher returned above")
+                }
+            }
+        }
+
+        let marker_fields =
+            generation_marker_template_fields(self.config.chain_id, backends, reason.clone())?;
+        let expected_writer_token = require_current_writer.then_some(self.writer_token.as_str());
+        let expected_generation = require_current_writer.then_some(guard.generation);
+        let promotion = self
+            .writer
+            .promote(RedisPromotionCommand {
+                stream_key: &self.config.stream_key,
+                writer_key: &self.writer_key,
+                writer_generation_key: &self.writer_generation_key,
+                maxlen: self.config.maxlen,
+                writer_token: &self.writer_token,
+                expected_writer_token,
+                expected_generation,
+                lease_ttl: WRITER_LEASE_TTL,
+                marker_fields: &marker_fields,
+            })
+            .await;
+
+        let promotion = match promotion {
+            Ok(promotion) => promotion,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if is_stale_writer_error(&error) {
+                    guard.record_retired(message);
+                } else {
+                    guard.record_unhealthy(message, false);
+                }
+                return Err(error);
+            }
+        };
+
+        guard.activate_generation(
+            self.config.chain_id,
+            promotion.generation,
+            count_generation_reset,
+        );
+        if count_generation_reset {
+            emit_broadcaster_redis_generation_reset();
+        }
+        warn!(
+            event = "redis_generation_reset",
+            stream_id = guard.stream_id.as_str(),
+            snapshot_id = guard.snapshot_id.as_str(),
+            generation = guard.generation,
+            reason,
+            "Redis broadcaster generation promoted"
+        );
+        self.replay_boundary_locked(&guard)
     }
 
     async fn append_payload_locked(
@@ -379,8 +868,16 @@ impl BroadcasterRedisPublisher {
             attempts = attempts.saturating_add(1);
             match timeout(
                 remaining,
-                self.writer
-                    .append(&self.config.stream_key, self.config.maxlen, entry),
+                self.writer.append_fenced(RedisAppendCommand {
+                    stream_key: &self.config.stream_key,
+                    writer_key: &self.writer_key,
+                    writer_generation_key: &self.writer_generation_key,
+                    maxlen: self.config.maxlen,
+                    writer_token: &self.writer_token,
+                    generation: guard.generation,
+                    lease_ttl: WRITER_LEASE_TTL,
+                    entry,
+                }),
             )
             .await
             {
@@ -391,6 +888,10 @@ impl BroadcasterRedisPublisher {
                 }
                 Ok(Ok(result)) => return Ok(result),
                 Ok(Err(error)) => {
+                    if is_stale_writer_error(&error) {
+                        self.record_write_failure(guard, entry, attempts, &error);
+                        return Err(error);
+                    }
                     if started_at.elapsed() >= self.config.append_retry_window {
                         self.record_write_failure(guard, entry, attempts, &error);
                         return Err(error);
@@ -461,81 +962,43 @@ fn format_redis_snapshot_id(chain_id: u64, generation: u64) -> String {
     format!("chain-{chain_id}-snapshot-{generation}")
 }
 
-fn reset_redis_generation(
-    guard: &mut BroadcasterRedisPublisherState,
+fn generation_marker_template_fields(
     chain_id: u64,
-    reason: &str,
-) -> Result<()> {
-    guard.advance_generation(chain_id)?;
-    emit_broadcaster_redis_generation_reset();
-    warn!(
-        event = "redis_generation_reset",
-        stream_id = guard.stream_id.as_str(),
-        snapshot_id = guard.snapshot_id.as_str(),
-        generation = guard.generation,
-        reason,
-        "Redis broadcaster generation reset"
-    );
-    Ok(())
+    backends: Vec<BroadcasterBackend>,
+    reason: String,
+) -> Result<Vec<(String, String)>> {
+    let stream_id = format!("chain-{chain_id}-stream-{GENERATION_PLACEHOLDER}");
+    let snapshot_id = format!("chain-{chain_id}-snapshot-{GENERATION_PLACEHOLDER}");
+    let marker = BroadcasterProgress::new(chain_id, snapshot_id.clone(), backends, reason)?;
+    let envelope = BroadcasterEnvelope::new(stream_id, 1, BroadcasterPayload::Progress(marker));
+    let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, current_time_ms(), &envelope)?;
+    redis_entry_fields(&entry)
 }
 
-fn next_generation_from_xinfo_reply(
-    reply: std::result::Result<StreamInfoStreamReply, redis::RedisError>,
-) -> Result<u64> {
-    match reply {
-        Ok(reply) => next_generation_after_entry_id(&reply.last_generated_id),
-        Err(error) if redis_stream_missing_key(&error) => Ok(1),
-        Err(error) => Err(anyhow!(error).context("Redis XINFO STREAM failed")),
-    }
+fn redis_writer_key(stream_key: &str) -> String {
+    // Keep deployment config to one public stream key; ownership keys follow it.
+    format!("{stream_key}:writer")
 }
 
-pub(super) fn next_generation_after_entry_id(entry_id: &str) -> Result<u64> {
-    let generation = entry_id
-        .split_once('-')
-        .map(|(generation, _)| generation)
-        .ok_or_else(|| anyhow!("Redis stream last-generated-id is invalid: {entry_id}"))?
-        .parse::<u64>()
-        .with_context(|| format!("Redis stream last-generated-id is invalid: {entry_id}"))?;
-    generation
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("Redis broadcaster generation overflow"))
+fn redis_writer_generation_key(stream_key: &str) -> String {
+    format!("{stream_key}:writer_generation")
 }
 
-fn redis_stream_missing_key(error: &redis::RedisError) -> bool {
-    error
-        .detail()
-        .is_some_and(|detail| detail.contains("no such key"))
+fn new_writer_token() -> String {
+    format!(
+        "{}-{}-{:016x}",
+        std::process::id(),
+        current_time_ms(),
+        rand::thread_rng().gen::<u64>()
+    )
 }
 
-#[cfg(test)]
-pub(super) fn redis_xadd_command(
-    stream_key: &str,
-    maxlen: Option<u64>,
-    entry: &BroadcasterRedisStreamEntry,
-) -> Result<redis::Cmd> {
-    let entry_id = redis_entry_id(entry)?;
-    let fields = redis_entry_fields(entry)?;
-    Ok(redis_xadd_command_from_fields(
-        stream_key, maxlen, &entry_id, &fields,
-    ))
+fn lease_ttl_ms(lease_ttl: Duration) -> u64 {
+    lease_ttl.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn redis_xadd_command_from_fields(
-    stream_key: &str,
-    maxlen: Option<u64>,
-    entry_id: &str,
-    fields: &[(String, String)],
-) -> redis::Cmd {
-    let mut command = redis::cmd("XADD");
-    command.arg(stream_key);
-    if let Some(maxlen) = maxlen {
-        command.arg("MAXLEN").arg("~").arg(maxlen);
-    }
-    command.arg(entry_id);
-    for (field, value) in fields {
-        command.arg(field).arg(value);
-    }
-    command
+fn is_stale_writer_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(STALE_WRITER_MESSAGE)
 }
 
 pub(super) fn redis_entry_id(entry: &BroadcasterRedisStreamEntry) -> Result<String> {

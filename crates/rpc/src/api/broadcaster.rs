@@ -50,7 +50,7 @@ mod tests {
         broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         models::tokens::TokenStore,
     };
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterRedisStreamEntry};
+    use simulator_core::broadcaster::BroadcasterBackend;
     use tokio::{
         sync::{Barrier, Mutex},
         task::JoinHandle,
@@ -179,9 +179,24 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
+        assert_eq!(body["redis_publisher"]["mode"], "active");
         assert_eq!(body["snapshot"]["ready"], true);
         assert_eq!(body["backends"]["native"]["block_number"], 10);
         assert_eq!(body["backends"]["native"]["pool_count"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_reports_passive_publisher_as_not_ready() -> Result<()> {
+        let app = create_broadcaster_router(build_passive_ready_state().await?);
+        let (status, body) = get_json(app, "/status").await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_passive");
+        assert_eq!(body["snapshot"]["ready"], true);
+        assert_eq!(body["redis_publisher"]["healthy"], true);
+        assert_eq!(body["redis_publisher"]["mode"], "passive");
+        assert!(body["redis_publisher"]["replay_boundary"].is_null());
         Ok(())
     }
 
@@ -195,10 +210,26 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         assert_eq!(body["redis_publisher"]["healthy"], true);
+        assert_eq!(body["redis_publisher"]["mode"], "active");
         let Some(stream_id) = body["redis_publisher"]["stream_id"].as_str() else {
             bail!("expected redis publisher stream_id");
         };
         assert!(stream_id.starts_with("chain-1-stream-"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_fences_stale_active_publisher_before_reporting_ready() -> Result<()> {
+        let writer = RpcFakeRedisWriter::healthy();
+        let app = create_broadcaster_router(build_stale_active_state(writer).await?);
+
+        let (status, body) = get_json(app, "/status").await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_retired");
+        assert_eq!(body["redis_publisher"]["healthy"], false);
+        assert_eq!(body["redis_publisher"]["mode"], "retired");
+        assert!(body["redis_publisher"]["replay_boundary"].is_null());
         Ok(())
     }
 
@@ -211,6 +242,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "redis_publisher_unhealthy");
         assert_eq!(body["redis_publisher"]["healthy"], false);
+        assert_eq!(body["redis_publisher"]["mode"], "unhealthy");
         Ok(())
     }
 
@@ -223,6 +255,18 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["redis_publisher"]["healthy"], true);
+        assert_eq!(body["redis_publisher"]["mode"], "passive");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_session_create_rejects_when_publisher_is_passive() -> Result<()> {
+        let app = create_broadcaster_router(build_passive_ready_state().await?);
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_passive");
+        assert_eq!(body["redis_publisher"]["mode"], "passive");
         Ok(())
     }
 
@@ -655,6 +699,13 @@ mod tests {
         let rfq_service =
             service_with_backend(rfq_mode, BroadcasterBackend::Rfq, publisher.clone(), gate)
                 .await?;
+        if matches!(raw_mode, SeedMode::Ready) && matches!(rfq_mode, SeedMode::Ready) {
+            BroadcasterServiceState::promote_when_ready(
+                &[raw_service.clone(), rfq_service.clone()],
+                "active_writer_promoted",
+            )
+            .await?;
+        }
         Ok(BroadcasterAppState::with_snapshot_session_ttl(
             raw_service,
             Some(rfq_service),
@@ -687,6 +738,11 @@ mod tests {
             SeedMode::Ready => {
                 service.mark_upstream_connected().await;
                 service.apply_update(&native_only_update()).await?;
+                BroadcasterServiceState::promote_when_ready(
+                    std::slice::from_ref(&service),
+                    "active_writer_promoted",
+                )
+                .await?;
             }
         }
 
@@ -713,6 +769,11 @@ mod tests {
         );
         service.mark_upstream_connected().await;
         service.apply_update(&native_only_update()).await?;
+        BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "active_writer_promoted",
+        )
+        .await?;
         Ok(BroadcasterAppState::with_snapshot_session_ttl(
             service,
             None,
@@ -720,6 +781,38 @@ mod tests {
             Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
+        ))
+    }
+
+    async fn build_stale_active_state(writer: RpcFakeRedisWriter) -> Result<BroadcasterAppState> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let upstream = BroadcasterUpstreamState::default();
+        let (old_publisher, gate) = publisher_and_gate(writer.clone());
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            old_publisher.clone(),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service.apply_update(&native_only_update()).await?;
+        BroadcasterServiceState::promote_when_ready(std::slice::from_ref(&service), "old_active")
+            .await?;
+
+        let new_publisher =
+            BroadcasterRedisPublisher::new(redis_publisher_config(), Arc::new(writer));
+        new_publisher
+            .promote(vec![BroadcasterBackend::Native], "new_active")
+            .await?;
+
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum),
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            old_publisher,
         ))
     }
 
@@ -737,6 +830,11 @@ mod tests {
         );
         service.mark_upstream_connected().await;
         service.apply_update(&native_only_update()).await?;
+        BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "active_writer_promoted",
+        )
+        .await?;
         let Err(_error) = service.broadcast_heartbeat().await else {
             bail!("expected heartbeat to mark Redis publisher unhealthy");
         };
@@ -762,6 +860,29 @@ mod tests {
             gate,
         );
         service.mark_upstream_connected().await;
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(vec![], "http://127.0.0.1:1".to_string(), Chain::Ethereum),
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_passive_ready_state() -> Result<BroadcasterAppState> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let upstream = BroadcasterUpstreamState::default();
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            upstream,
+            publisher.clone(),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service.apply_update(&native_only_update()).await?;
         Ok(BroadcasterAppState::with_snapshot_session_ttl(
             service,
             None,
@@ -810,10 +931,9 @@ mod tests {
         writer: RpcFakeRedisWriter,
     ) -> (Arc<BroadcasterRedisPublisher>, Arc<Mutex<()>>) {
         (
-            Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+            Arc::new(BroadcasterRedisPublisher::new(
                 redis_publisher_config(),
                 Arc::new(writer),
-                1,
             )),
             Arc::new(Mutex::new(())),
         )
@@ -822,43 +942,97 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RpcFakeRedisWriter {
         fail_after_successes: Option<usize>,
-        append_count: Arc<Mutex<usize>>,
+        state: Arc<Mutex<RpcFakeRedisWriterState>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RpcFakeRedisWriterState {
+        append_count: usize,
+        active_token: Option<String>,
+        active_generation: u64,
     }
 
     impl RpcFakeRedisWriter {
         fn healthy() -> Self {
             Self {
                 fail_after_successes: None,
-                append_count: Arc::new(Mutex::new(0)),
+                state: Arc::new(Mutex::new(RpcFakeRedisWriterState::default())),
             }
         }
 
         fn failing_after_first_append() -> Self {
             Self {
                 fail_after_successes: Some(1),
-                append_count: Arc::new(Mutex::new(0)),
+                state: Arc::new(Mutex::new(RpcFakeRedisWriterState::default())),
             }
         }
     }
 
     impl RedisStreamWriter for RpcFakeRedisWriter {
-        fn append<'a>(
+        fn promote<'a>(
             &'a self,
-            _stream_key: &'a str,
-            _maxlen: Option<u64>,
-            _entry: &'a BroadcasterRedisStreamEntry,
+            command: runtime::broadcaster::redis_publisher::RedisPromotionCommand<'a>,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<runtime::broadcaster::redis_publisher::RedisPromotionResult>,
+        > {
+            Box::pin(async move {
+                let mut state = self.state.lock().await;
+                if let Some(expected_token) = command.expected_writer_token {
+                    if state.active_token.as_deref() != Some(expected_token)
+                        || Some(state.active_generation) != command.expected_generation
+                    {
+                        bail!("stale Redis broadcaster writer token");
+                    }
+                }
+                state.active_generation = state.active_generation.saturating_add(1);
+                state.active_token = Some(command.writer_token.to_string());
+                let generation = state.active_generation;
+                state.append_count = state.append_count.saturating_add(1);
+                Ok(
+                    runtime::broadcaster::redis_publisher::RedisPromotionResult {
+                        generation,
+                        entry_id: format!("{generation}-1"),
+                    },
+                )
+            })
+        }
+
+        fn append_fenced<'a>(
+            &'a self,
+            command: runtime::broadcaster::redis_publisher::RedisAppendCommand<'a>,
         ) -> futures::future::BoxFuture<'a, Result<String>> {
             Box::pin(async move {
-                let mut append_count = self.append_count.lock().await;
+                let mut state = self.state.lock().await;
+                if state.active_token.as_deref() != Some(command.writer_token)
+                    || state.active_generation != command.generation
+                {
+                    bail!("stale Redis broadcaster writer token");
+                }
                 if self
                     .fail_after_successes
-                    .is_some_and(|threshold| *append_count >= threshold)
+                    .is_some_and(|threshold| state.append_count >= threshold)
                 {
                     bail!("planned append failure");
                 }
-                let entry_id = format!("1000-{append_count}");
-                *append_count = append_count.saturating_add(1);
+                let entry_id = format!("{}-{}", command.generation, command.entry.message_seq);
+                state.append_count = state.append_count.saturating_add(1);
                 Ok(entry_id)
+            })
+        }
+
+        fn renew_writer<'a>(
+            &'a self,
+            command: runtime::broadcaster::redis_publisher::RedisRenewCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let state = self.state.lock().await;
+                if state.active_token.as_deref() != Some(command.writer_token)
+                    || state.active_generation != command.generation
+                {
+                    bail!("stale Redis broadcaster writer token");
+                }
+                Ok(())
             })
         }
     }

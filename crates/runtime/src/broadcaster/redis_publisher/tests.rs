@@ -18,9 +18,9 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
 use tycho_simulation::tycho_common::Bytes;
 
 use super::{
-    next_generation_after_entry_id, redis_entry_fields, redis_entry_id,
-    redis_stream_entry_matches_reply, redis_xadd_command, BroadcasterRedisPublisher,
-    BroadcasterRedisPublisherConfig, RedisStreamWriter,
+    redis_entry_fields, redis_entry_id, redis_stream_entry_matches_reply,
+    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode,
+    RedisStreamWriter,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{
@@ -93,13 +93,283 @@ impl ProtocolSim for DummySim {
 }
 
 #[tokio::test]
+async fn passive_publisher_skips_appends_and_has_no_replay_boundary() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+
+    let status = publisher.status_snapshot().await;
+    assert_eq!(status.mode, "passive");
+    assert!(status.healthy);
+    assert!(status.replay_boundary.is_none());
+    assert!(publisher.replay_boundary().await.is_err());
+    assert!(
+        writer.appends().await.is_empty(),
+        "passive warmup must not append Redis entries"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_allocates_generation_and_appends_marker_before_live_updates() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+
+    let boundary = publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
+
+    assert_eq!(boundary.stream_key, "dsolver:broadcaster:test:events");
+    assert_eq!(boundary.stream_id, "chain-1-stream-1");
+    assert_eq!(boundary.snapshot_id, "chain-1-snapshot-1");
+    assert_eq!(boundary.generation, 1);
+    assert_eq!(boundary.exclusive_message_seq, 1);
+    assert_eq!(boundary.exclusive_entry_id(), "1-1");
+
+    let marker = writer
+        .appends()
+        .await
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("promotion should append a generation marker"))?;
+    assert_eq!(marker.entry.stream_id, "chain-1-stream-1");
+    assert_eq!(marker.entry.message_seq, 1);
+    assert_eq!(marker.entry.kind, BroadcasterMessageKind::Progress);
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(publisher.status_snapshot().await.mode, "active");
+    Ok(())
+}
+
+#[tokio::test]
+async fn second_promoted_writer_fences_old_writer_before_append() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    old.promote(vec![BroadcasterBackend::Native], "old_active")
+        .await?;
+
+    new.promote(vec![BroadcasterBackend::Native], "new_active")
+        .await?;
+    let stale_update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    let Err(error) = old
+        .publish_accepted_payload(BroadcasterPayload::Update(stale_update))
+        .await
+    else {
+        return Err(anyhow!("old writer append should be fenced"));
+    };
+
+    assert!(
+        format!("{error:#}").contains("stale Redis broadcaster writer"),
+        "unexpected stale-writer error: {error:#}"
+    );
+    assert_eq!(old.status_snapshot().await.mode, "retired");
+    assert_eq!(
+        writer
+            .appends()
+            .await
+            .iter()
+            .map(|append| (append.entry.stream_id.clone(), append.entry.message_seq))
+            .collect::<Vec<_>>(),
+        vec![
+            ("chain-1-stream-1".to_string(), 1),
+            ("chain-1-stream-2".to_string(), 1)
+        ],
+        "the fenced writer must not append its stale update"
+    );
+
+    let active_update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 12, "native-3"))
+        .await?;
+    new.publish_accepted_payload(BroadcasterPayload::Update(active_update))
+        .await?;
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends.last().map(|append| append.entry.message_seq),
+        Some(2)
+    );
+    assert_eq!(
+        appends.last().map(|append| append.entry.stream_id.as_str()),
+        Some("chain-1-stream-2")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_loss_retires_active_writer_without_appending() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
+    writer.expire_active_writer().await;
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    let Err(error) = publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+    else {
+        return Err(anyhow!(
+            "lost writer lease should fence the active publisher"
+        ));
+    };
+
+    assert!(format!("{error:#}").contains("stale Redis broadcaster writer"));
+    assert_eq!(publisher.status_snapshot().await.mode, "retired");
+    assert_eq!(writer.appends().await.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retired_publisher_does_not_run_generation_reset() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    old.promote(vec![BroadcasterBackend::Native], "old_active")
+        .await?;
+    new.promote(vec![BroadcasterBackend::Native], "new_active")
+        .await?;
+    writer.expire_active_writer().await;
+    let _ = old.renew_lease().await;
+
+    let _ = old
+        .reset_generation_boundary(
+            "shared broadcaster generation reset",
+            vec![BroadcasterBackend::Native],
+        )
+        .await;
+
+    assert_eq!(old.status_snapshot().await.mode, "retired");
+    assert_eq!(
+        writer.appends().await.len(),
+        2,
+        "retired publishers must not append reset markers"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_active_writer_cannot_return_replay_boundary_after_new_promotion() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    old.promote(vec![BroadcasterBackend::Native], "old_active")
+        .await?;
+    new.promote(vec![BroadcasterBackend::Native], "new_active")
+        .await?;
+
+    let Err(error) = old.replay_boundary().await else {
+        return Err(anyhow!("stale old writer must not serve a replay boundary"));
+    };
+
+    assert!(format!("{error:#}").contains("stale Redis broadcaster writer"));
+    assert_eq!(old.status_snapshot().await.mode, "retired");
+    assert_eq!(
+        writer.appends().await.len(),
+        2,
+        "replay-boundary fencing must not append Redis entries"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_active_writer_cannot_reset_generation_or_repromote() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    old.promote(vec![BroadcasterBackend::Native], "old_active")
+        .await?;
+    new.promote(vec![BroadcasterBackend::Native], "new_active")
+        .await?;
+
+    let Err(error) = old
+        .reset_generation_boundary(
+            "shared broadcaster generation reset",
+            vec![BroadcasterBackend::Native],
+        )
+        .await
+    else {
+        return Err(anyhow!(
+            "stale old writer must not reset or re-promote a writer generation"
+        ));
+    };
+
+    assert!(format!("{error:#}").contains("stale Redis broadcaster writer"));
+    assert_eq!(old.status_snapshot().await.mode, "retired");
+    assert_eq!(
+        writer
+            .appends()
+            .await
+            .iter()
+            .map(|append| (append.entry.stream_id.clone(), append.entry.message_seq))
+            .collect::<Vec<_>>(),
+        vec![
+            ("chain-1-stream-1".to_string(), 1),
+            ("chain-1-stream-2".to_string(), 1)
+        ],
+        "stale reset must not append a new generation marker"
+    );
+    Ok(())
+}
+
+#[test]
+fn promotion_lua_stores_gsub_result_before_table_insert() {
+    assert!(
+        super::PROMOTE_WRITER_SCRIPT.contains("local value = string.gsub"),
+        "Lua string.gsub returns value and replacement count; promotion must store only the value"
+    );
+    assert!(
+        !super::PROMOTE_WRITER_SCRIPT.contains("table.insert(command, string.gsub"),
+        "passing string.gsub directly to table.insert expands both Lua return values"
+    );
+}
+
+#[test]
+fn publisher_modes_serialize_as_stable_lowercase_strings() {
+    assert_eq!(BroadcasterRedisPublisherMode::Passive.as_str(), "passive");
+    assert_eq!(BroadcasterRedisPublisherMode::Active.as_str(), "active");
+    assert_eq!(BroadcasterRedisPublisherMode::Retired.as_str(), "retired");
+    assert_eq!(
+        BroadcasterRedisPublisherMode::Unhealthy.as_str(),
+        "unhealthy"
+    );
+}
+
+#[tokio::test]
 async fn replay_boundary_starts_before_first_delta_without_publishing_snapshot() -> Result<()> {
     let writer = FakeRedisWriter::default();
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
 
     let boundary = publisher.replay_boundary().await?;
 
@@ -107,10 +377,14 @@ async fn replay_boundary_starts_before_first_delta_without_publishing_snapshot()
     assert_eq!(boundary.stream_id, "chain-1-stream-1");
     assert_eq!(boundary.snapshot_id, "chain-1-snapshot-1");
     assert_eq!(boundary.generation, 1);
-    assert_eq!(boundary.exclusive_message_seq, 0);
-    assert_eq!(boundary.exclusive_entry_id(), "1-0");
+    assert_eq!(boundary.exclusive_message_seq, 1);
+    assert_eq!(boundary.exclusive_entry_id(), "1-1");
     assert!(
-        writer.appends().await.is_empty(),
+        writer
+            .appends()
+            .await
+            .iter()
+            .all(|append| append.entry.kind == BroadcasterMessageKind::Progress),
         "HTTP snapshots are the bootstrap source; Redis must not receive full snapshot entries"
     );
     Ok(())
@@ -121,11 +395,13 @@ async fn publishes_live_updates_and_heartbeats_as_deltas_after_replay_boundary()
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let rfq_cache = ready_cache(BroadcasterBackend::Rfq, 20, "rfq-1").await?;
     let writer = FakeRedisWriter::default();
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+            "active_writer_promoted",
+        )
+        .await?;
     let boundary = publisher.replay_boundary().await?;
 
     let native_update = raw_cache
@@ -152,19 +428,20 @@ async fn publishes_live_updates_and_heartbeats_as_deltas_after_replay_boundary()
             .iter()
             .map(|append| append.entry.message_seq)
             .collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        vec![1, 2, 3, 4]
     );
-    assert_eq!(appends[0].entry.kind.as_str(), "update");
-    assert_eq!(appends[0].entry.backend_scope, "native");
-    assert_eq!(appends[0].entry.block_number, Some(11));
+    assert_eq!(appends[0].entry.kind.as_str(), "progress");
     assert_eq!(appends[1].entry.kind.as_str(), "update");
-    assert_eq!(appends[1].entry.backend_scope, "rfq");
-    assert_eq!(appends[1].entry.block_number, None);
-    assert_eq!(appends[2].entry.kind.as_str(), "heartbeat");
-    assert_eq!(appends[2].entry.backend_scope, "native");
-    assert_eq!(appends[2].entry.stream_id, boundary.stream_id);
+    assert_eq!(appends[1].entry.backend_scope, "native");
+    assert_eq!(appends[1].entry.block_number, Some(11));
+    assert_eq!(appends[2].entry.kind.as_str(), "update");
+    assert_eq!(appends[2].entry.backend_scope, "rfq");
+    assert_eq!(appends[2].entry.block_number, None);
+    assert_eq!(appends[3].entry.kind.as_str(), "heartbeat");
+    assert_eq!(appends[3].entry.backend_scope, "native");
+    assert_eq!(appends[3].entry.stream_id, boundary.stream_id);
     assert_eq!(
-        appends[2].entry.snapshot_id.as_deref(),
+        appends[3].entry.snapshot_id.as_deref(),
         Some(boundary.snapshot_id.as_str())
     );
     Ok(())
@@ -175,11 +452,10 @@ async fn append_retry_success_preserves_message_sequence_order() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
     writer.fail_next_appends(1).await;
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
 
     let update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
@@ -195,9 +471,9 @@ async fn append_retry_success_preserves_message_sequence_order() -> Result<()> {
             .iter()
             .map(|append| append.entry.message_seq)
             .collect::<Vec<_>>(),
-        vec![1]
+        vec![1, 2]
     );
-    assert_eq!(appends[0].entry.kind.as_str(), "update");
+    assert_eq!(appends[1].entry.kind.as_str(), "update");
     Ok(())
 }
 
@@ -206,11 +482,10 @@ async fn readiness_triggering_update_is_published_as_a_delta() -> Result<()> {
     let rfq_cache =
         BroadcasterSnapshotCache::new(Chain::Ethereum.id(), vec![BroadcasterBackend::Rfq]);
     let writer = FakeRedisWriter::default();
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Rfq], "active_writer_promoted")
+        .await?;
     let rfq_update = rfq_cache
         .apply_update(&update(BroadcasterBackend::Rfq, 20, "rfq-1"))
         .await?;
@@ -220,9 +495,9 @@ async fn readiness_triggering_update_is_published_as_a_delta() -> Result<()> {
         .await?;
 
     let appends = writer.appends().await;
-    assert_eq!(appends.len(), 1);
-    assert_eq!(appends[0].entry.kind.as_str(), "update");
-    assert_eq!(appends[0].entry.backend_scope, "rfq");
+    assert_eq!(appends.len(), 2);
+    assert_eq!(appends[1].entry.kind.as_str(), "update");
+    assert_eq!(appends[1].entry.backend_scope, "rfq");
     Ok(())
 }
 
@@ -230,12 +505,11 @@ async fn readiness_triggering_update_is_published_as_a_delta() -> Result<()> {
 async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
     writer.fail_next_appends(100).await;
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
 
     let failed_update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
@@ -279,16 +553,16 @@ async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()>
     assert!(format!("{error:#}").contains("publisher is unhealthy"));
     assert_eq!(
         writer.appends().await.len(),
-        0,
+        1,
         "a blocked publisher must not append into a Redis-only generation"
     );
 
     publisher
-        .reset_generation(
+        .reset_generation_boundary(
             "shared broadcaster generation reset",
             vec![BroadcasterBackend::Native],
         )
-        .await;
+        .await?;
     let reset_status = publisher.status_snapshot().await;
     assert!(reset_status.healthy);
     assert_eq!(reset_status.generation_reset_count, 1);
@@ -342,11 +616,10 @@ async fn stalled_append_exhausts_retry_window() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
     writer.delay_appends(Duration::from_millis(50)).await;
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
 
     let update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
@@ -365,7 +638,7 @@ async fn stalled_append_exhausts_retry_window() -> Result<()> {
     assert_eq!(failed_status.generation_reset_count, 0);
     assert_eq!(failed_status.retry_exhaustion_count, 1);
     assert!(failed_status.replay_boundary.is_none());
-    assert!(writer.appends().await.is_empty());
+    assert_eq!(writer.appends().await.len(), 1);
     Ok(())
 }
 
@@ -373,11 +646,10 @@ async fn stalled_append_exhausts_retry_window() -> Result<()> {
 async fn publish_rejects_message_sequence_overflow() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
-    let publisher = BroadcasterRedisPublisher::new_with_initial_generation(
-        publisher_config(),
-        Arc::new(writer.clone()),
-        1,
-    );
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
     publisher.inner.lock().await.next_message_seq = u64::MAX;
 
     let update = raw_cache
@@ -394,7 +666,7 @@ async fn publish_rejects_message_sequence_overflow() -> Result<()> {
     let failed_status = publisher.status_snapshot().await;
     assert!(!failed_status.healthy);
     assert_eq!(failed_status.retry_exhaustion_count, 0);
-    assert!(writer.appends().await.is_empty());
+    assert_eq!(writer.appends().await.len(), 1);
     Ok(())
 }
 
@@ -415,39 +687,6 @@ fn redis_entry_id_uses_generation_and_message_sequence() -> Result<()> {
     };
 
     assert_eq!(redis_entry_id(&entry)?, "42-7");
-    Ok(())
-}
-
-#[test]
-fn next_generation_starts_after_retained_redis_stream_top() -> Result<()> {
-    assert_eq!(next_generation_after_entry_id("42-7")?, 43);
-    assert_eq!(next_generation_after_entry_id("0-0")?, 1);
-    assert!(next_generation_after_entry_id("not-an-entry-id").is_err());
-    Ok(())
-}
-
-#[test]
-fn redis_xadd_command_uses_configured_maxlen() -> Result<()> {
-    let entry = BroadcasterRedisStreamEntry {
-        schema_version: "1".to_string(),
-        chain_id: Chain::Ethereum.id(),
-        stream_id: "chain-1-stream-42".to_string(),
-        message_seq: 7,
-        kind: simulator_core::broadcaster::BroadcasterMessageKind::Update,
-        snapshot_id: None,
-        backend_scope: "native".to_string(),
-        block_number: Some(11),
-        observed_timestamp_ms: None,
-        event_time_ms: 1_710_000_000_123,
-        payload_json: "{}".to_string(),
-    };
-
-    let command = redis_xadd_command("stream:test", Some(1_000), &entry)?;
-    let packed = String::from_utf8(command.get_packed_command())?;
-
-    assert!(packed.contains("MAXLEN"));
-    assert!(packed.contains("\r\n~\r\n"));
-    assert!(packed.contains("\r\n1000\r\n"));
     Ok(())
 }
 
@@ -542,6 +781,9 @@ struct FakeRedisWriter {
 #[derive(Debug, Default)]
 struct FakeRedisWriterState {
     appends: Vec<CapturedAppend>,
+    active_token: Option<String>,
+    active_generation: u64,
+    lease_expired: bool,
     fail_next_appends: usize,
     append_delay: Option<Duration>,
     append_attempt_count: usize,
@@ -563,14 +805,55 @@ impl FakeRedisWriter {
     async fn appends(&self) -> Vec<CapturedAppend> {
         self.inner.lock().await.appends.clone()
     }
+
+    async fn expire_active_writer(&self) {
+        let mut guard = self.inner.lock().await;
+        guard.active_token = None;
+        guard.lease_expired = true;
+    }
 }
 
 impl RedisStreamWriter for FakeRedisWriter {
-    fn append<'a>(
+    fn promote<'a>(
         &'a self,
-        _stream_key: &'a str,
-        _maxlen: Option<u64>,
-        entry: &'a BroadcasterRedisStreamEntry,
+        command: super::RedisPromotionCommand<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<super::RedisPromotionResult>> {
+        Box::pin(async move {
+            let mut guard = self.inner.lock().await;
+            if let Some(expected_token) = command.expected_writer_token {
+                if guard.lease_expired {
+                    return Err(anyhow!("stale Redis broadcaster writer token"));
+                }
+                if guard.active_token.is_some()
+                    && (guard.active_token.as_deref() != Some(expected_token)
+                        || Some(guard.active_generation) != command.expected_generation)
+                {
+                    return Err(anyhow!("stale Redis broadcaster writer token"));
+                }
+                if guard.active_token.is_none() {
+                    guard.active_generation = guard
+                        .active_generation
+                        .max(command.expected_generation.unwrap_or_default());
+                }
+            }
+            guard.active_generation = guard.active_generation.saturating_add(1);
+            guard.active_token = Some(command.writer_token.to_string());
+            guard.lease_expired = false;
+            let generation = guard.active_generation;
+            let entry_id = format!("{generation}-1");
+            guard.appends.push(CapturedAppend {
+                entry: entry_from_fields(command.marker_fields, generation)?,
+            });
+            Ok(super::RedisPromotionResult {
+                generation,
+                entry_id,
+            })
+        })
+    }
+
+    fn append_fenced<'a>(
+        &'a self,
+        command: super::RedisAppendCommand<'a>,
     ) -> futures::future::BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let delay = self.inner.lock().await.append_delay;
@@ -579,17 +862,57 @@ impl RedisStreamWriter for FakeRedisWriter {
             }
             let mut guard = self.inner.lock().await;
             guard.append_attempt_count = guard.append_attempt_count.saturating_add(1);
+            if guard.lease_expired
+                || (guard.active_token.is_some()
+                    && (guard.active_token.as_deref() != Some(command.writer_token)
+                        || guard.active_generation != command.generation))
+            {
+                return Err(anyhow!("stale Redis broadcaster writer token"));
+            }
             if guard.fail_next_appends > 0 {
                 guard.fail_next_appends -= 1;
                 return Err(anyhow!("planned append failure"));
             }
-            let entry_id = format!("1000-{}", guard.appends.len());
+            let entry_id = redis_entry_id(command.entry)?;
             guard.appends.push(CapturedAppend {
-                entry: entry.clone(),
+                entry: command.entry.clone(),
             });
             Ok(entry_id)
         })
     }
+
+    fn renew_writer<'a>(
+        &'a self,
+        command: super::RedisRenewCommand<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let guard = self.inner.lock().await;
+            if guard.lease_expired
+                || (guard.active_token.is_some()
+                    && (guard.active_token.as_deref() != Some(command.writer_token)
+                        || guard.active_generation != command.generation))
+            {
+                return Err(anyhow!("stale Redis broadcaster writer token"));
+            }
+            Ok(())
+        })
+    }
+}
+
+fn entry_from_fields(
+    fields: &[(String, String)],
+    generation: u64,
+) -> Result<BroadcasterRedisStreamEntry> {
+    let mut value = serde_json::Map::new();
+    for (field, field_value) in fields {
+        value.insert(
+            field.clone(),
+            serde_json::Value::String(
+                field_value.replace(super::GENERATION_PLACEHOLDER, &generation.to_string()),
+            ),
+        );
+    }
+    serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
 }
 
 async fn ready_cache(

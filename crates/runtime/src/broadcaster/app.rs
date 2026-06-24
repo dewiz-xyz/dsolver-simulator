@@ -92,9 +92,9 @@ impl BroadcasterAppState {
         if let Some(rfq_service) = &self.rfq_service {
             snapshot = combine_status_snapshots(snapshot, rfq_service.status_snapshot().await);
         }
-        let redis_status = self.redis_publisher.status_snapshot().await;
-        if !redis_status.healthy && snapshot.readiness == BroadcasterReadiness::Ready {
-            snapshot.readiness = BroadcasterReadiness::RedisPublisherUnhealthy;
+        let redis_status = self.redis_publisher.verified_status_snapshot().await;
+        if snapshot.readiness == BroadcasterReadiness::Ready {
+            snapshot.readiness = redis_readiness(redis_status.mode);
         }
         snapshot.redis_publisher = Some(redis_status);
         snapshot
@@ -152,21 +152,13 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
 
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
-    let (redis_publisher, initial_generation) = build_redis_publisher(chain.id()).await?;
-    let raw_cache = BroadcasterSnapshotCache::new_with_initial_generation(
-        chain.id(),
-        raw_backends.clone(),
-        initial_generation,
-    );
+    let redis_publisher = build_redis_publisher(chain.id()).await?;
+    let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
-    let rfq_cache = rfq_backends.as_ref().map(|backends| {
-        BroadcasterSnapshotCache::new_with_initial_generation(
-            chain.id(),
-            backends.clone(),
-            initial_generation,
-        )
-    });
+    let rfq_cache = rfq_backends
+        .as_ref()
+        .map(|backends| BroadcasterSnapshotCache::new(chain.id(), backends.clone()));
     let rfq_upstream_state = rfq_cache
         .as_ref()
         .map(|_| BroadcasterUpstreamState::default());
@@ -217,6 +209,9 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
         None => vec![raw_service.clone()],
     };
+    // New broadcasters start passive and warm their caches first. This task is
+    // the local promotion loop; /status stays non-ready until it wins the fence.
+    spawn_promotion_task(reset_services.clone(), Duration::from_secs(1));
     spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
@@ -289,16 +284,23 @@ fn combine_readiness(
     left.max(right)
 }
 
-async fn build_redis_publisher(chain_id: u64) -> Result<(Arc<BroadcasterRedisPublisher>, u64)> {
+fn redis_readiness(mode: &str) -> BroadcasterReadiness {
+    match mode {
+        "active" => BroadcasterReadiness::Ready,
+        "passive" => BroadcasterReadiness::RedisPublisherPassive,
+        "retired" => BroadcasterReadiness::RedisPublisherRetired,
+        _ => BroadcasterReadiness::RedisPublisherUnhealthy,
+    }
+}
+
+async fn build_redis_publisher(chain_id: u64) -> Result<Arc<BroadcasterRedisPublisher>> {
     let redis_config = load_broadcaster_redis_config();
     let writer = Arc::new(TokioRedisStreamWriter::connect(&redis_config.redis_url).await?);
-    let initial_generation = writer.next_generation(&redis_config.stream_key).await?;
-    let publisher = Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+    let publisher = Arc::new(BroadcasterRedisPublisher::new(
         BroadcasterRedisPublisherConfig::from_redis_config(&redis_config, chain_id),
         writer,
-        initial_generation,
     ));
-    Ok((publisher, initial_generation))
+    Ok(publisher)
 }
 
 fn log_memory_config(memory: MemoryConfig) {
@@ -479,6 +481,33 @@ fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Durati
                     )
                     .await;
                     break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
+                .await
+            {
+                Ok(Some(boundary)) => {
+                    info!(
+                        stream_id = boundary.stream_id.as_str(),
+                        snapshot_id = boundary.snapshot_id.as_str(),
+                        generation = boundary.generation,
+                        "Broadcaster active writer promoted"
+                    );
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    info!(error = %error, "Broadcaster active writer promotion skipped");
                 }
             }
         }

@@ -25,6 +25,8 @@ use super::redis_publisher::BroadcasterRedisPublisherStatus;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BroadcasterReadiness {
     Ready,
+    RedisPublisherPassive,
+    RedisPublisherRetired,
     RedisPublisherUnhealthy,
     SnapshotWarmingUp,
     UpstreamDisconnected,
@@ -35,6 +37,8 @@ impl BroadcasterReadiness {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
+            Self::RedisPublisherPassive => "redis_publisher_passive",
+            Self::RedisPublisherRetired => "redis_publisher_retired",
             Self::RedisPublisherUnhealthy => "redis_publisher_unhealthy",
             Self::Ready => "ready",
         }
@@ -220,13 +224,16 @@ impl BroadcasterSnapshotCache {
         }
     }
 
-    pub async fn reset_generation(&self) {
+    pub async fn reset_to_generation(&self, generation: u64) {
         let mut guard = self.inner.write().await;
-        guard.generation = guard.generation.saturating_add(1);
-        guard.stream_id = format_stream_id(self.chain_id, guard.generation);
-        guard.snapshot_id = format_snapshot_id(self.chain_id, guard.generation);
+        Self::relabel_generation_locked(self.chain_id, &mut guard, generation);
         guard.partitions.clear();
         guard.known_backends.clear();
+    }
+
+    pub async fn relabel_generation(&self, generation: u64) {
+        let mut guard = self.inner.write().await;
+        Self::relabel_generation_locked(self.chain_id, &mut guard, generation);
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<BroadcasterUpdateMessage> {
@@ -422,6 +429,17 @@ impl BroadcasterSnapshotCache {
                 .and_then(|partition| partition.block_number)
                 .is_some()
         })
+    }
+
+    fn relabel_generation_locked(
+        chain_id: u64,
+        guard: &mut BroadcasterSnapshotCacheData,
+        generation: u64,
+    ) {
+        let generation = generation.max(1);
+        guard.generation = generation;
+        guard.stream_id = format_stream_id(chain_id, generation);
+        guard.snapshot_id = format_snapshot_id(chain_id, generation);
     }
 }
 
@@ -2068,13 +2086,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_resets_generation_on_reset() -> Result<()> {
+    async fn cache_resets_to_redis_owned_generation() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         cache.apply_update(&native_only_update()).await?;
         let snapshot_before = cache.export_snapshot(8_388_608).await?;
         assert_eq!(snapshot_before.snapshot_id, "chain-1-snapshot-1");
 
-        cache.reset_generation().await;
+        cache.reset_to_generation(2).await;
         let snapshot_after = cache.export_snapshot(8_388_608).await?;
         assert_eq!(snapshot_after.stream_id, "chain-1-stream-2");
         assert_eq!(snapshot_after.snapshot_id, "chain-1-snapshot-2");

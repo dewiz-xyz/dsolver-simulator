@@ -1117,7 +1117,7 @@ mod tests {
     use crate::models::state::{StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterRedisStreamEntry};
+    use simulator_core::broadcaster::BroadcasterBackend;
     use tycho_simulation::tycho_common::models::Chain;
 
     #[test]
@@ -1179,19 +1179,10 @@ mod tests {
     #[derive(Debug)]
     struct StreamTestRedisWriter;
 
-    impl RedisStreamWriter for StreamTestRedisWriter {
-        fn append<'a>(
-            &'a self,
-            _stream_key: &'a str,
-            _maxlen: Option<u64>,
-            entry: &'a BroadcasterRedisStreamEntry,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<String>> {
-            Box::pin(async move { Ok(format!("1-{}", entry.message_seq)) })
-        }
-    }
+    impl RedisStreamWriter for StreamTestRedisWriter {}
 
     fn test_redis_publisher(chain_id: u64) -> Arc<BroadcasterRedisPublisher> {
-        Arc::new(BroadcasterRedisPublisher::new_with_initial_generation(
+        Arc::new(BroadcasterRedisPublisher::new(
             BroadcasterRedisPublisherConfig {
                 stream_key: "stream:test".to_string(),
                 chain_id,
@@ -1199,7 +1190,6 @@ mod tests {
                 maxlen: None,
             },
             Arc::new(StreamTestRedisWriter),
-            1,
         ))
     }
 
