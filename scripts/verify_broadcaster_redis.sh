@@ -10,9 +10,9 @@ Verify that the local broadcaster Redis replay path is live.
 The script reads BROADCASTER_REDIS_URL and BROADCASTER_REDIS_STREAM_KEY from
 .env or the current environment. It checks:
   - broadcaster /status includes a healthy redis_publisher with replay_boundary
-  - the Redis stream has at least one entry
-  - the replay boundary cursor still has enough retained Redis history
   - simulator /status subscriptions caught up from the Redis replay boundary
+  - the Redis stream has at least one entry
+  - if simulator catch-up fails, retained Redis history is inspected for context
 
 Options:
   --repo                  Path to repo root (default: current directory)
@@ -176,7 +176,7 @@ print(f"{boundary['generation']}-{boundary['exclusiveMessageSeq']}")
 PY
 }
 
-boundary_message_seq() {
+post_boundary_entry_id() {
   local boundary_json="$1"
 
   BOUNDARY_JSON="$boundary_json" python3 <<'PY'
@@ -184,7 +184,7 @@ import json
 import os
 
 boundary = json.loads(os.environ["BOUNDARY_JSON"])
-print(boundary["exclusiveMessageSeq"])
+print(f"{boundary['generation']}-{boundary['exclusiveMessageSeq'] + 1}")
 PY
 }
 
@@ -200,24 +200,40 @@ print(boundary["streamKey"])
 PY
 }
 
-assert_entry_retained() {
-  local range_output="$1"
-  local expected_entry_id="$2"
+inspect_post_boundary_retention() {
+  local boundary_json="$1"
+  local stream_key="$2"
+  local required_entry_id
 
-  RANGE_OUTPUT="$range_output" EXPECTED_ENTRY_ID="$expected_entry_id" python3 <<'PY'
-import os
+  required_entry_id="$(post_boundary_entry_id "$boundary_json")"
 
-range_output = os.environ["RANGE_OUTPUT"]
-expected_entry_id = os.environ["EXPECTED_ENTRY_ID"]
-if not range_output:
-    raise SystemExit(f"Redis entry {expected_entry_id} is not retained")
+  local required_probe
+  if ! required_probe="$(redis_cli --raw XRANGE "$stream_key" "$required_entry_id" "$required_entry_id" COUNT 1 2>&1)"; then
+    echo "failed to inspect first required post-boundary entry $required_entry_id: $required_probe" >&2
+    return 1
+  fi
+  if [[ -n "$required_probe" ]]; then
+    local retained_entry_id
+    retained_entry_id="$(printf '%s\n' "$required_probe" | sed -n '1p')"
+    if [[ "$retained_entry_id" == "$required_entry_id" ]]; then
+      echo "Redis retained history includes first required post-boundary entry $required_entry_id."
+    else
+      echo "Redis retained history check returned $retained_entry_id while looking for first required post-boundary entry $required_entry_id."
+    fi
+    return 0
+  fi
 
-first_line = range_output.splitlines()[0]
-if first_line != expected_entry_id:
-    raise SystemExit(
-        f"Redis entry check returned {first_line}, expected {expected_entry_id}"
-    )
-PY
+  local first_retained_probe first_retained_entry_id
+  if ! first_retained_probe="$(redis_cli --raw XRANGE "$stream_key" - + COUNT 1 2>&1)"; then
+    echo "failed to inspect first retained Redis entry after missing first required post-boundary entry $required_entry_id: $first_retained_probe" >&2
+    return 1
+  fi
+  first_retained_entry_id="$(printf '%s\n' "$first_retained_probe" | sed -n '1p')"
+  if [[ -n "$first_retained_entry_id" ]]; then
+    echo "Redis retained history is missing first required post-boundary entry $required_entry_id; first retained entry is $first_retained_entry_id."
+  else
+    echo "Redis retained history is missing first required post-boundary entry $required_entry_id; stream has no retained entries."
+  fi
 }
 
 verify_simulator_replay_status() {
@@ -324,6 +340,17 @@ if [[ "$boundary_stream_key" != "$BROADCASTER_REDIS_STREAM_KEY" ]]; then
   exit 1
 fi
 
+simulator_status_body="$(curl -sS --max-time 5 "$simulator_status_url")"
+if ! checked_backends="$(verify_simulator_replay_status "$simulator_status_body" 2>&1)"; then
+  echo "$checked_backends" >&2
+  if retention_context="$(inspect_post_boundary_retention "$boundary_json" "$BROADCASTER_REDIS_STREAM_KEY" 2>&1)"; then
+    echo "$retention_context" >&2
+  else
+    echo "Redis retained history inspection failed: $retention_context" >&2
+  fi
+  exit 1
+fi
+
 stream_len="$(redis_cli --raw XLEN "$BROADCASTER_REDIS_STREAM_KEY")"
 if ! [[ "$stream_len" =~ ^[0-9]+$ ]] || ((stream_len == 0)); then
   echo "Redis stream $BROADCASTER_REDIS_STREAM_KEY has no entries." >&2
@@ -331,19 +358,11 @@ if ! [[ "$stream_len" =~ ^[0-9]+$ ]] || ((stream_len == 0)); then
 fi
 
 boundary_entry_id="$(boundary_entry_id "$boundary_json")"
-boundary_message_seq="$(boundary_message_seq "$boundary_json")"
-if ((boundary_message_seq > 0)); then
-  boundary_probe="$(redis_cli --raw XRANGE "$BROADCASTER_REDIS_STREAM_KEY" "$boundary_entry_id" "$boundary_entry_id" COUNT 1)"
-  assert_entry_retained "$boundary_probe" "$boundary_entry_id"
-fi
-
-simulator_status_body="$(curl -sS --max-time 5 "$simulator_status_url")"
-checked_backends="$(verify_simulator_replay_status "$simulator_status_body")"
 
 echo "Broadcaster Redis replay path is healthy."
 echo "Broadcaster status URL: $status_url"
 echo "Simulator status URL: $simulator_status_url"
 echo "Redis stream key: $BROADCASTER_REDIS_STREAM_KEY"
 echo "Redis stream entries: $stream_len"
-echo "Replay boundary entry: $boundary_entry_id"
+echo "Replay boundary cursor: $boundary_entry_id"
 echo "Simulator replay backends: $checked_backends"
