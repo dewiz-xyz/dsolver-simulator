@@ -28,6 +28,8 @@ Verify the broadcaster HTTP snapshot plus Redis delta replay path while services
 scripts/verify_broadcaster_redis.sh --repo .
 ```
 
+The replay contract is: simulators bootstrap from the active broadcaster HTTP snapshot session, then read Redis deltas after the returned replay boundary. Only the active broadcaster should append deltas or serve snapshot sessions; passive, retired, and unhealthy broadcasters fail closed for those operations.
+
 Disable baseline comparison for a one-off run:
 
 ```bash
@@ -37,7 +39,7 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
 ## What the analyzer does
 
 - reuses the existing local simulator if it is already responding, otherwise starts the local stack with the repo lifecycle helper
-- starts helper-managed Redis first when `BROADCASTER_REDIS_URL` is loopback `redis://`, then starts `dsolver-tycho-broadcaster-service` when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster or Redis URLs are treated as externally managed, and Redis carries broadcaster deltas after each HTTP snapshot replay boundary
+- starts helper-managed Redis first when `BROADCASTER_REDIS_URL` is loopback `redis://`, then starts `dsolver-tycho-broadcaster-service` when `TYCHO_BROADCASTER_URL` points at local loopback, then starts `dsolver-simulator-service`; non-local broadcaster or Redis URLs are treated as externally managed, and Redis carries active-broadcaster deltas after each HTTP snapshot replay boundary
 - waits for `/status` service health, then confirms native readiness first and includes VM and RFQ readiness when those backends are enabled
 - allows longer VM or RFQ warmups on fresh starts; budget up to about 10 minutes before assuming either backend is stuck
 - runs a balanced `/simulate` sweep across representative pairs
@@ -60,6 +62,7 @@ Main artifacts:
 - `summary.md`: human-readable findings and investigation hints
 - `evidence/`: readiness snapshots, sampled request/response bodies, and simulator/broadcaster log excerpts
 - Redis replay status from simulator `/status` subscriptions is preserved in `report.json` and summarized in `summary.md` when present.
+- Replay gaps or Redis generation crossings should surface as readiness issues and fresh active-broadcaster snapshot bootstrap attempts, not as stitched Redis-only recovery.
 
 ## Behavior model
 

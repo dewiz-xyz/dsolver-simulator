@@ -85,7 +85,7 @@ Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
 - `CHAIN_ID` for chain selection from `simulator-manifest.toml`
-- `TYCHO_BROADCASTER_URL` pointing at the broadcaster HTTP base URL, for example `http://127.0.0.1:3001`
+- `TYCHO_BROADCASTER_URL` pointing at the active broadcaster HTTP base URL, for example `http://127.0.0.1:3001`
 - `BROADCASTER_REDIS_URL` and `BROADCASTER_REDIS_STREAM_KEY` for the Redis stream that carries broadcaster deltas after each HTTP snapshot replay boundary
 
 Common optional inputs:
@@ -106,6 +106,19 @@ Common optional inputs:
 
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
+
+## Runtime Handoff Contract
+
+The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is not the full-state bootstrap store.
+
+Broadcaster deployments use four modes:
+
+- `Passive` warms upstream/cache state, but does not append Redis deltas or serve snapshot sessions.
+- `Active` is the only Redis writer and the only snapshot-session authority for an environment and chain.
+- `Retired` rejects appends and snapshot sessions after it has been replaced.
+- `Unhealthy` fails closed until it recovers or is replaced.
+
+Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. Simulators that hit a replay gap or need to cross Redis generations create a fresh HTTP snapshot session from the current active broadcaster instead of stitching generations from Redis. The handoff uses independent `XREAD` cursors per simulator process; it does not use Redis consumer groups or per-deployment stream keys.
 
 ## API Surface
 
