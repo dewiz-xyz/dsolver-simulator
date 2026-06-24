@@ -128,6 +128,8 @@ if not isinstance(publisher, dict):
     raise SystemExit("broadcaster /status did not include redis_publisher")
 if publisher.get("healthy") is not True:
     raise SystemExit("broadcaster redis_publisher is not healthy")
+if publisher.get("mode") != "active":
+    raise SystemExit("broadcaster redis_publisher is not active")
 boundary = publisher.get("replay_boundary")
 if not isinstance(boundary, dict):
     raise SystemExit("broadcaster redis_publisher has no replay_boundary")

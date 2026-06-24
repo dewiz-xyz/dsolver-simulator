@@ -13,9 +13,14 @@ TYCHO_BROADCASTER_URL=https://broadcaster.example/prod/base
 [[ "$(derive_status_url)" == "https://broadcaster.example/prod/base/status" ]]
 unset TYCHO_BROADCASTER_URL
 
-status_body='{"status":"ready","chain_id":8453,"redis_publisher":{"healthy":true,"stream_key":"dsolver:broadcaster:local:8453:events","stream_id":"chain-8453-stream-2","snapshot_id":"chain-8453-snapshot-2","replay_boundary":{"streamKey":"dsolver:broadcaster:local:8453:events","streamId":"chain-8453-stream-2","snapshotId":"chain-8453-snapshot-2","generation":2,"exclusiveMessageSeq":14}}}'
+status_body='{"status":"ready","chain_id":8453,"redis_publisher":{"healthy":true,"mode":"active","stream_key":"dsolver:broadcaster:local:8453:events","stream_id":"chain-8453-stream-2","snapshot_id":"chain-8453-snapshot-2","replay_boundary":{"streamKey":"dsolver:broadcaster:local:8453:events","streamId":"chain-8453-stream-2","snapshotId":"chain-8453-snapshot-2","generation":2,"exclusiveMessageSeq":14}}}'
 boundary_json="$(extract_replay_boundary "$status_body")"
 [[ "$(boundary_entry_id "$boundary_json")" == "2-14" ]]
+
+if extract_replay_boundary "${status_body/\"mode\":\"active\"/\"mode\":\"passive\"}" >/dev/null 2>&1; then
+  echo "expected passive redis_publisher mode to fail replay boundary parsing" >&2
+  exit 1
+fi
 
 if extract_replay_boundary "${status_body/exclusiveMessageSeq/missingMessageSeq}" >/dev/null 2>&1; then
   echo "expected missing exclusiveMessageSeq to fail replay boundary parsing" >&2
