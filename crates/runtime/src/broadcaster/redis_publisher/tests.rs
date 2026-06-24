@@ -19,8 +19,8 @@ use tycho_simulation::tycho_common::Bytes;
 
 use super::{
     redis_entry_fields, redis_entry_id, redis_stream_entry_matches_reply,
-    BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode,
-    RedisStreamWriter,
+    writer_lease_ttl_for_heartbeat_interval, BroadcasterRedisPublisher,
+    BroadcasterRedisPublisherConfig, BroadcasterRedisPublisherMode, RedisStreamWriter,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{
@@ -249,6 +249,37 @@ async fn lease_loss_retires_active_writer_without_appending() -> Result<()> {
 }
 
 #[tokio::test]
+async fn configured_writer_lease_ttl_is_used_for_all_fenced_writer_commands() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let mut config = publisher_config();
+    config.writer_lease_ttl = Duration::from_secs(180);
+    let publisher = BroadcasterRedisPublisher::new(config, Arc::new(writer.clone()));
+
+    publisher
+        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .await?;
+
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await?;
+    publisher.renew_lease().await?;
+
+    assert_eq!(
+        writer.lease_ttls().await,
+        vec![
+            Duration::from_secs(180),
+            Duration::from_secs(180),
+            Duration::from_secs(180)
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn retired_publisher_does_not_run_generation_reset() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
@@ -360,6 +391,18 @@ fn publisher_modes_serialize_as_stable_lowercase_strings() {
     assert_eq!(
         BroadcasterRedisPublisherMode::Unhealthy.as_str(),
         "unhealthy"
+    );
+}
+
+#[test]
+fn writer_lease_ttl_keeps_a_margin_over_the_heartbeat_interval() {
+    assert_eq!(
+        writer_lease_ttl_for_heartbeat_interval(Duration::from_secs(5)),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        writer_lease_ttl_for_heartbeat_interval(Duration::from_secs(60)),
+        Duration::from_secs(180)
     );
 }
 
@@ -784,6 +827,7 @@ struct FakeRedisWriterState {
     active_token: Option<String>,
     active_generation: u64,
     lease_expired: bool,
+    lease_ttls: Vec<Duration>,
     fail_next_appends: usize,
     append_delay: Option<Duration>,
     append_attempt_count: usize,
@@ -806,6 +850,10 @@ impl FakeRedisWriter {
         self.inner.lock().await.appends.clone()
     }
 
+    async fn lease_ttls(&self) -> Vec<Duration> {
+        self.inner.lock().await.lease_ttls.clone()
+    }
+
     async fn expire_active_writer(&self) {
         let mut guard = self.inner.lock().await;
         guard.active_token = None;
@@ -820,6 +868,7 @@ impl RedisStreamWriter for FakeRedisWriter {
     ) -> futures::future::BoxFuture<'a, Result<super::RedisPromotionResult>> {
         Box::pin(async move {
             let mut guard = self.inner.lock().await;
+            guard.lease_ttls.push(command.lease_ttl);
             if let Some(expected_token) = command.expected_writer_token {
                 if guard.lease_expired {
                     return Err(anyhow!("stale Redis broadcaster writer token"));
@@ -862,6 +911,7 @@ impl RedisStreamWriter for FakeRedisWriter {
             }
             let mut guard = self.inner.lock().await;
             guard.append_attempt_count = guard.append_attempt_count.saturating_add(1);
+            guard.lease_ttls.push(command.lease_ttl);
             if guard.lease_expired
                 || (guard.active_token.is_some()
                     && (guard.active_token.as_deref() != Some(command.writer_token)
@@ -886,7 +936,8 @@ impl RedisStreamWriter for FakeRedisWriter {
         command: super::RedisRenewCommand<'a>,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let guard = self.inner.lock().await;
+            let mut guard = self.inner.lock().await;
+            guard.lease_ttls.push(command.lease_ttl);
             if guard.lease_expired
                 || (guard.active_token.is_some()
                     && (guard.active_token.as_deref() != Some(command.writer_token)
@@ -992,5 +1043,6 @@ fn publisher_config() -> BroadcasterRedisPublisherConfig {
         chain_id: Chain::Ethereum.id(),
         append_retry_window: Duration::from_millis(10),
         maxlen: None,
+        writer_lease_ttl: Duration::from_secs(30),
     }
 }

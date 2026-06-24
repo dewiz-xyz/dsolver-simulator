@@ -1043,6 +1043,7 @@ mod tests {
             chain_id: Chain::Ethereum.id(),
             append_retry_window: Duration::from_millis(1),
             maxlen: None,
+            writer_lease_ttl: Duration::from_secs(30),
         }
     }
 

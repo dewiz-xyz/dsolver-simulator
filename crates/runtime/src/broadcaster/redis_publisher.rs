@@ -23,7 +23,8 @@ use simulator_core::broadcaster::{
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
 const RETRY_BACKOFF_CAP: Duration = Duration::from_millis(200);
-const WRITER_LEASE_TTL: Duration = Duration::from_secs(30);
+const MIN_WRITER_LEASE_TTL: Duration = Duration::from_secs(30);
+const WRITER_LEASE_HEARTBEAT_MULTIPLIER: u32 = 3;
 const STALE_WRITER_MESSAGE: &str = "stale Redis broadcaster writer";
 pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
 
@@ -153,15 +154,21 @@ pub struct BroadcasterRedisPublisherConfig {
     pub chain_id: u64,
     pub append_retry_window: Duration,
     pub maxlen: Option<u64>,
+    pub writer_lease_ttl: Duration,
 }
 
 impl BroadcasterRedisPublisherConfig {
-    pub fn from_redis_config(redis_config: &BroadcasterRedisConfig, chain_id: u64) -> Self {
+    pub fn from_redis_config(
+        redis_config: &BroadcasterRedisConfig,
+        chain_id: u64,
+        heartbeat_interval: Duration,
+    ) -> Self {
         Self {
             stream_key: redis_config.stream_key.clone(),
             chain_id,
             append_retry_window: Duration::from_millis(redis_config.append_retry_window_ms),
             maxlen: redis_config.maxlen,
+            writer_lease_ttl: writer_lease_ttl_for_heartbeat_interval(heartbeat_interval),
         }
     }
 }
@@ -701,7 +708,7 @@ impl BroadcasterRedisPublisher {
                 writer_generation_key: &self.writer_generation_key,
                 writer_token: &self.writer_token,
                 generation: guard.generation,
-                lease_ttl: WRITER_LEASE_TTL,
+                lease_ttl: self.config.writer_lease_ttl,
             })
             .await
         {
@@ -760,7 +767,7 @@ impl BroadcasterRedisPublisher {
                 writer_token: &self.writer_token,
                 expected_writer_token,
                 expected_generation,
-                lease_ttl: WRITER_LEASE_TTL,
+                lease_ttl: self.config.writer_lease_ttl,
                 marker_fields: &marker_fields,
             })
             .await;
@@ -875,7 +882,7 @@ impl BroadcasterRedisPublisher {
                     maxlen: self.config.maxlen,
                     writer_token: &self.writer_token,
                     generation: guard.generation,
-                    lease_ttl: WRITER_LEASE_TTL,
+                    lease_ttl: self.config.writer_lease_ttl,
                     entry,
                 }),
             )
@@ -991,6 +998,12 @@ fn new_writer_token() -> String {
         current_time_ms(),
         rand::thread_rng().gen::<u64>()
     )
+}
+
+pub(super) fn writer_lease_ttl_for_heartbeat_interval(heartbeat_interval: Duration) -> Duration {
+    heartbeat_interval
+        .saturating_mul(WRITER_LEASE_HEARTBEAT_MULTIPLIER)
+        .max(MIN_WRITER_LEASE_TTL)
 }
 
 fn lease_ttl_ms(lease_ttl: Duration) -> u64 {
