@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_redis_replay_boundary_and_cursor() {
+    async fn status_reports_redis_replay_boundary_and_checkpoint() {
         let state = test_state(false, false);
         let boundary = BroadcasterRedisReplayBoundary::new(
             "dsolver:broadcaster:test:1:events",
@@ -463,7 +463,7 @@ mod tests {
             .await;
         state
             .native_broadcaster_subscription
-            .mark_redis_catch_up_cursor("2-14")
+            .mark_redis_catch_up_checkpoint("2-14")
             .await;
 
         let (_status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;

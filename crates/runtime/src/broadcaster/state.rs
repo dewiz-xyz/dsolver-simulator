@@ -341,17 +341,7 @@ impl BroadcasterSnapshotCache {
             return Ok(None);
         }
 
-        let backend_heads = self
-            .configured_backends
-            .iter()
-            .filter_map(|backend| {
-                guard
-                    .partitions
-                    .get(backend)
-                    .and_then(|partition| partition.block_number)
-                    .map(|block_number| BroadcasterBackendHead::new(*backend, block_number))
-            })
-            .collect();
+        let backend_heads = self.backend_heads_locked(&guard);
 
         Ok(Some(BroadcasterPayload::Heartbeat(
             BroadcasterHeartbeat::new(self.chain_id, guard.snapshot_id.clone(), backend_heads)?,
@@ -360,6 +350,11 @@ impl BroadcasterSnapshotCache {
 
     pub fn configured_backends(&self) -> Vec<BroadcasterBackend> {
         self.configured_backends.clone()
+    }
+
+    pub async fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
+        let guard = self.inner.read().await;
+        self.backend_heads_locked(&guard)
     }
 
     pub async fn is_ready(&self) -> bool {
@@ -429,6 +424,22 @@ impl BroadcasterSnapshotCache {
                 .and_then(|partition| partition.block_number)
                 .is_some()
         })
+    }
+
+    fn backend_heads_locked(
+        &self,
+        guard: &BroadcasterSnapshotCacheData,
+    ) -> Vec<BroadcasterBackendHead> {
+        self.configured_backends
+            .iter()
+            .filter_map(|backend| {
+                guard
+                    .partitions
+                    .get(backend)
+                    .and_then(|partition| partition.block_number)
+                    .map(|block_number| BroadcasterBackendHead::new(*backend, block_number))
+            })
+            .collect()
     }
 
     fn relabel_generation_locked(

@@ -3132,7 +3132,7 @@ mod tests {
         subscription
             .mark_bootstrap_complete_with_redis_boundary(test_replay_boundary())
             .await;
-        subscription.mark_redis_catch_up_cursor("1-1").await;
+        subscription.mark_redis_catch_up_checkpoint("1-1").await;
     }
 
     fn test_replay_boundary() -> BroadcasterRedisReplayBoundary {

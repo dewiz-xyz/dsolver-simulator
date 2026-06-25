@@ -24,8 +24,8 @@ use super::{
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress,
-    BroadcasterRedisStreamEntry,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
+    BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -124,7 +124,10 @@ async fn promotion_allocates_generation_and_appends_marker_before_live_updates()
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
 
     let boundary = publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
 
     assert_eq!(boundary.stream_key, "dsolver:broadcaster:test:events");
@@ -143,6 +146,11 @@ async fn promotion_allocates_generation_and_appends_marker_before_live_updates()
     assert_eq!(marker.entry.stream_id, "chain-1-stream-1");
     assert_eq!(marker.entry.message_seq, 1);
     assert_eq!(marker.entry.kind, BroadcasterMessageKind::Progress);
+    let progress = progress_payload(&marker.entry)?;
+    assert!(
+        progress.handoff.is_none(),
+        "first promotion on an empty Redis stream should write a normal marker"
+    );
 
     let update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
@@ -164,15 +172,56 @@ async fn promotion_allocates_generation_and_appends_marker_before_live_updates()
 }
 
 #[tokio::test]
+async fn promotion_after_existing_tail_writes_handoff_marker() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
+        .await?;
+    let old_update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    old.publish_accepted_payload(BroadcasterPayload::Update(old_update))
+        .await?;
+    let old_tail = writer
+        .appends()
+        .await
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("old writer should leave a Redis tail"))?;
+
+    let boundary = new
+        .promote(base_heads([BroadcasterBackend::Native]), "new_active")
+        .await?;
+
+    assert_eq!(boundary.generation, 2);
+    assert_eq!(boundary.exclusive_entry_id(), "2-1");
+    let marker = writer
+        .appends()
+        .await
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("new promotion should append a marker"))?;
+    assert_eq!(redis_entry_id(&marker.entry)?, "2-1");
+    let handoff = progress_payload(&marker.entry)?
+        .handoff
+        .ok_or_else(|| anyhow!("promotion marker should include handoff proof"))?;
+    assert_eq!(handoff.previous_stream_id, old_tail.entry.stream_id);
+    assert_eq!(handoff.previous_entry_id, redis_entry_id(&old_tail.entry)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn second_promoted_writer_fences_old_writer_before_append() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
     let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    old.promote(vec![BroadcasterBackend::Native], "old_active")
+    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
         .await?;
 
-    new.promote(vec![BroadcasterBackend::Native], "new_active")
+    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
         .await?;
     let stale_update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
@@ -226,7 +275,10 @@ async fn lease_loss_retires_active_writer_without_appending() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
     writer.expire_active_writer().await;
 
@@ -257,7 +309,10 @@ async fn configured_writer_lease_ttl_is_used_for_all_fenced_writer_commands() ->
     let publisher = BroadcasterRedisPublisher::new(config, Arc::new(writer.clone()));
 
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
 
     let update = raw_cache
@@ -284,9 +339,9 @@ async fn retired_publisher_does_not_run_generation_reset() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    old.promote(vec![BroadcasterBackend::Native], "old_active")
+    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
         .await?;
-    new.promote(vec![BroadcasterBackend::Native], "new_active")
+    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
         .await?;
     writer.expire_active_writer().await;
     let _ = old.renew_lease().await;
@@ -312,9 +367,9 @@ async fn stale_active_writer_cannot_return_replay_boundary_after_new_promotion()
     let writer = FakeRedisWriter::default();
     let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    old.promote(vec![BroadcasterBackend::Native], "old_active")
+    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
         .await?;
-    new.promote(vec![BroadcasterBackend::Native], "new_active")
+    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
         .await?;
 
     let Err(error) = old.replay_boundary().await else {
@@ -336,9 +391,9 @@ async fn stale_active_writer_cannot_reset_generation_or_repromote() -> Result<()
     let writer = FakeRedisWriter::default();
     let old = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-    old.promote(vec![BroadcasterBackend::Native], "old_active")
+    old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
         .await?;
-    new.promote(vec![BroadcasterBackend::Native], "new_active")
+    new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
         .await?;
 
     let Err(error) = old
@@ -411,7 +466,10 @@ async fn replay_boundary_starts_before_first_delta_without_publishing_snapshot()
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
 
     let boundary = publisher.replay_boundary().await?;
@@ -441,7 +499,7 @@ async fn publishes_live_updates_and_heartbeats_as_deltas_after_replay_boundary()
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
         .promote(
-            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+            base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
             "active_writer_promoted",
         )
         .await?;
@@ -497,7 +555,10 @@ async fn append_retry_success_preserves_message_sequence_order() -> Result<()> {
     writer.fail_next_appends(1).await;
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
 
     let update = raw_cache
@@ -527,7 +588,10 @@ async fn readiness_triggering_update_is_published_as_a_delta() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Rfq], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Rfq]),
+            "active_writer_promoted",
+        )
         .await?;
     let rfq_update = rfq_cache
         .apply_update(&update(BroadcasterBackend::Rfq, 20, "rfq-1"))
@@ -550,7 +614,10 @@ async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()>
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
     writer.fail_next_appends(100).await;
 
@@ -616,14 +683,7 @@ async fn retry_exhaustion_marks_unhealthy_until_generation_reset() -> Result<()>
     let reset_marker = appends_after_reset
         .last()
         .ok_or_else(|| anyhow!("generation reset should publish a Redis progress marker"))?;
-    assert_eq!(reset_marker.entry.stream_id, "chain-1-stream-2");
-    assert_eq!(reset_marker.entry.message_seq, 1);
-    assert_eq!(reset_marker.entry.kind, BroadcasterMessageKind::Progress);
-    assert_eq!(reset_marker.entry.backend_scope, "native");
-    assert!(reset_marker
-        .entry
-        .payload_json
-        .contains("shared broadcaster generation reset"));
+    assert_generation_reset_marker(&reset_marker.entry)?;
 
     let recovered_update = raw_cache
         .apply_update(&update(BroadcasterBackend::Native, 13, "native-4"))
@@ -661,7 +721,10 @@ async fn stalled_append_exhausts_retry_window() -> Result<()> {
     writer.delay_appends(Duration::from_millis(50)).await;
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
 
     let update = raw_cache
@@ -691,7 +754,10 @@ async fn publish_rejects_message_sequence_overflow() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
     publisher
-        .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
         .await?;
     publisher.inner.lock().await.next_message_seq = u64::MAX;
 
@@ -796,6 +862,34 @@ fn redis_xadd_recovery_requires_existing_entry_to_match_exact_fields() -> Result
     Ok(())
 }
 
+fn progress_payload(entry: &BroadcasterRedisStreamEntry) -> Result<BroadcasterProgress> {
+    let envelope: BroadcasterEnvelope = serde_json::from_str(&entry.payload_json)?;
+    let BroadcasterPayload::Progress(progress) = envelope.payload else {
+        return Err(anyhow!("Redis stream entry payload should be progress"));
+    };
+    Ok(progress)
+}
+
+fn assert_no_progress_handoff(entry: &BroadcasterRedisStreamEntry, context: &str) -> Result<()> {
+    assert!(
+        progress_payload(entry)?.handoff.is_none(),
+        "{context} must stay normal progress markers"
+    );
+    Ok(())
+}
+
+fn assert_generation_reset_marker(entry: &BroadcasterRedisStreamEntry) -> Result<()> {
+    assert_eq!(entry.stream_id, "chain-1-stream-2");
+    assert_eq!(entry.message_seq, 1);
+    assert_eq!(entry.kind, BroadcasterMessageKind::Progress);
+    assert_eq!(entry.backend_scope, "native");
+    assert_no_progress_handoff(entry, "shared generation reset markers")?;
+    assert!(entry
+        .payload_json
+        .contains("shared broadcaster generation reset"));
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct CapturedAppend {
     entry: BroadcasterRedisStreamEntry,
@@ -890,8 +984,29 @@ impl RedisStreamWriter for FakeRedisWriter {
             guard.lease_expired = false;
             let generation = guard.active_generation;
             let entry_id = format!("{generation}-1");
+            let previous_tail = guard.appends.last().cloned();
+            let marker_fields =
+                if previous_tail.is_some() && !command.handoff_marker_fields.is_empty() {
+                    command.handoff_marker_fields
+                } else {
+                    command.normal_marker_fields
+                };
+            let previous_stream_id = previous_tail
+                .as_ref()
+                .map(|append| append.entry.stream_id.as_str())
+                .unwrap_or_default();
+            let previous_entry_id = previous_tail
+                .as_ref()
+                .map(|append| redis_entry_id(&append.entry))
+                .transpose()?
+                .unwrap_or_default();
             guard.appends.push(CapturedAppend {
-                entry: entry_from_fields(command.marker_fields, generation)?,
+                entry: entry_from_fields(
+                    marker_fields,
+                    generation,
+                    previous_stream_id,
+                    &previous_entry_id,
+                )?,
             });
             Ok(super::RedisPromotionResult {
                 generation,
@@ -953,15 +1068,16 @@ impl RedisStreamWriter for FakeRedisWriter {
 fn entry_from_fields(
     fields: &[(String, String)],
     generation: u64,
+    previous_stream_id: &str,
+    previous_entry_id: &str,
 ) -> Result<BroadcasterRedisStreamEntry> {
     let mut value = serde_json::Map::new();
     for (field, field_value) in fields {
-        value.insert(
-            field.clone(),
-            serde_json::Value::String(
-                field_value.replace(super::GENERATION_PLACEHOLDER, &generation.to_string()),
-            ),
-        );
+        let field_value = field_value
+            .replace(super::GENERATION_PLACEHOLDER, &generation.to_string())
+            .replace(super::PREVIOUS_STREAM_ID_PLACEHOLDER, previous_stream_id)
+            .replace(super::PREVIOUS_ENTRY_ID_PLACEHOLDER, previous_entry_id);
+        value.insert(field.clone(), serde_json::Value::String(field_value));
     }
     serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
 }
@@ -1045,4 +1161,12 @@ fn publisher_config() -> BroadcasterRedisPublisherConfig {
         maxlen: None,
         writer_lease_ttl: Duration::from_secs(30),
     }
+}
+
+fn base_heads<const N: usize>(backends: [BroadcasterBackend; N]) -> Vec<BroadcasterBackendHead> {
+    backends
+        .into_iter()
+        .enumerate()
+        .map(|(index, backend)| BroadcasterBackendHead::new(backend, index as u64))
+        .collect()
 }

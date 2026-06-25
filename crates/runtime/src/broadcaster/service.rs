@@ -344,15 +344,13 @@ impl BroadcasterServiceState {
 
         // The process has warmed every configured cache. Promotion is the point
         // where that local state becomes the active snapshot generation.
-        let mut backends = services
-            .iter()
-            .flat_map(|service| service.cache.configured_backends())
-            .collect::<Vec<_>>();
-        backends.sort();
-        backends.dedup();
+        let mut base_heads = Vec::new();
+        for service in services {
+            base_heads.extend(service.cache.backend_heads().await);
+        }
         let boundary = services[0]
             .redis_publisher
-            .promote(backends, reason)
+            .promote(base_heads, reason)
             .await?;
         for service in services {
             service.cache.relabel_generation(boundary.generation).await;
@@ -564,8 +562,9 @@ mod tests {
         BroadcasterSnapshotCache, BroadcasterSnapshotExport, BroadcasterUpstreamState,
     };
     use simulator_core::broadcaster::{
-        BroadcasterBackend, BroadcasterMessageKind, BroadcasterPayload,
-        BroadcasterRedisStreamEntry, BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
+        BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
+        BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
+        BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
     };
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -716,6 +715,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promotion_marker_handoff_base_heads_match_warmed_caches() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let old_publisher =
+            BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+        old_publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "old_active")
+            .await?;
+        let old_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let old_update = old_cache
+            .apply_update(&native_only_update(10, "old-native"))
+            .await?;
+        old_publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(old_update))
+            .await?;
+
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::clone(&lifecycle_gate),
+        );
+        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            lifecycle_gate,
+        );
+        raw_service.mark_upstream_connected().await;
+        rfq_service.mark_upstream_connected().await;
+        raw_service
+            .apply_update(&native_only_update(101, "native-1"))
+            .await?;
+        rfq_service
+            .apply_update(&rfq_only_update(202, "rfq-1", 7))
+            .await?;
+
+        BroadcasterServiceState::promote_when_ready(
+            &[raw_service.clone(), rfq_service.clone()],
+            "new_active",
+        )
+        .await?
+        .ok_or_else(|| anyhow!("ready passive services should promote"))?;
+
+        let marker = writer
+            .appends()
+            .await
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("promotion should append a marker"))?;
+        let handoff = progress_payload(&marker)?
+            .handoff
+            .ok_or_else(|| anyhow!("promotion marker should include handoff proof"))?;
+        let mut expected_heads = vec![
+            BroadcasterBackendHead::new(BroadcasterBackend::Native, 101),
+            BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 202),
+        ];
+        expected_heads.sort_by_key(|head| head.backend);
+        assert_eq!(handoff.base_heads, expected_heads);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn active_publication_failure_keeps_update_out_of_cache() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         let writer = ServiceFakeRedisWriter::default();
@@ -724,7 +792,10 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         publisher
-            .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -759,9 +830,9 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
-        old.promote(vec![BroadcasterBackend::Native], "old_active")
+        old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
             .await?;
-        new.promote(vec![BroadcasterBackend::Native], "new_active")
+        new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -796,7 +867,7 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer));
-        old.promote(vec![BroadcasterBackend::Native], "old_active")
+        old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -814,7 +885,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("active service should create a snapshot session"))?;
 
-        new.promote(vec![BroadcasterBackend::Native], "new_active")
+        new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
             .await?;
         let Err(_error) = service
             .apply_update(&native_only_update(11, "native-2"))
@@ -846,7 +917,7 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer));
-        old.promote(vec![BroadcasterBackend::Native], "old_active")
+        old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -859,7 +930,7 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
-        new.promote(vec![BroadcasterBackend::Native], "new_active")
+        new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
             .await?;
 
         assert!(
@@ -883,7 +954,7 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         let new = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer));
-        old.promote(vec![BroadcasterBackend::Native], "old_active")
+        old.promote(base_heads([BroadcasterBackend::Native]), "old_active")
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -900,7 +971,7 @@ mod tests {
             .create_snapshot_session(Duration::from_secs(300))
             .await?
             .ok_or_else(|| anyhow!("active service should create a snapshot session"))?;
-        new.promote(vec![BroadcasterBackend::Native], "new_active")
+        new.promote(base_heads([BroadcasterBackend::Native]), "new_active")
             .await?;
 
         let Err(error) = service
@@ -983,7 +1054,7 @@ mod tests {
         ));
         publisher
             .promote(
-                vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
                 "active_writer_promoted",
             )
             .await?;
@@ -1163,7 +1234,10 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         publisher
-            .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -1226,7 +1300,10 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         publisher
-            .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -1264,7 +1341,10 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         publisher
-            .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -1298,7 +1378,7 @@ mod tests {
         ));
         publisher
             .promote(
-                vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
                 "active_writer_promoted",
             )
             .await?;
@@ -1349,7 +1429,10 @@ mod tests {
             Arc::new(writer.clone()),
         ));
         publisher
-            .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
@@ -1505,7 +1588,10 @@ mod tests {
             Arc::new(writer),
         ));
         publisher
-            .promote(vec![BroadcasterBackend::Native], "active_writer_promoted")
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
             .await?;
         let upstream = BroadcasterUpstreamState::default();
         let service = BroadcasterServiceState::with_lifecycle_gate(
@@ -1572,9 +1658,28 @@ mod tests {
                 guard.active_token = Some(command.writer_token.to_string());
                 let generation = guard.active_generation;
                 let entry_id = format!("{generation}-1");
-                guard
-                    .appends
-                    .push(entry_from_fields(command.marker_fields, generation)?);
+                let previous_tail = guard.appends.last().cloned();
+                let marker_fields =
+                    if previous_tail.is_some() && !command.handoff_marker_fields.is_empty() {
+                        command.handoff_marker_fields
+                    } else {
+                        command.normal_marker_fields
+                    };
+                let previous_stream_id = previous_tail
+                    .as_ref()
+                    .map(|entry| entry.stream_id.as_str())
+                    .unwrap_or_default();
+                let previous_entry_id = previous_tail
+                    .as_ref()
+                    .map(crate::broadcaster::redis_publisher::redis_entry_id)
+                    .transpose()?
+                    .unwrap_or_default();
+                guard.appends.push(entry_from_fields(
+                    marker_fields,
+                    generation,
+                    previous_stream_id,
+                    &previous_entry_id,
+                )?);
                 Ok(crate::broadcaster::redis_publisher::RedisPromotionResult {
                     generation,
                     entry_id,
@@ -1627,18 +1732,35 @@ mod tests {
     fn entry_from_fields(
         fields: &[(String, String)],
         generation: u64,
+        previous_stream_id: &str,
+        previous_entry_id: &str,
     ) -> Result<BroadcasterRedisStreamEntry> {
         let mut value = serde_json::Map::new();
         for (field, field_value) in fields {
-            value.insert(
-                field.clone(),
-                serde_json::Value::String(field_value.replace(
+            let field_value = field_value
+                .replace(
                     crate::broadcaster::redis_publisher::GENERATION_PLACEHOLDER,
                     &generation.to_string(),
-                )),
-            );
+                )
+                .replace(
+                    crate::broadcaster::redis_publisher::PREVIOUS_STREAM_ID_PLACEHOLDER,
+                    previous_stream_id,
+                )
+                .replace(
+                    crate::broadcaster::redis_publisher::PREVIOUS_ENTRY_ID_PLACEHOLDER,
+                    previous_entry_id,
+                );
+            value.insert(field.clone(), serde_json::Value::String(field_value));
         }
         serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
+    }
+
+    fn progress_payload(entry: &BroadcasterRedisStreamEntry) -> Result<BroadcasterProgress> {
+        let envelope: BroadcasterEnvelope = serde_json::from_str(&entry.payload_json)?;
+        let BroadcasterPayload::Progress(progress) = envelope.payload else {
+            return Err(anyhow!("Redis stream entry payload should be progress"));
+        };
+        Ok(progress)
     }
 
     fn snapshot_export() -> BroadcasterSnapshotExport {
@@ -1675,6 +1797,16 @@ mod tests {
             maxlen: None,
             writer_lease_ttl: Duration::from_secs(30),
         }
+    }
+
+    fn base_heads<const N: usize>(
+        backends: [BroadcasterBackend; N],
+    ) -> Vec<BroadcasterBackendHead> {
+        backends
+            .into_iter()
+            .enumerate()
+            .map(|(index, backend)| BroadcasterBackendHead::new(backend, index as u64))
+            .collect()
     }
 
     fn native_only_update(block_number: u64, component_id: &str) -> Update {

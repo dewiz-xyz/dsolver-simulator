@@ -155,15 +155,28 @@ impl BroadcasterSubscriptionStatus {
         guard.last_error = None;
     }
 
-    pub async fn mark_redis_replay_cursor(&self, cursor: impl Into<String>) {
+    pub async fn mark_redis_generation_continued(&self, boundary: BroadcasterRedisReplayBoundary) {
         let mut guard = self.inner.write().await;
-        guard.redis_catch_up_cursor = Some(cursor.into());
+        guard.connected = true;
+        guard.bootstrap_complete = true;
+        guard.stream_id = Some(boundary.stream_id.clone());
+        guard.snapshot_id = Some(boundary.snapshot_id.clone());
+        guard.redis_catch_up_cursor = Some(boundary.exclusive_entry_id());
+        guard.redis_replay_boundary = Some(boundary);
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = None;
+        guard.last_error = None;
+    }
+
+    pub async fn mark_redis_replay_checkpoint(&self, checkpoint: impl Into<String>) {
+        let mut guard = self.inner.write().await;
+        guard.redis_catch_up_cursor = Some(checkpoint.into());
         guard.redis_gap_reason = None;
     }
 
-    pub async fn mark_redis_catch_up_cursor(&self, cursor: impl Into<String>) {
+    pub async fn mark_redis_catch_up_checkpoint(&self, checkpoint: impl Into<String>) {
         let mut guard = self.inner.write().await;
-        guard.redis_catch_up_cursor = Some(cursor.into());
+        guard.redis_catch_up_cursor = Some(checkpoint.into());
         guard.redis_replay_caught_up = true;
         guard.redis_gap_reason = None;
     }
@@ -1717,6 +1730,22 @@ mod tests {
         .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
     }
 
+    fn replay_boundary_for(
+        stream_id: &str,
+        snapshot_id: &str,
+        generation: u64,
+        exclusive_message_seq: u64,
+    ) -> BroadcasterRedisReplayBoundary {
+        BroadcasterRedisReplayBoundary::new(
+            "redis-stream",
+            stream_id,
+            snapshot_id,
+            generation,
+            exclusive_message_seq,
+        )
+        .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
+    }
+
     struct TestAppStateStores {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
@@ -2055,7 +2084,7 @@ mod tests {
             .await;
         state
             .native_broadcaster_subscription
-            .mark_redis_catch_up_cursor("1-1")
+            .mark_redis_catch_up_checkpoint("1-1")
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
@@ -2085,11 +2114,55 @@ mod tests {
 
         state
             .native_broadcaster_subscription
-            .mark_redis_catch_up_cursor("1-7")
+            .mark_redis_catch_up_checkpoint("1-7")
             .await;
 
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn redis_generation_continuation_updates_checkpoint_without_restart() {
+        let state = build_readiness_test_state(false, false).await;
+        state
+            .native_broadcaster_subscription
+            .mark_snapshot_started("stream-7", "snapshot-7")
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary_for(
+                "stream-7",
+                "snapshot-7",
+                7,
+                103,
+            ))
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_redis_catch_up_checkpoint("7-103")
+            .await;
+
+        state
+            .native_broadcaster_subscription
+            .mark_redis_generation_continued(replay_boundary_for("stream-8", "snapshot-8", 8, 1))
+            .await;
+
+        let snapshot = state.native_broadcaster_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert_eq!(snapshot.restart_count, 0);
+        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-8"));
+        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-8"));
+        assert_eq!(snapshot.redis_catch_up_cursor.as_deref(), Some("8-1"));
+        assert!(!snapshot.redis_replay_caught_up);
+        let boundary = snapshot
+            .redis_replay_boundary
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("continuation should publish a Redis boundary"));
+        assert_eq!(boundary.stream_id, "stream-8");
+        assert_eq!(boundary.snapshot_id, "snapshot-8");
+        assert_eq!(boundary.generation, 8);
+        assert_eq!(boundary.exclusive_message_seq, 1);
     }
 
     #[tokio::test]
@@ -2342,7 +2415,7 @@ mod tests {
 
         state
             .vm_broadcaster_subscription
-            .mark_redis_catch_up_cursor("1-1")
+            .mark_redis_catch_up_checkpoint("1-1")
             .await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
@@ -2393,7 +2466,7 @@ mod tests {
             .await;
         state
             .rfq_broadcaster_subscription
-            .mark_redis_catch_up_cursor("1-1")
+            .mark_redis_catch_up_checkpoint("1-1")
             .await;
 
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);

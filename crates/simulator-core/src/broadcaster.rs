@@ -627,7 +627,7 @@ impl BroadcasterHeartbeat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterProgress {
     pub chain_id: u64,
@@ -635,6 +635,8 @@ pub struct BroadcasterProgress {
     #[serde(deserialize_with = "deserialize_unique_progress_backends")]
     pub backends: Vec<BroadcasterBackend>,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<BroadcasterGenerationHandoff>,
 }
 
 impl BroadcasterProgress {
@@ -655,11 +657,77 @@ impl BroadcasterProgress {
             snapshot_id: snapshot_id.into(),
             backends,
             reason,
+            handoff: None,
+        })
+    }
+
+    pub fn new_with_handoff(
+        chain_id: u64,
+        snapshot_id: impl Into<String>,
+        backends: Vec<BroadcasterBackend>,
+        reason: impl Into<String>,
+        handoff: BroadcasterGenerationHandoff,
+    ) -> Result<Self, BroadcasterContractError> {
+        let mut progress = Self::new(chain_id, snapshot_id, backends, reason)?;
+        progress.handoff = Some(handoff);
+        Ok(progress)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterGenerationHandoff {
+    pub previous_stream_id: String,
+    pub previous_entry_id: String,
+    pub base_heads: Vec<BroadcasterBackendHead>,
+}
+
+impl BroadcasterGenerationHandoff {
+    pub fn new(
+        previous_stream_id: impl Into<String>,
+        previous_entry_id: impl Into<String>,
+        mut base_heads: Vec<BroadcasterBackendHead>,
+    ) -> Result<Self, BroadcasterContractError> {
+        base_heads.sort_by_key(|head| head.backend);
+        validate_generation_handoff_base_heads(&base_heads)?;
+        Ok(Self {
+            previous_stream_id: required_handoff_field(
+                "handoff.previousStreamId",
+                previous_stream_id.into(),
+            )?,
+            previous_entry_id: required_handoff_field(
+                "handoff.previousEntryId",
+                previous_entry_id.into(),
+            )?,
+            base_heads,
         })
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for BroadcasterGenerationHandoff {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireHandoff {
+            previous_stream_id: String,
+            previous_entry_id: String,
+            base_heads: Vec<BroadcasterBackendHead>,
+        }
+
+        let wire = WireHandoff::deserialize(deserializer)?;
+        Self::new(
+            wire.previous_stream_id,
+            wire.previous_entry_id,
+            wire.base_heads,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterBackendHead {
     pub backend: BroadcasterBackend,
@@ -920,6 +988,33 @@ impl BroadcasterSubscriptionTracker {
 
         ensure_stream_id(stream_id, &boundary.stream_id)?;
         ensure_snapshot_id(snapshot_id, &boundary.snapshot_id)?;
+        self.next_message_seq = Some(next_message_seq(boundary.exclusive_message_seq)?);
+        Ok(())
+    }
+
+    pub fn continue_live_generation(
+        &mut self,
+        boundary: &BroadcasterRedisReplayBoundary,
+    ) -> Result<(), BroadcasterContractError> {
+        let BroadcasterSubscriptionState::Live {
+            chain_id,
+            declared_backends,
+            ..
+        } = self.state.clone()
+        else {
+            return Err(
+                BroadcasterContractError::RedisReplayBoundaryBeforeSnapshotComplete {
+                    state: self.state.label(),
+                },
+            );
+        };
+
+        self.state = BroadcasterSubscriptionState::Live {
+            stream_id: boundary.stream_id.clone(),
+            chain_id,
+            snapshot_id: boundary.snapshot_id.clone(),
+            declared_backends,
+        };
         self.next_message_seq = Some(next_message_seq(boundary.exclusive_message_seq)?);
         Ok(())
     }
@@ -1846,6 +1941,12 @@ fn validate_heartbeat_backend_heads(
     validate_unique_backend_heads("heartbeat.backend_heads", heads)
 }
 
+fn validate_generation_handoff_base_heads(
+    heads: &[BroadcasterBackendHead],
+) -> Result<(), BroadcasterContractError> {
+    validate_unique_backend_heads("progress.handoff.baseHeads", heads)
+}
+
 fn validate_progress_backends(
     backends: &[BroadcasterBackend],
 ) -> Result<(), BroadcasterContractError> {
@@ -1954,6 +2055,17 @@ fn validate_unique_backend_entries(
         }
     }
     Ok(())
+}
+
+fn required_handoff_field(
+    field: &'static str,
+    value: String,
+) -> Result<String, BroadcasterContractError> {
+    if value.trim().is_empty() {
+        Err(BroadcasterContractError::RedisEntryEmptyField { field })
+    } else {
+        Ok(value)
+    }
 }
 
 fn validate_declared_backend_entries(

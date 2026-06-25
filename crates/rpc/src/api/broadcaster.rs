@@ -50,7 +50,7 @@ mod tests {
         broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         models::tokens::TokenStore,
     };
-    use simulator_core::broadcaster::BroadcasterBackend;
+    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
     use tokio::{
         sync::{Barrier, Mutex},
         task::JoinHandle,
@@ -803,7 +803,10 @@ mod tests {
         let new_publisher =
             BroadcasterRedisPublisher::new(redis_publisher_config(), Arc::new(writer));
         new_publisher
-            .promote(vec![BroadcasterBackend::Native], "new_active")
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "new_active",
+            )
             .await?;
 
         Ok(BroadcasterAppState::with_snapshot_session_ttl(

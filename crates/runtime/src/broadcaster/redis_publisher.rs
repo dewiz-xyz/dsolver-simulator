@@ -16,8 +16,9 @@ use crate::metrics::{
     emit_broadcaster_redis_append_failure, emit_broadcaster_redis_generation_reset,
 };
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload,
-    BroadcasterProgress, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
+    BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterRedisReplayBoundary,
+    BroadcasterRedisStreamEntry,
 };
 
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
@@ -27,6 +28,8 @@ const MIN_WRITER_LEASE_TTL: Duration = Duration::from_secs(30);
 const WRITER_LEASE_HEARTBEAT_MULTIPLIER: u32 = 3;
 const STALE_WRITER_MESSAGE: &str = "stale Redis broadcaster writer";
 pub(super) const GENERATION_PLACEHOLDER: &str = "__GENERATION__";
+pub(super) const PREVIOUS_STREAM_ID_PLACEHOLDER: &str = "__PREVIOUS_STREAM_ID__";
+pub(super) const PREVIOUS_ENTRY_ID_PLACEHOLDER: &str = "__PREVIOUS_ENTRY_ID__";
 
 // Redis has no native "check active writer, then XADD" command. These small Lua
 // scripts keep the fence and stream mutation in one Redis operation.
@@ -39,6 +42,8 @@ local lease_ttl_ms = ARGV[2]
 local maxlen = ARGV[3]
 local expected_writer_token = ARGV[4]
 local expected_generation = ARGV[5]
+local normal_marker_field_count = tonumber(ARGV[6] or "0")
+local handoff_marker_field_count = tonumber(ARGV[7] or "0")
 
 -- Generation resets are only allowed by the current active writer. A passive
 -- promotion passes no expectation and claims the next Redis generation.
@@ -48,6 +53,23 @@ if expected_writer_token ~= "" then
   end
   if tostring(redis.call("GET", generation_key) or "") ~= expected_generation then
     return redis.error_reply("stale Redis broadcaster writer generation")
+  end
+end
+
+local previous_entry_id = ""
+local previous_stream_id = ""
+local tail = redis.call("XREVRANGE", stream_key, "+", "-", "COUNT", 1)
+if #tail > 0 then
+  previous_entry_id = tostring(tail[1][1])
+  local tail_fields = tail[1][2]
+  for index = 1, #tail_fields - 1, 2 do
+    if tail_fields[index] == "stream_id" then
+      previous_stream_id = tostring(tail_fields[index + 1])
+      break
+    end
+  end
+  if previous_stream_id == "" then
+    return redis.error_reply("Redis broadcaster previous stream tail missing stream_id")
   end
 end
 
@@ -90,9 +112,19 @@ if maxlen ~= "" then
 end
 table.insert(command, entry_id)
 
-for index = 6, #ARGV, 2 do
+local marker_start = 8
+local marker_field_count = normal_marker_field_count
+if previous_entry_id ~= "" and handoff_marker_field_count > 0 then
+  marker_start = 8 + (normal_marker_field_count * 2)
+  marker_field_count = handoff_marker_field_count
+end
+
+for offset = 0, marker_field_count - 1 do
+  local index = marker_start + (offset * 2)
   table.insert(command, ARGV[index])
   local value = string.gsub(ARGV[index + 1], "__GENERATION__", tostring(generation))
+  value = string.gsub(value, "__PREVIOUS_STREAM_ID__", previous_stream_id)
+  value = string.gsub(value, "__PREVIOUS_ENTRY_ID__", previous_entry_id)
   table.insert(command, value)
 end
 
@@ -216,7 +248,8 @@ pub struct RedisPromotionCommand<'a> {
     pub expected_writer_token: Option<&'a str>,
     pub expected_generation: Option<u64>,
     pub lease_ttl: Duration,
-    pub marker_fields: &'a [(String, String)],
+    pub normal_marker_fields: &'a [(String, String)],
+    pub handoff_marker_fields: &'a [(String, String)],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,8 +322,13 @@ impl RedisStreamWriter for TokioRedisStreamWriter {
                         .expected_generation
                         .map(|value| value.to_string())
                         .unwrap_or_default(),
-                );
-            for (field, value) in request.marker_fields {
+                )
+                .arg(request.normal_marker_fields.len())
+                .arg(request.handoff_marker_fields.len());
+            for (field, value) in request.normal_marker_fields {
+                command.arg(field).arg(value);
+            }
+            for (field, value) in request.handoff_marker_fields {
                 command.arg(field).arg(value);
             }
 
@@ -585,10 +623,11 @@ impl BroadcasterRedisPublisher {
 
     pub async fn promote(
         &self,
-        backends: Vec<BroadcasterBackend>,
+        base_heads: Vec<BroadcasterBackendHead>,
         reason: impl Into<String>,
     ) -> Result<BroadcasterRedisReplayBoundary> {
-        self.promote_locked(backends, reason.into(), false, false)
+        let backends = backends_from_base_heads(&base_heads);
+        self.promote_locked(backends, Some(base_heads), reason.into(), false, false)
             .await
     }
 
@@ -619,7 +658,7 @@ impl BroadcasterRedisPublisher {
         reason: impl Into<String>,
         backends: Vec<BroadcasterBackend>,
     ) -> Result<BroadcasterRedisReplayBoundary> {
-        self.promote_locked(backends, reason.into(), true, true)
+        self.promote_locked(backends, None, reason.into(), true, true)
             .await
     }
 
@@ -728,6 +767,7 @@ impl BroadcasterRedisPublisher {
     async fn promote_locked(
         &self,
         backends: Vec<BroadcasterBackend>,
+        handoff_base_heads: Option<Vec<BroadcasterBackendHead>>,
         reason: String,
         count_generation_reset: bool,
         require_current_writer: bool,
@@ -753,8 +793,28 @@ impl BroadcasterRedisPublisher {
             }
         }
 
-        let marker_fields =
-            generation_marker_template_fields(self.config.chain_id, backends, reason.clone())?;
+        let normal_marker_fields = generation_marker_template_fields(
+            self.config.chain_id,
+            backends.clone(),
+            reason.clone(),
+            None,
+        )?;
+        let handoff_marker_fields = handoff_base_heads
+            .map(|base_heads| {
+                let handoff = BroadcasterGenerationHandoff::new(
+                    PREVIOUS_STREAM_ID_PLACEHOLDER,
+                    PREVIOUS_ENTRY_ID_PLACEHOLDER,
+                    base_heads,
+                )?;
+                generation_marker_template_fields(
+                    self.config.chain_id,
+                    backends,
+                    reason.clone(),
+                    Some(handoff),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let expected_writer_token = require_current_writer.then_some(self.writer_token.as_str());
         let expected_generation = require_current_writer.then_some(guard.generation);
         let promotion = self
@@ -768,7 +828,8 @@ impl BroadcasterRedisPublisher {
                 expected_writer_token,
                 expected_generation,
                 lease_ttl: self.config.writer_lease_ttl,
-                marker_fields: &marker_fields,
+                normal_marker_fields: &normal_marker_fields,
+                handoff_marker_fields: &handoff_marker_fields,
             })
             .await;
 
@@ -969,14 +1030,34 @@ fn format_redis_snapshot_id(chain_id: u64, generation: u64) -> String {
     format!("chain-{chain_id}-snapshot-{generation}")
 }
 
+fn backends_from_base_heads(base_heads: &[BroadcasterBackendHead]) -> Vec<BroadcasterBackend> {
+    let mut backends = base_heads
+        .iter()
+        .map(|head| head.backend)
+        .collect::<Vec<_>>();
+    backends.sort();
+    backends.dedup();
+    backends
+}
+
 fn generation_marker_template_fields(
     chain_id: u64,
     backends: Vec<BroadcasterBackend>,
     reason: String,
+    handoff: Option<BroadcasterGenerationHandoff>,
 ) -> Result<Vec<(String, String)>> {
     let stream_id = format!("chain-{chain_id}-stream-{GENERATION_PLACEHOLDER}");
     let snapshot_id = format!("chain-{chain_id}-snapshot-{GENERATION_PLACEHOLDER}");
-    let marker = BroadcasterProgress::new(chain_id, snapshot_id.clone(), backends, reason)?;
+    let marker = match handoff {
+        Some(handoff) => BroadcasterProgress::new_with_handoff(
+            chain_id,
+            snapshot_id.clone(),
+            backends,
+            reason,
+            handoff,
+        )?,
+        None => BroadcasterProgress::new(chain_id, snapshot_id.clone(), backends, reason)?,
+    };
     let envelope = BroadcasterEnvelope::new(stream_id, 1, BroadcasterPayload::Progress(marker));
     let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, current_time_ms(), &envelope)?;
     redis_entry_fields(&entry)
