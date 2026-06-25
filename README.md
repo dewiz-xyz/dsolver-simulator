@@ -109,7 +109,7 @@ is an example setup, not the source of truth for every default.
 
 ## Runtime Handoff Contract
 
-The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is not the full-state bootstrap store.
+The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.
 
 Broadcaster deployments use four modes:
 
@@ -118,7 +118,7 @@ Broadcaster deployments use four modes:
 - `Retired` rejects appends and snapshot sessions after it has been replaced.
 - `Unhealthy` fails closed until it recovers or is replaced.
 
-Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. Simulators that hit a replay gap or need to cross Redis generations create a fresh HTTP snapshot session from the current active broadcaster instead of stitching generations from Redis. The handoff uses independent `XREAD` cursors per simulator process; it does not use Redis consumer groups or per-deployment stream keys.
+Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. During active broadcaster handoff, a simulator may continue across Redis generations only when the first new-generation progress marker carries a valid Redis handoff proof; otherwise it fails closed and creates a fresh HTTP snapshot session from the current active broadcaster. Shared generation resets after append failure still omit handoff proof and always rebootstrap. The handoff uses independent `XREAD` positions per simulator process; it does not use Redis consumer groups or per-deployment stream keys.
 
 ## API Surface
 

@@ -62,7 +62,7 @@ Main artifacts:
 - `summary.md`: human-readable findings and investigation hints
 - `evidence/`: readiness snapshots, sampled request/response bodies, and simulator/broadcaster log excerpts
 - Redis replay status from simulator `/status` subscriptions is preserved in `report.json` and summarized in `summary.md` when present.
-- Replay gaps or Redis generation crossings should surface as readiness issues and fresh active-broadcaster snapshot bootstrap attempts, not as stitched Redis-only recovery.
+- Replay gaps should surface as readiness issues and fresh active-broadcaster snapshot bootstrap attempts. Redis generation crossings may continue only through a valid active-handoff marker; resets after append failure remain fail-closed.
 
 ## Behavior model
 
