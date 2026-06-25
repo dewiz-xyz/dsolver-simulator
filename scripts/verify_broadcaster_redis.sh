@@ -238,12 +238,14 @@ inspect_post_boundary_retention() {
 
 verify_simulator_replay_status() {
   local status_body="$1"
+  local broadcaster_boundary_json="$2"
 
-  SIMULATOR_STATUS_BODY="$status_body" python3 <<'PY'
+  SIMULATOR_STATUS_BODY="$status_body" BROADCASTER_BOUNDARY_JSON="$broadcaster_boundary_json" python3 <<'PY'
 import json
 import os
 
 payload = json.loads(os.environ["SIMULATOR_STATUS_BODY"])
+broadcaster_boundary = json.loads(os.environ["BROADCASTER_BOUNDARY_JSON"])
 backends = payload.get("backends")
 if not isinstance(backends, dict):
     raise SystemExit("simulator /status did not include backends")
@@ -261,14 +263,22 @@ for kind, backend in sorted(backends.items()):
     for field in ["streamKey", "streamId", "snapshotId", "generation", "exclusiveMessageSeq"]:
         if field not in boundary:
             raise SystemExit(f"simulator /status backend {kind} replay boundary is missing {field}")
-    cursor = subscription.get("redis_catch_up_cursor")
-    if not isinstance(cursor, str) or not cursor:
+    checkpoint = subscription.get("redis_catch_up_cursor")
+    if not isinstance(checkpoint, str) or not checkpoint:
         raise SystemExit(f"simulator /status backend {kind} has no redis_catch_up_cursor")
     if subscription.get("redis_replay_caught_up") is not True:
         raise SystemExit(f"simulator /status backend {kind} has not caught up from Redis replay")
     gap = subscription.get("redis_gap_reason")
     if gap is not None:
         raise SystemExit(f"simulator /status backend {kind} has redis_gap_reason={gap}")
+    for field in ["streamKey", "generation", "streamId", "snapshotId"]:
+        expected = broadcaster_boundary[field]
+        actual = boundary[field]
+        if actual != expected:
+            raise SystemExit(
+                f"simulator /status backend {kind} replay boundary {field}={actual} "
+                f"does not match current broadcaster replay boundary {field}={expected}"
+            )
     checked.append(kind)
 
 if not checked:
@@ -341,7 +351,7 @@ if [[ "$boundary_stream_key" != "$BROADCASTER_REDIS_STREAM_KEY" ]]; then
 fi
 
 simulator_status_body="$(curl -sS --max-time 5 "$simulator_status_url")"
-if ! checked_backends="$(verify_simulator_replay_status "$simulator_status_body" 2>&1)"; then
+if ! checked_backends="$(verify_simulator_replay_status "$simulator_status_body" "$boundary_json" 2>&1)"; then
   echo "$checked_backends" >&2
   if retention_context="$(inspect_post_boundary_retention "$boundary_json" "$BROADCASTER_REDIS_STREAM_KEY" 2>&1)"; then
     echo "$retention_context" >&2
@@ -364,5 +374,5 @@ echo "Broadcaster status URL: $status_url"
 echo "Simulator status URL: $simulator_status_url"
 echo "Redis stream key: $BROADCASTER_REDIS_STREAM_KEY"
 echo "Redis stream entries: $stream_len"
-echo "Replay boundary cursor: $boundary_entry_id"
+echo "Replay boundary checkpoint: $boundary_entry_id"
 echo "Simulator replay backends: $checked_backends"

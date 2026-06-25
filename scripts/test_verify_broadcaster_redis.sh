@@ -60,9 +60,14 @@ fi
 simulator_status_body() {
   local caught_up="$1"
   local gap_reason="$2"
+  local generation="${3:-2}"
+  local stream_key="${4:-dsolver:broadcaster:local:8453:events}"
+  local stream_id="${5:-chain-8453-stream-$generation}"
+  local snapshot_id="${6:-chain-8453-snapshot-$generation}"
+  local exclusive_message_seq="${7:-14}"
 
   cat <<JSON
-{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"dsolver:broadcaster:local:8453:events","streamId":"chain-8453-stream-2","snapshotId":"chain-8453-snapshot-2","generation":2,"exclusiveMessageSeq":14},"redis_catch_up_cursor":"2-14","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason}}}}
+{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq},"redis_catch_up_cursor":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason}}}}
 JSON
 }
 
@@ -185,6 +190,32 @@ cleanup_paths+=("$output_file")
 
 if ! run_verifier_fixture "$(simulator_status_body true null)" "2-15" "2-15" "$output_file"; then
   echo "expected trimmed boundary entry to pass when simulator replay is caught up" >&2
+  cat "$output_file" >&2
+  exit 1
+fi
+
+if ! run_verifier_fixture "$(simulator_status_body true null 2 dsolver:broadcaster:local:8453:events chain-8453-stream-2 chain-8453-snapshot-2 9)" "2-15" "2-15" "$output_file"; then
+  echo "expected older same-generation bootstrap boundary to pass when simulator replay is caught up" >&2
+  cat "$output_file" >&2
+  exit 1
+fi
+
+if run_verifier_fixture "$(simulator_status_body true null 1)" "2-15" "2-15" "$output_file"; then
+  echo "expected caught-up simulator on old Redis generation to fail" >&2
+  exit 1
+fi
+if ! grep -q "does not match current broadcaster replay boundary generation=2" "$output_file"; then
+  echo "expected old-generation simulator failure context" >&2
+  cat "$output_file" >&2
+  exit 1
+fi
+
+if run_verifier_fixture "$(simulator_status_body true null 2 dsolver:broadcaster:local:8453:events stale-stream chain-8453-snapshot-2)" "2-15" "2-15" "$output_file"; then
+  echo "expected caught-up simulator with stale Redis stream id to fail" >&2
+  exit 1
+fi
+if ! grep -q "does not match current broadcaster replay boundary streamId=chain-8453-stream-2" "$output_file"; then
+  echo "expected stale stream id simulator failure context" >&2
   cat "$output_file" >&2
   exit 1
 fi

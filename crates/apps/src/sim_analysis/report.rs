@@ -541,7 +541,7 @@ fn append_redis_replay_status(lines: &mut Vec<String>, snapshot: &ReadinessSnaps
             continue;
         }
         lines.push(format!(
-            "  redis {}: boundary={} cursor={} caught_up={} gap={}",
+            "  redis {}: boundary={} checkpoint={} caught_up={} gap={}",
             kind,
             subscription.redis_boundary_label(),
             subscription
@@ -969,7 +969,9 @@ mod tests {
 
         let summary = render_summary(&analysis);
 
-        assert!(summary.contains("redis native: boundary=2-14 cursor=2-16 caught_up=true gap=none"));
+        assert!(
+            summary.contains("redis native: boundary=2-14 checkpoint=2-16 caught_up=true gap=none")
+        );
         Ok(())
     }
 
