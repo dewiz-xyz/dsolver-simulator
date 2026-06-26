@@ -93,7 +93,7 @@ pub struct BackendSubscriptionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    redis_catch_up_cursor: Option<String>,
+    redis_replay_checkpoint: Option<String>,
     redis_replay_caught_up: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     redis_gap_reason: Option<String>,
@@ -110,7 +110,7 @@ impl From<SimulatorBackendSubscriptionSnapshot> for BackendSubscriptionPayload {
             stream_id: snapshot.stream_id,
             snapshot_id: snapshot.snapshot_id,
             redis_replay_boundary: snapshot.redis_replay_boundary,
-            redis_catch_up_cursor: snapshot.redis_catch_up_cursor,
+            redis_replay_checkpoint: snapshot.redis_replay_checkpoint,
             redis_replay_caught_up: snapshot.redis_replay_caught_up,
             redis_gap_reason: snapshot.redis_gap_reason,
             restart_count: snapshot.restart_count,
@@ -473,7 +473,10 @@ mod tests {
             .unwrap_or_else(|| unreachable!("native status must include subscription"));
 
         assert_eq!(subscription.redis_replay_boundary, Some(boundary));
-        assert_eq!(subscription.redis_catch_up_cursor.as_deref(), Some("2-14"));
+        assert_eq!(
+            subscription.redis_replay_checkpoint.as_deref(),
+            Some("2-14")
+        );
         assert!(subscription.redis_replay_caught_up);
         assert!(subscription.redis_gap_reason.is_none());
     }

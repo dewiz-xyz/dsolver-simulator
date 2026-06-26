@@ -263,9 +263,9 @@ for kind, backend in sorted(backends.items()):
     for field in ["streamKey", "streamId", "snapshotId", "generation", "exclusiveMessageSeq"]:
         if field not in boundary:
             raise SystemExit(f"simulator /status backend {kind} replay boundary is missing {field}")
-    checkpoint = subscription.get("redis_catch_up_cursor")
+    checkpoint = subscription.get("redis_replay_checkpoint")
     if not isinstance(checkpoint, str) or not checkpoint:
-        raise SystemExit(f"simulator /status backend {kind} has no redis_catch_up_cursor")
+        raise SystemExit(f"simulator /status backend {kind} has no redis_replay_checkpoint")
     if subscription.get("redis_replay_caught_up") is not True:
         raise SystemExit(f"simulator /status backend {kind} has not caught up from Redis replay")
     gap = subscription.get("redis_gap_reason")

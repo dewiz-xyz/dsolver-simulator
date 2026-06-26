@@ -89,7 +89,7 @@ struct BroadcasterSubscriptionStatusData {
     stream_id: Option<String>,
     snapshot_id: Option<String>,
     redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
-    redis_catch_up_cursor: Option<String>,
+    redis_replay_checkpoint: Option<String>,
     redis_replay_caught_up: bool,
     redis_gap_reason: Option<String>,
     restart_count: u64,
@@ -103,7 +103,7 @@ pub struct BroadcasterSubscriptionSnapshot {
     pub stream_id: Option<String>,
     pub snapshot_id: Option<String>,
     pub redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
-    pub redis_catch_up_cursor: Option<String>,
+    pub redis_replay_checkpoint: Option<String>,
     pub redis_replay_caught_up: bool,
     pub redis_gap_reason: Option<String>,
     pub restart_count: u64,
@@ -118,7 +118,7 @@ impl BroadcasterSubscriptionStatus {
         guard.stream_id = None;
         guard.snapshot_id = None;
         guard.redis_replay_boundary = None;
-        guard.redis_catch_up_cursor = None;
+        guard.redis_replay_checkpoint = None;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
         guard.last_error = None;
@@ -135,7 +135,7 @@ impl BroadcasterSubscriptionStatus {
         guard.stream_id = Some(stream_id.into());
         guard.snapshot_id = Some(snapshot_id.into());
         guard.redis_replay_boundary = None;
-        guard.redis_catch_up_cursor = None;
+        guard.redis_replay_checkpoint = None;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
         guard.last_error = None;
@@ -148,7 +148,7 @@ impl BroadcasterSubscriptionStatus {
         let mut guard = self.inner.write().await;
         guard.connected = true;
         guard.bootstrap_complete = true;
-        guard.redis_catch_up_cursor = Some(boundary.exclusive_entry_id());
+        guard.redis_replay_checkpoint = Some(boundary.exclusive_entry_id());
         guard.redis_replay_boundary = Some(boundary);
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
@@ -161,7 +161,7 @@ impl BroadcasterSubscriptionStatus {
         guard.bootstrap_complete = true;
         guard.stream_id = Some(boundary.stream_id.clone());
         guard.snapshot_id = Some(boundary.snapshot_id.clone());
-        guard.redis_catch_up_cursor = Some(boundary.exclusive_entry_id());
+        guard.redis_replay_checkpoint = Some(boundary.exclusive_entry_id());
         guard.redis_replay_boundary = Some(boundary);
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
@@ -170,13 +170,13 @@ impl BroadcasterSubscriptionStatus {
 
     pub async fn mark_redis_replay_checkpoint(&self, checkpoint: impl Into<String>) {
         let mut guard = self.inner.write().await;
-        guard.redis_catch_up_cursor = Some(checkpoint.into());
+        guard.redis_replay_checkpoint = Some(checkpoint.into());
         guard.redis_gap_reason = None;
     }
 
     pub async fn mark_redis_catch_up_checkpoint(&self, checkpoint: impl Into<String>) {
         let mut guard = self.inner.write().await;
-        guard.redis_catch_up_cursor = Some(checkpoint.into());
+        guard.redis_replay_checkpoint = Some(checkpoint.into());
         guard.redis_replay_caught_up = true;
         guard.redis_gap_reason = None;
     }
@@ -194,7 +194,7 @@ impl BroadcasterSubscriptionStatus {
         guard.stream_id = None;
         guard.snapshot_id = None;
         guard.redis_replay_boundary = None;
-        guard.redis_catch_up_cursor = None;
+        guard.redis_replay_checkpoint = None;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
         guard.restart_count = guard.restart_count.saturating_add(1);
@@ -209,7 +209,7 @@ impl BroadcasterSubscriptionStatus {
             stream_id: guard.stream_id.clone(),
             snapshot_id: guard.snapshot_id.clone(),
             redis_replay_boundary: guard.redis_replay_boundary.clone(),
-            redis_catch_up_cursor: guard.redis_catch_up_cursor.clone(),
+            redis_replay_checkpoint: guard.redis_replay_checkpoint.clone(),
             redis_replay_caught_up: guard.redis_replay_caught_up,
             redis_gap_reason: guard.redis_gap_reason.clone(),
             restart_count: guard.restart_count,
@@ -225,7 +225,7 @@ impl BroadcasterSubscriptionStatus {
                 stream_id: Some("stream-test".to_string()),
                 snapshot_id: Some("snapshot-test".to_string()),
                 redis_replay_boundary: None,
-                redis_catch_up_cursor: None,
+                redis_replay_checkpoint: None,
                 redis_replay_caught_up: true,
                 redis_gap_reason: None,
                 restart_count: 0,
@@ -406,7 +406,7 @@ pub struct SimulatorBackendSubscriptionSnapshot {
     pub stream_id: Option<String>,
     pub snapshot_id: Option<String>,
     pub redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
-    pub redis_catch_up_cursor: Option<String>,
+    pub redis_replay_checkpoint: Option<String>,
     pub redis_replay_caught_up: bool,
     pub redis_gap_reason: Option<String>,
     pub restart_count: u64,
@@ -991,7 +991,7 @@ impl From<BroadcasterSubscriptionSnapshot> for SimulatorBackendSubscriptionSnaps
             stream_id: snapshot.stream_id,
             snapshot_id: snapshot.snapshot_id,
             redis_replay_boundary: snapshot.redis_replay_boundary,
-            redis_catch_up_cursor: snapshot.redis_catch_up_cursor,
+            redis_replay_checkpoint: snapshot.redis_replay_checkpoint,
             redis_replay_caught_up: snapshot.redis_replay_caught_up,
             redis_gap_reason: snapshot.redis_gap_reason,
             restart_count: snapshot.restart_count,
@@ -2153,7 +2153,7 @@ mod tests {
         assert_eq!(snapshot.restart_count, 0);
         assert_eq!(snapshot.stream_id.as_deref(), Some("stream-8"));
         assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-8"));
-        assert_eq!(snapshot.redis_catch_up_cursor.as_deref(), Some("8-1"));
+        assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("8-1"));
         assert!(!snapshot.redis_replay_caught_up);
         let boundary = snapshot
             .redis_replay_boundary

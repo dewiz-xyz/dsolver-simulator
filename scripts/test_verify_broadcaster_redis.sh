@@ -67,7 +67,7 @@ simulator_status_body() {
   local exclusive_message_seq="${7:-14}"
 
   cat <<JSON
-{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq},"redis_catch_up_cursor":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason}}}}
+{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq},"redis_replay_checkpoint":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason}}}}
 JSON
 }
 

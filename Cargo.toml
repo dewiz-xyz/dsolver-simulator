@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/simulator-core",
+    "crates/broadcaster-replay-client",
     "crates/runtime",
     "crates/rpc",
     "crates/apps",

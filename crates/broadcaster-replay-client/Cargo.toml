@@ -1,0 +1,21 @@
+[package]
+name = "broadcaster-replay-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared broadcaster snapshot and Redis replay client."
+
+[dependencies]
+redis.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+simulator_core = { package = "simulator-core", path = "../simulator-core" }
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true
