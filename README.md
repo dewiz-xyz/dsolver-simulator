@@ -63,7 +63,7 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Binary | `dsolver-simulator-service` |
 | Endpoints | `GET /status`, `POST /simulate`, `POST /encode` |
 | Supported chains | Defined in `simulator-manifest.toml` |
-| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_WS_URL` |
+| Required inputs | `TYCHO_API_KEY`, `CHAIN_ID`, `TYCHO_BROADCASTER_URL` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
@@ -79,13 +79,14 @@ Use the explicit `-p ... --bin ...` form for local runs and builds so it's alway
 workspace binary you're targeting.
 
 For manual service runs, start `dsolver-tycho-broadcaster-service` first on the port used by
-`TYCHO_BROADCASTER_WS_URL`, then start `dsolver-simulator-service`.
+`TYCHO_BROADCASTER_URL`, then start `dsolver-simulator-service`.
 
 Required runtime inputs:
 
 - `TYCHO_API_KEY` for Tycho access
 - `CHAIN_ID` for chain selection from `simulator-manifest.toml`
-- `TYCHO_BROADCASTER_WS_URL` pointing at the broadcaster websocket, for example `ws://127.0.0.1:3001/ws`
+- `TYCHO_BROADCASTER_URL` pointing at the active broadcaster HTTP base URL, for example `http://127.0.0.1:3001`
+- `BROADCASTER_REDIS_URL` and `BROADCASTER_REDIS_STREAM_KEY` for the Redis stream that carries broadcaster deltas after each HTTP snapshot replay boundary
 
 Common optional inputs:
 
@@ -97,12 +98,27 @@ Common optional inputs:
 - `BROADCASTER_TOKEN_MIN_QUALITY` to tune the broadcaster's startup Tycho token quality floor
 - `BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES` to cap serialized HTTP snapshot payloads
 - `BROADCASTER_SNAPSHOT_SESSION_TTL_SECS` to set how long an unattached snapshot session can wait before cleanup
+- `BROADCASTER_REDIS_BLOCK_MS`, `BROADCASTER_REDIS_READ_COUNT`, and `BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS` to tune Redis stream reads and append retries
+- `BROADCASTER_REDIS_MAXLEN` to cap retained Redis delta entries and force simulators to fail readiness if replay data is trimmed before catch-up
 - `TOKEN_SNAPSHOT_TIMEOUT_MS` for the simulator's startup load of the full broadcaster token snapshot
 - `TOKEN_REFRESH_TIMEOUT_MS` for RFQ provider token bootstrap and later single-token lookup misses
 - timeout and stream-health knobs from `crates/runtime/src/config/mod.rs`
 
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
+
+## Runtime Handoff Contract
+
+The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.
+
+Broadcaster deployments use four modes:
+
+- `Passive` warms upstream/cache state, but does not append Redis deltas or serve snapshot sessions.
+- `Active` is the only Redis writer and the only snapshot-session authority for an environment and chain.
+- `Retired` rejects appends and snapshot sessions after it has been replaced.
+- `Unhealthy` fails closed until it recovers or is replaced.
+
+Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. During active broadcaster handoff, a simulator may continue across Redis generations only when the first new-generation progress marker carries a valid Redis handoff proof; otherwise it fails closed and creates a fresh HTTP snapshot session from the current active broadcaster. Shared generation resets after append failure still omit handoff proof and always rebootstrap. The handoff uses independent `XREAD` positions per simulator process; it does not use Redis consumer groups or per-deployment stream keys.
 
 ## API Surface
 
@@ -220,9 +236,13 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
 cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
-When `TYCHO_BROADCASTER_WS_URL` points at local loopback, the analyzer uses the repo lifecycle
-helper to start the broadcaster before the simulator. Non-local broadcaster URLs are treated as
-externally managed.
+When `TYCHO_BROADCASTER_URL` points at local loopback, the analyzer uses the repo lifecycle
+helper to start Redis, the broadcaster, then the simulator. Non-local broadcaster or Redis URLs
+are treated as externally managed. To verify the Redis replay path while services are running:
+
+```bash
+scripts/verify_broadcaster_redis.sh --repo .
+```
 
 Container builds:
 
@@ -235,10 +255,11 @@ Useful helpers:
 
 - `scripts/start_server.sh` to start the local broadcaster plus simulator stack with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
+- `scripts/verify_broadcaster_redis.sh` to check the broadcaster replay boundary, Redis stream retention, and simulator catch-up status
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
-The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so agents can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so reviewers can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
 
 ## Docs Map
 

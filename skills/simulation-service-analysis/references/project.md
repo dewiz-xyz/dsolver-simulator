@@ -7,7 +7,7 @@
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
-- Keep `TYCHO_BROADCASTER_WS_URL` pointed at the broadcaster websocket. The local default lets the lifecycle helper start the broadcaster on port `3001` before the simulator.
+- Keep `TYCHO_BROADCASTER_URL` pointed at the broadcaster HTTP base URL and configure `BROADCASTER_REDIS_URL` plus `BROADCASTER_REDIS_STREAM_KEY` for Redis deltas. The local default lets the lifecycle helper start the broadcaster on port `3001` before the simulator.
 - RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently need the Bebop and Hashflow credential pairs; Liquorice credentials are only needed after `rfq:liquorice` is added to an active chain profile.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
@@ -15,6 +15,7 @@
   ```bash
   scripts/start_server.sh --repo . --chain-id 1
   ```
+- When `BROADCASTER_REDIS_URL` is loopback `redis://`, the lifecycle helper starts Redis from `docker-compose.redis.yml` before the local broadcaster. Use `scripts/verify_broadcaster_redis.sh --repo .` while services are running to confirm the broadcaster replay boundary, Redis stream retention, and simulator catch-up status.
 - Default bind: `127.0.0.1:3000` (override with `HOST`/`PORT`).
 
 ## Readiness
@@ -40,9 +41,10 @@
   - `summary.md` for the narrative overview
   - `report.json` for exact metrics and scenario breakdowns
   - `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts
+- Redis replay fields from simulator `/status` subscriptions are preserved in `report.json` and summarized in `summary.md` when present.
 - RFQ-enabled Ethereum runs should also surface RFQ readiness and any RFQ-visibility findings in `summary.md` and `report.json`.
 - Baseline comparison is meant to be flexible. Use the latest saved run when it helps, disable it with `--baseline none` when you want a clean one-off read.
-- The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so the agent can investigate.
+- The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so a reviewer can investigate.
 
 ## Useful commands
 - Format: `cargo fmt --all`
@@ -53,6 +55,7 @@
 - Manual lifecycle:
   - `scripts/start_server.sh --repo . --chain-id 1`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1`
+  - `scripts/verify_broadcaster_redis.sh --repo .`
   - `scripts/wait_ready.sh --url http://localhost:3000/status --expect-chain-id 1 --require-rfq-ready --timeout 600`
   - `scripts/stop_server.sh --repo .`
 

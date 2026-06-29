@@ -17,7 +17,7 @@ use crate::models::protocol::ProtocolKind;
 
 mod redis_streams;
 
-pub use redis_streams::{BroadcasterRedisSnapshotPointer, BroadcasterRedisStreamEntry};
+pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +55,7 @@ pub struct BroadcasterSnapshotSessionResponse {
     pub session_id: u64,
     pub stream_id: String,
     pub snapshot_id: String,
+    pub redis_replay_boundary: BroadcasterRedisReplayBoundary,
     pub payload_count: u32,
     pub snapshot_chunk_count: u32,
     pub expires_in_ms: u64,
@@ -134,6 +135,7 @@ pub enum BroadcasterMessageKind {
     SnapshotEnd,
     Update,
     Heartbeat,
+    Progress,
 }
 
 impl BroadcasterMessageKind {
@@ -144,6 +146,7 @@ impl BroadcasterMessageKind {
             Self::SnapshotEnd => "snapshot_end",
             Self::Update => "update",
             Self::Heartbeat => "heartbeat",
+            Self::Progress => "progress",
         }
     }
 }
@@ -188,6 +191,7 @@ pub enum BroadcasterPayload {
     SnapshotEnd(BroadcasterSnapshotEnd),
     Update(BroadcasterUpdateMessage),
     Heartbeat(BroadcasterHeartbeat),
+    Progress(BroadcasterProgress),
 }
 
 impl BroadcasterPayload {
@@ -198,6 +202,7 @@ impl BroadcasterPayload {
             Self::SnapshotEnd(_) => BroadcasterMessageKind::SnapshotEnd,
             Self::Update(_) => BroadcasterMessageKind::Update,
             Self::Heartbeat(_) => BroadcasterMessageKind::Heartbeat,
+            Self::Progress(_) => BroadcasterMessageKind::Progress,
         }
     }
 }
@@ -622,7 +627,107 @@ impl BroadcasterHeartbeat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterProgress {
+    pub chain_id: u64,
+    pub snapshot_id: String,
+    #[serde(deserialize_with = "deserialize_unique_progress_backends")]
+    pub backends: Vec<BroadcasterBackend>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<BroadcasterGenerationHandoff>,
+}
+
+impl BroadcasterProgress {
+    pub fn new(
+        chain_id: u64,
+        snapshot_id: impl Into<String>,
+        mut backends: Vec<BroadcasterBackend>,
+        reason: impl Into<String>,
+    ) -> Result<Self, BroadcasterContractError> {
+        backends.sort();
+        validate_progress_backends(&backends)?;
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(BroadcasterContractError::ProgressReasonEmpty);
+        }
+        Ok(Self {
+            chain_id,
+            snapshot_id: snapshot_id.into(),
+            backends,
+            reason,
+            handoff: None,
+        })
+    }
+
+    pub fn new_with_handoff(
+        chain_id: u64,
+        snapshot_id: impl Into<String>,
+        backends: Vec<BroadcasterBackend>,
+        reason: impl Into<String>,
+        handoff: BroadcasterGenerationHandoff,
+    ) -> Result<Self, BroadcasterContractError> {
+        let mut progress = Self::new(chain_id, snapshot_id, backends, reason)?;
+        progress.handoff = Some(handoff);
+        Ok(progress)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterGenerationHandoff {
+    pub previous_stream_id: String,
+    pub previous_entry_id: String,
+    pub base_heads: Vec<BroadcasterBackendHead>,
+}
+
+impl BroadcasterGenerationHandoff {
+    pub fn new(
+        previous_stream_id: impl Into<String>,
+        previous_entry_id: impl Into<String>,
+        mut base_heads: Vec<BroadcasterBackendHead>,
+    ) -> Result<Self, BroadcasterContractError> {
+        base_heads.sort_by_key(|head| head.backend);
+        validate_generation_handoff_base_heads(&base_heads)?;
+        Ok(Self {
+            previous_stream_id: required_handoff_field(
+                "handoff.previousStreamId",
+                previous_stream_id.into(),
+            )?,
+            previous_entry_id: required_handoff_field(
+                "handoff.previousEntryId",
+                previous_entry_id.into(),
+            )?,
+            base_heads,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for BroadcasterGenerationHandoff {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireHandoff {
+            previous_stream_id: String,
+            previous_entry_id: String,
+            base_heads: Vec<BroadcasterBackendHead>,
+        }
+
+        let wire = WireHandoff::deserialize(deserializer)?;
+        Self::new(
+            wire.previous_stream_id,
+            wire.previous_entry_id,
+            wire.base_heads,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterBackendHead {
     pub backend: BroadcasterBackend,
@@ -826,6 +931,7 @@ pub enum BroadcasterSubscriptionEvent {
     },
     UpdateAccepted,
     HeartbeatAccepted,
+    ProgressAccepted,
 }
 
 #[derive(Debug, Clone)]
@@ -861,6 +967,92 @@ impl BroadcasterSubscriptionTracker {
     pub fn reset_for_reconnect(&mut self) {
         self.state = BroadcasterSubscriptionState::AwaitingSnapshot;
         self.next_message_seq = None;
+    }
+
+    pub fn align_live_replay_boundary(
+        &mut self,
+        boundary: &BroadcasterRedisReplayBoundary,
+    ) -> Result<(), BroadcasterContractError> {
+        let BroadcasterSubscriptionState::Live {
+            stream_id,
+            snapshot_id,
+            ..
+        } = &self.state
+        else {
+            return Err(
+                BroadcasterContractError::RedisReplayBoundaryBeforeSnapshotComplete {
+                    state: self.state.label(),
+                },
+            );
+        };
+
+        ensure_stream_id(stream_id, &boundary.stream_id)?;
+        ensure_snapshot_id(snapshot_id, &boundary.snapshot_id)?;
+        self.next_message_seq = Some(next_message_seq(boundary.exclusive_message_seq)?);
+        Ok(())
+    }
+
+    pub fn continue_live_generation(
+        &mut self,
+        boundary: &BroadcasterRedisReplayBoundary,
+    ) -> Result<(), BroadcasterContractError> {
+        let BroadcasterSubscriptionState::Live {
+            chain_id,
+            declared_backends,
+            ..
+        } = self.state.clone()
+        else {
+            return Err(
+                BroadcasterContractError::RedisReplayBoundaryBeforeSnapshotComplete {
+                    state: self.state.label(),
+                },
+            );
+        };
+
+        self.state = BroadcasterSubscriptionState::Live {
+            stream_id: boundary.stream_id.clone(),
+            chain_id,
+            snapshot_id: boundary.snapshot_id.clone(),
+            declared_backends,
+        };
+        self.next_message_seq = Some(next_message_seq(boundary.exclusive_message_seq)?);
+        Ok(())
+    }
+
+    pub fn skip_live_delta(
+        &mut self,
+        envelope: &BroadcasterEnvelope,
+    ) -> Result<(), BroadcasterContractError> {
+        let BroadcasterSubscriptionState::Live { stream_id, .. } = self.state.clone() else {
+            return Err(
+                BroadcasterContractError::RedisReplayBoundaryBeforeSnapshotComplete {
+                    state: self.state.label(),
+                },
+            );
+        };
+
+        ensure_stream_id(&stream_id, &envelope.stream_id)?;
+        ensure_message_seq(self.next_message_seq, envelope.message_seq)?;
+        let next_seq = next_message_seq(envelope.message_seq)?;
+        match &envelope.payload {
+            BroadcasterPayload::SnapshotStart(_) => {
+                Err(BroadcasterContractError::UnexpectedSnapshotStart {
+                    state: self.state.label(),
+                })
+            }
+            BroadcasterPayload::SnapshotChunk(_) => {
+                Err(BroadcasterContractError::UnexpectedSnapshotChunk)
+            }
+            BroadcasterPayload::SnapshotEnd(_) => {
+                Err(BroadcasterContractError::UnexpectedSnapshotEnd)
+            }
+            BroadcasterPayload::Update(_)
+            | BroadcasterPayload::Heartbeat(_)
+            | BroadcasterPayload::Progress(_) => {
+                self.next_message_seq = Some(next_seq);
+                Ok(())
+            }
+        }
     }
 
     pub fn observe(
@@ -1028,6 +1220,9 @@ impl BroadcasterSubscriptionTracker {
             BroadcasterPayload::Heartbeat(_) => {
                 Err(BroadcasterContractError::HeartbeatBeforeSnapshotComplete)
             }
+            BroadcasterPayload::Progress(_) => {
+                Err(BroadcasterContractError::ProgressBeforeSnapshotComplete)
+            }
         }
     }
 
@@ -1068,6 +1263,14 @@ impl BroadcasterSubscriptionTracker {
                 ensure_snapshot_id(snapshot_id, &heartbeat.snapshot_id)?;
                 self.next_message_seq = Some(next_seq);
                 Ok(BroadcasterSubscriptionEvent::HeartbeatAccepted)
+            }
+            BroadcasterPayload::Progress(progress) => {
+                validate_progress_backends(&progress.backends)?;
+                validate_declared_progress_backends(&progress.backends, &declared_backends)?;
+                ensure_chain_id(chain_id, progress.chain_id)?;
+                ensure_snapshot_id(snapshot_id, &progress.snapshot_id)?;
+                self.next_message_seq = Some(next_seq);
+                Ok(BroadcasterSubscriptionEvent::ProgressAccepted)
             }
         }
     }
@@ -1119,7 +1322,12 @@ pub enum BroadcasterContractError {
     },
     UpdateBeforeSnapshotComplete,
     HeartbeatBeforeSnapshotComplete,
+    ProgressBeforeSnapshotComplete,
+    RedisReplayBoundaryBeforeSnapshotComplete {
+        state: &'static str,
+    },
     EmptyUpdate,
+    ProgressReasonEmpty,
     EmptyUpdatePartition {
         backend: BroadcasterBackend,
     },
@@ -1169,7 +1377,7 @@ pub enum BroadcasterContractError {
         kind: BroadcasterMessageKind,
     },
     RedisMessageSequenceZero,
-    RedisFirstMessageNotSnapshotStart {
+    RedisSnapshotPayloadUnsupported {
         kind: BroadcasterMessageKind,
     },
     RedisBackendScopeInvalid {
@@ -1186,20 +1394,12 @@ pub enum BroadcasterContractError {
         entry_block_number: u64,
         payload_block_number: u64,
     },
+    RedisObservedTimestampMismatch {
+        entry_observed_timestamp_ms: u64,
+        payload_observed_timestamp_ms: u64,
+    },
     InvalidRedisEntryId {
         entry_id: String,
-    },
-    RedisSnapshotEntryRangeInvalid {
-        snapshot_start_entry_id: String,
-        snapshot_end_entry_id: String,
-    },
-    RedisSnapshotPointerLiveCursorMismatch {
-        snapshot_end_entry_id: String,
-        live_cursor_entry_id: String,
-    },
-    RedisSnapshotRetentionGap {
-        oldest_retained_entry_id: String,
-        snapshot_start_entry_id: String,
     },
     TokenChainMismatch {
         expected: u64,
@@ -1357,8 +1557,8 @@ fn fmt_redis_contract_error(
         BroadcasterContractError::RedisMessageSequenceZero => {
             write!(f, "redis message_seq must start at 1")
         }
-        BroadcasterContractError::RedisFirstMessageNotSnapshotStart { kind } => {
-            write!(f, "redis message_seq 1 must be snapshot_start, found {kind}")
+        BroadcasterContractError::RedisSnapshotPayloadUnsupported { kind } => {
+            write!(f, "redis stream does not support {kind} payloads in V1")
         }
         BroadcasterContractError::RedisBackendScopeInvalid { backend_scope } => {
             write!(f, "invalid redis backend_scope: {backend_scope}")
@@ -1379,30 +1579,16 @@ fn fmt_redis_contract_error(
             f,
             "redis block_number mismatch: entry {entry_block_number}, payload {payload_block_number}"
         ),
+        BroadcasterContractError::RedisObservedTimestampMismatch {
+            entry_observed_timestamp_ms,
+            payload_observed_timestamp_ms,
+        } => write!(
+            f,
+            "redis observed_timestamp_ms mismatch: entry {entry_observed_timestamp_ms}, payload {payload_observed_timestamp_ms}"
+        ),
         BroadcasterContractError::InvalidRedisEntryId { entry_id } => {
             write!(f, "invalid redis stream entry id: {entry_id}")
         }
-        BroadcasterContractError::RedisSnapshotEntryRangeInvalid {
-            snapshot_start_entry_id,
-            snapshot_end_entry_id,
-        } => write!(
-            f,
-            "redis snapshot range is invalid: start {snapshot_start_entry_id}, end {snapshot_end_entry_id}"
-        ),
-        BroadcasterContractError::RedisSnapshotPointerLiveCursorMismatch {
-            snapshot_end_entry_id,
-            live_cursor_entry_id,
-        } => write!(
-            f,
-            "redis snapshot pointer live cursor {live_cursor_entry_id} must match snapshot end {snapshot_end_entry_id}"
-        ),
-        BroadcasterContractError::RedisSnapshotRetentionGap {
-            oldest_retained_entry_id,
-            snapshot_start_entry_id,
-        } => write!(
-            f,
-            "redis retention starts at {oldest_retained_entry_id}, after latest snapshot start {snapshot_start_entry_id}"
-        ),
         _ => f.write_str("redis contract error"),
     }
 }
@@ -1503,7 +1689,15 @@ impl fmt::Display for BroadcasterContractError {
             Self::HeartbeatBeforeSnapshotComplete => {
                 write!(f, "received heartbeat before snapshot bootstrap completed")
             }
+            Self::ProgressBeforeSnapshotComplete => {
+                write!(f, "received progress before snapshot bootstrap completed")
+            }
+            Self::RedisReplayBoundaryBeforeSnapshotComplete { state } => write!(
+                f,
+                "redis replay boundary requires completed snapshot bootstrap, current state is {state}"
+            ),
             Self::EmptyUpdate => write!(f, "update message must contain at least one partition"),
+            Self::ProgressReasonEmpty => write!(f, "progress reason must not be empty"),
             Self::EmptyUpdatePartition { backend } => {
                 write!(
                     f,
@@ -1543,15 +1737,13 @@ impl fmt::Display for BroadcasterContractError {
             | Self::RedisUnsupportedSchemaVersion { .. }
             | Self::RedisEntryMissingSnapshotId { .. }
             | Self::RedisMessageSequenceZero
-            | Self::RedisFirstMessageNotSnapshotStart { .. }
+            | Self::RedisSnapshotPayloadUnsupported { .. }
             | Self::RedisBackendScopeInvalid { .. }
             | Self::RedisPayloadJsonInvalid { .. }
             | Self::RedisPayloadKindMismatch { .. }
             | Self::RedisBlockNumberMismatch { .. }
-            | Self::InvalidRedisEntryId { .. }
-            | Self::RedisSnapshotEntryRangeInvalid { .. }
-            | Self::RedisSnapshotPointerLiveCursorMismatch { .. }
-            | Self::RedisSnapshotRetentionGap { .. } => fmt_redis_contract_error(f, self),
+            | Self::RedisObservedTimestampMismatch { .. }
+            | Self::InvalidRedisEntryId { .. } => fmt_redis_contract_error(f, self),
             Self::TokenChainMismatch { expected, actual } => {
                 write!(
                     f,
@@ -1707,6 +1899,18 @@ where
     Ok(heads)
 }
 
+fn deserialize_unique_progress_backends<'de, D>(
+    deserializer: D,
+) -> Result<Vec<BroadcasterBackend>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut backends = Vec::<BroadcasterBackend>::deserialize(deserializer)?;
+    backends.sort();
+    validate_progress_backends(&backends).map_err(de::Error::custom)?;
+    Ok(backends)
+}
+
 fn validate_snapshot_start_backends(
     backends: &[BroadcasterBackend],
 ) -> Result<(), BroadcasterContractError> {
@@ -1735,6 +1939,18 @@ fn validate_heartbeat_backend_heads(
     heads: &[BroadcasterBackendHead],
 ) -> Result<(), BroadcasterContractError> {
     validate_unique_backend_heads("heartbeat.backend_heads", heads)
+}
+
+fn validate_generation_handoff_base_heads(
+    heads: &[BroadcasterBackendHead],
+) -> Result<(), BroadcasterContractError> {
+    validate_unique_backend_heads("progress.handoff.baseHeads", heads)
+}
+
+fn validate_progress_backends(
+    backends: &[BroadcasterBackend],
+) -> Result<(), BroadcasterContractError> {
+    validate_unique_backends("progress.backends", backends)
 }
 
 fn validate_declared_snapshot_chunk_backends(
@@ -1766,6 +1982,17 @@ fn validate_declared_heartbeat_backends(
     validate_declared_backend_entries(
         "heartbeat.backend_heads",
         heads.iter().map(|head| head.backend),
+        declared_backends,
+    )
+}
+
+fn validate_declared_progress_backends(
+    backends: &[BroadcasterBackend],
+    declared_backends: &HashSet<BroadcasterBackend>,
+) -> Result<(), BroadcasterContractError> {
+    validate_declared_backend_entries(
+        "progress.backends",
+        backends.iter().copied(),
         declared_backends,
     )
 }
@@ -1828,6 +2055,17 @@ fn validate_unique_backend_entries(
         }
     }
     Ok(())
+}
+
+fn required_handoff_field(
+    field: &'static str,
+    value: String,
+) -> Result<String, BroadcasterContractError> {
+    if value.trim().is_empty() {
+        Err(BroadcasterContractError::RedisEntryEmptyField { field })
+    } else {
+        Ok(value)
+    }
 }
 
 fn validate_declared_backend_entries(
@@ -2230,14 +2468,14 @@ mod tests {
     };
     use super::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterRemovedPair,
-        BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
-        BroadcasterSnapshotSessionResponse, BroadcasterSnapshotStart, BroadcasterStateDelta,
-        BroadcasterStateEntry, BroadcasterSubscriptionEvent, BroadcasterSubscriptionState,
-        BroadcasterSubscriptionTracker, BroadcasterTokenDto, BroadcasterTokenLookupRequest,
-        BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage,
-        BroadcasterUpdatePartition,
+        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolMessage,
+        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind,
+        BroadcasterRedisReplayBoundary, BroadcasterRemovedPair, BroadcasterSnapshotChunk,
+        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
+        BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
+        BroadcasterSubscriptionEvent, BroadcasterSubscriptionState, BroadcasterSubscriptionTracker,
+        BroadcasterTokenDto, BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
+        BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
 
     #[test]
@@ -2309,6 +2547,13 @@ mod tests {
             session_id: 9,
             stream_id: "stream-1".to_string(),
             snapshot_id: "snapshot-1".to_string(),
+            redis_replay_boundary: BroadcasterRedisReplayBoundary::new(
+                "dsolver:broadcaster:test:events",
+                "stream-1",
+                "snapshot-1",
+                1,
+                7,
+            )?,
             payload_count: 4,
             snapshot_chunk_count: 2,
             expires_in_ms: 300_000,
@@ -2319,6 +2564,14 @@ mod tests {
         assert_eq!(json["sessionId"], 9);
         assert_eq!(json["streamId"], "stream-1");
         assert_eq!(json["snapshotId"], "snapshot-1");
+        assert_eq!(
+            json["redisReplayBoundary"]["streamKey"],
+            "dsolver:broadcaster:test:events"
+        );
+        assert!(json["redisReplayBoundary"]
+            .get("exclusiveEntryId")
+            .is_none());
+        assert_eq!(json["redisReplayBoundary"]["exclusiveMessageSeq"], 7);
         assert_eq!(json["payloadCount"], 4);
         assert_eq!(json["snapshotChunkCount"], 2);
         assert_eq!(json["expiresInMs"], 300_000);
@@ -2701,8 +2954,92 @@ mod tests {
             tracker.observe(&heartbeat_envelope("stream-1", 8453, "snapshot-1", 54)?)?,
             BroadcasterSubscriptionEvent::HeartbeatAccepted
         );
-        assert_eq!(tracker.next_message_seq(), Some(55));
+        assert_eq!(
+            tracker.observe(&BroadcasterEnvelope::new(
+                "stream-1",
+                55,
+                BroadcasterPayload::Progress(BroadcasterProgress::new(
+                    8453,
+                    "snapshot-1",
+                    vec![BroadcasterBackend::Native],
+                    "generation_reset",
+                )?),
+            ))?,
+            BroadcasterSubscriptionEvent::ProgressAccepted
+        );
+        assert_eq!(tracker.next_message_seq(), Some(56));
 
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_can_rebase_live_sequence_to_redis_replay_boundary() -> Result<()> {
+        let mut tracker = BroadcasterSubscriptionTracker::new();
+        tracker.observe(&snapshot_start_envelope(
+            "stream-1",
+            8453,
+            "snapshot-1",
+            50,
+            1,
+        )?)?;
+        tracker.observe(&snapshot_chunk_envelope("stream-1", 51, 0)?)?;
+        tracker.observe(&snapshot_end_envelope("stream-1", 52))?;
+
+        let boundary = BroadcasterRedisReplayBoundary::new(
+            "redis-key".to_string(),
+            "stream-1".to_string(),
+            "snapshot-1".to_string(),
+            1,
+            99,
+        )?;
+        tracker.align_live_replay_boundary(&boundary)?;
+
+        assert_eq!(tracker.next_message_seq(), Some(100));
+        assert_eq!(
+            tracker.observe(&update_envelope("stream-1", 100)?)?,
+            BroadcasterSubscriptionEvent::UpdateAccepted
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tracker_can_advance_sequence_for_skipped_live_delta() -> Result<()> {
+        let mut tracker = BroadcasterSubscriptionTracker::new();
+        tracker.observe(&snapshot_start_envelope(
+            "stream-1",
+            8453,
+            "snapshot-1",
+            50,
+            1,
+        )?)?;
+        tracker.observe(&snapshot_chunk_envelope("stream-1", 51, 0)?)?;
+        tracker.observe(&snapshot_end_envelope("stream-1", 52))?;
+
+        tracker.skip_live_delta(&BroadcasterEnvelope::new(
+            "stream-1",
+            53,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    BroadcasterBackend::Rfq,
+                    124,
+                    vec![BroadcasterStateEntry::new(
+                        "pool-rfq",
+                        protocol_component("pool-rfq", "rfq:hashflow"),
+                        dummy_state("rfq"),
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                ),
+            ])?),
+        ))?;
+
+        assert_eq!(tracker.next_message_seq(), Some(54));
+        assert_eq!(
+            tracker.observe(&update_envelope("stream-1", 54)?)?,
+            BroadcasterSubscriptionEvent::UpdateAccepted
+        );
         Ok(())
     }
 

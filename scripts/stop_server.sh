@@ -87,6 +87,48 @@ stop_process() {
   return 1
 }
 
+read_metadata_value() {
+  local metadata_file="$1"
+  local key="$2"
+
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      print substr($0, length(key) + 2)
+      exit
+    }
+  ' "$metadata_file" 2>/dev/null || true
+}
+
+stop_redis_service() {
+  local metadata_file="$repo/.tycho-redis-service.meta"
+
+  if [[ ! -f "$metadata_file" ]]; then
+    echo "No Redis service metadata found at $metadata_file."
+    return 0
+  fi
+
+  local compose_file compose_project
+  compose_file="$(read_metadata_value "$metadata_file" "compose_file")"
+  compose_project="$(read_metadata_value "$metadata_file" "compose_project")"
+
+  if [[ -z "$compose_file" || -z "$compose_project" || ! -f "$compose_file" ]]; then
+    echo "Redis service metadata is stale; removing $metadata_file." >&2
+    rm -f "$metadata_file"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    echo "Docker Compose is required to stop helper-managed Redis from $metadata_file." >&2
+    return 1
+  fi
+
+  echo "Stopping Redis service..."
+  (
+    cd "$repo"
+    docker compose -p "$compose_project" -f "$compose_file" down
+  )
+  rm -f "$metadata_file"
+}
+
 status=0
 if ! stop_process "simulator service" "$repo/.tycho-sim-server.pid"; then
   status=1
@@ -98,6 +140,13 @@ fi
 if stop_process "broadcaster service" "$repo/.tycho-broadcaster-service.pid"; then
   rm -f "$repo/.tycho-broadcaster-service.meta"
 else
+  status=1
+  if [[ "$force" != "true" ]]; then
+    echo "Preserving Redis service because broadcaster service did not stop." >&2
+    exit "$status"
+  fi
+fi
+if ! stop_redis_service; then
   status=1
 fi
 

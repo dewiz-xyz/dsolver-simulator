@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
 use tycho_simulation::{
@@ -87,6 +88,10 @@ struct BroadcasterSubscriptionStatusData {
     bootstrap_complete: bool,
     stream_id: Option<String>,
     snapshot_id: Option<String>,
+    redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
+    redis_catch_up_cursor: Option<String>,
+    redis_replay_caught_up: bool,
+    redis_gap_reason: Option<String>,
     restart_count: u64,
     last_error: Option<String>,
 }
@@ -97,6 +102,10 @@ pub struct BroadcasterSubscriptionSnapshot {
     pub bootstrap_complete: bool,
     pub stream_id: Option<String>,
     pub snapshot_id: Option<String>,
+    pub redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
+    pub redis_catch_up_cursor: Option<String>,
+    pub redis_replay_caught_up: bool,
+    pub redis_gap_reason: Option<String>,
     pub restart_count: u64,
     pub last_error: Option<String>,
 }
@@ -108,6 +117,10 @@ impl BroadcasterSubscriptionStatus {
         guard.bootstrap_complete = false;
         guard.stream_id = None;
         guard.snapshot_id = None;
+        guard.redis_replay_boundary = None;
+        guard.redis_catch_up_cursor = None;
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = None;
         guard.last_error = None;
     }
 
@@ -121,21 +134,69 @@ impl BroadcasterSubscriptionStatus {
         guard.bootstrap_complete = false;
         guard.stream_id = Some(stream_id.into());
         guard.snapshot_id = Some(snapshot_id.into());
+        guard.redis_replay_boundary = None;
+        guard.redis_catch_up_cursor = None;
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = None;
         guard.last_error = None;
     }
 
-    pub async fn mark_bootstrap_complete(&self) {
+    pub async fn mark_bootstrap_complete_with_redis_boundary(
+        &self,
+        boundary: BroadcasterRedisReplayBoundary,
+    ) {
         let mut guard = self.inner.write().await;
         guard.connected = true;
         guard.bootstrap_complete = true;
+        guard.redis_catch_up_cursor = Some(boundary.exclusive_entry_id());
+        guard.redis_replay_boundary = Some(boundary);
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = None;
         guard.last_error = None;
+    }
+
+    pub async fn mark_redis_generation_continued(&self, boundary: BroadcasterRedisReplayBoundary) {
+        let mut guard = self.inner.write().await;
+        guard.connected = true;
+        guard.bootstrap_complete = true;
+        guard.stream_id = Some(boundary.stream_id.clone());
+        guard.snapshot_id = Some(boundary.snapshot_id.clone());
+        guard.redis_catch_up_cursor = Some(boundary.exclusive_entry_id());
+        guard.redis_replay_boundary = Some(boundary);
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = None;
+        guard.last_error = None;
+    }
+
+    pub async fn mark_redis_replay_checkpoint(&self, checkpoint: impl Into<String>) {
+        let mut guard = self.inner.write().await;
+        guard.redis_catch_up_cursor = Some(checkpoint.into());
+        guard.redis_gap_reason = None;
+    }
+
+    pub async fn mark_redis_catch_up_checkpoint(&self, checkpoint: impl Into<String>) {
+        let mut guard = self.inner.write().await;
+        guard.redis_catch_up_cursor = Some(checkpoint.into());
+        guard.redis_replay_caught_up = true;
+        guard.redis_gap_reason = None;
+    }
+
+    pub async fn mark_redis_gap(&self, reason: impl Into<String>) {
+        let mut guard = self.inner.write().await;
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = Some(reason.into());
     }
 
     pub async fn mark_disconnected(&self, last_error: Option<String>) {
         let mut guard = self.inner.write().await;
         guard.connected = false;
         guard.bootstrap_complete = false;
+        guard.stream_id = None;
         guard.snapshot_id = None;
+        guard.redis_replay_boundary = None;
+        guard.redis_catch_up_cursor = None;
+        guard.redis_replay_caught_up = false;
+        guard.redis_gap_reason = None;
         guard.restart_count = guard.restart_count.saturating_add(1);
         guard.last_error = last_error;
     }
@@ -147,6 +208,10 @@ impl BroadcasterSubscriptionStatus {
             bootstrap_complete: guard.bootstrap_complete,
             stream_id: guard.stream_id.clone(),
             snapshot_id: guard.snapshot_id.clone(),
+            redis_replay_boundary: guard.redis_replay_boundary.clone(),
+            redis_catch_up_cursor: guard.redis_catch_up_cursor.clone(),
+            redis_replay_caught_up: guard.redis_replay_caught_up,
+            redis_gap_reason: guard.redis_gap_reason.clone(),
             restart_count: guard.restart_count,
             last_error: guard.last_error.clone(),
         }
@@ -159,6 +224,10 @@ impl BroadcasterSubscriptionStatus {
                 bootstrap_complete: true,
                 stream_id: Some("stream-test".to_string()),
                 snapshot_id: Some("snapshot-test".to_string()),
+                redis_replay_boundary: None,
+                redis_catch_up_cursor: None,
+                redis_replay_caught_up: true,
+                redis_gap_reason: None,
                 restart_count: 0,
                 last_error: None,
             })),
@@ -285,6 +354,8 @@ pub enum SimulatorReadinessReason {
     DisabledByConfig,
     BroadcasterDisconnected,
     SnapshotBootstrapping,
+    RedisReplayCatchingUp,
+    RedisReplayGap,
     StateWarmingUp,
     Rebuilding,
     Stale,
@@ -296,6 +367,8 @@ impl SimulatorReadinessReason {
             Self::DisabledByConfig => "disabled_by_config",
             Self::BroadcasterDisconnected => "broadcaster_disconnected",
             Self::SnapshotBootstrapping => "snapshot_bootstrapping",
+            Self::RedisReplayCatchingUp => "redis_replay_catching_up",
+            Self::RedisReplayGap => "redis_replay_gap",
             Self::StateWarmingUp => "state_warming_up",
             Self::Rebuilding => "rebuilding",
             Self::Stale => "stale",
@@ -332,6 +405,10 @@ pub struct SimulatorBackendSubscriptionSnapshot {
     pub bootstrap_complete: bool,
     pub stream_id: Option<String>,
     pub snapshot_id: Option<String>,
+    pub redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
+    pub redis_catch_up_cursor: Option<String>,
+    pub redis_replay_caught_up: bool,
+    pub redis_gap_reason: Option<String>,
     pub restart_count: u64,
     pub last_error: Option<String>,
 }
@@ -380,26 +457,21 @@ impl EncodeAvailability {
 impl AppState {
     async fn native_broadcaster_bootstrap_ready(&self) -> bool {
         let subscription = self.native_broadcaster_subscription.snapshot().await;
-        subscription.connected && subscription.bootstrap_complete
+        subscription_readiness_reason(&subscription).is_none()
     }
 
     async fn vm_broadcaster_bootstrap_ready(&self) -> bool {
         let subscription = self.vm_broadcaster_subscription.snapshot().await;
-        subscription.connected && subscription.bootstrap_complete
+        subscription_readiness_reason(&subscription).is_none()
     }
 
     async fn rfq_broadcaster_bootstrap_ready(&self) -> bool {
         let subscription = self.rfq_broadcaster_subscription.snapshot().await;
-        subscription.connected && subscription.bootstrap_complete
+        subscription_readiness_reason(&subscription).is_none()
     }
 
     pub async fn status_snapshot(&self) -> SimulatorStatusSnapshot {
         let native = self.native_status_snapshot().await;
-        let status = match native.readiness {
-            SimulatorBackendReadiness::Ready => SimulatorServiceStatus::Ready,
-            SimulatorBackendReadiness::Stale => SimulatorServiceStatus::Stale,
-            _ => SimulatorServiceStatus::WarmingUp,
-        };
         let mut backends = vec![native];
 
         if self.configured_backends.vm {
@@ -408,6 +480,7 @@ impl AppState {
         if self.configured_backends.rfq {
             backends.push(self.rfq_status_snapshot().await);
         }
+        let status = service_status_from_backends(&backends);
 
         SimulatorStatusSnapshot {
             status,
@@ -575,7 +648,31 @@ impl AppState {
     }
 
     pub async fn is_ready(&self) -> bool {
-        matches!(self.native_readiness().await, NativeReadiness::Ready)
+        if !matches!(self.native_readiness().await, NativeReadiness::Ready) {
+            return false;
+        }
+
+        if self.enable_vm_pools
+            && self
+                .vm_broadcaster_subscription
+                .snapshot()
+                .await
+                .redis_gap_reason
+                .is_some()
+        {
+            return false;
+        }
+        if self.enable_rfq_pools
+            && self
+                .rfq_broadcaster_subscription
+                .snapshot()
+                .await
+                .redis_gap_reason
+                .is_some()
+        {
+            return false;
+        }
+        true
     }
 
     pub fn readiness_stale_ms(&self) -> u64 {
@@ -853,12 +950,36 @@ fn is_update_stale(last_update_age_ms: Option<u64>, readiness_stale_ms: u64) -> 
 fn subscription_readiness_reason(
     subscription: &BroadcasterSubscriptionSnapshot,
 ) -> Option<SimulatorReadinessReason> {
-    if !subscription.connected {
+    if subscription.redis_gap_reason.is_some() {
+        Some(SimulatorReadinessReason::RedisReplayGap)
+    } else if !subscription.connected {
         Some(SimulatorReadinessReason::BroadcasterDisconnected)
     } else if !subscription.bootstrap_complete {
         Some(SimulatorReadinessReason::SnapshotBootstrapping)
+    } else if !subscription.redis_replay_caught_up {
+        Some(SimulatorReadinessReason::RedisReplayCatchingUp)
     } else {
         None
+    }
+}
+
+fn service_status_from_backends(
+    backends: &[SimulatorBackendStatusSnapshot],
+) -> SimulatorServiceStatus {
+    if backends.iter().any(|backend| {
+        backend.enabled && backend.reason == Some(SimulatorReadinessReason::RedisReplayGap)
+    }) {
+        return SimulatorServiceStatus::WarmingUp;
+    }
+
+    match backends
+        .first()
+        .map(|backend| backend.readiness)
+        .unwrap_or(SimulatorBackendReadiness::WarmingUp)
+    {
+        SimulatorBackendReadiness::Ready => SimulatorServiceStatus::Ready,
+        SimulatorBackendReadiness::Stale => SimulatorServiceStatus::Stale,
+        _ => SimulatorServiceStatus::WarmingUp,
     }
 }
 
@@ -869,6 +990,10 @@ impl From<BroadcasterSubscriptionSnapshot> for SimulatorBackendSubscriptionSnaps
             bootstrap_complete: snapshot.bootstrap_complete,
             stream_id: snapshot.stream_id,
             snapshot_id: snapshot.snapshot_id,
+            redis_replay_boundary: snapshot.redis_replay_boundary,
+            redis_catch_up_cursor: snapshot.redis_catch_up_cursor,
+            redis_replay_caught_up: snapshot.redis_replay_caught_up,
+            redis_gap_reason: snapshot.redis_gap_reason,
             restart_count: snapshot.restart_count,
             last_error: snapshot.last_error,
         }
@@ -1594,6 +1719,33 @@ mod tests {
         Update::new(1, states, new_pairs)
     }
 
+    fn replay_boundary(exclusive_message_seq: u64) -> BroadcasterRedisReplayBoundary {
+        BroadcasterRedisReplayBoundary::new(
+            "redis-stream",
+            "stream-2",
+            "snapshot-2",
+            1,
+            exclusive_message_seq,
+        )
+        .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
+    }
+
+    fn replay_boundary_for(
+        stream_id: &str,
+        snapshot_id: &str,
+        generation: u64,
+        exclusive_message_seq: u64,
+    ) -> BroadcasterRedisReplayBoundary {
+        BroadcasterRedisReplayBoundary::new(
+            "redis-stream",
+            stream_id,
+            snapshot_id,
+            generation,
+            exclusive_message_seq,
+        )
+        .unwrap_or_else(|error| unreachable!("valid replay boundary: {error}"))
+    }
+
     struct TestAppStateStores {
         token_store: Arc<TokenStore>,
         native_state_store: Arc<StateStore>,
@@ -1675,6 +1827,82 @@ mod tests {
                 enable_rfq_pools,
             },
         )
+    }
+
+    async fn build_ready_state_with_vm_and_rfq() -> AppState {
+        let state = build_readiness_test_state(true, true).await;
+        state.native_stream_health.record_update(1).await;
+        state
+            .vm_state_store
+            .apply_update(mk_update(vec![(
+                "pool-vm".to_string(),
+                mk_component(
+                    38,
+                    "vm:curve",
+                    "curve_pool",
+                    vec![mk_token(39, "TKNA"), mk_token(40, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        state
+            .rfq_state_store
+            .apply_update(mk_update(vec![(
+                "pool-rfq".to_string(),
+                mk_component(
+                    41,
+                    "rfq:hashflow",
+                    "hashflow_pool",
+                    vec![mk_token(42, "TKNA"), mk_token(43, "TKNB")],
+                ),
+                Box::new(DummySim),
+            )]))
+            .await;
+        state.vm_stream_health.record_update(1).await;
+        state.rfq_stream_health.record_update(1).await;
+        state
+    }
+
+    async fn assert_service_readiness_fails_for_redis_gap(
+        backend: SimulatorBackendKind,
+        gap_reason: &'static str,
+    ) {
+        let state = build_ready_state_with_vm_and_rfq().await;
+        assert!(state.is_ready().await);
+        assert_eq!(
+            state.status_snapshot().await.status,
+            SimulatorServiceStatus::Ready
+        );
+
+        match backend {
+            SimulatorBackendKind::Vm => {
+                state
+                    .vm_broadcaster_subscription
+                    .mark_redis_gap(gap_reason)
+                    .await;
+            }
+            SimulatorBackendKind::Rfq => {
+                state
+                    .rfq_broadcaster_subscription
+                    .mark_redis_gap(gap_reason)
+                    .await;
+            }
+            SimulatorBackendKind::Native => {
+                state
+                    .native_broadcaster_subscription
+                    .mark_redis_gap(gap_reason)
+                    .await;
+            }
+        }
+
+        assert!(!state.is_ready().await);
+        let snapshot = state.status_snapshot().await;
+        let backend_snapshot = backend_snapshot(&snapshot, backend);
+        assert_eq!(snapshot.status, SimulatorServiceStatus::WarmingUp);
+        assert_eq!(
+            backend_snapshot.reason,
+            Some(SimulatorReadinessReason::RedisReplayGap)
+        );
     }
 
     #[tokio::test]
@@ -1852,10 +2080,180 @@ mod tests {
 
         state
             .native_broadcaster_subscription
-            .mark_bootstrap_complete()
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary(1))
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_redis_catch_up_checkpoint("1-1")
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn native_readiness_waits_for_redis_catch_up_after_replay_boundary() {
+        let state = build_readiness_test_state(false, false).await;
+        state.native_stream_health.record_update(1).await;
+        state
+            .native_broadcaster_subscription
+            .mark_snapshot_started("stream-2", "snapshot-2")
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary(7))
+            .await;
+
+        assert!(!state.is_ready().await);
+        let snapshot = state.status_snapshot().await;
+        let native = backend_snapshot(&snapshot, SimulatorBackendKind::Native);
+        assert_eq!(native.readiness, SimulatorBackendReadiness::WarmingUp);
+        assert_eq!(
+            native.reason,
+            Some(SimulatorReadinessReason::RedisReplayCatchingUp)
+        );
+
+        state
+            .native_broadcaster_subscription
+            .mark_redis_catch_up_checkpoint("1-7")
+            .await;
+
+        assert!(state.is_ready().await);
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn redis_generation_continuation_updates_checkpoint_without_restart() {
+        let state = build_readiness_test_state(false, false).await;
+        state
+            .native_broadcaster_subscription
+            .mark_snapshot_started("stream-7", "snapshot-7")
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary_for(
+                "stream-7",
+                "snapshot-7",
+                7,
+                103,
+            ))
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_redis_catch_up_checkpoint("7-103")
+            .await;
+
+        state
+            .native_broadcaster_subscription
+            .mark_redis_generation_continued(replay_boundary_for("stream-8", "snapshot-8", 8, 1))
+            .await;
+
+        let snapshot = state.native_broadcaster_subscription.snapshot().await;
+        assert!(snapshot.connected);
+        assert!(snapshot.bootstrap_complete);
+        assert_eq!(snapshot.restart_count, 0);
+        assert_eq!(snapshot.stream_id.as_deref(), Some("stream-8"));
+        assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-8"));
+        assert_eq!(snapshot.redis_catch_up_cursor.as_deref(), Some("8-1"));
+        assert!(!snapshot.redis_replay_caught_up);
+        let boundary = snapshot
+            .redis_replay_boundary
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("continuation should publish a Redis boundary"));
+        assert_eq!(boundary.stream_id, "stream-8");
+        assert_eq!(boundary.snapshot_id, "snapshot-8");
+        assert_eq!(boundary.generation, 8);
+        assert_eq!(boundary.exclusive_message_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn native_readiness_surfaces_redis_replay_gap() {
+        let state = build_readiness_test_state(false, false).await;
+        state.native_stream_health.record_update(1).await;
+        state
+            .native_broadcaster_subscription
+            .mark_snapshot_started("stream-2", "snapshot-2")
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary(7))
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(Some("Redis replay gap: expected message_seq 8".to_string()))
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_redis_gap("Redis replay gap: expected message_seq 8")
+            .await;
+
+        assert!(!state.is_ready().await);
+        let snapshot = state.status_snapshot().await;
+        let native = backend_snapshot(&snapshot, SimulatorBackendKind::Native);
+        assert_eq!(native.readiness, SimulatorBackendReadiness::WarmingUp);
+        assert_eq!(
+            native.reason,
+            Some(SimulatorReadinessReason::RedisReplayGap)
+        );
+        assert_eq!(
+            native
+                .subscription
+                .as_ref()
+                .and_then(|subscription| subscription.redis_gap_reason.as_deref()),
+            Some("Redis replay gap: expected message_seq 8")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_readiness_fails_when_enabled_backend_has_redis_replay_gap() {
+        assert_service_readiness_fails_for_redis_gap(
+            SimulatorBackendKind::Vm,
+            "VM Redis replay gap",
+        )
+        .await;
+        assert_service_readiness_fails_for_redis_gap(
+            SimulatorBackendKind::Rfq,
+            "RFQ Redis replay gap",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_readiness_clears_stale_redis_gap_on_plain_disconnect() {
+        let state = build_readiness_test_state(false, false).await;
+        state.native_stream_health.record_update(1).await;
+        state
+            .native_broadcaster_subscription
+            .mark_snapshot_started("stream-2", "snapshot-2")
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary(7))
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_redis_gap("Redis replay gap: expected message_seq 8")
+            .await;
+        state
+            .native_broadcaster_subscription
+            .mark_disconnected(Some("Redis connection failed".to_string()))
+            .await;
+
+        let snapshot = state.status_snapshot().await;
+        let native = backend_snapshot(&snapshot, SimulatorBackendKind::Native);
+        assert_eq!(
+            native.reason,
+            Some(SimulatorReadinessReason::BroadcasterDisconnected)
+        );
+        assert!(native
+            .subscription
+            .as_ref()
+            .and_then(|subscription| subscription.redis_gap_reason.as_deref())
+            .is_none());
+        assert!(native.subscription.is_some());
+        if let Some(subscription) = native.subscription.as_ref() {
+            assert!(subscription.stream_id.is_none());
+            assert!(subscription.redis_replay_boundary.is_none());
+        }
     }
 
     #[tokio::test]
@@ -2008,11 +2406,18 @@ mod tests {
 
         state
             .vm_broadcaster_subscription
-            .mark_bootstrap_complete()
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary(1))
             .await;
         state.vm_stream_health.record_update(1).await;
 
         assert_eq!(state.native_readiness().await, NativeReadiness::WarmingUp);
+        assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
+
+        state
+            .vm_broadcaster_subscription
+            .mark_redis_catch_up_checkpoint("1-1")
+            .await;
+
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
         assert_eq!(
             state.encode_availability(false, true, false).await,
@@ -2057,8 +2462,13 @@ mod tests {
 
         state
             .rfq_broadcaster_subscription
-            .mark_bootstrap_complete()
+            .mark_bootstrap_complete_with_redis_boundary(replay_boundary(1))
             .await;
+        state
+            .rfq_broadcaster_subscription
+            .mark_redis_catch_up_checkpoint("1-1")
+            .await;
+
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
     }
 

@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use runtime::broadcaster::redis_publisher::BroadcasterRedisPublisherStatus;
 use runtime::broadcaster::state::{
-    BroadcasterBackendStatus, BroadcasterSnapshotStatus, BroadcasterStatusSnapshot,
-    BroadcasterSubscriberSnapshot, BroadcasterUpstreamSnapshot,
+    BroadcasterBackendStatus, BroadcasterSnapshotSessionsSnapshot, BroadcasterSnapshotStatus,
+    BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
 };
 use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
 
@@ -14,8 +15,10 @@ pub struct BroadcasterStatusPayload {
     pub chain_id: u64,
     pub upstream: BroadcasterUpstreamPayload,
     pub snapshot: BroadcasterSnapshotPayload,
-    pub subscribers: BroadcasterSubscribersPayload,
+    pub snapshot_sessions: BroadcasterSnapshotSessionsPayload,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -25,7 +28,7 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
             chain_id: snapshot.chain_id,
             upstream: snapshot.upstream.into(),
             snapshot: snapshot.snapshot.into(),
-            subscribers: snapshot.subscribers.into(),
+            snapshot_sessions: snapshot.snapshot_sessions.into(),
             backends: snapshot
                 .backends
                 .into_iter()
@@ -36,6 +39,7 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                     )
                 })
                 .collect(),
+            redis_publisher: snapshot.redis_publisher,
         }
     }
 }
@@ -88,18 +92,16 @@ impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct BroadcasterSubscribersPayload {
+pub struct BroadcasterSnapshotSessionsPayload {
     pub active: usize,
-    pub lag_disconnects: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
-impl From<BroadcasterSubscriberSnapshot> for BroadcasterSubscribersPayload {
-    fn from(snapshot: BroadcasterSubscriberSnapshot) -> Self {
+impl From<BroadcasterSnapshotSessionsSnapshot> for BroadcasterSnapshotSessionsPayload {
+    fn from(snapshot: BroadcasterSnapshotSessionsSnapshot) -> Self {
         Self {
             active: snapshot.active,
-            lag_disconnects: snapshot.lag_disconnects,
             last_error: snapshot.last_error,
         }
     }

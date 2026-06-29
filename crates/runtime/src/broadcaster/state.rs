@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context, Result};
@@ -20,11 +20,16 @@ use simulator_core::broadcaster::{
     BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use super::redis_publisher::BroadcasterRedisPublisherStatus;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BroadcasterReadiness {
-    UpstreamDisconnected,
-    SnapshotWarmingUp,
     Ready,
+    RedisPublisherPassive,
+    RedisPublisherRetired,
+    RedisPublisherUnhealthy,
+    SnapshotWarmingUp,
+    UpstreamDisconnected,
 }
 
 impl BroadcasterReadiness {
@@ -32,6 +37,9 @@ impl BroadcasterReadiness {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
+            Self::RedisPublisherPassive => "redis_publisher_passive",
+            Self::RedisPublisherRetired => "redis_publisher_retired",
+            Self::RedisPublisherUnhealthy => "redis_publisher_unhealthy",
             Self::Ready => "ready",
         }
     }
@@ -43,8 +51,9 @@ pub struct BroadcasterStatusSnapshot {
     pub chain_id: u64,
     pub upstream: BroadcasterUpstreamSnapshot,
     pub snapshot: BroadcasterSnapshotStatus,
-    pub subscribers: BroadcasterSubscriberSnapshot,
+    pub snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
+    pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,9 +76,8 @@ pub struct BroadcasterSnapshotStatus {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BroadcasterSubscriberSnapshot {
+pub struct BroadcasterSnapshotSessionsSnapshot {
     pub active: usize,
-    pub lag_disconnects: u64,
     pub last_error: Option<String>,
 }
 
@@ -88,10 +96,22 @@ pub struct BroadcasterSnapshotExport {
     pub payloads: Vec<BroadcasterPayload>,
 }
 
-#[derive(Debug, Clone)]
-pub struct BroadcasterLiveState {
-    pub stream_id: String,
-    pub snapshot_id: String,
+#[derive(Debug)]
+pub(crate) struct BroadcasterStagedUpdate {
+    message: BroadcasterUpdateMessage,
+    apply_mode: BroadcasterStagedUpdateApplyMode,
+}
+
+impl BroadcasterStagedUpdate {
+    pub(crate) fn message(&self) -> &BroadcasterUpdateMessage {
+        &self.message
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BroadcasterStagedUpdateApplyMode {
+    Decoded,
+    Raw,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -178,10 +198,18 @@ struct BroadcasterPartitionState {
 }
 
 impl BroadcasterSnapshotCache {
-    pub fn new(chain_id: u64, mut configured_backends: Vec<BroadcasterBackend>) -> Self {
+    pub fn new(chain_id: u64, configured_backends: Vec<BroadcasterBackend>) -> Self {
+        Self::new_with_initial_generation(chain_id, configured_backends, 1)
+    }
+
+    pub(crate) fn new_with_initial_generation(
+        chain_id: u64,
+        mut configured_backends: Vec<BroadcasterBackend>,
+        generation: u64,
+    ) -> Self {
         configured_backends.sort();
         configured_backends.dedup();
-        let generation = 1;
+        let generation = generation.max(1);
 
         Self {
             chain_id,
@@ -196,29 +224,22 @@ impl BroadcasterSnapshotCache {
         }
     }
 
-    pub async fn reset_generation(&self) -> BroadcasterLiveState {
+    pub async fn reset_to_generation(&self, generation: u64) {
         let mut guard = self.inner.write().await;
-        guard.generation = guard.generation.saturating_add(1);
-        guard.stream_id = format_stream_id(self.chain_id, guard.generation);
-        guard.snapshot_id = format_snapshot_id(self.chain_id, guard.generation);
+        Self::relabel_generation_locked(self.chain_id, &mut guard, generation);
         guard.partitions.clear();
         guard.known_backends.clear();
+    }
 
-        BroadcasterLiveState {
-            stream_id: guard.stream_id.clone(),
-            snapshot_id: guard.snapshot_id.clone(),
-        }
+    pub async fn relabel_generation(&self, generation: u64) {
+        let mut guard = self.inner.write().await;
+        Self::relabel_generation_locked(self.chain_id, &mut guard, generation);
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<BroadcasterUpdateMessage> {
-        let known_backends = {
-            let guard = self.inner.read().await;
-            guard.known_backends.clone()
-        };
-        let message = BroadcasterUpdateMessage::from_tycho_update(update, &known_backends)?;
-        ensure_configured_update_backends(&message, &self.configured_backends)?;
-        let mut guard = self.inner.write().await;
-        apply_update_message(&mut guard, &message)?;
+        let staged = self.stage_update(update).await?;
+        let message = staged.message.clone();
+        self.commit_staged_update(staged).await?;
         Ok(message)
     }
 
@@ -226,11 +247,49 @@ impl BroadcasterSnapshotCache {
         &self,
         feed: &FeedMessage<BlockHeader>,
     ) -> Result<BroadcasterUpdateMessage> {
+        let staged = self.stage_feed_message(feed)?;
+        let message = staged.message.clone();
+        self.commit_staged_update(staged).await?;
+        Ok(message)
+    }
+
+    pub(crate) async fn stage_update(
+        &self,
+        update: &TychoUpdate,
+    ) -> Result<BroadcasterStagedUpdate> {
+        let guard = self.inner.read().await;
+        let message = BroadcasterUpdateMessage::from_tycho_update(update, &guard.known_backends)?;
+        ensure_configured_update_backends(&message, &self.configured_backends)?;
+        validate_update_message_applicable(&guard, &message)?;
+        Ok(BroadcasterStagedUpdate {
+            message,
+            apply_mode: BroadcasterStagedUpdateApplyMode::Decoded,
+        })
+    }
+
+    pub(crate) fn stage_feed_message(
+        &self,
+        feed: &FeedMessage<BlockHeader>,
+    ) -> Result<BroadcasterStagedUpdate> {
         let message = BroadcasterUpdateMessage::from_tycho_feed_message(feed)?;
         ensure_configured_update_backends(&message, &self.configured_backends)?;
+        Ok(BroadcasterStagedUpdate {
+            message,
+            apply_mode: BroadcasterStagedUpdateApplyMode::Raw,
+        })
+    }
+
+    pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) -> Result<()> {
         let mut guard = self.inner.write().await;
-        apply_raw_update_message(&mut guard, &message);
-        Ok(message)
+        match staged.apply_mode {
+            BroadcasterStagedUpdateApplyMode::Decoded => {
+                apply_update_message(&mut guard, &staged.message)
+            }
+            BroadcasterStagedUpdateApplyMode::Raw => {
+                apply_raw_update_message(&mut guard, &staged.message);
+                Ok(())
+            }
+        }
     }
 
     pub async fn export_snapshot(
@@ -282,36 +341,32 @@ impl BroadcasterSnapshotCache {
             return Ok(None);
         }
 
-        let backend_heads = self
-            .configured_backends
-            .iter()
-            .filter_map(|backend| {
-                guard
-                    .partitions
-                    .get(backend)
-                    .and_then(|partition| partition.block_number)
-                    .map(|block_number| BroadcasterBackendHead::new(*backend, block_number))
-            })
-            .collect();
+        let backend_heads = self.backend_heads_locked(&guard);
 
         Ok(Some(BroadcasterPayload::Heartbeat(
             BroadcasterHeartbeat::new(self.chain_id, guard.snapshot_id.clone(), backend_heads)?,
         )))
     }
 
-    pub async fn live_state(&self) -> BroadcasterLiveState {
+    pub fn configured_backends(&self) -> Vec<BroadcasterBackend> {
+        self.configured_backends.clone()
+    }
+
+    pub async fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
         let guard = self.inner.read().await;
-        BroadcasterLiveState {
-            stream_id: guard.stream_id.clone(),
-            snapshot_id: guard.snapshot_id.clone(),
-        }
+        self.backend_heads_locked(&guard)
+    }
+
+    pub async fn is_ready(&self) -> bool {
+        let guard = self.inner.read().await;
+        self.is_ready_locked(&guard)
     }
 
     pub async fn status_snapshot(
         &self,
         max_payload_bytes: usize,
         upstream: BroadcasterUpstreamSnapshot,
-        subscribers: BroadcasterSubscriberSnapshot,
+        snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     ) -> BroadcasterStatusSnapshot {
         let guard = self.inner.read().await;
         let ready = self.is_ready_locked(&guard);
@@ -355,8 +410,9 @@ impl BroadcasterSnapshotCache {
                     .sum(),
                 max_payload_bytes,
             },
-            subscribers,
+            snapshot_sessions,
             backends,
+            redis_publisher: None,
         }
     }
 
@@ -369,6 +425,156 @@ impl BroadcasterSnapshotCache {
                 .is_some()
         })
     }
+
+    fn backend_heads_locked(
+        &self,
+        guard: &BroadcasterSnapshotCacheData,
+    ) -> Vec<BroadcasterBackendHead> {
+        self.configured_backends
+            .iter()
+            .filter_map(|backend| {
+                guard
+                    .partitions
+                    .get(backend)
+                    .and_then(|partition| partition.block_number)
+                    .map(|block_number| BroadcasterBackendHead::new(*backend, block_number))
+            })
+            .collect()
+    }
+
+    fn relabel_generation_locked(
+        chain_id: u64,
+        guard: &mut BroadcasterSnapshotCacheData,
+        generation: u64,
+    ) {
+        let generation = generation.max(1);
+        guard.generation = generation;
+        guard.stream_id = format_stream_id(chain_id, generation);
+        guard.snapshot_id = format_snapshot_id(chain_id, generation);
+    }
+}
+
+pub(crate) fn combine_snapshot_exports(
+    chain_id: u64,
+    exports: Vec<BroadcasterSnapshotExport>,
+) -> Result<BroadcasterSnapshotExport> {
+    let mut exports = exports.into_iter();
+    let first = exports
+        .next()
+        .ok_or_else(|| anyhow!("cannot combine empty broadcaster snapshot export set"))?;
+    let stream_id = first.stream_id.clone();
+    let snapshot_id = first.snapshot_id.clone();
+    let max_payload_bytes = first.max_payload_bytes;
+    let mut backends = Vec::new();
+    let mut chunks = Vec::new();
+
+    for export in std::iter::once(first).chain(exports) {
+        collect_snapshot_export_parts(
+            chain_id,
+            &stream_id,
+            &snapshot_id,
+            max_payload_bytes,
+            export,
+            &mut backends,
+            &mut chunks,
+        )?;
+    }
+
+    backends.sort();
+    backends.dedup();
+    let total_chunks = chunks.len() as u32;
+    let mut payloads = Vec::with_capacity(chunks.len().saturating_add(2));
+    payloads.push(BroadcasterPayload::SnapshotStart(
+        BroadcasterSnapshotStart::new(snapshot_id.clone(), chain_id, backends, total_chunks)?,
+    ));
+    for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+        payloads.push(BroadcasterPayload::SnapshotChunk(
+            BroadcasterSnapshotChunk::new(
+                snapshot_id.clone(),
+                chunk_index as u32,
+                chunk.partitions,
+            )?,
+        ));
+    }
+    payloads.push(BroadcasterPayload::SnapshotEnd(
+        BroadcasterSnapshotEnd::new(snapshot_id.clone()),
+    ));
+
+    Ok(BroadcasterSnapshotExport {
+        stream_id,
+        snapshot_id,
+        max_payload_bytes,
+        payloads,
+    })
+}
+
+fn collect_snapshot_export_parts(
+    chain_id: u64,
+    stream_id: &str,
+    snapshot_id: &str,
+    max_payload_bytes: usize,
+    export: BroadcasterSnapshotExport,
+    backends: &mut Vec<BroadcasterBackend>,
+    chunks: &mut Vec<BroadcasterSnapshotChunk>,
+) -> Result<()> {
+    ensure!(
+        export.stream_id == stream_id,
+        "snapshot export stream_id mismatch: expected {stream_id}, found {}",
+        export.stream_id
+    );
+    ensure!(
+        export.snapshot_id == snapshot_id,
+        "snapshot export snapshot_id mismatch: expected {snapshot_id}, found {}",
+        export.snapshot_id
+    );
+    ensure!(
+        export.max_payload_bytes == max_payload_bytes,
+        "snapshot export max_payload_bytes mismatch: expected {max_payload_bytes}, found {}",
+        export.max_payload_bytes
+    );
+
+    for payload in export.payloads {
+        match payload {
+            BroadcasterPayload::SnapshotStart(start) => {
+                ensure!(
+                    start.snapshot_id == snapshot_id,
+                    "snapshot_start id mismatch: expected {snapshot_id}, found {}",
+                    start.snapshot_id
+                );
+                ensure!(
+                    start.chain_id == chain_id,
+                    "snapshot_start chain_id mismatch: expected {chain_id}, found {}",
+                    start.chain_id
+                );
+                backends.extend(start.backends);
+            }
+            BroadcasterPayload::SnapshotChunk(chunk) => {
+                ensure!(
+                    chunk.snapshot_id == snapshot_id,
+                    "snapshot_chunk id mismatch: expected {snapshot_id}, found {}",
+                    chunk.snapshot_id
+                );
+                chunks.push(chunk);
+            }
+            BroadcasterPayload::SnapshotEnd(end) => {
+                ensure!(
+                    end.snapshot_id == snapshot_id,
+                    "snapshot_end id mismatch: expected {snapshot_id}, found {}",
+                    end.snapshot_id
+                );
+            }
+            BroadcasterPayload::Update(_)
+            | BroadcasterPayload::Heartbeat(_)
+            | BroadcasterPayload::Progress(_) => {
+                return Err(anyhow!(
+                    "snapshot export contains non-snapshot payload {}",
+                    payload.kind().as_str()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl BroadcasterPartitionState {
@@ -409,6 +615,43 @@ fn ensure_configured_update_backends(
             partition.backend.as_str()
         );
     }
+    Ok(())
+}
+
+fn validate_update_message_applicable(
+    guard: &BroadcasterSnapshotCacheData,
+    message: &BroadcasterUpdateMessage,
+) -> Result<()> {
+    for partition in &message.partitions {
+        let new_pair_ids = partition
+            .new_pairs
+            .iter()
+            .map(|entry| entry.component_id.as_str())
+            .collect::<HashSet<_>>();
+        let partition_state = guard.partitions.get(&partition.backend);
+        for delta in &partition.updated_states {
+            if delta.backend != partition.backend {
+                return Err(anyhow!(
+                    "backend mismatch for {}: expected {}, found {}",
+                    delta.component_id,
+                    partition.backend,
+                    delta.backend
+                ));
+            }
+
+            let is_known = partition_state
+                .is_some_and(|state| state.states.contains_key(&delta.component_id))
+                || new_pair_ids.contains(delta.component_id.as_str());
+            if !is_known {
+                return Err(anyhow!(
+                    "missing tracked broadcaster state for {} on backend {}",
+                    delta.component_id,
+                    partition.backend
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1050,7 +1293,7 @@ mod tests {
 
     use super::{
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
-        BroadcasterSubscriberSnapshot, BroadcasterUpstreamState,
+        BroadcasterSnapshotSessionsSnapshot, BroadcasterUpstreamState,
     };
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
@@ -1319,6 +1562,83 @@ mod tests {
 
         let heartbeat = cache.heartbeat().await?;
         assert!(matches!(heartbeat, Some(BroadcasterPayload::Heartbeat(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combines_raw_and_rfq_exports_into_one_snapshot_flow() -> Result<()> {
+        let raw_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        raw_cache.apply_update(&native_only_update()).await?;
+        let rfq_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]);
+        rfq_cache
+            .apply_update(&rfq_only_update(12, "rfq-1", 7))
+            .await?;
+
+        let export = super::combine_snapshot_exports(
+            1,
+            vec![
+                raw_cache.export_snapshot(8_388_608).await?,
+                rfq_cache.export_snapshot(8_388_608).await?,
+            ],
+        )?;
+
+        assert_eq!(export.stream_id, "chain-1-stream-1");
+        assert_eq!(export.snapshot_id, "chain-1-snapshot-1");
+        assert_eq!(export.payloads.len(), 4);
+        let BroadcasterPayload::SnapshotStart(start) = &export.payloads[0] else {
+            return Err(anyhow!("expected combined snapshot_start"));
+        };
+        assert_eq!(
+            start.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        );
+        assert_eq!(start.total_chunks, 2);
+        let chunks = snapshot_chunks(&export);
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[0].partitions[0].backend, BroadcasterBackend::Native);
+        assert_eq!(chunks[1].chunk_index, 1);
+        assert_eq!(chunks[1].partitions[0].backend, BroadcasterBackend::Rfq);
+        assert!(matches!(
+            export.payloads.last(),
+            Some(BroadcasterPayload::SnapshotEnd(end)) if end.snapshot_id == "chain-1-snapshot-1"
+        ));
+        assert_payloads_at_most(&export, 8_388_608)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combined_snapshot_export_rejects_mismatched_stream_generation() -> Result<()> {
+        let raw_cache = BroadcasterSnapshotCache::new_with_initial_generation(
+            1,
+            vec![BroadcasterBackend::Native],
+            1,
+        );
+        raw_cache.apply_update(&native_only_update()).await?;
+        let rfq_cache = BroadcasterSnapshotCache::new_with_initial_generation(
+            1,
+            vec![BroadcasterBackend::Rfq],
+            2,
+        );
+        rfq_cache
+            .apply_update(&rfq_only_update(12, "rfq-1", 7))
+            .await?;
+
+        let Err(error) = super::combine_snapshot_exports(
+            1,
+            vec![
+                raw_cache.export_snapshot(8_388_608).await?,
+                rfq_cache.export_snapshot(8_388_608).await?,
+            ],
+        ) else {
+            return Err(anyhow!("mismatched stream generations must fail"));
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot export stream_id mismatch"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 
@@ -1717,7 +2037,7 @@ mod tests {
             .status_snapshot(
                 8_388_608,
                 connected_upstream().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         let rfq_status = status
@@ -1742,7 +2062,7 @@ mod tests {
             .status_snapshot(
                 8_388_608,
                 connected_upstream().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(status.readiness, BroadcasterReadiness::Ready);
@@ -1777,15 +2097,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_resets_generation_on_reset() -> Result<()> {
+    async fn cache_resets_to_redis_owned_generation() -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         cache.apply_update(&native_only_update()).await?;
-        let live_before = cache.live_state().await;
-        assert_eq!(live_before.snapshot_id, "chain-1-snapshot-1");
+        let snapshot_before = cache.export_snapshot(8_388_608).await?;
+        assert_eq!(snapshot_before.snapshot_id, "chain-1-snapshot-1");
 
-        let live_after = cache.reset_generation().await;
-        assert_eq!(live_after.stream_id, "chain-1-stream-2");
-        assert_eq!(live_after.snapshot_id, "chain-1-snapshot-2");
+        cache.reset_to_generation(2).await;
+        let snapshot_after = cache.export_snapshot(8_388_608).await?;
+        assert_eq!(snapshot_after.stream_id, "chain-1-stream-2");
+        assert_eq!(snapshot_after.snapshot_id, "chain-1-snapshot-2");
         assert!(cache.heartbeat().await?.is_none());
         Ok(())
     }
@@ -1798,7 +2119,7 @@ mod tests {
             .status_snapshot(
                 500,
                 upstream_state.snapshot().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(
@@ -1811,7 +2132,7 @@ mod tests {
             .status_snapshot(
                 500,
                 upstream_state.snapshot().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(warming.readiness, BroadcasterReadiness::SnapshotWarmingUp);
@@ -1822,7 +2143,7 @@ mod tests {
             .status_snapshot(
                 500,
                 upstream_state.snapshot().await,
-                BroadcasterSubscriberSnapshot::default(),
+                BroadcasterSnapshotSessionsSnapshot::default(),
             )
             .await;
         assert_eq!(ready.readiness, BroadcasterReadiness::Ready);

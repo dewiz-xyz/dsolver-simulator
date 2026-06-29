@@ -10,17 +10,20 @@ use tycho_simulation::tycho_common::{
     Bytes,
 };
 
-use crate::config::{init_logging, load_config, AppConfig, MemoryConfig};
+use crate::broadcaster::redis_subscription::{
+    supervise_broadcaster_redis_subscription, BroadcasterSubscriptionControls,
+    NativeBroadcasterSubscriptionControls, RfqBroadcasterSubscriptionControls,
+    VmBroadcasterSubscriptionControls,
+};
+use crate::config::{
+    init_logging, load_broadcaster_redis_config, load_config, AppConfig, BroadcasterRedisConfig,
+    MemoryConfig,
+};
 use crate::memory::maybe_log_memory_snapshot;
 use crate::models::state::{AppState, BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{
     derive_broadcaster_token_lookup_url, derive_broadcaster_token_snapshot_url, TokenStore,
-};
-use crate::services::broadcaster_subscription::{
-    supervise_broadcaster_subscription, BroadcasterSubscriptionControls,
-    NativeBroadcasterSubscriptionControls, RfqBroadcasterSubscriptionControls,
-    VmBroadcasterSubscriptionControls,
 };
 use crate::services::{EncodeService, QuoteService};
 use crate::stream::StreamSupervisorConfig;
@@ -80,9 +83,16 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     let stream_resources = create_stream_resources(Arc::clone(&tokens));
     let app_state = build_app_state(&config, Arc::clone(&tokens), &stream_resources);
     let supervisor_cfg = build_supervisor_config(&config);
+    let redis_config = load_broadcaster_redis_config();
 
     log_rebuild_config(&config);
-    spawn_broadcaster_subscription_task(&config, &supervisor_cfg, &stream_resources, &app_state);
+    spawn_broadcaster_subscription_task(
+        &config,
+        &redis_config,
+        &supervisor_cfg,
+        &stream_resources,
+        &app_state,
+    );
 
     Ok(SimulatorServiceParts {
         config,
@@ -132,9 +142,9 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
 
 async fn load_token_store(config: &AppConfig) -> anyhow::Result<Arc<TokenStore>> {
     let chain = config.chain_profile.chain;
-    let lookup_url = derive_broadcaster_token_lookup_url(&config.tycho_broadcaster_ws_url)
+    let lookup_url = derive_broadcaster_token_lookup_url(&config.tycho_broadcaster_url)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let snapshot_url = derive_broadcaster_token_snapshot_url(&config.tycho_broadcaster_ws_url)
+    let snapshot_url = derive_broadcaster_token_snapshot_url(&config.tycho_broadcaster_url)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let fetch_timeout = Duration::from_millis(config.token_refresh_timeout_ms);
     let snapshot_timeout = Duration::from_millis(config.token_snapshot_timeout_ms);
@@ -410,19 +420,32 @@ fn log_rebuild_config(config: &AppConfig) {
 
 fn spawn_broadcaster_subscription_task(
     config: &AppConfig,
+    redis_config: &BroadcasterRedisConfig,
     supervisor_cfg: &StreamSupervisorConfig,
     resources: &StreamResources,
     app_state: &AppState,
 ) {
-    for backend in broadcaster_subscription_plan(app_state) {
-        spawn_broadcaster_subscription_backend(
-            backend,
-            config,
-            supervisor_cfg,
-            resources,
-            app_state,
+    let controls = broadcaster_subscription_controls(config, resources, app_state);
+    let backend_count = controls.len();
+    let base_url = config.tycho_broadcaster_url.clone();
+    let expected_chain_id = config.chain_profile.chain.id();
+    let redis_config = redis_config.clone();
+    let supervisor_cfg = supervisor_cfg.clone();
+    tokio::spawn(async move {
+        info!(
+            backend_count,
+            "Starting broadcaster Redis subscription supervisor..."
         );
-    }
+        supervise_broadcaster_redis_subscription(
+            base_url,
+            expected_chain_id,
+            redis_config,
+            supervisor_cfg,
+            controls,
+        )
+        .await;
+    });
+    debug!("Broadcaster Redis subscription supervisor task spawned");
 }
 
 #[cfg(test)]
@@ -462,60 +485,58 @@ fn broadcaster_subscription_plan(app_state: &AppState) -> Vec<BroadcasterSubscri
     backends
 }
 
-fn spawn_broadcaster_subscription_backend(
-    backend: BroadcasterSubscriptionBackend,
+fn broadcaster_subscription_controls(
     config: &AppConfig,
-    supervisor_cfg: &StreamSupervisorConfig,
     resources: &StreamResources,
     app_state: &AppState,
-) {
+) -> Vec<BroadcasterSubscriptionControls> {
+    broadcaster_subscription_plan(app_state)
+        .into_iter()
+        .map(|backend| {
+            broadcaster_subscription_controls_for_backend(backend, config, resources, app_state)
+        })
+        .collect()
+}
+
+fn broadcaster_subscription_controls_for_backend(
+    backend: BroadcasterSubscriptionBackend,
+    config: &AppConfig,
+    resources: &StreamResources,
+    app_state: &AppState,
+) -> BroadcasterSubscriptionControls {
     match backend {
         BroadcasterSubscriptionBackend::Native => {
-            spawn_native_broadcaster_subscription_task(
-                config,
-                supervisor_cfg,
-                resources,
-                app_state,
-            );
+            native_broadcaster_subscription_controls(config, resources, app_state)
         }
         BroadcasterSubscriptionBackend::Vm => {
-            spawn_vm_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+            vm_broadcaster_subscription_controls(config, resources, app_state)
         }
         BroadcasterSubscriptionBackend::Rfq => {
-            spawn_rfq_broadcaster_subscription_task(config, supervisor_cfg, resources, app_state);
+            rfq_broadcaster_subscription_controls(config, resources, app_state)
         }
     }
 }
 
-fn spawn_native_broadcaster_subscription_task(
+fn native_broadcaster_subscription_controls(
     config: &AppConfig,
-    supervisor_cfg: &StreamSupervisorConfig,
     resources: &StreamResources,
     app_state: &AppState,
-) {
-    let controls = BroadcasterSubscriptionControls::Native(NativeBroadcasterSubscriptionControls {
+) -> BroadcasterSubscriptionControls {
+    BroadcasterSubscriptionControls::Native(NativeBroadcasterSubscriptionControls {
         broadcaster_subscription: app_state.native_broadcaster_subscription.clone(),
         state_store: Arc::clone(&resources.native_state_store),
         stream_health: Arc::clone(&resources.native_stream_health),
         tokens: Arc::clone(&app_state.tokens),
         protocols: config.chain_profile.native_protocols.clone(),
-    });
-    spawn_backend_broadcaster_subscription_task(
-        "native",
-        config.tycho_broadcaster_ws_url.clone(),
-        config.chain_profile.chain.id(),
-        supervisor_cfg.clone(),
-        controls,
-    );
+    })
 }
 
-fn spawn_vm_broadcaster_subscription_task(
+fn vm_broadcaster_subscription_controls(
     config: &AppConfig,
-    supervisor_cfg: &StreamSupervisorConfig,
     resources: &StreamResources,
     app_state: &AppState,
-) {
-    let controls = BroadcasterSubscriptionControls::Vm(VmBroadcasterSubscriptionControls {
+) -> BroadcasterSubscriptionControls {
+    BroadcasterSubscriptionControls::Vm(VmBroadcasterSubscriptionControls {
         broadcaster_subscription: app_state.vm_broadcaster_subscription.clone(),
         state_store: Arc::clone(&resources.vm_state_store),
         stream_health: Arc::clone(&resources.vm_stream_health),
@@ -523,52 +544,22 @@ fn spawn_vm_broadcaster_subscription_task(
         protocols: config.chain_profile.vm_protocols.clone(),
         vm_stream: Arc::clone(&resources.vm_stream),
         simulation_rebuild_gate: app_state.vm_simulation_rebuild_gate(),
-    });
-    spawn_backend_broadcaster_subscription_task(
-        "vm",
-        config.tycho_broadcaster_ws_url.clone(),
-        config.chain_profile.chain.id(),
-        supervisor_cfg.clone(),
-        controls,
-    );
+    })
 }
 
-fn spawn_rfq_broadcaster_subscription_task(
+fn rfq_broadcaster_subscription_controls(
     config: &AppConfig,
-    supervisor_cfg: &StreamSupervisorConfig,
     resources: &StreamResources,
     app_state: &AppState,
-) {
-    let controls = BroadcasterSubscriptionControls::Rfq(RfqBroadcasterSubscriptionControls {
+) -> BroadcasterSubscriptionControls {
+    BroadcasterSubscriptionControls::Rfq(RfqBroadcasterSubscriptionControls {
         broadcaster_subscription: app_state.rfq_broadcaster_subscription.clone(),
         state_store: Arc::clone(&resources.rfq_state_store),
         stream_health: Arc::clone(&resources.rfq_stream_health),
         tokens: Arc::clone(&app_state.tokens),
         protocols: config.chain_profile.rfq_protocols.clone(),
         simulation_rebuild_gate: app_state.rfq_simulation_rebuild_gate(),
-    });
-    spawn_backend_broadcaster_subscription_task(
-        "rfq",
-        config.tycho_broadcaster_ws_url.clone(),
-        config.chain_profile.chain.id(),
-        supervisor_cfg.clone(),
-        controls,
-    );
-}
-
-fn spawn_backend_broadcaster_subscription_task(
-    backend: &'static str,
-    ws_url: String,
-    expected_chain_id: u64,
-    supervisor_cfg: StreamSupervisorConfig,
-    controls: BroadcasterSubscriptionControls,
-) {
-    tokio::spawn(async move {
-        info!(backend, "Starting broadcaster subscription supervisor...");
-        supervise_broadcaster_subscription(ws_url, expected_chain_id, supervisor_cfg, controls)
-            .await;
-    });
-    debug!(backend, "Broadcaster subscription supervisor task spawned");
+    })
 }
 
 #[cfg(test)]
@@ -597,7 +588,7 @@ mod tests {
     };
 
     struct TokenAuthority {
-        ws_url: String,
+        base_url: String,
         lookup_hits: Arc<AtomicUsize>,
         snapshot_hits: Arc<AtomicUsize>,
         tycho_hits: Arc<AtomicUsize>,
@@ -639,7 +630,7 @@ mod tests {
             options: TokenAuthorityOptions,
         ) -> Result<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let ws_url = format!("ws://{}/ws", listener.local_addr()?);
+            let base_url = format!("http://{}", listener.local_addr()?);
             let lookup_hits = Arc::new(AtomicUsize::new(0));
             let snapshot_hits = Arc::new(AtomicUsize::new(0));
             let tycho_hits = Arc::new(AtomicUsize::new(0));
@@ -666,7 +657,7 @@ mod tests {
             });
 
             Ok(Self {
-                ws_url,
+                base_url,
                 lookup_hits,
                 snapshot_hits,
                 tycho_hits,
@@ -794,7 +785,7 @@ mod tests {
         AppConfig {
             chain_profile,
             tycho_url: "http://localhost:4242".to_string(),
-            tycho_broadcaster_ws_url: "ws://127.0.0.1:3001/ws".to_string(),
+            tycho_broadcaster_url: "http://127.0.0.1:3001".to_string(),
             bebop_url: "https://example.com/bebop".to_string(),
             hashflow_filename: "./hashflow.csv".to_string(),
             liquorice_url: Some("https://example.com/liquorice".to_string()),
@@ -894,12 +885,8 @@ mod tests {
         let authority =
             TokenAuthority::spawn(vec![test_token(&token_address, Chain::Ethereum)]).await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_url = authority
-            .ws_url
-            .replace("ws://", "http://")
-            .trim_end_matches("/ws")
-            .to_string();
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_url = authority.base_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
 
         let store = load_token_store(&config).await?;
         let resolved = store.ensure(&token_address).await?;
@@ -930,12 +917,8 @@ mod tests {
         let authority =
             TokenAuthority::spawn(vec![test_token(&cached_address, Chain::Ethereum)]).await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_url = authority
-            .ws_url
-            .replace("ws://", "http://")
-            .trim_end_matches("/ws")
-            .to_string();
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_url = authority.base_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
 
         let store = load_token_store(&config).await?;
         let resolved = store.ensure(&missed_address).await?;
@@ -967,7 +950,7 @@ mod tests {
         )
         .await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
         config.token_refresh_timeout_ms = 1;
         config.token_snapshot_timeout_ms = 500;
 
@@ -996,7 +979,7 @@ mod tests {
         )
         .await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
         config.token_snapshot_timeout_ms = 1_000;
 
         let store = load_token_store(&config).await?;
@@ -1023,7 +1006,7 @@ mod tests {
         )
         .await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
         config.token_snapshot_timeout_ms = 1_000;
 
         let store = load_token_store(&config).await?;
@@ -1050,7 +1033,7 @@ mod tests {
         )
         .await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
 
         let Err(error) = load_token_store(&config).await else {
             anyhow::bail!("chain mismatch should fail startup");
@@ -1073,7 +1056,7 @@ mod tests {
         )
         .await?;
         let mut config = build_test_config(ethereum_chain_profile(), false, false, None);
-        config.tycho_broadcaster_ws_url = authority.ws_url.clone();
+        config.tycho_broadcaster_url = authority.base_url.clone();
         config.token_snapshot_timeout_ms = 20;
 
         let Err(error) = load_token_store(&config).await else {

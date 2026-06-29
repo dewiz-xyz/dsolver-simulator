@@ -1,0 +1,13 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - target: 6379
+        published: "${LOCAL_REDIS_PORT:-6379}"
+        host_ip: "${LOCAL_REDIS_BIND:-127.0.0.1}"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
