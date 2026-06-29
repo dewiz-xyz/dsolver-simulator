@@ -246,6 +246,20 @@ are treated as externally managed. To verify the Redis replay path while service
 scripts/verify_broadcaster_redis.sh --repo .
 ```
 
+To run the live mainnet VM wire e2e, point at an already running mainnet
+broadcaster plus Redis and enable the explicit live-test gate:
+
+```bash
+DSOLVER_LIVE_MAINNET_VM_E2E=1 \
+TYCHO_BROADCASTER_URL=http://127.0.0.1:3001 \
+BROADCASTER_REDIS_URL=redis://127.0.0.1:6379 \
+cargo test -p runtime mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The test expects Curve and Balancer VM deltas from live mainnet traffic. A normal
+run should usually finish in about 10 minutes, and it fails after 20 minutes.
+
 Container builds:
 
 ```bash

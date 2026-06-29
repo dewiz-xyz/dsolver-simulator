@@ -1565,6 +1565,21 @@ impl StateStore {
             .get(id)
             .map(|(state, component)| (Arc::clone(state), Arc::clone(component)))
     }
+
+    #[cfg(test)]
+    pub(crate) async fn pool_ids_by_protocol_system(&self, protocol_system: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        for shard in self.shards.values() {
+            let guard = shard.states.read().await;
+            for (id, (_state, component)) in guard.iter() {
+                if component.protocol_system == protocol_system {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
 }
 
 fn apply_token_index_changes(
