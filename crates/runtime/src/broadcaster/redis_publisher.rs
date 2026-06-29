@@ -875,11 +875,7 @@ impl BroadcasterRedisPublisher {
             .checked_add(1)
             .ok_or_else(|| anyhow!("Redis broadcaster message_seq overflow"))?;
         let envelope = BroadcasterEnvelope::new(guard.stream_id.clone(), message_seq, payload);
-        let entry = BroadcasterRedisStreamEntry::from_envelope(
-            self.config.chain_id,
-            current_time_ms(),
-            &envelope,
-        )?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(self.config.chain_id, &envelope)?;
         let entry_id = self
             .append_with_retry(guard, &entry)
             .await
@@ -1059,7 +1055,7 @@ fn generation_marker_template_fields(
         None => BroadcasterProgress::new(chain_id, snapshot_id.clone(), backends, reason)?,
     };
     let envelope = BroadcasterEnvelope::new(stream_id, 1, BroadcasterPayload::Progress(marker));
-    let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, current_time_ms(), &envelope)?;
+    let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope)?;
     redis_entry_fields(&entry)
 }
 

@@ -200,27 +200,29 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
                 supervisor_cfg.clone(),
                 service.clone(),
                 vec![raw_service.clone(), service.clone()],
+                vec![service.clone()],
                 rfq_token_stores,
             );
             Some(service)
         } else {
             None
         };
-    let reset_services = match &rfq_service {
+    let generation_services = match &rfq_service {
         Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
         None => vec![raw_service.clone()],
     };
     // New broadcasters start passive and warm their caches first. This task is
     // the local promotion loop; /status stays non-ready until it wins the fence.
-    spawn_promotion_task(reset_services.clone(), Duration::from_secs(1));
+    spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
     spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
         Arc::clone(&raw_health),
         raw_service.clone(),
-        reset_services.clone(),
+        generation_services.clone(),
+        vec![raw_service.clone()],
     );
-    spawn_heartbeat_task(reset_services, heartbeat_interval);
+    spawn_heartbeat_task(generation_services, heartbeat_interval);
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
     let app_state = BroadcasterAppState::with_snapshot_session_ttl(
         raw_service,
@@ -384,7 +386,8 @@ fn spawn_broadcaster_stream_task(
     supervisor_cfg: StreamSupervisorConfig,
     health: Arc<StreamHealth>,
     service: BroadcasterServiceState,
-    reset_services: Vec<BroadcasterServiceState>,
+    generation_services: Vec<BroadcasterServiceState>,
+    cache_reset_services: Vec<BroadcasterServiceState>,
 ) {
     let chain = config.chain_profile.chain;
     let tycho_url = config.tycho_url.clone();
@@ -419,7 +422,8 @@ fn spawn_broadcaster_stream_task(
             supervisor_cfg,
             BroadcasterStreamControls {
                 service,
-                reset_services,
+                generation_services,
+                cache_reset_services,
             },
         )
         .await;
@@ -430,7 +434,8 @@ fn spawn_broadcaster_rfq_stream_task(
     config: &BroadcasterConfig,
     supervisor_cfg: StreamSupervisorConfig,
     service: BroadcasterServiceState,
-    reset_services: Vec<BroadcasterServiceState>,
+    generation_services: Vec<BroadcasterServiceState>,
+    cache_reset_services: Vec<BroadcasterServiceState>,
     token_stores: RFQTokenStores,
 ) {
     let chain = config.chain_profile.chain;
@@ -462,7 +467,8 @@ fn spawn_broadcaster_rfq_stream_task(
             supervisor_cfg,
             BroadcasterStreamControls {
                 service,
-                reset_services,
+                generation_services,
+                cache_reset_services,
             },
         )
         .await;

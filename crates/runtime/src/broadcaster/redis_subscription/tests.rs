@@ -53,8 +53,6 @@ use simulator_core::broadcaster::{
     BroadcasterUpdatePartition,
 };
 
-const REDIS_EVENT_TIME_MS: u64 = 1_710_000_000_123;
-
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DummySim(u8);
 
@@ -458,7 +456,6 @@ fn redis_entry_for_scope(
         backend_scope: backend_scope.to_string(),
         block_number: None,
         observed_timestamp_ms: None,
-        event_time_ms: REDIS_EVENT_TIME_MS,
         payload_json: String::new(),
     }
 }
@@ -612,11 +609,7 @@ fn generation_handoff_candidate(
     let envelope = BroadcasterEnvelope::new("stream-8", 1, BroadcasterPayload::Progress(progress));
     let boundary = redis_boundary("stream-8", "snapshot-8", 8, 1)?;
     Ok(GenerationHandoffCandidate {
-        entry: BroadcasterRedisStreamEntry::from_envelope(
-            Chain::Ethereum.id(),
-            1_710_000_000_123,
-            &envelope,
-        )?,
+        entry: BroadcasterRedisStreamEntry::from_envelope(Chain::Ethereum.id(), &envelope)?,
         envelope,
         boundary: boundary.clone(),
         checkpoint_after: ReplayCheckpoint::new(boundary, Chain::Ethereum.id()),
