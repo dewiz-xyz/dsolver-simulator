@@ -1932,11 +1932,13 @@ name = "broadcaster-replay-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures 0.3.32",
  "redis",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "simulator-core",
+ "tokio",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures::Stream;
 use reqwest::Client;
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
@@ -10,7 +11,10 @@ use crate::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction, ReplayChe
 use crate::error::{BroadcasterReplayClientError, Result};
 use crate::handoff::{redis_generation_handoff_candidate, validate_handoff_candidate};
 use crate::reader::{RedisStreamMessage, TokioRedisStreamReader};
-use crate::snapshot::{create_broadcaster_snapshot_session, fetch_broadcaster_snapshot_payload};
+use crate::snapshot::{
+    create_broadcaster_snapshot_session, fetch_broadcaster_snapshot_payload,
+    fetch_broadcaster_snapshot_payloads,
+};
 
 #[derive(Debug, Clone)]
 /// Configuration for the broadcaster replay client.
@@ -89,6 +93,22 @@ impl BroadcasterReplayClient {
             self.config.request_timeout,
         )
         .await
+    }
+
+    /// Fetch snapshot payloads from an existing session with bounded concurrency.
+    ///
+    /// The returned stream yields payloads in index order, so callers can apply
+    /// envelopes directly while later payload requests are already in flight.
+    pub fn snapshot_payloads<'a>(
+        &'a self,
+        session: &'a BroadcasterSnapshotSessionResponse,
+    ) -> impl Stream<Item = Result<BroadcasterEnvelope>> + 'a {
+        fetch_broadcaster_snapshot_payloads(
+            &self.http,
+            &self.config.broadcaster_url,
+            session,
+            self.config.request_timeout,
+        )
     }
 
     /// Read and validate the next Redis replay batch after `checkpoint`.

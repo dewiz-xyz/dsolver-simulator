@@ -8,6 +8,7 @@ use broadcaster_replay_client::{
     BroadcasterSnapshotSessionResponse, GenerationHandoffCandidate, ReplayBatchItem,
     ReplayCheckpoint, ReplayPoll,
 };
+use futures::StreamExt;
 use rand::Rng;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -377,29 +378,32 @@ async fn bootstrap_pending_processors(
 
     mark_pending_processors_started(&mut processors, &session.redis_replay_boundary).await;
 
-    for index in 0..session.payload_count {
-        let envelope = match replay_client.fetch_snapshot_payload(&session, index).await {
-            Ok(envelope) => envelope,
-            Err(error) => {
+    {
+        let mut payloads = replay_client.snapshot_payloads(&session);
+        while let Some(envelope) = payloads.next().await {
+            let envelope = match envelope {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    return Err(pending_processor_bootstrap_error(
+                        error.to_string(),
+                        "broadcaster_redis_subscription_bootstrap_failed",
+                        "Failed to fetch broadcaster snapshot payload",
+                        processors,
+                        rebuilds,
+                    ));
+                }
+            };
+            if let Err(error) =
+                apply_snapshot_payload_to_pending_processors(&mut processors, envelope).await
+            {
                 return Err(pending_processor_bootstrap_error(
                     error.to_string(),
                     "broadcaster_redis_subscription_bootstrap_failed",
-                    "Failed to fetch broadcaster snapshot payload",
+                    "Failed to apply broadcaster snapshot payload",
                     processors,
                     rebuilds,
                 ));
             }
-        };
-        if let Err(error) =
-            apply_snapshot_payload_to_pending_processors(&mut processors, envelope).await
-        {
-            return Err(pending_processor_bootstrap_error(
-                error.to_string(),
-                "broadcaster_redis_subscription_bootstrap_failed",
-                "Failed to apply broadcaster snapshot payload",
-                processors,
-                rebuilds,
-            ));
         }
     }
 
