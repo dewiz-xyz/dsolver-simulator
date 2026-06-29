@@ -791,7 +791,6 @@ fn redis_entry_id_uses_generation_and_message_sequence() -> Result<()> {
         backend_scope: "native".to_string(),
         block_number: Some(11),
         observed_timestamp_ms: None,
-        event_time_ms: 1_710_000_000_123,
         payload_json: "{}".to_string(),
     };
 
@@ -811,11 +810,7 @@ fn redis_progress_entry_carries_generation_reset_reason() -> Result<()> {
             "stream_restart",
         )?),
     );
-    let entry = BroadcasterRedisStreamEntry::from_envelope(
-        Chain::Ethereum.id(),
-        1_710_000_000_123,
-        &envelope,
-    )?;
+    let entry = BroadcasterRedisStreamEntry::from_envelope(Chain::Ethereum.id(), &envelope)?;
 
     assert_eq!(entry.kind, BroadcasterMessageKind::Progress);
     assert_eq!(entry.snapshot_id.as_deref(), Some("chain-1-snapshot-2"));
@@ -836,11 +831,11 @@ fn redis_xadd_recovery_requires_existing_entry_to_match_exact_fields() -> Result
         backend_scope: "native".to_string(),
         block_number: Some(12),
         observed_timestamp_ms: None,
-        event_time_ms: 1_000,
         payload_json: "{}".to_string(),
     };
     let entry_id = redis_entry_id(&entry)?;
     let fields = redis_entry_fields(&entry)?;
+    assert!(fields.iter().all(|(field, _)| field != "event_time_ms"));
     let reply = stream_range_reply(&entry_id, &fields);
 
     assert!(redis_stream_entry_matches_reply(
@@ -857,6 +852,14 @@ fn redis_xadd_recovery_requires_existing_entry_to_match_exact_fields() -> Result
         &reply,
         &entry_id,
         &changed_fields
+    )?);
+    let mut stale_event_time_fields = fields.clone();
+    stale_event_time_fields.push(("event_time_ms".to_string(), "1710000000000".to_string()));
+    let stale_event_time_reply = stream_range_reply(&entry_id, &stale_event_time_fields);
+    assert!(!redis_stream_entry_matches_reply(
+        &stale_event_time_reply,
+        &entry_id,
+        &fields
     )?);
     assert!(!redis_stream_entry_matches_reply(&reply, "7-4", &fields)?);
     Ok(())

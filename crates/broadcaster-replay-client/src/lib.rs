@@ -51,11 +51,7 @@ mod tests {
                 vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 12)],
             )?),
         );
-        let entry = BroadcasterRedisStreamEntry::from_envelope(
-            ETHEREUM_CHAIN_ID,
-            1_710_000_000_123,
-            &envelope,
-        )?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
 
         let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
             entry_id: "1-2".to_string(),
@@ -74,8 +70,7 @@ mod tests {
     fn replay_checkpoint_rejects_wrong_chain_id_before_applying_update() -> Result<()> {
         let checkpoint = ReplayCheckpoint::new(replay_boundary(0)?, ETHEREUM_CHAIN_ID);
         let envelope = heartbeat_envelope("stream-1", 1, BASE_CHAIN_ID)?;
-        let entry =
-            BroadcasterRedisStreamEntry::from_envelope(BASE_CHAIN_ID, EVENT_TIME_MS, &envelope)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(BASE_CHAIN_ID, &envelope)?;
 
         let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
             entry_id: "1-1".to_string(),
@@ -101,11 +96,7 @@ mod tests {
                 "generation_reset",
             )?),
         );
-        let entry = BroadcasterRedisStreamEntry::from_envelope(
-            ETHEREUM_CHAIN_ID,
-            EVENT_TIME_MS,
-            &envelope,
-        )?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
 
         let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
             entry_id: "2-1".to_string(),
@@ -259,11 +250,7 @@ mod tests {
             "1-3",
             vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 40)],
         )?))?;
-        let entry = BroadcasterRedisStreamEntry::from_envelope(
-            ETHEREUM_CHAIN_ID,
-            EVENT_TIME_MS,
-            &envelope,
-        )?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
 
         let batch = build_replay_batch(
             &checkpoint,
@@ -289,11 +276,7 @@ mod tests {
     fn replay_batch_rejects_handoff_without_previous_checkpoint_proof() -> Result<()> {
         let checkpoint = ReplayCheckpoint::new(replay_boundary(3)?, ETHEREUM_CHAIN_ID);
         let envelope = handoff_envelope(None)?;
-        let entry = BroadcasterRedisStreamEntry::from_envelope(
-            ETHEREUM_CHAIN_ID,
-            EVENT_TIME_MS,
-            &envelope,
-        )?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(ETHEREUM_CHAIN_ID, &envelope)?;
 
         let Err(error) = build_replay_batch(
             &checkpoint,
@@ -363,5 +346,4 @@ mod tests {
 
     const ETHEREUM_CHAIN_ID: u64 = 1;
     const BASE_CHAIN_ID: u64 = 8453;
-    const EVENT_TIME_MS: u64 = 1_710_000_000_123;
 }
