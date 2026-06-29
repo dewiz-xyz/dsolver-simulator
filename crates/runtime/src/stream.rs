@@ -65,6 +65,13 @@ impl StreamRestartReason {
 pub struct StreamExit {
     pub reason: StreamRestartReason,
     pub last_error: Option<String>,
+    pub broadcaster_reset_scope: BroadcasterResetScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcasterResetScope {
+    RestartedService,
+    AllServices,
 }
 
 #[derive(Debug, Clone)]
@@ -90,13 +97,24 @@ pub struct VmStreamControls {
 #[derive(Debug, Clone)]
 pub struct BroadcasterStreamControls {
     pub service: BroadcasterServiceState,
-    pub reset_services: Vec<BroadcasterServiceState>,
+    pub generation_services: Vec<BroadcasterServiceState>,
+    pub cache_reset_services: Vec<BroadcasterServiceState>,
 }
 
 impl BroadcasterStreamControls {
-    async fn reset_generation(&self, reason: &str, last_error: Option<String>) {
-        BroadcasterServiceState::handle_shared_generation_reset(
-            &self.reset_services,
+    async fn reset_generation(
+        &self,
+        scope: BroadcasterResetScope,
+        reason: &str,
+        last_error: Option<String>,
+    ) {
+        let cache_reset_services = match scope {
+            BroadcasterResetScope::RestartedService => &self.cache_reset_services,
+            BroadcasterResetScope::AllServices => &self.generation_services,
+        };
+        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
+            &self.generation_services,
+            cache_reset_services,
             reason,
             last_error,
         )
@@ -119,7 +137,23 @@ enum BroadcasterRawStreamMessage {
 }
 
 fn stream_exit(reason: StreamRestartReason, last_error: Option<String>) -> StreamExit {
-    StreamExit { reason, last_error }
+    stream_exit_with_broadcaster_reset_scope(
+        reason,
+        last_error,
+        BroadcasterResetScope::RestartedService,
+    )
+}
+
+fn stream_exit_with_broadcaster_reset_scope(
+    reason: StreamRestartReason,
+    last_error: Option<String>,
+    broadcaster_reset_scope: BroadcasterResetScope,
+) -> StreamExit {
+    StreamExit {
+        reason,
+        last_error,
+        broadcaster_reset_scope,
+    }
 }
 
 pub async fn process_stream(
@@ -465,7 +499,16 @@ async fn handle_broadcaster_update(
     if let Err(error) = service.apply_update(&update).await {
         let error = error.to_string();
         health.set_last_error(Some(error.clone())).await;
-        return Some(stream_exit(StreamRestartReason::Error, Some(error)));
+        let reset_scope = if service.redis_publisher_needs_generation_reset().await {
+            BroadcasterResetScope::AllServices
+        } else {
+            BroadcasterResetScope::RestartedService
+        };
+        return Some(stream_exit_with_broadcaster_reset_scope(
+            StreamRestartReason::Error,
+            Some(error),
+            reset_scope,
+        ));
     }
 
     health.record_update(block_number).await;
@@ -551,7 +594,16 @@ async fn handle_broadcaster_raw_update(
     if let Err(error) = service.apply_feed_message(&update).await {
         let error = error.to_string();
         health.set_last_error(Some(error.clone())).await;
-        return Some(stream_exit(StreamRestartReason::Error, Some(error)));
+        let reset_scope = if service.redis_publisher_needs_generation_reset().await {
+            BroadcasterResetScope::AllServices
+        } else {
+            BroadcasterResetScope::RestartedService
+        };
+        return Some(stream_exit_with_broadcaster_reset_scope(
+            StreamRestartReason::Error,
+            Some(error),
+            reset_scope,
+        ));
     }
 
     health.record_update(block_number).await;
@@ -809,7 +861,11 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
         );
 
         controls
-            .reset_generation(exit.reason.as_str(), exit.last_error.clone())
+            .reset_generation(
+                exit.broadcaster_reset_scope,
+                exit.reason.as_str(),
+                exit.last_error.clone(),
+            )
             .await;
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
@@ -887,7 +943,11 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
         );
 
         controls
-            .reset_generation(exit.reason.as_str(), exit.last_error.clone())
+            .reset_generation(
+                exit.broadcaster_reset_scope,
+                exit.reason.as_str(),
+                exit.last_error.clone(),
+            )
             .await;
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
@@ -1105,11 +1165,12 @@ mod tests {
     use tycho_simulation::protocol::models::Update;
 
     use super::{
-        begin_vm_rebuild, classify_stream_error, handle_broadcaster_update, StreamRestartReason,
-        StreamSupervisorConfig, VmStreamControls,
+        begin_vm_rebuild, classify_stream_error, handle_broadcaster_update, BroadcasterResetScope,
+        StreamRestartReason, StreamSupervisorConfig, VmStreamControls,
     };
     use crate::broadcaster::redis_publisher::{
-        BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
+        BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
+        RedisPromotionCommand, RedisPromotionResult, RedisRenewCommand, RedisStreamWriter,
     };
     use crate::broadcaster::service::BroadcasterServiceState;
     use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
@@ -1117,8 +1178,8 @@ mod tests {
     use crate::models::state::{StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
-    use simulator_core::broadcaster::BroadcasterBackend;
-    use tycho_simulation::tycho_common::models::Chain;
+    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
+    use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
     #[test]
     fn classifies_state_decoding_failure_messages() {
@@ -1176,10 +1237,88 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn broadcaster_update_uses_full_reset_scope_when_publisher_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            BroadcasterRedisPublisherConfig {
+                stream_key: "stream:test".to_string(),
+                chain_id: 8453,
+                append_retry_window: Duration::from_millis(10),
+                maxlen: None,
+                writer_lease_ttl: Duration::from_secs(30),
+            },
+            Arc::new(FailAppendRedisWriter),
+        ));
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            1024,
+            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        let health = StreamHealth::new();
+        let mut ready_logged = false;
+
+        let exit = handle_broadcaster_update(
+            native_sync_update(10),
+            &service,
+            &health,
+            &test_supervisor_config(),
+            &mut ready_logged,
+        )
+        .await
+        .ok_or("publisher failure should restart the broadcaster stream")?;
+
+        assert_eq!(
+            exit.broadcaster_reset_scope,
+            BroadcasterResetScope::AllServices
+        );
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct StreamTestRedisWriter;
 
     impl RedisStreamWriter for StreamTestRedisWriter {}
+
+    #[derive(Debug)]
+    struct FailAppendRedisWriter;
+
+    impl RedisStreamWriter for FailAppendRedisWriter {
+        fn promote<'a>(
+            &'a self,
+            _command: RedisPromotionCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<RedisPromotionResult>> {
+            Box::pin(async move {
+                Ok(RedisPromotionResult {
+                    generation: 1,
+                    entry_id: "1-1".to_string(),
+                })
+            })
+        }
+
+        fn append_fenced<'a>(
+            &'a self,
+            _command: RedisAppendCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async move { Err(anyhow::anyhow!("planned append failure")) })
+        }
+
+        fn renew_writer<'a>(
+            &'a self,
+            _command: RedisRenewCommand<'a>,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
 
     fn test_redis_publisher(chain_id: u64) -> Arc<BroadcasterRedisPublisher> {
         Arc::new(BroadcasterRedisPublisher::new(
@@ -1192,6 +1331,24 @@ mod tests {
             },
             Arc::new(StreamTestRedisWriter),
         ))
+    }
+
+    fn native_sync_update(block_number: u64) -> Update {
+        Update::new(block_number, HashMap::new(), HashMap::new()).set_sync_states(HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                tycho_simulation::tycho_client::feed::SynchronizerState::Ready(
+                    tycho_simulation::tycho_client::feed::BlockHeader {
+                        hash: Bytes::from(vec![1u8; 32]),
+                        number: block_number,
+                        parent_hash: Bytes::from(vec![2u8; 32]),
+                        revert: false,
+                        timestamp: block_number * 10,
+                        partial_block_index: None,
+                    },
+                ),
+            ),
+        ]))
     }
 
     #[tokio::test]

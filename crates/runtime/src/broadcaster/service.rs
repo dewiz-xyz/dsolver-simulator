@@ -75,6 +75,10 @@ impl BroadcasterSnapshotSessionRegistry {
         }
     }
 
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pending_sessions, &other.pending_sessions)
+    }
+
     async fn create_snapshot_session(
         &self,
         snapshot: BroadcasterSnapshotExport,
@@ -113,6 +117,17 @@ impl BroadcasterSnapshotSessionRegistry {
         let payload_count = snapshot_payloads.len() as u32;
         let expires_in_ms = ttl.as_millis().try_into().unwrap_or(u64::MAX);
         let expires_at = Instant::now() + ttl;
+
+        anyhow::ensure!(
+            stream_id == redis_replay_boundary.stream_id,
+            "snapshot stream_id mismatch with Redis replay boundary: snapshot={stream_id}, boundary={}",
+            redis_replay_boundary.stream_id
+        );
+        anyhow::ensure!(
+            snapshot_id == redis_replay_boundary.snapshot_id,
+            "snapshot_id mismatch with Redis replay boundary: snapshot={snapshot_id}, boundary={}",
+            redis_replay_boundary.snapshot_id
+        );
 
         self.pending_sessions.lock().await.insert(
             session_id,
@@ -253,31 +268,66 @@ impl BroadcasterServiceState {
         reason: impl Into<String>,
         last_error: Option<String>,
     ) {
+        Self::handle_shared_generation_reset_with_cache_scope(
+            services, services, reason, last_error,
+        )
+        .await;
+    }
+
+    /// Advances the shared Redis generation while only clearing caches that restarted.
+    ///
+    /// Snapshot sessions belong to the shared generation, so they are closed for every service.
+    /// Preserved caches are relabelled to the new generation instead of being rewarmed.
+    pub async fn handle_shared_generation_reset_with_cache_scope(
+        generation_services: &[Self],
+        cache_reset_services: &[Self],
+        reason: impl Into<String>,
+        last_error: Option<String>,
+    ) {
         assert!(
-            !services.is_empty(),
+            !generation_services.is_empty(),
             "broadcaster generation reset requires at least one service"
         );
+        assert!(
+            !cache_reset_services.is_empty(),
+            "broadcaster generation reset requires at least one cache reset service"
+        );
         debug_assert!(
-            services
-                .iter()
-                .all(|service| Arc::ptr_eq(&service.lifecycle_gate, &services[0].lifecycle_gate)),
+            generation_services.iter().all(|service| Arc::ptr_eq(
+                &service.lifecycle_gate,
+                &generation_services[0].lifecycle_gate
+            )),
             "shared broadcaster generation reset requires one lifecycle gate"
         );
         debug_assert!(
-            services
-                .iter()
-                .all(|service| Arc::ptr_eq(&service.redis_publisher, &services[0].redis_publisher)),
+            generation_services.iter().all(|service| Arc::ptr_eq(
+                &service.redis_publisher,
+                &generation_services[0].redis_publisher
+            )),
             "shared broadcaster generation reset requires one Redis publisher"
         );
+        assert!(
+            cache_reset_services.iter().all(|reset_service| {
+                generation_services
+                    .iter()
+                    .any(|service| service.ptr_eq(reset_service))
+            }),
+            "cache reset services must be part of the shared generation reset"
+        );
         let reason = reason.into();
-        let _gate = services[0].lifecycle_gate.lock().await;
-        let publisher_mode = services[0].redis_publisher.mode().await;
+        let _gate = generation_services[0].lifecycle_gate.lock().await;
+        let publisher_mode = generation_services[0].redis_publisher.mode().await;
         let mut reset_backends = Vec::new();
-        for service in services {
-            service
-                .upstream
-                .mark_disconnected(reason.clone(), last_error.clone())
-                .await;
+        for service in generation_services {
+            if cache_reset_services
+                .iter()
+                .any(|reset_service| service.ptr_eq(reset_service))
+            {
+                service
+                    .upstream
+                    .mark_disconnected(reason.clone(), last_error.clone())
+                    .await;
+            }
             service
                 .snapshot_sessions
                 .disconnect_all(SessionCloseReason::GenerationReset)
@@ -291,7 +341,7 @@ impl BroadcasterServiceState {
         }
         reset_backends.sort();
         reset_backends.dedup();
-        let boundary = match services[0]
+        let boundary = match generation_services[0]
             .redis_publisher
             .reset_generation_boundary(reason, reset_backends)
             .await
@@ -305,9 +355,27 @@ impl BroadcasterServiceState {
                 return;
             }
         };
-        for service in services {
-            service.cache.reset_to_generation(boundary.generation).await;
+        for service in generation_services {
+            if cache_reset_services
+                .iter()
+                .any(|reset_service| service.ptr_eq(reset_service))
+            {
+                service.cache.reset_to_generation(boundary.generation).await;
+            } else {
+                service.cache.relabel_generation(boundary.generation).await;
+            }
         }
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        self.snapshot_sessions.ptr_eq(&other.snapshot_sessions)
+    }
+
+    pub(crate) async fn redis_publisher_needs_generation_reset(&self) -> bool {
+        matches!(
+            self.redis_publisher.mode().await,
+            BroadcasterRedisPublisherMode::Retired | BroadcasterRedisPublisherMode::Unhealthy
+        )
     }
 
     pub async fn promote_when_ready(
@@ -363,7 +431,7 @@ impl BroadcasterServiceState {
         let staged = self.cache.stage_update(update).await?;
         self.publish_to_redis(BroadcasterPayload::Update(staged.message().clone()))
             .await?;
-        self.cache.commit_staged_update(staged).await?;
+        self.cache.commit_staged_update(staged).await;
         self.upstream.record_update().await;
         Ok(())
     }
@@ -373,7 +441,7 @@ impl BroadcasterServiceState {
         let staged = self.cache.stage_feed_message(feed)?;
         self.publish_to_redis(BroadcasterPayload::Update(staged.message().clone()))
             .await?;
-        self.cache.commit_staged_update(staged).await?;
+        self.cache.commit_staged_update(staged).await;
         self.upstream.record_update().await;
         Ok(())
     }
@@ -559,7 +627,8 @@ mod tests {
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
     };
     use crate::broadcaster::state::{
-        BroadcasterSnapshotCache, BroadcasterSnapshotExport, BroadcasterUpstreamState,
+        BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
+        BroadcasterUpstreamState,
     };
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
@@ -817,6 +886,50 @@ mod tests {
         assert!(format!("{error:#}").contains("failed to publish accepted broadcaster delta"));
         let status = service.status_snapshot().await;
         assert!(!status.snapshot.ready);
+        assert_eq!(status.snapshot.total_states, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_decoded_update_fails_before_redis_append() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+
+        let append_count_before = writer.appends().await.len();
+        let Err(error) = service
+            .apply_update(&native_update_state(11, "missing-native", 2))
+            .await
+        else {
+            return Err(anyhow!(
+                "invalid decoded update should fail before Redis append"
+            ));
+        };
+
+        assert!(
+            format!("{error:#}")
+                .contains("state missing-native is missing a known broadcaster backend"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(writer.appends().await.len(), append_count_before);
+        let status = service.status_snapshot().await;
         assert_eq!(status.snapshot.total_states, 0);
         Ok(())
     }
@@ -1371,32 +1484,7 @@ mod tests {
     #[tokio::test]
     async fn shared_generation_reset_keeps_backend_caches_and_redis_publisher_aligned() -> Result<()>
     {
-        let writer = ServiceFakeRedisWriter::default();
-        let publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(writer),
-        ));
-        publisher
-            .promote(
-                base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
-                "active_writer_promoted",
-            )
-            .await?;
-        let lifecycle_gate = Arc::new(Mutex::new(()));
-        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
-            BroadcasterUpstreamState::default(),
-            Arc::clone(&publisher),
-            Arc::clone(&lifecycle_gate),
-        );
-        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
-            BroadcasterUpstreamState::default(),
-            Arc::clone(&publisher),
-            lifecycle_gate,
-        );
+        let (raw_service, rfq_service, _writer, publisher) = ready_raw_and_rfq_services().await?;
 
         BroadcasterServiceState::handle_shared_generation_reset(
             &[raw_service.clone(), rfq_service.clone()],
@@ -1405,18 +1493,183 @@ mod tests {
         )
         .await;
 
+        let raw_status = raw_service.status_snapshot().await;
         assert_eq!(
-            raw_service.status_snapshot().await.snapshot.stream_id,
-            "chain-1-stream-2"
+            raw_status.readiness,
+            BroadcasterReadiness::UpstreamDisconnected
         );
+        assert_eq!(raw_status.snapshot.stream_id, "chain-1-stream-2");
+        assert_eq!(raw_status.snapshot.total_states, 0);
+
+        let rfq_status = rfq_service.status_snapshot().await;
         assert_eq!(
-            rfq_service.status_snapshot().await.snapshot.stream_id,
-            "chain-1-stream-2"
+            rfq_status.readiness,
+            BroadcasterReadiness::UpstreamDisconnected
         );
+        assert_eq!(rfq_status.snapshot.stream_id, "chain-1-stream-2");
+        assert_eq!(rfq_status.snapshot.total_states, 0);
+
         assert_eq!(
             publisher.status_snapshot().await.stream_id,
             "chain-1-stream-2"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_generation_reset_relabels_raw_cache_without_clearing_it() -> Result<()> {
+        let (raw_service, rfq_service, _writer, _publisher) = ready_raw_and_rfq_services().await?;
+        let raw_before = raw_service.status_snapshot().await;
+        assert_eq!(raw_before.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(raw_before.snapshot.total_states, 1);
+
+        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
+            &[raw_service.clone(), rfq_service.clone()],
+            std::slice::from_ref(&rfq_service),
+            "rfq_restart",
+            Some("rfq stale".to_string()),
+        )
+        .await;
+
+        let raw_after = raw_service.status_snapshot().await;
+        assert_eq!(raw_after.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(raw_after.snapshot.stream_id, "chain-1-stream-2");
+        assert_eq!(raw_after.snapshot.snapshot_id, "chain-1-snapshot-2");
+        assert_eq!(
+            raw_after.snapshot.total_states,
+            raw_before.snapshot.total_states
+        );
+
+        let rfq_after = rfq_service.status_snapshot().await;
+        assert_eq!(
+            rfq_after.readiness,
+            BroadcasterReadiness::UpstreamDisconnected
+        );
+        assert_eq!(rfq_after.snapshot.stream_id, "chain-1-stream-2");
+        assert_eq!(rfq_after.snapshot.snapshot_id, "chain-1-snapshot-2");
+        assert_eq!(rfq_after.snapshot.total_states, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_generation_reset_relabels_rfq_cache_without_clearing_it() -> Result<()> {
+        let (raw_service, rfq_service, _writer, _publisher) = ready_raw_and_rfq_services().await?;
+        let rfq_before = rfq_service.status_snapshot().await;
+        assert_eq!(rfq_before.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(rfq_before.snapshot.total_states, 1);
+
+        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
+            &[raw_service.clone(), rfq_service.clone()],
+            std::slice::from_ref(&raw_service),
+            "raw_restart",
+            Some("raw stale".to_string()),
+        )
+        .await;
+
+        let raw_after = raw_service.status_snapshot().await;
+        assert_eq!(
+            raw_after.readiness,
+            BroadcasterReadiness::UpstreamDisconnected
+        );
+        assert_eq!(raw_after.snapshot.stream_id, "chain-1-stream-2");
+        assert_eq!(raw_after.snapshot.snapshot_id, "chain-1-snapshot-2");
+        assert_eq!(raw_after.snapshot.total_states, 0);
+
+        let rfq_after = rfq_service.status_snapshot().await;
+        assert_eq!(rfq_after.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(rfq_after.snapshot.stream_id, "chain-1-stream-2");
+        assert_eq!(rfq_after.snapshot.snapshot_id, "chain-1-snapshot-2");
+        assert_eq!(
+            rfq_after.snapshot.total_states,
+            rfq_before.snapshot.total_states
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_generation_reset_uses_all_configured_backends_for_marker() -> Result<()> {
+        let (raw_service, rfq_service, writer, _publisher) = raw_and_rfq_services().await?;
+
+        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
+            &[raw_service.clone(), rfq_service.clone()],
+            std::slice::from_ref(&rfq_service),
+            "rfq_restart",
+            Some("rfq stale".to_string()),
+        )
+        .await;
+
+        let reset_marker = writer
+            .appends()
+            .await
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("generation reset should publish a marker"))?;
+        assert_eq!(reset_marker.stream_id, "chain-1-stream-2");
+        assert_eq!(reset_marker.message_seq, 1);
+        assert_eq!(reset_marker.backend_scope, "native,rfq");
+        assert_eq!(
+            progress_payload(&reset_marker)?.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combined_snapshot_session_works_after_preserved_cache_is_relabelled() -> Result<()> {
+        let (raw_service, rfq_service, _writer, _publisher) = ready_raw_and_rfq_services().await?;
+        let old_session = BroadcasterServiceState::create_snapshot_session_for_services(
+            &[raw_service.clone(), rfq_service.clone()],
+            Duration::from_secs(300),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("expected initial combined snapshot session"))?;
+
+        BroadcasterServiceState::handle_shared_generation_reset_with_cache_scope(
+            &[raw_service.clone(), rfq_service.clone()],
+            std::slice::from_ref(&rfq_service),
+            "rfq_restart",
+            Some("rfq stale".to_string()),
+        )
+        .await;
+
+        let Err(error) = raw_service
+            .snapshot_session_payload(old_session.session_id, 0)
+            .await
+        else {
+            return Err(anyhow!("old generation snapshot session should be closed"));
+        };
+        assert_eq!(error, SnapshotSessionError::NotFound);
+
+        rfq_service.mark_upstream_connected().await;
+        rfq_service
+            .apply_update(&rfq_only_update(203, "rfq-2", 8))
+            .await?;
+
+        let session = BroadcasterServiceState::create_snapshot_session_for_services(
+            &[raw_service.clone(), rfq_service.clone()],
+            Duration::from_secs(300),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("expected combined snapshot session after RFQ rewarm"))?;
+
+        assert_eq!(session.stream_id, "chain-1-stream-2");
+        assert_eq!(session.snapshot_id, "chain-1-snapshot-2");
+        assert_eq!(session.redis_replay_boundary.stream_id, "chain-1-stream-2");
+        assert_eq!(
+            session.redis_replay_boundary.snapshot_id,
+            "chain-1-snapshot-2"
+        );
+        let start = raw_service
+            .snapshot_session_payload(session.session_id, 0)
+            .await
+            .map_err(|error| anyhow!("snapshot payload failed: {error:?}"))?;
+        assert_eq!(start.stream_id, "chain-1-stream-2");
+        assert!(matches!(
+            start.payload,
+            BroadcasterPayload::SnapshotStart(ref start)
+                if start.snapshot_id == "chain-1-snapshot-2"
+                    && start.backends == vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        ));
         Ok(())
     }
 
@@ -1478,6 +1731,56 @@ mod tests {
             }),
             "creating an HTTP snapshot session must not publish Redis snapshot payloads"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_session_rejects_snapshot_stream_id_boundary_mismatch() -> Result<()> {
+        let registry = BroadcasterSnapshotSessionRegistry::new();
+
+        let Err(error) = registry
+            .create_snapshot_session(
+                snapshot_export(),
+                1,
+                replay_boundary_with_ids("stream-2", "snapshot-1"),
+                Duration::from_secs(300),
+            )
+            .await
+        else {
+            return Err(anyhow!(
+                "snapshot stream_id mismatch should reject the session"
+            ));
+        };
+
+        assert!(
+            format!("{error:#}").contains("snapshot stream_id mismatch"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(registry.snapshot().await.active, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_session_rejects_snapshot_id_boundary_mismatch() -> Result<()> {
+        let registry = BroadcasterSnapshotSessionRegistry::new();
+
+        let Err(error) = registry
+            .create_snapshot_session(
+                snapshot_export(),
+                1,
+                replay_boundary_with_ids("stream-1", "snapshot-2"),
+                Duration::from_secs(300),
+            )
+            .await
+        else {
+            return Err(anyhow!("snapshot_id mismatch should reject the session"));
+        };
+
+        assert!(
+            format!("{error:#}").contains("snapshot_id mismatch"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(registry.snapshot().await.active, 0);
         Ok(())
     }
 
@@ -1606,6 +1909,60 @@ mod tests {
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
         Ok(service)
+    }
+
+    async fn raw_and_rfq_services() -> Result<(
+        BroadcasterServiceState,
+        BroadcasterServiceState,
+        ServiceFakeRedisWriter,
+        Arc<BroadcasterRedisPublisher>,
+    )> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native, BroadcasterBackend::Rfq]),
+                "active_writer_promoted",
+            )
+            .await?;
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::clone(&lifecycle_gate),
+        );
+        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            lifecycle_gate,
+        );
+
+        Ok((raw_service, rfq_service, writer, publisher))
+    }
+
+    async fn ready_raw_and_rfq_services() -> Result<(
+        BroadcasterServiceState,
+        BroadcasterServiceState,
+        ServiceFakeRedisWriter,
+        Arc<BroadcasterRedisPublisher>,
+    )> {
+        let (raw_service, rfq_service, writer, publisher) = raw_and_rfq_services().await?;
+        raw_service.mark_upstream_connected().await;
+        rfq_service.mark_upstream_connected().await;
+        raw_service
+            .apply_update(&native_only_update(101, "native-1"))
+            .await?;
+        rfq_service
+            .apply_update(&rfq_only_update(202, "rfq-1", 7))
+            .await?;
+        Ok((raw_service, rfq_service, writer, publisher))
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1779,10 +2136,17 @@ mod tests {
     }
 
     fn replay_boundary() -> simulator_core::broadcaster::BroadcasterRedisReplayBoundary {
+        replay_boundary_with_ids("stream-1", "snapshot-1")
+    }
+
+    fn replay_boundary_with_ids(
+        stream_id: &str,
+        snapshot_id: &str,
+    ) -> simulator_core::broadcaster::BroadcasterRedisReplayBoundary {
         simulator_core::broadcaster::BroadcasterRedisReplayBoundary::new(
             "dsolver:broadcaster:test:events",
-            "stream-1",
-            "snapshot-1",
+            stream_id,
+            snapshot_id,
             1,
             0,
         )
@@ -1829,6 +2193,27 @@ mod tests {
                 hash: Bytes::from(vec![1u8; 32]),
                 number: block_number,
                 parent_hash: Bytes::from(vec![2u8; 32]),
+                revert: false,
+                timestamp: block_number * 10,
+                partial_block_index: None,
+            }),
+        )]))
+    }
+
+    fn native_update_state(block_number: u64, component_id: &str, seed: u8) -> Update {
+        let protocol = "uniswap_v2";
+        let mut states = HashMap::new();
+        states.insert(
+            component_id.to_string(),
+            Box::new(DummySim(seed)) as Box<dyn ProtocolSim>,
+        );
+
+        Update::new(block_number, states, HashMap::new()).set_sync_states(HashMap::from([(
+            protocol.to_string(),
+            SynchronizerState::Ready(BlockHeader {
+                hash: Bytes::from(vec![seed; 32]),
+                number: block_number,
+                parent_hash: Bytes::from(vec![seed.saturating_add(1); 32]),
                 revert: false,
                 timestamp: block_number * 10,
                 partial_block_index: None,

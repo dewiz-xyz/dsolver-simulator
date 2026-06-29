@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 
 const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
 
@@ -72,22 +73,6 @@ pub struct ReadinessBackendSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadinessRedisReplayBoundarySnapshot {
-    pub stream_key: String,
-    pub stream_id: String,
-    pub snapshot_id: String,
-    pub generation: u64,
-    pub exclusive_message_seq: u64,
-}
-
-impl ReadinessRedisReplayBoundarySnapshot {
-    fn exclusive_entry_id(&self) -> String {
-        format!("{}-{}", self.generation, self.exclusive_message_seq)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReadinessSubscriptionSnapshot {
     pub connected: bool,
     pub bootstrap_complete: bool,
@@ -96,9 +81,9 @@ pub struct ReadinessSubscriptionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redis_replay_boundary: Option<ReadinessRedisReplayBoundarySnapshot>,
+    pub redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redis_catch_up_cursor: Option<String>,
+    pub redis_replay_checkpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis_replay_caught_up: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,7 +530,7 @@ fn append_redis_replay_status(lines: &mut Vec<String>, snapshot: &ReadinessSnaps
             kind,
             subscription.redis_boundary_label(),
             subscription
-                .redis_catch_up_cursor
+                .redis_replay_checkpoint
                 .as_deref()
                 .unwrap_or("unknown"),
             fmt_optional_bool(subscription.redis_replay_caught_up),
@@ -656,7 +641,7 @@ fn readiness_component_status(enabled: bool, status: Option<&str>) -> &str {
 impl ReadinessSubscriptionSnapshot {
     fn has_redis_replay_status(&self) -> bool {
         self.redis_replay_boundary.is_some()
-            || self.redis_catch_up_cursor.is_some()
+            || self.redis_replay_checkpoint.is_some()
             || self.redis_replay_caught_up.is_some()
             || self.redis_gap_reason.is_some()
     }
@@ -664,7 +649,7 @@ impl ReadinessSubscriptionSnapshot {
     fn redis_boundary_label(&self) -> String {
         self.redis_replay_boundary
             .as_ref()
-            .map(ReadinessRedisReplayBoundarySnapshot::exclusive_entry_id)
+            .map(BroadcasterRedisReplayBoundary::exclusive_entry_id)
             .unwrap_or_else(|| "unknown".to_string())
     }
 }
@@ -855,7 +840,7 @@ mod tests {
                 "generation": 2,
                 "exclusiveMessageSeq": 14
             },
-            "redis_catch_up_cursor": "2-16",
+            "redis_replay_checkpoint": "2-16",
             "redis_replay_caught_up": true,
             "restart_count": 0
         }))?;
@@ -867,7 +852,7 @@ mod tests {
             "dsolver:broadcaster:local:8453:events"
         );
         assert_eq!(value["redis_replay_boundary"]["exclusiveMessageSeq"], 14);
-        assert_eq!(value["redis_catch_up_cursor"], "2-16");
+        assert_eq!(value["redis_replay_checkpoint"], "2-16");
         assert!(value["redis_replay_caught_up"].as_bool().unwrap_or(false));
         assert!(value.get("redis_gap_reason").is_none());
         Ok(())
@@ -962,7 +947,7 @@ mod tests {
                 "generation": 2,
                 "exclusiveMessageSeq": 14
             },
-            "redis_catch_up_cursor": "2-16",
+            "redis_replay_checkpoint": "2-16",
             "redis_replay_caught_up": true,
             "restart_count": 0
         }))?);

@@ -1,41 +1,40 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use broadcaster_replay_client::{
+    BroadcasterReplayClient, BroadcasterReplayClientError, BroadcasterReplayConfig,
+    BroadcasterSnapshotSessionResponse, GenerationHandoffCandidate, ReplayBatchItem,
+    ReplayCheckpoint, ReplayPoll,
+};
+use futures::StreamExt;
 use rand::Rng;
-use reqwest::Client;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterRedisReplayBoundary,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
+    BroadcasterRedisReplayBoundary,
 };
 
 use crate::config::BroadcasterRedisConfig;
 use crate::memory::maybe_purge_allocator;
-use crate::models::broadcaster_urls::derive_broadcaster_http_url;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_broadcaster_subscription_decoder;
 use crate::stream::StreamSupervisorConfig;
 
-mod checkpoint;
-mod handoff;
 mod processor;
-mod reader;
 mod snapshot;
 #[cfg(test)]
 mod tests;
 
-use self::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction, RedisReplayCheckpoint};
-use self::handoff::{continue_redis_generation_handoff, redis_generation_handoff_candidate};
 use self::processor::{
     handle_subscription_reset, BroadcasterSubscriptionProcessor, PreparedRedisProcessor,
     SubscriptionRebuildState,
 };
-use self::reader::{RedisStreamMessage, TokioRedisStreamReader};
-use self::snapshot::{bootstrap_broadcaster_snapshot, BROADCASTER_SNAPSHOT_SESSIONS_PATH};
 
 #[derive(Clone)]
 pub(crate) enum BroadcasterSubscriptionControls {
@@ -140,15 +139,22 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
         return;
     }
 
-    let client = Client::new();
     let mut backoff = cfg.restart_backoff_min;
     let mut rebuilds = empty_rebuilds(controls.len());
 
     loop {
-        let reader = match TokioRedisStreamReader::connect(&redis_config.redis_url).await {
-            Ok(reader) => reader,
+        let replay_client = match BroadcasterReplayClient::connect(BroadcasterReplayConfig {
+            broadcaster_url: broadcaster_url.clone(),
+            redis_url: redis_config.redis_url.clone(),
+            block_ms: redis_config.block_ms,
+            read_count: redis_config.read_count,
+            request_timeout: cfg.readiness_stale,
+        })
+        .await
+        {
+            Ok(client) => client,
             Err(error) => {
-                let message = format!("Failed to connect to broadcaster Redis: {error:#}");
+                let message = error.to_string();
                 (rebuilds, backoff) = reset_redis_subscription_after_error(
                     &controls,
                     &cfg,
@@ -167,10 +173,8 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
         };
 
         let prepared = match prepare_broadcaster_redis_subscription(
-            &client,
-            &broadcaster_url,
+            &replay_client,
             expected_chain_id,
-            &cfg,
             &controls,
             rebuilds,
         )
@@ -200,7 +204,7 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
         );
 
         let (exit, next_rebuilds) =
-            process_broadcaster_redis_subscription(reader, prepared, &redis_config).await;
+            process_broadcaster_redis_subscription(&replay_client, prepared).await;
         (rebuilds, backoff) = reset_redis_subscription_after_error(
             &controls,
             &cfg,
@@ -224,8 +228,12 @@ fn empty_rebuilds(count: usize) -> Vec<Option<SubscriptionRebuildState>> {
 struct PreparedBroadcasterRedisSubscription {
     processors: Vec<PreparedRedisProcessor>,
     replay_boundary: BroadcasterRedisReplayBoundary,
-    required_catch_up_message_seq: u64,
     expected_chain_id: u64,
+}
+
+struct PendingRedisProcessor {
+    index: usize,
+    processor: BroadcasterSubscriptionProcessor,
 }
 
 struct PrepareBroadcasterRedisSubscriptionError {
@@ -252,10 +260,8 @@ impl PrepareBroadcasterRedisSubscriptionError {
 }
 
 async fn prepare_broadcaster_redis_subscription(
-    client: &Client,
-    broadcaster_url: &str,
+    replay_client: &BroadcasterReplayClient,
     expected_chain_id: u64,
-    cfg: &StreamSupervisorConfig,
     controls: &[BroadcasterSubscriptionControls],
     mut rebuilds: Vec<Option<SubscriptionRebuildState>>,
 ) -> std::result::Result<
@@ -266,20 +272,6 @@ async fn prepare_broadcaster_redis_subscription(
     let mut last_backend_error = None;
 
     for (index, controls) in controls.iter().enumerate() {
-        let snapshot_sessions_url = match derive_broadcaster_http_url(
-            broadcaster_url,
-            BROADCASTER_SNAPSHOT_SESSIONS_PATH,
-        ) {
-            Ok(url) => url,
-            Err(error) => {
-                return Err(PrepareBroadcasterRedisSubscriptionError::new(
-                    format!("Invalid broadcaster URL: {error}"),
-                    "broadcaster_redis_subscription_url_invalid",
-                    "Failed to derive broadcaster snapshot session URL",
-                    rebuilds,
-                ));
-            }
-        };
         let decoder = match build_broadcaster_subscription_decoder(
             controls.tokens(),
             controls.backend(),
@@ -297,56 +289,28 @@ async fn prepare_broadcaster_redis_subscription(
             }
         };
         let rebuild = rebuilds.get_mut(index).and_then(Option::take);
-        let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+        let processor = BroadcasterSubscriptionProcessor::with_decoder(
             expected_chain_id,
             controls.clone(),
             decoder,
             rebuild,
         );
-        let session = match bootstrap_broadcaster_snapshot(
-            client,
-            broadcaster_url,
-            &snapshot_sessions_url,
-            &mut processor,
-            controls,
-            cfg,
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(error) => {
-                let message = error.to_string();
-                last_backend_error = Some(message.clone());
-                rebuilds[index] =
-                    handle_subscription_reset(controls, Some(message), processor.rebuild).await;
-                continue;
-            }
-        };
-        if let Err(error) = processor.align_redis_replay_boundary(&session.redis_replay_boundary) {
-            let message = error.to_string();
-            last_backend_error = Some(message.clone());
-            rebuilds[index] =
-                handle_subscription_reset(controls, Some(message), processor.rebuild).await;
-            continue;
-        }
-
-        processors.push(PreparedRedisProcessor {
-            index,
-            processor,
-            replay_boundary: session.redis_replay_boundary,
-        });
+        processors.push(PendingRedisProcessor { index, processor });
     }
 
     finish_prepared_broadcaster_redis_subscription(
+        replay_client,
         processors,
         rebuilds,
         last_backend_error,
         expected_chain_id,
     )
+    .await
 }
 
-fn finish_prepared_broadcaster_redis_subscription(
-    processors: Vec<PreparedRedisProcessor>,
+async fn finish_prepared_broadcaster_redis_subscription(
+    replay_client: &BroadcasterReplayClient,
+    processors: Vec<PendingRedisProcessor>,
     rebuilds: Vec<Option<SubscriptionRebuildState>>,
     last_backend_error: Option<String>,
     expected_chain_id: u64,
@@ -355,7 +319,7 @@ fn finish_prepared_broadcaster_redis_subscription(
     PrepareBroadcasterRedisSubscriptionError,
 > {
     if let Some(message) = last_backend_error {
-        let rebuilds = merge_redis_processor_rebuilds(processors, rebuilds);
+        let rebuilds = merge_pending_processor_rebuilds(processors, rebuilds);
         return Err(PrepareBroadcasterRedisSubscriptionError::new(
             message,
             "broadcaster_redis_subscription_bootstrap_failed",
@@ -373,167 +337,345 @@ fn finish_prepared_broadcaster_redis_subscription(
         ));
     }
 
-    let required_catch_up_message_seq = processors
-        .iter()
-        .map(|processor| processor.replay_boundary.exclusive_message_seq)
-        .max()
-        .unwrap_or(0);
-    let replay_boundary = match coalesce_redis_replay_boundary(
-        processors
-            .iter()
-            .map(|processor| processor.replay_boundary.clone())
-            .collect(),
-    ) {
-        Ok(replay_boundary) => replay_boundary,
-        Err(error) => {
-            return Err(PrepareBroadcasterRedisSubscriptionError::new(
-                error.to_string(),
-                "broadcaster_redis_subscription_boundary_invalid",
-                "Failed to derive process Redis replay boundary",
-                merge_redis_processor_rebuilds(processors, rebuilds),
-            ));
-        }
-    };
+    let (processors, replay_boundary) =
+        bootstrap_pending_processors(replay_client, processors, rebuilds).await?;
+    let processors = processors
+        .into_iter()
+        .map(|pending| PreparedRedisProcessor {
+            index: pending.index,
+            processor: pending.processor,
+            replay_boundary: replay_boundary.clone(),
+        })
+        .collect();
 
     Ok(PreparedBroadcasterRedisSubscription {
         processors,
         replay_boundary,
-        required_catch_up_message_seq,
         expected_chain_id,
     })
 }
 
+async fn bootstrap_pending_processors(
+    replay_client: &BroadcasterReplayClient,
+    mut processors: Vec<PendingRedisProcessor>,
+    rebuilds: Vec<Option<SubscriptionRebuildState>>,
+) -> std::result::Result<
+    (Vec<PendingRedisProcessor>, BroadcasterRedisReplayBoundary),
+    PrepareBroadcasterRedisSubscriptionError,
+> {
+    let session = match replay_client.create_snapshot_session().await {
+        Ok(session) => session,
+        Err(error) => {
+            return Err(pending_processor_bootstrap_error(
+                error.to_string(),
+                "broadcaster_redis_subscription_bootstrap_failed",
+                "Failed to create broadcaster snapshot session",
+                processors,
+                rebuilds,
+            ));
+        }
+    };
+
+    mark_pending_processors_started(&mut processors, &session.redis_replay_boundary).await;
+
+    {
+        let mut payloads = replay_client.snapshot_payloads(&session);
+        while let Some(envelope) = payloads.next().await {
+            let envelope = match envelope {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    return Err(pending_processor_bootstrap_error(
+                        error.to_string(),
+                        "broadcaster_redis_subscription_bootstrap_failed",
+                        "Failed to fetch broadcaster snapshot payload",
+                        processors,
+                        rebuilds,
+                    ));
+                }
+            };
+            if let Err(error) =
+                apply_snapshot_payload_to_pending_processors(&mut processors, envelope).await
+            {
+                return Err(pending_processor_bootstrap_error(
+                    error.to_string(),
+                    "broadcaster_redis_subscription_bootstrap_failed",
+                    "Failed to apply broadcaster snapshot payload",
+                    processors,
+                    rebuilds,
+                ));
+            }
+        }
+    }
+
+    if let Err((message, event, detail)) =
+        validate_pending_processors_bootstrapped(&mut processors, &session)
+    {
+        return Err(pending_processor_bootstrap_error(
+            message, event, detail, processors, rebuilds,
+        ));
+    }
+
+    Ok((processors, session.redis_replay_boundary))
+}
+
+async fn mark_pending_processors_started(
+    processors: &mut [PendingRedisProcessor],
+    replay_boundary: &BroadcasterRedisReplayBoundary,
+) {
+    for prepared in processors {
+        prepared
+            .processor
+            .set_bootstrap_redis_replay_boundary(replay_boundary.clone());
+        prepared
+            .processor
+            .controls
+            .stream_health()
+            .mark_started()
+            .await;
+    }
+}
+
+async fn apply_snapshot_payload_to_pending_processors(
+    processors: &mut [PendingRedisProcessor],
+    envelope: BroadcasterEnvelope,
+) -> Result<()> {
+    for prepared in processors {
+        prepared.processor.observe(envelope.clone()).await?;
+    }
+    Ok(())
+}
+
+fn validate_pending_processors_bootstrapped(
+    processors: &mut [PendingRedisProcessor],
+    session: &BroadcasterSnapshotSessionResponse,
+) -> std::result::Result<(), (String, &'static str, &'static str)> {
+    for prepared in processors {
+        if !prepared.processor.bootstrap_complete() {
+            return Err((
+                format!(
+                    "broadcaster HTTP snapshot session {} ended before {} bootstrap completed",
+                    session.session_id,
+                    prepared.processor.controls.backend_label()
+                ),
+                "broadcaster_redis_subscription_bootstrap_failed",
+                "Failed to bootstrap broadcaster subscription from HTTP snapshot",
+            ));
+        }
+        if let Err(error) = prepared
+            .processor
+            .align_redis_replay_boundary(&session.redis_replay_boundary)
+        {
+            return Err((
+                error.to_string(),
+                "broadcaster_redis_subscription_boundary_invalid",
+                "Failed to align broadcaster Redis replay boundary",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pending_processor_bootstrap_error(
+    message: impl Into<String>,
+    event: &'static str,
+    detail: &'static str,
+    processors: Vec<PendingRedisProcessor>,
+    rebuilds: Vec<Option<SubscriptionRebuildState>>,
+) -> PrepareBroadcasterRedisSubscriptionError {
+    PrepareBroadcasterRedisSubscriptionError::new(
+        message.into(),
+        event,
+        detail,
+        merge_pending_processor_rebuilds(processors, rebuilds),
+    )
+}
+
 async fn process_broadcaster_redis_subscription(
-    reader: TokioRedisStreamReader,
+    replay_client: &BroadcasterReplayClient,
     mut prepared: PreparedBroadcasterRedisSubscription,
-    redis_config: &BroadcasterRedisConfig,
 ) -> (SubscriptionExit, Vec<Option<SubscriptionRebuildState>>) {
     let mut checkpoint =
-        RedisReplayCheckpoint::new(prepared.replay_boundary.clone(), prepared.expected_chain_id);
+        ReplayCheckpoint::new(prepared.replay_boundary.clone(), prepared.expected_chain_id);
 
     loop {
-        let messages = match reader
-            .read_after(
-                &prepared.replay_boundary.stream_key,
-                checkpoint.entry_id(),
-                redis_config.block_ms,
-                redis_config.read_count,
-            )
-            .await
-        {
-            Ok(messages) => messages,
+        let poll = match replay_client.read_next(&checkpoint).await {
+            Ok(poll) => poll,
             Err(error) => {
                 return (
-                    SubscriptionExit::error(format!(
-                        "failed to read broadcaster Redis stream: {error:#}"
-                    )),
+                    replay_error_exit(error),
                     redis_processor_rebuilds(prepared.processors),
                 );
             }
         };
 
-        let caught_up_after_batch = messages.len() < redis_config.read_count as usize;
-        if messages.is_empty() {
-            if let Err(exit) = handle_empty_redis_poll(&reader, &checkpoint, &prepared).await {
-                return (exit, redis_processor_rebuilds(prepared.processors));
+        match poll {
+            ReplayPoll::Pending => {}
+            ReplayPoll::CaughtUp {
+                checkpoint: caught_up_checkpoint,
+            } => {
+                mark_redis_catch_up_checkpoints(
+                    &prepared.processors,
+                    caught_up_checkpoint.entry_id(),
+                )
+                .await;
+                checkpoint = caught_up_checkpoint;
             }
-            continue;
-        }
-
-        if let Err(exit) = apply_redis_message_batch(&mut prepared, &mut checkpoint, messages).await
-        {
-            return (exit, redis_processor_rebuilds(prepared.processors));
-        }
-
-        if caught_up_after_batch {
-            if let Err(error) =
-                checkpoint.ensure_reached_required_boundary(prepared.required_catch_up_message_seq)
-            {
-                return (
-                    SubscriptionExit::redis_gap(error.to_string()),
-                    redis_processor_rebuilds(prepared.processors),
-                );
+            ReplayPoll::Batch(batch) => {
+                let caught_up_after_batch = batch.caught_up_after_batch;
+                if let Err(exit) =
+                    apply_replay_batch(&mut prepared, &mut checkpoint, batch.items).await
+                {
+                    return (exit, redis_processor_rebuilds(prepared.processors));
+                }
+                if caught_up_after_batch {
+                    mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id())
+                        .await;
+                }
             }
-            mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id()).await;
         }
     }
 }
 
-async fn handle_empty_redis_poll(
-    reader: &TokioRedisStreamReader,
-    checkpoint: &RedisReplayCheckpoint,
-    prepared: &PreparedBroadcasterRedisSubscription,
-) -> std::result::Result<(), SubscriptionExit> {
-    let stream_info = match reader
-        .stream_info(&prepared.replay_boundary.stream_key)
-        .await
-    {
-        Ok(stream_info) => stream_info,
-        Err(error) => {
-            return Err(SubscriptionExit::error(format!(
-                "failed to inspect broadcaster Redis stream: {error:#}"
-            )));
-        }
-    };
+fn replay_error_exit(error: BroadcasterReplayClientError) -> SubscriptionExit {
+    if matches!(error, BroadcasterReplayClientError::RedisGap { .. }) {
+        SubscriptionExit::redis_gap(error.to_string())
+    } else {
+        SubscriptionExit::error(error.to_string())
+    }
+}
 
-    match redis_empty_poll_action(
-        checkpoint,
-        stream_info.as_ref(),
-        prepared.required_catch_up_message_seq,
-    ) {
-        Ok(RedisEmptyPollAction::CaughtUp) => {
-            mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id()).await;
+async fn apply_replay_batch(
+    prepared: &mut PreparedBroadcasterRedisSubscription,
+    checkpoint: &mut ReplayCheckpoint,
+    items: Vec<ReplayBatchItem>,
+) -> std::result::Result<(), SubscriptionExit> {
+    for item in items {
+        match item {
+            ReplayBatchItem::Message(message) => {
+                for prepared_processor in &mut prepared.processors {
+                    if message.entry.message_seq
+                        <= prepared_processor.replay_boundary.exclusive_message_seq
+                    {
+                        continue;
+                    }
+                    prepared_processor
+                        .processor
+                        .observe_redis_delta(&message.entry, &message.envelope)
+                        .await
+                        .map_err(|error| SubscriptionExit::error(error.to_string()))?;
+                }
+                *checkpoint = message.checkpoint_after;
+            }
+            ReplayBatchItem::GenerationHandoff(candidate) => {
+                continue_redis_generation_handoff(prepared, &candidate)
+                    .await
+                    .map_err(|error| SubscriptionExit::redis_gap(error.to_string()))?;
+                *checkpoint = candidate.checkpoint_after;
+            }
         }
-        Ok(RedisEmptyPollAction::Pending) => {}
-        Err(error) => return Err(SubscriptionExit::redis_gap(error.to_string())),
+        mark_redis_replay_checkpoints(
+            &prepared.processors,
+            checkpoint.entry_id(),
+            checkpoint.last_message_seq(),
+        )
+        .await;
     }
     Ok(())
 }
 
-async fn apply_redis_message_batch(
+async fn continue_redis_generation_handoff(
     prepared: &mut PreparedBroadcasterRedisSubscription,
-    checkpoint: &mut RedisReplayCheckpoint,
-    messages: Vec<RedisStreamMessage>,
-) -> std::result::Result<(), SubscriptionExit> {
-    let mut last_applied_entry_id = None;
-    for message in messages {
-        let envelope: BroadcasterEnvelope = serde_json::from_str(&message.entry.payload_json)
-            .map_err(|error| {
-                SubscriptionExit::error(format!(
-                    "failed to decode broadcaster Redis payload: {error}"
-                ))
-            })?;
+    candidate: &GenerationHandoffCandidate,
+) -> Result<()> {
+    let BroadcasterPayload::Progress(progress) = &candidate.envelope.payload else {
+        return Err(anyhow!(
+            "Redis replay gap: generation handoff payload is not progress"
+        ));
+    };
 
-        if let Err(error) = checkpoint.ensure_next_message(&message) {
-            if redis_generation_handoff_candidate(checkpoint, &message, &envelope) {
-                continue_redis_generation_handoff(prepared, checkpoint, &message, &envelope)
-                    .await
-                    .map_err(|error| SubscriptionExit::redis_gap(error.to_string()))?;
-                last_applied_entry_id = Some(message.entry_id);
-                continue;
-            }
-            return Err(SubscriptionExit::redis_gap(error.to_string()));
-        }
-
-        for prepared_processor in &mut prepared.processors {
-            if message.entry.message_seq <= prepared_processor.replay_boundary.exclusive_message_seq
-            {
-                continue;
-            }
-            prepared_processor
-                .processor
-                .observe_redis_delta(&message.entry, &envelope)
-                .await
-                .map_err(|error| SubscriptionExit::error(error.to_string()))?;
-        }
-
-        checkpoint.mark_applied(&message);
-        last_applied_entry_id = Some(message.entry_id);
+    let enabled_backends = prepared_enabled_backends(prepared);
+    if progress.backends != enabled_backends {
+        return Err(anyhow!(
+            "Redis replay gap: handoff progress backends {:?} do not match enabled backends {:?}",
+            progress.backends,
+            enabled_backends
+        ));
     }
-    if let Some(entry_id) = last_applied_entry_id {
-        mark_redis_replay_checkpoints(&prepared.processors, &entry_id, checkpoint.last_message_seq)
+    let Some(handoff) = progress.handoff.as_ref() else {
+        return Err(anyhow!(
+            "Redis replay gap: generation handoff marker is missing handoff proof"
+        ));
+    };
+    ensure_handoff_base_heads_match(prepared, &handoff.base_heads).await?;
+
+    for prepared_processor in &mut prepared.processors {
+        prepared_processor
+            .processor
+            .continue_redis_generation_handoff(&candidate.boundary)?;
+        prepared_processor.replay_boundary = candidate.boundary.clone();
+        prepared_processor
+            .processor
+            .controls
+            .broadcaster_subscription()
+            .mark_redis_generation_continued(candidate.boundary.clone())
             .await;
     }
+    prepared.replay_boundary = candidate.boundary.clone();
+    Ok(())
+}
+
+fn prepared_enabled_backends(
+    prepared: &PreparedBroadcasterRedisSubscription,
+) -> Vec<BroadcasterBackend> {
+    let mut backends = prepared
+        .processors
+        .iter()
+        .map(|processor| processor.processor.controls.backend())
+        .collect::<Vec<_>>();
+    backends.sort();
+    backends
+}
+
+async fn ensure_handoff_base_heads_match(
+    prepared: &PreparedBroadcasterRedisSubscription,
+    base_heads: &[BroadcasterBackendHead],
+) -> Result<()> {
+    let mut heads_by_backend = BTreeMap::new();
+    for head in base_heads {
+        heads_by_backend.insert(head.backend, head.block_number);
+    }
+
+    for prepared_processor in &prepared.processors {
+        let backend = prepared_processor.processor.controls.backend();
+        let Some(expected_block) = heads_by_backend.remove(&backend) else {
+            return Err(anyhow!(
+                "Redis replay gap: handoff base heads are missing {} backend",
+                backend
+            ));
+        };
+        let current_block = prepared_processor
+            .processor
+            .controls
+            .state_store()
+            .current_block()
+            .await;
+        if current_block != expected_block {
+            return Err(anyhow!(
+                "Redis replay gap: handoff {} base head {} does not match local block {}",
+                backend,
+                expected_block,
+                current_block
+            ));
+        }
+    }
+
+    if let Some((backend, _)) = heads_by_backend.into_iter().next() {
+        return Err(anyhow!(
+            "Redis replay gap: handoff base heads include unexpected {} backend",
+            backend
+        ));
+    }
+
     Ok(())
 }
 
@@ -581,12 +723,12 @@ fn redis_processor_rebuilds(
     rebuilds
 }
 
-fn merge_redis_processor_rebuilds(
-    processors: Vec<PreparedRedisProcessor>,
+fn merge_pending_processor_rebuilds(
+    processors: Vec<PendingRedisProcessor>,
     mut rebuilds: Vec<Option<SubscriptionRebuildState>>,
 ) -> Vec<Option<SubscriptionRebuildState>> {
-    for prepared in processors {
-        rebuilds[prepared.index] = prepared.processor.rebuild;
+    for pending in processors {
+        rebuilds[pending.index] = pending.processor.rebuild;
     }
     rebuilds
 }
@@ -623,46 +765,6 @@ async fn reset_redis_subscription_after_error(
         next_rebuilds,
         next_backoff(backoff, cfg.restart_backoff_max),
     )
-}
-
-fn coalesce_redis_replay_boundary(
-    boundaries: Vec<BroadcasterRedisReplayBoundary>,
-) -> Result<BroadcasterRedisReplayBoundary> {
-    let mut boundaries = boundaries.into_iter();
-    let Some(mut earliest) = boundaries.next() else {
-        return Err(anyhow!("no Redis replay boundaries were captured"));
-    };
-
-    for boundary in boundaries {
-        ensure_same_redis_stream_boundary(&earliest, &boundary)?;
-        if boundary.exclusive_message_seq < earliest.exclusive_message_seq {
-            earliest = boundary;
-        }
-    }
-
-    Ok(earliest)
-}
-
-fn ensure_same_redis_stream_boundary(
-    left: &BroadcasterRedisReplayBoundary,
-    right: &BroadcasterRedisReplayBoundary,
-) -> Result<()> {
-    if left.stream_key != right.stream_key
-        || left.stream_id != right.stream_id
-        || left.snapshot_id != right.snapshot_id
-        || left.generation != right.generation
-    {
-        return Err(anyhow!(
-            "backend HTTP snapshots returned different Redis replay boundaries: left stream_id={} generation={} snapshot_id={}, right stream_id={} generation={} snapshot_id={}",
-            left.stream_id,
-            left.generation,
-            left.snapshot_id,
-            right.stream_id,
-            right.generation,
-            right.snapshot_id
-        ));
-    }
-    Ok(())
 }
 
 async fn sleep_backoff(backoff_ms: u64, memory: crate::config::MemoryConfig) {

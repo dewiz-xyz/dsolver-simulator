@@ -5,14 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
-use redis::streams::{StreamKey, StreamReadReply};
-use reqwest::Client;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::RwLock,
-    task::JoinHandle,
-};
+use tokio::sync::RwLock;
 use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
 use tycho_simulation::{
@@ -36,30 +29,28 @@ use tycho_simulation::{
     },
 };
 
-use super::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction, RedisReplayCheckpoint};
 use super::processor::{
     handle_subscription_reset, BroadcasterSubscriptionProcessor, PreparedRedisProcessor,
 };
-use super::reader::{redis_xread_messages, RedisStreamInfo, RedisStreamMessage};
-use super::snapshot::{bootstrap_broadcaster_snapshot, RawSnapshotReassembly};
+use super::snapshot::RawSnapshotReassembly;
 use super::{
-    apply_redis_message_batch, coalesce_redis_replay_boundary, empty_rebuilds,
-    mark_redis_replay_checkpoints, prepare_broadcaster_redis_subscription,
+    apply_replay_batch, continue_redis_generation_handoff, mark_redis_replay_checkpoints,
     BroadcasterSubscriptionControls, NativeBroadcasterSubscriptionControls,
     PreparedBroadcasterRedisSubscription, VmBroadcasterSubscriptionControls,
 };
-use crate::config::MemoryConfig;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
-use crate::stream::StreamSupervisorConfig;
+use broadcaster_replay_client::{
+    GenerationHandoffCandidate, ReplayBatchItem, ReplayCheckpoint, ReplayMessage,
+};
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
     BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolMessage,
-    BroadcasterProtocolSyncStatus, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
-    BroadcasterRemovedPair, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-    BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk,
+    BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+    BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage,
+    BroadcasterUpdatePartition,
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -224,289 +215,6 @@ async fn bootstrap(processor: &mut BroadcasterSubscriptionProcessor) -> Result<(
     Ok(())
 }
 
-#[test]
-fn redis_replay_boundary_for_process_uses_earliest_backend_boundary() -> Result<()> {
-    let boundary = coalesce_redis_replay_boundary(vec![
-        replay_boundary(5)?,
-        replay_boundary(3)?,
-        replay_boundary(7)?,
-    ])?;
-
-    assert_eq!(boundary.exclusive_message_seq, 3);
-    assert_eq!(boundary.exclusive_entry_id(), "1-3");
-    Ok(())
-}
-
-#[test]
-fn redis_replay_boundary_rejects_mixed_generations() -> Result<()> {
-    let first = replay_boundary(3)?;
-    let second = BroadcasterRedisReplayBoundary::new(
-        "dsolver:broadcaster:test:events",
-        "stream-1",
-        "snapshot-1",
-        2,
-        4,
-    )?;
-
-    let Err(error) = coalesce_redis_replay_boundary(vec![first, second]) else {
-        return Err(anyhow!(
-            "mixed Redis replay generations must not be coalesced"
-        ));
-    };
-
-    assert!(error
-        .to_string()
-        .contains("different Redis replay boundaries"));
-    Ok(())
-}
-
-#[test]
-fn redis_replay_checkpoint_detects_message_sequence_gap() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(0)?, Chain::Ethereum.id());
-    let envelope = BroadcasterEnvelope::new(
-        "stream-1",
-        2,
-        BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
-            Chain::Ethereum.id(),
-            "snapshot-1",
-            vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 12)],
-        )?),
-    );
-    let entry = BroadcasterRedisStreamEntry::from_envelope(
-        Chain::Ethereum.id(),
-        1_710_000_000_123,
-        &envelope,
-    )?;
-
-    let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
-        entry_id: "1-2".to_string(),
-        entry,
-    }) else {
-        return Err(anyhow!(
-            "message_seq gap should fail before applying the delta"
-        ));
-    };
-
-    assert!(error.to_string().contains("Redis replay gap"));
-    Ok(())
-}
-
-#[test]
-fn redis_replay_checkpoint_rejects_wrong_chain_id_before_applying_update() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(0)?, Chain::Ethereum.id());
-    let envelope = BroadcasterEnvelope::new(
-        "stream-1",
-        1,
-        BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
-            BroadcasterUpdatePartition::new(
-                BroadcasterBackend::Native,
-                12,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                BTreeMap::from([(
-                    "uniswap_v2".to_string(),
-                    BroadcasterProtocolSyncStatus::from_synchronizer_state(
-                        &SynchronizerState::Ready(raw_block_header(12, 1)),
-                    ),
-                )]),
-            ),
-        ])?),
-    );
-    let entry =
-        BroadcasterRedisStreamEntry::from_envelope(Chain::Base.id(), 1_710_000_000_123, &envelope)?;
-
-    let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
-        entry_id: "1-1".to_string(),
-        entry,
-    }) else {
-        return Err(anyhow!("wrong-chain Redis update should fail"));
-    };
-
-    assert!(error.to_string().contains("expected chain_id"));
-    Ok(())
-}
-
-#[test]
-fn redis_replay_checkpoint_detects_generation_reset_before_duplicate_sequence() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(18)?, Chain::Ethereum.id());
-    let envelope = BroadcasterEnvelope::new(
-        "stream-2",
-        1,
-        BroadcasterPayload::Progress(BroadcasterProgress::new(
-            Chain::Ethereum.id(),
-            "snapshot-2",
-            vec![BroadcasterBackend::Native],
-            "generation_reset",
-        )?),
-    );
-    let entry = BroadcasterRedisStreamEntry::from_envelope(
-        Chain::Ethereum.id(),
-        1_710_000_000_123,
-        &envelope,
-    )?;
-
-    let Err(error) = checkpoint.ensure_next_message(&RedisStreamMessage {
-        entry_id: "2-1".to_string(),
-        entry,
-    }) else {
-        return Err(anyhow!(
-            "new generation with a low message_seq should fail before being skipped"
-        ));
-    };
-
-    assert!(error.to_string().contains("Redis replay gap"));
-    Ok(())
-}
-
-#[test]
-fn redis_replay_checkpoint_detects_empty_stream_before_latest_backend_boundary() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(3)?, Chain::Ethereum.id());
-
-    let Err(error) = checkpoint.ensure_reached_required_boundary(7) else {
-        return Err(anyhow!(
-            "empty Redis poll before the newest backend boundary should fail closed"
-        ));
-    };
-
-    assert!(error.to_string().contains("Redis replay gap"));
-    assert!(error
-        .to_string()
-        .contains("required snapshot replay boundary 7"));
-    Ok(())
-}
-
-#[test]
-fn empty_redis_poll_marks_caught_up_when_no_new_entry_was_generated() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(3)?, Chain::Ethereum.id());
-    let stream_info = RedisStreamInfo {
-        last_generated_entry_id: "1-3".to_string(),
-        first_entry_id: Some("1-1".to_string()),
-        last_entry_id: Some("1-3".to_string()),
-    };
-
-    let action = redis_empty_poll_action(&checkpoint, Some(&stream_info), 3)?;
-
-    assert_eq!(action, RedisEmptyPollAction::CaughtUp);
-    Ok(())
-}
-
-#[test]
-fn empty_redis_poll_detects_stream_recreation_behind_checkpoint() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(9)?, Chain::Ethereum.id());
-    let stream_info = RedisStreamInfo {
-        last_generated_entry_id: "1-2".to_string(),
-        first_entry_id: Some("1-1".to_string()),
-        last_entry_id: Some("1-2".to_string()),
-    };
-
-    let Err(error) = redis_empty_poll_action(&checkpoint, Some(&stream_info), 9) else {
-        return Err(anyhow!(
-            "Redis stream recreation behind the checkpoint should fail closed"
-        ));
-    };
-
-    assert!(error.to_string().contains("Redis replay gap"));
-    assert!(error.to_string().contains("moved backwards"));
-    Ok(())
-}
-
-#[test]
-fn empty_redis_poll_detects_fully_trimmed_generated_entries() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(3)?, Chain::Ethereum.id());
-    let stream_info = RedisStreamInfo {
-        last_generated_entry_id: "1-5".to_string(),
-        first_entry_id: None,
-        last_entry_id: None,
-    };
-
-    let Err(error) = redis_empty_poll_action(&checkpoint, Some(&stream_info), 3) else {
-        return Err(anyhow!(
-            "trimmed Redis entries after the checkpoint should be a gap"
-        ));
-    };
-
-    assert!(error.to_string().contains("Redis replay gap"));
-    assert!(error.to_string().contains("retained no entries"));
-    Ok(())
-}
-
-#[test]
-fn empty_redis_poll_detects_retention_gap_before_next_expected_entry() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(3)?, Chain::Ethereum.id());
-    let stream_info = RedisStreamInfo {
-        last_generated_entry_id: "1-5".to_string(),
-        first_entry_id: Some("1-5".to_string()),
-        last_entry_id: Some("1-5".to_string()),
-    };
-
-    let Err(error) = redis_empty_poll_action(&checkpoint, Some(&stream_info), 3) else {
-        return Err(anyhow!(
-            "first retained Redis entry after the expected checkpoint should be a gap"
-        ));
-    };
-
-    assert!(error.to_string().contains("Redis replay gap"));
-    assert!(error.to_string().contains("first retained entry 1-5"));
-    Ok(())
-}
-
-#[test]
-fn empty_redis_poll_waits_when_new_entry_arrives_after_timeout() -> Result<()> {
-    let checkpoint = RedisReplayCheckpoint::new(replay_boundary(3)?, Chain::Ethereum.id());
-    let stream_info = RedisStreamInfo {
-        last_generated_entry_id: "1-4".to_string(),
-        first_entry_id: Some("1-4".to_string()),
-        last_entry_id: Some("1-4".to_string()),
-    };
-
-    let action = redis_empty_poll_action(&checkpoint, Some(&stream_info), 3)?;
-
-    assert_eq!(action, RedisEmptyPollAction::Pending);
-    Ok(())
-}
-
-#[test]
-fn redis_xread_timeout_returns_empty_poll() -> Result<()> {
-    let timeout: redis::RedisError = std::io::Error::from(std::io::ErrorKind::TimedOut).into();
-
-    let messages =
-        redis_xread_messages("stream", Err(timeout)).map_err(|error| anyhow!("{error:?}"))?;
-
-    assert!(messages.is_empty());
-    Ok(())
-}
-
-#[test]
-fn redis_xread_broken_pipe_includes_command_context() -> Result<()> {
-    let broken_pipe: redis::RedisError =
-        std::io::Error::from(std::io::ErrorKind::BrokenPipe).into();
-
-    let error = redis_xread_messages("stream", Err(broken_pipe))
-        .err()
-        .ok_or_else(|| anyhow!("broken pipe should fail"))?;
-
-    assert!(format!("{error:#}").contains("Redis XREAD failed"));
-    Ok(())
-}
-
-#[test]
-fn redis_xread_malformed_reply_reports_stream_key_mismatch() -> Result<()> {
-    let reply = StreamReadReply {
-        keys: vec![StreamKey {
-            key: "other-stream".to_string(),
-            ids: Vec::new(),
-        }],
-    };
-
-    let error = redis_xread_messages("stream", Ok(Some(reply)))
-        .err()
-        .ok_or_else(|| anyhow!("malformed stream reply should fail"))?;
-
-    assert!(error.to_string().contains("expected stream"));
-    Ok(())
-}
-
 #[tokio::test]
 async fn redis_replay_boundary_rebases_processor_after_http_snapshot() -> Result<()> {
     let controls = TestControls::new();
@@ -585,7 +293,7 @@ async fn redis_replay_status_checkpoint_does_not_move_behind_backend_boundary() 
             .native_subscription
             .snapshot()
             .await
-            .redis_catch_up_cursor
+            .redis_replay_checkpoint
             .as_deref(),
         Some("1-5")
     );
@@ -594,7 +302,7 @@ async fn redis_replay_status_checkpoint_does_not_move_behind_backend_boundary() 
             .vm_subscription
             .snapshot()
             .await
-            .redis_catch_up_cursor
+            .redis_replay_checkpoint
             .as_deref(),
         Some("1-7")
     );
@@ -602,26 +310,25 @@ async fn redis_replay_status_checkpoint_does_not_move_behind_backend_boundary() 
 }
 
 #[tokio::test]
-async fn redis_generation_handoff_accepts_marker_and_next_update() -> Result<()> {
-    let (controls, mut prepared, mut checkpoint) = prepared_native_handoff_subscription().await?;
+async fn redis_generation_handoff_accepts_marker() -> Result<()> {
+    let (controls, mut prepared) = prepared_native_handoff_subscription().await?;
 
-    apply_redis_message_batch(
+    continue_redis_generation_handoff(
         &mut prepared,
-        &mut checkpoint,
-        vec![handoff_progress_message(
+        &handoff_candidate(
             "stream-7",
             "7-103",
             vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 70)],
-        )?],
+        )?,
     )
     .await
-    .map_err(|exit| anyhow!(exit.message))?;
+    .map_err(|error| anyhow!(error))?;
 
     let snapshot = controls.native_subscription.snapshot().await;
     assert_eq!(snapshot.restart_count, 0);
     assert_eq!(snapshot.stream_id.as_deref(), Some("stream-8"));
     assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-8"));
-    assert_eq!(snapshot.redis_catch_up_cursor.as_deref(), Some("8-1"));
+    assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("8-1"));
     assert!(!snapshot.redis_replay_caught_up);
     let status_boundary = snapshot
         .redis_replay_boundary
@@ -631,25 +338,49 @@ async fn redis_generation_handoff_accepts_marker_and_next_update() -> Result<()>
     assert_eq!(status_boundary.snapshot_id, "snapshot-8");
     assert_eq!(status_boundary.generation, 8);
     assert_eq!(status_boundary.exclusive_message_seq, 1);
-    assert_eq!(checkpoint.entry_id(), "8-1");
-    assert_eq!(checkpoint.boundary.generation, 8);
+    Ok(())
+}
 
-    apply_redis_message_batch(
+#[tokio::test]
+async fn redis_replay_batch_applies_update_after_generation_handoff() -> Result<()> {
+    let (controls, mut prepared) = prepared_native_handoff_subscription().await?;
+    let old_boundary = redis_boundary("stream-7", "snapshot-7", 7, 103)?;
+    let new_boundary = redis_boundary("stream-8", "snapshot-8", 8, 1)?;
+    let update_boundary = redis_boundary("stream-8", "snapshot-8", 8, 2)?;
+    let update = update_envelope_for_stream("stream-8", 2, 71)?;
+    let mut update_entry = redis_entry_for_scope(&update, "native");
+    update_entry.snapshot_id = Some("snapshot-8".to_string());
+    let mut checkpoint = ReplayCheckpoint::new(old_boundary, Chain::Ethereum.id());
+
+    apply_replay_batch(
         &mut prepared,
         &mut checkpoint,
-        vec![new_generation_update_message(2, 71)?],
+        vec![
+            ReplayBatchItem::GenerationHandoff(handoff_candidate(
+                "stream-7",
+                "7-103",
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 70)],
+            )?),
+            ReplayBatchItem::Message(ReplayMessage {
+                entry_id: "8-2".to_string(),
+                entry: update_entry,
+                envelope: update,
+                checkpoint_after: ReplayCheckpoint::new(update_boundary, Chain::Ethereum.id()),
+            }),
+        ],
     )
     .await
     .map_err(|exit| anyhow!(exit.message))?;
 
     assert_eq!(controls.native_state_store.current_block().await, 71);
     assert_eq!(checkpoint.entry_id(), "8-2");
+    assert_eq!(prepared.replay_boundary, new_boundary);
     assert_eq!(
         controls
             .native_subscription
             .snapshot()
             .await
-            .redis_catch_up_cursor
+            .redis_replay_checkpoint
             .as_deref(),
         Some("8-2")
     );
@@ -659,30 +390,14 @@ async fn redis_generation_handoff_accepts_marker_and_next_update() -> Result<()>
 #[tokio::test]
 async fn redis_generation_handoff_rejects_invalid_proofs_before_applying_state() -> Result<()> {
     let invalid_messages = [
-        ("missing handoff", progress_message(None)?),
-        (
-            "wrong previous entry id",
-            handoff_progress_message(
-                "stream-7",
-                "7-102",
-                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 70)],
-            )?,
-        ),
-        (
-            "wrong previous stream id",
-            handoff_progress_message(
-                "stream-other",
-                "7-103",
-                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 70)],
-            )?,
-        ),
+        ("missing handoff", handoff_candidate_without_proof()?),
         (
             "missing backend head",
-            handoff_progress_message("stream-7", "7-103", Vec::new())?,
+            handoff_candidate("stream-7", "7-103", Vec::new())?,
         ),
         (
             "extra backend head",
-            handoff_progress_message(
+            handoff_candidate(
                 "stream-7",
                 "7-103",
                 vec![
@@ -693,7 +408,7 @@ async fn redis_generation_handoff_rejects_invalid_proofs_before_applying_state()
         ),
         (
             "base head mismatch",
-            handoff_progress_message(
+            handoff_candidate(
                 "stream-7",
                 "7-103",
                 vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 69)],
@@ -701,26 +416,23 @@ async fn redis_generation_handoff_rejects_invalid_proofs_before_applying_state()
         ),
     ];
 
-    for (invalid, message) in invalid_messages {
-        let (controls, mut prepared, mut checkpoint) =
-            prepared_native_handoff_subscription().await?;
-        let error = apply_redis_message_batch(&mut prepared, &mut checkpoint, vec![message])
+    for (invalid, candidate) in invalid_messages {
+        let (controls, mut prepared) = prepared_native_handoff_subscription().await?;
+        let error = continue_redis_generation_handoff(&mut prepared, &candidate)
             .await
             .err()
             .ok_or_else(|| anyhow!("{invalid} should fail closed"))?;
 
         assert!(
-            error.redis_gap,
-            "{invalid} should return a Redis replay gap"
+            error.to_string().contains("Redis replay gap"),
+            "{invalid} should return a Redis replay gap: {error}"
         );
         assert_eq!(controls.native_state_store.current_block().await, 70);
-        assert_eq!(checkpoint.entry_id(), "7-103");
-        assert_eq!(checkpoint.boundary.generation, 7);
         let snapshot = controls.native_subscription.snapshot().await;
         assert_eq!(snapshot.restart_count, 0);
         assert_eq!(snapshot.stream_id.as_deref(), Some("stream-7"));
         assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-7"));
-        assert_eq!(snapshot.redis_catch_up_cursor.as_deref(), Some("7-103"));
+        assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("7-103"));
         let boundary = snapshot
             .redis_replay_boundary
             .as_ref()
@@ -744,7 +456,6 @@ fn redis_entry_for_scope(
         backend_scope: backend_scope.to_string(),
         block_number: None,
         observed_timestamp_ms: None,
-        event_time_ms: 1_710_000_000_123,
         payload_json: String::new(),
     }
 }
@@ -792,11 +503,8 @@ fn redis_boundary(
     .map_err(Into::into)
 }
 
-async fn prepared_native_handoff_subscription() -> Result<(
-    TestControls,
-    PreparedBroadcasterRedisSubscription,
-    RedisReplayCheckpoint,
-)> {
+async fn prepared_native_handoff_subscription(
+) -> Result<(TestControls, PreparedBroadcasterRedisSubscription)> {
     let controls = TestControls::new();
     let old_boundary = redis_boundary("stream-7", "snapshot-7", 7, 103)?;
     let mut processor =
@@ -812,11 +520,9 @@ async fn prepared_native_handoff_subscription() -> Result<(
             replay_boundary: old_boundary.clone(),
         }],
         replay_boundary: old_boundary.clone(),
-        required_catch_up_message_seq: old_boundary.exclusive_message_seq,
         expected_chain_id: Chain::Ethereum.id(),
     };
-    let checkpoint = RedisReplayCheckpoint::new(old_boundary, Chain::Ethereum.id());
-    Ok((controls, prepared, checkpoint))
+    Ok((controls, prepared))
 }
 
 async fn bootstrap_native_stream(
@@ -866,19 +572,25 @@ async fn bootstrap_native_stream(
         .await
 }
 
-fn handoff_progress_message(
+fn handoff_candidate(
     previous_stream_id: &str,
     previous_entry_id: &str,
     base_heads: Vec<BroadcasterBackendHead>,
-) -> Result<RedisStreamMessage> {
-    progress_message(Some(BroadcasterGenerationHandoff::new(
+) -> Result<GenerationHandoffCandidate> {
+    generation_handoff_candidate(Some(BroadcasterGenerationHandoff::new(
         previous_stream_id,
         previous_entry_id,
         base_heads,
     )?))
 }
 
-fn progress_message(handoff: Option<BroadcasterGenerationHandoff>) -> Result<RedisStreamMessage> {
+fn handoff_candidate_without_proof() -> Result<GenerationHandoffCandidate> {
+    generation_handoff_candidate(None)
+}
+
+fn generation_handoff_candidate(
+    handoff: Option<BroadcasterGenerationHandoff>,
+) -> Result<GenerationHandoffCandidate> {
     let progress = match handoff {
         Some(handoff) => BroadcasterProgress::new_with_handoff(
             Chain::Ethereum.id(),
@@ -895,44 +607,12 @@ fn progress_message(handoff: Option<BroadcasterGenerationHandoff>) -> Result<Red
         )?,
     };
     let envelope = BroadcasterEnvelope::new("stream-8", 1, BroadcasterPayload::Progress(progress));
-    redis_test_message("8-1", &envelope)
-}
-
-fn new_generation_update_message(
-    message_seq: u64,
-    block_number: u64,
-) -> Result<RedisStreamMessage> {
-    let envelope = BroadcasterEnvelope::new(
-        "stream-8",
-        message_seq,
-        BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
-            BroadcasterUpdatePartition::new(
-                BroadcasterBackend::Native,
-                block_number,
-                Vec::new(),
-                Vec::new(),
-                vec![BroadcasterRemovedPair::new(
-                    "pool-native",
-                    native_component(),
-                )],
-                BTreeMap::new(),
-            ),
-        ])?),
-    );
-    redis_test_message(&format!("8-{message_seq}"), &envelope)
-}
-
-fn redis_test_message(
-    entry_id: &str,
-    envelope: &BroadcasterEnvelope,
-) -> Result<RedisStreamMessage> {
-    Ok(RedisStreamMessage {
-        entry_id: entry_id.to_string(),
-        entry: BroadcasterRedisStreamEntry::from_envelope(
-            Chain::Ethereum.id(),
-            1_710_000_000_123,
-            envelope,
-        )?,
+    let boundary = redis_boundary("stream-8", "snapshot-8", 8, 1)?;
+    Ok(GenerationHandoffCandidate {
+        entry: BroadcasterRedisStreamEntry::from_envelope(Chain::Ethereum.id(), &envelope)?,
+        envelope,
+        boundary: boundary.clone(),
+        checkpoint_after: ReplayCheckpoint::new(boundary, Chain::Ethereum.id()),
     })
 }
 
@@ -1023,31 +703,6 @@ fn snapshot_chunk_envelope() -> Result<BroadcasterEnvelope> {
     ))
 }
 
-fn empty_snapshot_chunk_envelope() -> Result<BroadcasterEnvelope> {
-    Ok(BroadcasterEnvelope::new(
-        "stream-1",
-        2,
-        BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
-            "snapshot-1",
-            0,
-            vec![
-                BroadcasterSnapshotPartition::new(
-                    BroadcasterBackend::Native,
-                    10,
-                    Vec::new(),
-                    BTreeMap::new(),
-                ),
-                BroadcasterSnapshotPartition::new(
-                    BroadcasterBackend::Vm,
-                    11,
-                    Vec::new(),
-                    BTreeMap::new(),
-                ),
-            ],
-        )?),
-    ))
-}
-
 fn snapshot_end_envelope() -> BroadcasterEnvelope {
     BroadcasterEnvelope::new(
         "stream-1",
@@ -1112,13 +767,21 @@ fn update_envelope() -> Result<BroadcasterEnvelope> {
 }
 
 fn update_envelope_at(message_seq: u64) -> Result<BroadcasterEnvelope> {
+    update_envelope_for_stream("stream-1", message_seq, 12)
+}
+
+fn update_envelope_for_stream(
+    stream_id: &str,
+    message_seq: u64,
+    block_number: u64,
+) -> Result<BroadcasterEnvelope> {
     Ok(BroadcasterEnvelope::new(
-        "stream-1",
+        stream_id,
         message_seq,
         BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
             BroadcasterUpdatePartition::new(
                 BroadcasterBackend::Native,
-                12,
+                block_number,
                 Vec::new(),
                 vec![BroadcasterStateDelta::new(
                     "pool-native",
@@ -1251,128 +914,6 @@ fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
         message_seq,
         BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
     )
-}
-
-async fn spawn_snapshot_session_server(
-    payloads: Vec<BroadcasterEnvelope>,
-) -> Result<(String, String, JoinHandle<()>)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let payloads = Arc::new(
-        payloads
-            .into_iter()
-            .map(|payload| serde_json::to_string(&payload))
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-    let server_task = tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            let payloads = Arc::clone(&payloads);
-            tokio::spawn(async move {
-                let mut buffer = [0u8; 8192];
-                let Ok(read) = socket.read(&mut buffer).await else {
-                    return;
-                };
-                let request = String::from_utf8_lossy(&buffer[..read]);
-                let first_line = request.lines().next().unwrap_or_default();
-                let (status, body) = snapshot_server_response(first_line, &payloads);
-                let response = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-
-    Ok((
-        format!("http://{addr}"),
-        format!("http://{addr}/snapshot-sessions"),
-        server_task,
-    ))
-}
-
-fn snapshot_server_response(first_line: &str, payloads: &[String]) -> (&'static str, String) {
-    if first_line == "POST /snapshot-sessions HTTP/1.1" {
-        return (
-            "201 Created",
-            serde_json::json!({
-                "chainId": Chain::Ethereum.id(),
-                "sessionId": 7,
-                "streamId": "stream-1",
-                "snapshotId": "snapshot-1",
-                "redisReplayBoundary": {
-                    "streamKey": "dsolver:broadcaster:test:events",
-                    "streamId": "stream-1",
-                    "snapshotId": "snapshot-1",
-                    "generation": 1,
-                    "exclusiveMessageSeq": 0
-                },
-                "payloadCount": payloads.len(),
-                "snapshotChunkCount": payloads
-                    .iter()
-                    .filter(|payload| payload.contains("\"kind\":\"snapshot_chunk\""))
-                    .count(),
-                "redisReplayBoundary": {
-                    "streamKey": "dsolver:broadcaster:test:1:events",
-                    "streamId": "stream-1",
-                    "snapshotId": "snapshot-1",
-                    "generation": 1,
-                    "exclusiveMessageSeq": 0
-                },
-                "expiresInMs": 300000
-            })
-            .to_string(),
-        );
-    }
-
-    let Some(path) = first_line
-        .strip_prefix("GET /snapshot-sessions/7/payloads/")
-        .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
-    else {
-        return (
-            "404 Not Found",
-            serde_json::json!({ "error": "not found" }).to_string(),
-        );
-    };
-    let Ok(index) = path.parse::<usize>() else {
-        return (
-            "416 Range Not Satisfiable",
-            serde_json::json!({ "error": "bad index" }).to_string(),
-        );
-    };
-    match payloads.get(index) {
-        Some(payload) => ("200 OK", payload.clone()),
-        None => (
-            "416 Range Not Satisfiable",
-            serde_json::json!({ "error": "bad index" }).to_string(),
-        ),
-    }
-}
-
-fn test_supervisor_config() -> StreamSupervisorConfig {
-    StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(1),
-        stream_stale: Duration::from_secs(1),
-        missing_block_burst: 3,
-        missing_block_window: Duration::from_secs(60),
-        error_burst: 3,
-        error_window: Duration::from_secs(60),
-        resync_grace: Duration::from_secs(60),
-        restart_backoff_min: Duration::from_millis(10),
-        restart_backoff_max: Duration::from_millis(100),
-        restart_backoff_jitter_pct: 0.0,
-        memory: MemoryConfig {
-            purge_enabled: false,
-            snapshots_enabled: false,
-            snapshots_min_interval_secs: 60,
-            snapshots_min_new_pairs: 1_000,
-            snapshots_emit_emf: false,
-        },
-    }
 }
 
 fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
@@ -1674,92 +1215,6 @@ async fn rfq_raw_message_partition_fails_explicitly() -> Result<()> {
 }
 
 #[tokio::test]
-async fn http_snapshot_bootstrap_populates_processor_before_live_attach() -> Result<()> {
-    let controls = TestControls::new();
-    let native_controls = controls.native();
-    let mut processor =
-        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), native_controls.clone(), None);
-    let payloads = vec![
-        snapshot_start_envelope()?,
-        empty_snapshot_chunk_envelope()?,
-        snapshot_end_envelope(),
-    ];
-    let (broadcaster_url, snapshot_sessions_url, server_task) =
-        spawn_snapshot_session_server(payloads).await?;
-
-    let session = bootstrap_broadcaster_snapshot(
-        &Client::new(),
-        &broadcaster_url,
-        &snapshot_sessions_url,
-        &mut processor,
-        &native_controls,
-        &test_supervisor_config(),
-    )
-    .await?;
-    server_task.abort();
-
-    assert_eq!(session.session_id, 7);
-    assert!(processor.bootstrap_complete());
-    assert_eq!(controls.native_state_store.current_block().await, 10);
-    assert!(!controls.native_state_store.has_pool("pool-native").await);
-    assert!(!controls.native_state_store.has_pool("pool-vm").await);
-    let snapshot = controls.native_subscription.snapshot().await;
-    assert!(snapshot.connected);
-    assert!(snapshot.bootstrap_complete);
-    assert_eq!(snapshot.stream_id.as_deref(), Some("stream-1"));
-    assert_eq!(snapshot.snapshot_id.as_deref(), Some("snapshot-1"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn prepare_redis_subscription_retries_all_backends_when_snapshot_omits_rfq_backend(
-) -> Result<()> {
-    let controls = TestControls::new();
-    let native_controls = controls.native();
-    let rfq_controls = controls.rfq();
-    let payloads = vec![
-        snapshot_start_envelope()?,
-        empty_snapshot_chunk_envelope()?,
-        snapshot_end_envelope(),
-    ];
-    let (broadcaster_url, _snapshot_sessions_url, server_task) =
-        spawn_snapshot_session_server(payloads).await?;
-
-    let Err(error) = prepare_broadcaster_redis_subscription(
-        &Client::new(),
-        &broadcaster_url,
-        Chain::Ethereum.id(),
-        &test_supervisor_config(),
-        &[native_controls, rfq_controls],
-        empty_rebuilds(2),
-    )
-    .await
-    else {
-        return Err(anyhow!(
-            "RFQ snapshot omission should abort this supervisor iteration"
-        ));
-    };
-    server_task.abort();
-
-    assert!(
-        error.message.contains("does not include rfq backend"),
-        "unexpected error: {}",
-        error.message
-    );
-    assert_eq!(error.rebuilds.len(), 2);
-    let rfq = controls.rfq_subscription.snapshot().await;
-    assert!(!rfq.bootstrap_complete);
-    assert!(
-        rfq.last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("does not include rfq backend")),
-        "unexpected RFQ error: {:?}",
-        rfq.last_error
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> Result<()> {
     let controls = TestControls::new();
     let vm_controls = controls.vm();
@@ -1887,21 +1342,12 @@ async fn http_snapshot_bootstrap_decodes_unsplit_raw_message() -> Result<()> {
         )?,
         snapshot_end_envelope_at(3),
     ];
-    let (broadcaster_url, snapshot_sessions_url, server_task) =
-        spawn_snapshot_session_server(payloads).await?;
+    processor.set_bootstrap_redis_replay_boundary(replay_boundary(3)?);
+    vm_controls.stream_health().mark_started().await;
+    for payload in payloads {
+        processor.observe(payload).await?;
+    }
 
-    let session = bootstrap_broadcaster_snapshot(
-        &Client::new(),
-        &broadcaster_url,
-        &snapshot_sessions_url,
-        &mut processor,
-        &vm_controls,
-        &test_supervisor_config(),
-    )
-    .await?;
-    server_task.abort();
-
-    assert_eq!(session.session_id, 7);
     assert!(processor.bootstrap_complete());
     assert!(
         controls

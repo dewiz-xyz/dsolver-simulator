@@ -111,6 +111,8 @@ is an example setup, not the source of truth for every default.
 
 The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.
 
+The shared `broadcaster-replay-client` crate owns that bootstrap and Redis replay contract, so simulator and external consumers use the same checkpoint, gap detection, and handoff rules.
+
 Broadcaster deployments use four modes:
 
 - `Passive` warms upstream/cache state, but does not append Redis deltas or serve snapshot sessions.

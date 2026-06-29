@@ -239,7 +239,7 @@ impl BroadcasterSnapshotCache {
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<BroadcasterUpdateMessage> {
         let staged = self.stage_update(update).await?;
         let message = staged.message.clone();
-        self.commit_staged_update(staged).await?;
+        self.commit_staged_update(staged).await;
         Ok(message)
     }
 
@@ -249,7 +249,7 @@ impl BroadcasterSnapshotCache {
     ) -> Result<BroadcasterUpdateMessage> {
         let staged = self.stage_feed_message(feed)?;
         let message = staged.message.clone();
-        self.commit_staged_update(staged).await?;
+        self.commit_staged_update(staged).await;
         Ok(message)
     }
 
@@ -279,15 +279,14 @@ impl BroadcasterSnapshotCache {
         })
     }
 
-    pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) -> Result<()> {
+    pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) {
         let mut guard = self.inner.write().await;
         match staged.apply_mode {
             BroadcasterStagedUpdateApplyMode::Decoded => {
-                apply_update_message(&mut guard, &staged.message)
+                apply_update_message(&mut guard, &staged.message);
             }
             BroadcasterStagedUpdateApplyMode::Raw => {
                 apply_raw_update_message(&mut guard, &staged.message);
-                Ok(())
             }
         }
     }
@@ -674,7 +673,7 @@ fn merge_raw_message(
 fn apply_update_message(
     guard: &mut BroadcasterSnapshotCacheData,
     message: &BroadcasterUpdateMessage,
-) -> Result<()> {
+) {
     for partition in &message.partitions {
         let partition_state = guard.partitions.entry(partition.backend).or_default();
         partition_state.block_number = Some(partition.block_number);
@@ -690,7 +689,7 @@ fn apply_update_message(
         }
 
         for delta in &partition.updated_states {
-            apply_state_delta(partition.backend, partition_state, delta)?;
+            apply_state_delta(partition.backend, partition_state, delta);
         }
 
         for removed in &partition.removed_pairs {
@@ -698,32 +697,27 @@ fn apply_update_message(
             partition_state.states.remove(&removed.component_id);
         }
     }
-
-    Ok(())
 }
 
 fn apply_state_delta(
     backend: BroadcasterBackend,
     partition_state: &mut BroadcasterPartitionState,
     delta: &BroadcasterStateDelta,
-) -> Result<()> {
-    let Some(existing) = partition_state.states.get_mut(&delta.component_id) else {
-        return Err(anyhow!(
-            "missing tracked broadcaster state for {} on backend {}",
-            delta.component_id,
-            backend
-        ));
-    };
-    if delta.backend != backend {
-        return Err(anyhow!(
-            "backend mismatch for {}: expected {}, found {}",
-            delta.component_id,
-            backend,
-            delta.backend
-        ));
+) {
+    assert_eq!(
+        delta.backend, backend,
+        "staged broadcaster delta backend mismatch for {}",
+        delta.component_id
+    );
+    assert!(
+        partition_state.states.contains_key(&delta.component_id),
+        "staged broadcaster delta missing tracked state for {} on backend {}",
+        delta.component_id,
+        backend
+    );
+    if let Some(existing) = partition_state.states.get_mut(&delta.component_id) {
+        existing.state = delta.state.clone();
     }
-    existing.state = delta.state.clone();
-    Ok(())
 }
 
 fn build_snapshot_chunks(
@@ -1566,6 +1560,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_decoded_commit_does_not_revalidate_after_staging() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        cache.apply_update(&native_only_update()).await?;
+        let staged = cache
+            .stage_update(&native_update_state(11, "native-1", 2))
+            .await?;
+
+        let committed: () = cache.commit_staged_update(staged).await;
+
+        let export = cache.export_snapshot(8_388_608).await?;
+        let chunks = snapshot_chunks(&export);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].partitions[0].states[0].component_id, "native-1");
+        assert_eq!(committed, ());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn combines_raw_and_rfq_exports_into_one_snapshot_flow() -> Result<()> {
         let raw_cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
         raw_cache.apply_update(&native_only_update()).await?;
@@ -2203,6 +2215,19 @@ mod tests {
         Update::new(10, states, new_pairs).set_sync_states(HashMap::from([(
             "uniswap_v2".to_string(),
             SynchronizerState::Ready(block_header(10, 1)),
+        )]))
+    }
+
+    fn native_update_state(block_number: u64, component_id: &str, seed: u8) -> Update {
+        let mut states = HashMap::new();
+        states.insert(
+            component_id.to_string(),
+            Box::new(DummySim(seed)) as Box<dyn ProtocolSim>,
+        );
+
+        Update::new(block_number, states, HashMap::new()).set_sync_states(HashMap::from([(
+            "uniswap_v2".to_string(),
+            SynchronizerState::Ready(block_header(block_number, seed)),
         )]))
     }
 

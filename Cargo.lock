@@ -1928,6 +1928,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "broadcaster-replay-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "redis",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "simulator-core",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5482,6 +5496,7 @@ dependencies = [
  "alloy-primitives 1.5.7",
  "alloy-sol-types",
  "anyhow",
+ "broadcaster-replay-client",
  "chrono",
  "csv",
  "dotenv",

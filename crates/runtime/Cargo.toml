@@ -32,6 +32,7 @@ tracing-subscriber.workspace = true
 tycho-common.workspace = true
 tycho-execution.workspace = true
 tycho-simulation.workspace = true
+broadcaster_replay_client = { package = "broadcaster-replay-client", path = "../broadcaster-replay-client" }
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
 
 [dev-dependencies]

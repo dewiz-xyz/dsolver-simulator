@@ -38,8 +38,6 @@ pub struct BroadcasterRedisStreamEntry {
         with = "optional_u64_string"
     )]
     pub observed_timestamp_ms: Option<u64>,
-    #[serde(with = "u64_string")]
-    pub event_time_ms: u64,
     /// Serialized `BroadcasterEnvelope` for the Redis delta payload contract.
     pub payload_json: String,
 }
@@ -109,7 +107,6 @@ impl<'de> Deserialize<'de> for BroadcasterRedisReplayBoundary {
 impl BroadcasterRedisStreamEntry {
     pub fn from_envelope(
         chain_id: u64,
-        event_time_ms: u64,
         envelope: &BroadcasterEnvelope,
     ) -> Result<Self, BroadcasterContractError> {
         ensure_redis_delta_kind(envelope.kind())?;
@@ -129,7 +126,6 @@ impl BroadcasterRedisStreamEntry {
             backend_scope: redis_backend_scope(backends)?,
             block_number: redis_entry_block_number(&envelope.payload),
             observed_timestamp_ms: redis_entry_observed_timestamp_ms(&envelope.payload),
-            event_time_ms,
             payload_json,
         };
         entry.validate()?;
@@ -186,6 +182,7 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WireEntry {
             schema_version: String,
             #[serde(with = "u64_string")]
@@ -201,8 +198,6 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
             block_number: Option<u64>,
             #[serde(default, with = "optional_u64_string")]
             observed_timestamp_ms: Option<u64>,
-            #[serde(with = "u64_string")]
-            event_time_ms: u64,
             payload_json: String,
         }
 
@@ -217,7 +212,6 @@ impl<'de> Deserialize<'de> for BroadcasterRedisStreamEntry {
             backend_scope: wire.backend_scope,
             block_number: wire.block_number,
             observed_timestamp_ms: wire.observed_timestamp_ms,
-            event_time_ms: wire.event_time_ms,
             payload_json: wire.payload_json,
         };
         entry.validate().map_err(de::Error::custom)?;
@@ -711,12 +705,27 @@ mod tests {
         assert_eq!(value["backend_scope"], "native");
         assert_eq!(value["block_number"], "124");
         assert!(value.get("observed_timestamp_ms").is_none());
-        assert_eq!(value["event_time_ms"], "1710000000123");
+        assert!(value.get("event_time_ms").is_none());
         assert_eq!(value["payload_json"], serde_json::to_string(&envelope)?);
 
         let decoded: BroadcasterRedisStreamEntry = serde_json::from_value(value)?;
         assert_eq!(decoded, entry);
 
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_construction_is_stable_for_same_envelope() -> Result<()> {
+        let envelope = update_envelope("stream-1", 4)?;
+
+        let first = redis_entry(&envelope)?;
+        let second = redis_entry(&envelope)?;
+
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_value(&first)?,
+            serde_json::to_value(&second)?
+        );
         Ok(())
     }
 
@@ -728,13 +737,23 @@ mod tests {
             "stream_id": "stream-1",
             "message_seq": "1",
             "kind": "update",
-            "backend_scope": "native",
-            "event_time_ms": "1710000000000"
+            "backend_scope": "native"
         }))
         .err()
         .ok_or_else(|| anyhow!("missing payload_json should fail deserialization"))?;
 
         assert!(error.to_string().contains("missing field `payload_json`"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redis_stream_entry_deserialization_rejects_stale_event_time_field() -> Result<()> {
+        let mut value = redis_entry_value(&update_envelope("stream-1", 2)?)?;
+        value["event_time_ms"] = serde_json::json!("1710000000000");
+
+        let error = redis_entry_decode_error(value, "stale event_time_ms field")?;
+        assert!(error.to_string().contains("event_time_ms"));
 
         Ok(())
     }
@@ -1141,7 +1160,7 @@ mod tests {
     fn redis_entry(
         envelope: &BroadcasterEnvelope,
     ) -> Result<BroadcasterRedisStreamEntry, BroadcasterContractError> {
-        BroadcasterRedisStreamEntry::from_envelope(8453, 1_710_000_000_123, envelope)
+        BroadcasterRedisStreamEntry::from_envelope(8453, envelope)
     }
 
     fn redis_entry_value(envelope: &BroadcasterEnvelope) -> Result<serde_json::Value> {

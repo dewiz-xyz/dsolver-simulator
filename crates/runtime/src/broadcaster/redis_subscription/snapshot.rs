@@ -1,24 +1,11 @@
 use std::collections::{
     btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, HashMap,
 };
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
-use reqwest::Client;
 use tycho_simulation::tycho_common::{dto::ResponseAccount, Bytes};
 
-use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterProtocolMessage, BroadcasterSnapshotSessionResponse,
-};
-
-use crate::models::broadcaster_urls::derive_broadcaster_http_url;
-use crate::stream::StreamSupervisorConfig;
-
-use super::processor::BroadcasterSubscriptionProcessor;
-use super::BroadcasterSubscriptionControls;
-
-const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
+use simulator_core::broadcaster::BroadcasterProtocolMessage;
 
 #[derive(Default)]
 pub(super) struct RawSnapshotReassembly {
@@ -253,124 +240,4 @@ fn ensure_vm_account_metadata_matches(
         ));
     }
     Ok(())
-}
-
-pub(super) async fn bootstrap_broadcaster_snapshot(
-    client: &Client,
-    broadcaster_url: &str,
-    snapshot_sessions_url: &str,
-    processor: &mut BroadcasterSubscriptionProcessor,
-    controls: &BroadcasterSubscriptionControls,
-    cfg: &StreamSupervisorConfig,
-) -> Result<BroadcasterSnapshotSessionResponse> {
-    let session =
-        create_broadcaster_snapshot_session(client, snapshot_sessions_url, cfg.readiness_stale)
-            .await?;
-    processor.set_bootstrap_redis_replay_boundary(session.redis_replay_boundary.clone());
-    controls.stream_health().mark_started().await;
-
-    {
-        let mut payloads = futures::stream::iter(0..session.payload_count)
-            .map(|index| {
-                let session = session.clone();
-                async move {
-                    fetch_broadcaster_snapshot_payload(
-                        client,
-                        broadcaster_url,
-                        &session,
-                        index,
-                        cfg.readiness_stale,
-                    )
-                    .await
-                }
-            })
-            .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY);
-
-        while let Some(envelope) = payloads.next().await {
-            processor.observe(envelope?).await?;
-        }
-    }
-
-    if !processor.bootstrap_complete() {
-        return Err(anyhow!(
-            "broadcaster HTTP snapshot session {} ended before bootstrap completed",
-            session.session_id
-        ));
-    }
-
-    Ok(session)
-}
-
-async fn create_broadcaster_snapshot_session(
-    client: &Client,
-    snapshot_sessions_url: &str,
-    request_timeout: Duration,
-) -> Result<BroadcasterSnapshotSessionResponse> {
-    let response = client
-        .post(snapshot_sessions_url)
-        .timeout(request_timeout)
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow!(
-                "failed to create broadcaster snapshot session at {snapshot_sessions_url}: {error}"
-            )
-        })?;
-    decode_success_json(
-        response,
-        snapshot_sessions_url,
-        "create broadcaster snapshot session",
-    )
-    .await
-}
-
-async fn fetch_broadcaster_snapshot_payload(
-    client: &Client,
-    broadcaster_url: &str,
-    session: &BroadcasterSnapshotSessionResponse,
-    index: u32,
-    request_timeout: Duration,
-) -> Result<BroadcasterEnvelope> {
-    let payload_url = derive_broadcaster_http_url(
-        broadcaster_url,
-        &broadcaster_snapshot_payload_path(session.session_id, index),
-    )
-    .map_err(|error| anyhow!("failed to derive broadcaster snapshot payload URL: {error}"))?;
-    let response = client
-        .get(&payload_url)
-        .timeout(request_timeout)
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow!(
-                "failed to fetch broadcaster snapshot payload {index} from {payload_url}: {error}"
-            )
-        })?;
-    decode_success_json(response, &payload_url, "fetch broadcaster snapshot payload").await
-}
-
-pub(super) const BROADCASTER_SNAPSHOT_SESSIONS_PATH: &str = "snapshot-sessions";
-
-fn broadcaster_snapshot_payload_path(session_id: u64, index: u32) -> String {
-    format!("{BROADCASTER_SNAPSHOT_SESSIONS_PATH}/{session_id}/payloads/{index}")
-}
-
-async fn decode_success_json<T>(
-    response: reqwest::Response,
-    url: &str,
-    operation: &str,
-) -> Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let status = response.status();
-    if !status.is_success() {
-        return Err(anyhow!("{operation} at {url} failed with HTTP {status}"));
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| anyhow!("failed to read {operation} response from {url}: {error}"))?;
-    serde_json::from_slice(&body)
-        .map_err(|error| anyhow!("failed to decode {operation} response from {url}: {error}"))
 }
