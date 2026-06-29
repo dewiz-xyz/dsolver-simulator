@@ -26,6 +26,8 @@ use crate::models::tokens::TokenStore;
 use crate::services::stream_builder::build_broadcaster_subscription_decoder;
 use crate::stream::StreamSupervisorConfig;
 
+#[cfg(test)]
+mod live_vm_wire_e2e;
 mod processor;
 mod snapshot;
 #[cfg(test)]
