@@ -74,7 +74,7 @@ JSON
 run_verifier_fixture() {
   local simulator_body="$1"
   local first_required_probe="$2"
-  local first_retained_probe="$3"
+  local first_available_probe="$3"
   local output_file="$4"
   local fixture_dir fixture_repo
 
@@ -86,7 +86,7 @@ run_verifier_fixture() {
   printf '%s\n' "$status_body" > "$fixture_dir/broadcaster-status.json"
   printf '%s\n' "$simulator_body" > "$fixture_dir/simulator-status.json"
   printf '%s' "$first_required_probe" > "$fixture_dir/first-required-xrange.txt"
-  printf '%s' "$first_retained_probe" > "$fixture_dir/first-retained-xrange.txt"
+  printf '%s' "$first_available_probe" > "$fixture_dir/first-available-xrange.txt"
 
   cat > "$fixture_dir/curl" <<'SH'
 #!/usr/bin/env bash
@@ -158,7 +158,7 @@ case "$command" in
         emit_probe "$FIXTURE_DIR/first-required-xrange.txt"
         ;;
       "dsolver:broadcaster:local:8453:events:-:+")
-        emit_probe "$FIXTURE_DIR/first-retained-xrange.txt"
+        emit_probe "$FIXTURE_DIR/first-available-xrange.txt"
         ;;
       *)
         echo "unexpected XRANGE: $key $start $end" >&2
@@ -231,11 +231,11 @@ if ! grep -q "simulator /status backend native has not caught up from Redis repl
 fi
 
 if run_verifier_fixture "$(simulator_status_body false null)" "" "2-16" "$output_file"; then
-  echo "expected missing post-boundary retained history to fail" >&2
+  echo "expected missing post-boundary stream history to fail" >&2
   exit 1
 fi
-if ! grep -q "missing first required post-boundary entry 2-15" "$output_file"; then
-  echo "expected missing post-boundary retained history context" >&2
+if ! grep -q "Trimmed history gap: first required post-boundary entry 2-15 is no longer available; first available entry is 2-16." "$output_file"; then
+  echo "expected missing post-boundary stream history context" >&2
   cat "$output_file" >&2
   exit 1
 fi
@@ -244,7 +244,7 @@ if run_verifier_fixture "$(simulator_status_body false null)" "__FAIL__:redis un
   echo "expected Redis inspection failure during required-entry probe to fail" >&2
   exit 1
 fi
-if ! grep -q "Redis retained history inspection failed:" "$output_file"; then
+if ! grep -q "Redis stream history inspection failed:" "$output_file"; then
   echo "expected Redis inspection failure prefix" >&2
   cat "$output_file" >&2
   exit 1
@@ -260,22 +260,22 @@ if ! grep -q "redis unavailable during required probe" "$output_file"; then
   exit 1
 fi
 
-if run_verifier_fixture "$(simulator_status_body false null)" "" "__FAIL__:redis unavailable during retained probe" "$output_file"; then
-  echo "expected Redis inspection failure during first-retained probe to fail" >&2
+if run_verifier_fixture "$(simulator_status_body false null)" "" "__FAIL__:redis unavailable during available-history probe" "$output_file"; then
+  echo "expected Redis inspection failure during first-available probe to fail" >&2
   exit 1
 fi
-if ! grep -q "Redis retained history inspection failed:" "$output_file"; then
+if ! grep -q "Redis stream history inspection failed:" "$output_file"; then
   echo "expected Redis inspection failure prefix" >&2
   cat "$output_file" >&2
   exit 1
 fi
-if ! grep -q "failed to inspect first retained Redis entry after missing first required post-boundary entry 2-15" "$output_file"; then
-  echo "expected first-retained inspection failure context" >&2
+if ! grep -q "failed to inspect first available Redis stream entry after missing first required post-boundary entry 2-15" "$output_file"; then
+  echo "expected first-available inspection failure context" >&2
   cat "$output_file" >&2
   exit 1
 fi
-if ! grep -q "redis unavailable during retained probe" "$output_file"; then
-  echo "expected first-retained redis-cli failure output to be preserved" >&2
+if ! grep -q "redis unavailable during available-history probe" "$output_file"; then
+  echo "expected first-available redis-cli failure output to be preserved" >&2
   cat "$output_file" >&2
   exit 1
 fi

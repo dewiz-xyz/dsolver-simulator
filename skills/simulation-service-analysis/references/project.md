@@ -15,7 +15,7 @@
   ```bash
   scripts/start_server.sh --repo . --chain-id 1
   ```
-- When `BROADCASTER_REDIS_URL` is loopback `redis://`, the lifecycle helper starts Redis from `docker-compose.redis.yml` before the local broadcaster. Use `scripts/verify_broadcaster_redis.sh --repo .` while services are running to confirm the broadcaster replay boundary, Redis stream retention, and simulator catch-up status.
+- When `BROADCASTER_REDIS_URL` is loopback `redis://`, the lifecycle helper starts Redis from `docker-compose.redis.yml` before the local broadcaster. Use `scripts/verify_broadcaster_redis.sh --repo .` while services are running to confirm the broadcaster replay boundary, available Redis stream history, and simulator catch-up status.
 - Default bind: `127.0.0.1:3000` (override with `HOST`/`PORT`).
 
 ## Readiness

@@ -12,7 +12,7 @@ The script reads BROADCASTER_REDIS_URL and BROADCASTER_REDIS_STREAM_KEY from
   - broadcaster /status includes a healthy redis_publisher with replay_boundary
   - simulator /status subscriptions caught up from the Redis replay boundary
   - the Redis stream has at least one entry
-  - if simulator catch-up fails, retained Redis history is inspected for context
+  - if simulator catch-up fails, available Redis stream history is inspected for context
 
 Options:
   --repo                  Path to repo root (default: current directory)
@@ -200,7 +200,7 @@ print(boundary["streamKey"])
 PY
 }
 
-inspect_post_boundary_retention() {
+inspect_post_boundary_stream_history() {
   local boundary_json="$1"
   local stream_key="$2"
   local required_entry_id
@@ -213,26 +213,26 @@ inspect_post_boundary_retention() {
     return 1
   fi
   if [[ -n "$required_probe" ]]; then
-    local retained_entry_id
-    retained_entry_id="$(printf '%s\n' "$required_probe" | sed -n '1p')"
-    if [[ "$retained_entry_id" == "$required_entry_id" ]]; then
-      echo "Redis retained history includes first required post-boundary entry $required_entry_id."
+    local available_entry_id
+    available_entry_id="$(printf '%s\n' "$required_probe" | sed -n '1p')"
+    if [[ "$available_entry_id" == "$required_entry_id" ]]; then
+      echo "Available Redis stream history includes first required post-boundary entry $required_entry_id."
     else
-      echo "Redis retained history check returned $retained_entry_id while looking for first required post-boundary entry $required_entry_id."
+      echo "Redis stream history check returned $available_entry_id while looking for first required post-boundary entry $required_entry_id."
     fi
     return 0
   fi
 
-  local first_retained_probe first_retained_entry_id
-  if ! first_retained_probe="$(redis_cli --raw XRANGE "$stream_key" - + COUNT 1 2>&1)"; then
-    echo "failed to inspect first retained Redis entry after missing first required post-boundary entry $required_entry_id: $first_retained_probe" >&2
+  local first_available_probe first_available_entry_id
+  if ! first_available_probe="$(redis_cli --raw XRANGE "$stream_key" - + COUNT 1 2>&1)"; then
+    echo "failed to inspect first available Redis stream entry after missing first required post-boundary entry $required_entry_id: $first_available_probe" >&2
     return 1
   fi
-  first_retained_entry_id="$(printf '%s\n' "$first_retained_probe" | sed -n '1p')"
-  if [[ -n "$first_retained_entry_id" ]]; then
-    echo "Redis retained history is missing first required post-boundary entry $required_entry_id; first retained entry is $first_retained_entry_id."
+  first_available_entry_id="$(printf '%s\n' "$first_available_probe" | sed -n '1p')"
+  if [[ -n "$first_available_entry_id" ]]; then
+    echo "Trimmed history gap: first required post-boundary entry $required_entry_id is no longer available; first available entry is $first_available_entry_id."
   else
-    echo "Redis retained history is missing first required post-boundary entry $required_entry_id; stream has no retained entries."
+    echo "Trimmed history gap: first required post-boundary entry $required_entry_id is no longer available; stream has no available entries."
   fi
 }
 
@@ -353,10 +353,10 @@ fi
 simulator_status_body="$(curl -sS --max-time 5 "$simulator_status_url")"
 if ! checked_backends="$(verify_simulator_replay_status "$simulator_status_body" "$boundary_json" 2>&1)"; then
   echo "$checked_backends" >&2
-  if retention_context="$(inspect_post_boundary_retention "$boundary_json" "$BROADCASTER_REDIS_STREAM_KEY" 2>&1)"; then
-    echo "$retention_context" >&2
+  if stream_history_context="$(inspect_post_boundary_stream_history "$boundary_json" "$BROADCASTER_REDIS_STREAM_KEY" 2>&1)"; then
+    echo "$stream_history_context" >&2
   else
-    echo "Redis retained history inspection failed: $retention_context" >&2
+    echo "Redis stream history inspection failed: $stream_history_context" >&2
   fi
   exit 1
 fi

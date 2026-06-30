@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_redis_poll_detects_retention_gap_before_next_expected_entry() -> Result<()> {
+    fn empty_redis_poll_detects_trimmed_history_gap_before_next_expected_entry() -> Result<()> {
         let checkpoint = ReplayCheckpoint::new(replay_boundary(3)?, ETHEREUM_CHAIN_ID);
         let stream_info = RedisStreamInfo {
             last_generated_entry_id: "1-5".to_string(),

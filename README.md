@@ -271,7 +271,7 @@ Useful helpers:
 
 - `scripts/start_server.sh` to start the local broadcaster plus simulator stack with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
-- `scripts/verify_broadcaster_redis.sh` to check the broadcaster replay boundary, Redis stream retention, and simulator catch-up status
+- `scripts/verify_broadcaster_redis.sh` to check the broadcaster replay boundary, available Redis stream history, and simulator catch-up status
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
