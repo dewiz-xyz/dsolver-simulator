@@ -4,10 +4,11 @@ State history is an opt-in long-term store for accepted broadcaster state change
 
 ## What Is Stored
 
-- PostgreSQL stores accepted state-changing broadcaster Redis entries, per-backend indexes, checkpoint manifests, and explicit ingestion gaps.
-- S3 stores compressed combined checkpoints built from the broadcaster snapshot payload model.
+- PostgreSQL stores accepted state-changing broadcaster Redis entries, per-backend indexes with optional gas metadata, checkpoint manifests, checkpoint backend indexes, and explicit ingestion gaps.
+- S3 stores compressed combined checkpoints built from the broadcaster snapshot payload model, including checkpoint backend indexes and optional gas metadata.
 - Native and VM history use block-number cursors.
 - RFQ history uses the RFQ update timestamp cursor. This stores RFQ state for historical indicative `/simulate` reconstruction. It does not store signed quote replay material for `/encode`.
+- Gas metadata means block `baseFeePerGas` in wei. If it is unavailable, the affected backend index row is still stored with null gas fields.
 
 ## Runtime Contract
 
@@ -16,6 +17,8 @@ State history is disabled unless `STATE_HISTORY_ENABLED=true`.
 When enabled, broadcaster startup connects to PostgreSQL, validates that migrations have already been applied, builds the S3 checkpoint store, and starts the async history writer. Live serving does not wait for history storage. If the queue fills or a write exhausts its retry window, the writer records an explicit gap when PostgreSQL is available and reports the failure in `/status.state_history`.
 
 Checkpoints are captured by block interval. A checkpoint contains the combined raw/RFQ snapshot payloads from the broadcaster cache and is anchored to the active Redis replay boundary. Upload failure marks the checkpoint manifest `failed`; delta history continues.
+
+For native and VM backend rows, the broadcaster tries to attach `baseFeePerGas` for the exact backend block. The current Tycho header does not expose that field, so the runtime uses `RPC_URL` and `eth_getBlockByNumber` when available. Missing `RPC_URL`, missing RPC blocks, missing `baseFeePerGas`, and RPC failures only leave gas fields null; they do not block delta or checkpoint writes.
 
 ## Configuration
 
@@ -34,6 +37,7 @@ Optional:
 - `STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS`, default `30`
 - `STATE_HISTORY_QUEUE_CAPACITY`, default `8192`
 - `STATE_HISTORY_WRITE_RETRY_WINDOW_MS`, default `30000`
+- `RPC_URL`, used for optional native/VM `baseFeePerGas` enrichment
 
 Operators must run the migrations in `crates/state-history/migrations/` before enabling the broadcaster. The service validates the schema on startup but does not mutate production databases by itself.
 
@@ -54,6 +58,8 @@ The harness:
 - writes synthetic native, VM, and RFQ deltas;
 - writes and fetches a combined checkpoint;
 - resolves a history range through the reader API;
+- verifies native/VM gas metadata in replayed deltas, checkpoint manifests, and checkpoint archives;
+- verifies a missing-gas replayed delta still restores successfully;
 - verifies the gap-free helper;
 - records one synthetic gap and verifies that the reader reports it.
 

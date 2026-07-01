@@ -26,8 +26,16 @@ CREATE TABLE state_history.delta_backend_index (
     block_number BIGINT,
     observed_timestamp_ms BIGINT,
     message_seq BIGINT NOT NULL,
+    gas_price_wei NUMERIC(78, 0),
+    gas_price_source TEXT CHECK (gas_price_source = 'rpc_block'),
+    gas_price_block_hash TEXT,
+    gas_price_block_timestamp_secs BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (delta_id, backend)
+    PRIMARY KEY (delta_id, backend),
+    CHECK (
+        (gas_price_wei IS NULL AND gas_price_source IS NULL)
+        OR (gas_price_wei IS NOT NULL AND gas_price_source IS NOT NULL)
+    )
 );
 
 CREATE INDEX state_history_delta_backend_block_idx
@@ -67,6 +75,31 @@ CREATE INDEX state_history_checkpoints_lookup_idx
 CREATE INDEX state_history_checkpoints_rfq_lookup_idx
     ON state_history.checkpoints (chain_id, block_number DESC, rfq_update_timestamp_ms DESC)
     WHERE status = 'complete' AND rfq_update_timestamp_ms IS NOT NULL;
+
+CREATE TABLE state_history.checkpoint_backend_index (
+    checkpoint_id BIGINT NOT NULL REFERENCES state_history.checkpoints(id) ON DELETE CASCADE,
+    chain_id BIGINT NOT NULL,
+    backend TEXT NOT NULL,
+    block_number BIGINT,
+    observed_timestamp_ms BIGINT,
+    gas_price_wei NUMERIC(78, 0),
+    gas_price_source TEXT CHECK (gas_price_source = 'rpc_block'),
+    gas_price_block_hash TEXT,
+    gas_price_block_timestamp_secs BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (checkpoint_id, backend),
+    CHECK (
+        block_number IS NOT NULL OR observed_timestamp_ms IS NOT NULL
+    ),
+    CHECK (
+        (gas_price_wei IS NULL AND gas_price_source IS NULL)
+        OR (gas_price_wei IS NOT NULL AND gas_price_source IS NOT NULL)
+    )
+);
+
+CREATE INDEX state_history_checkpoint_backend_block_idx
+    ON state_history.checkpoint_backend_index (chain_id, backend, block_number)
+    WHERE block_number IS NOT NULL;
 
 CREATE TABLE state_history.ingestion_gaps (
     id BIGSERIAL PRIMARY KEY,

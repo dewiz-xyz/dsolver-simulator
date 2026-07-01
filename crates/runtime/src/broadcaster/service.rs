@@ -12,6 +12,7 @@ use tycho_simulation::{
     tycho_client::feed::{BlockHeader, FeedMessage},
 };
 
+use crate::broadcaster::gas_price::StateHistoryGasPriceProvider;
 use crate::broadcaster::redis_publisher::{
     BroadcasterRedisPublisher, BroadcasterRedisPublisherMode,
 };
@@ -24,7 +25,10 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
     BroadcasterRedisStreamEntry, BroadcasterSnapshotSessionResponse,
 };
-use state_history::{CheckpointArchive, CheckpointArchiveMetadata, StateHistoryWriter};
+use state_history::{
+    CheckpointArchive, CheckpointArchiveMetadata, CheckpointPayload, StateHistoryGasPriceLookup,
+    StateHistoryWriter,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotSessionError {
@@ -231,6 +235,7 @@ pub struct BroadcasterServiceState {
     snapshot_sessions: BroadcasterSnapshotSessionRegistry,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
     state_history: Option<StateHistoryWriter>,
+    gas_price_provider: Option<StateHistoryGasPriceProvider>,
     // This gate keeps snapshot export plus replay-boundary capture atomic with respect to
     // updates, heartbeats, and generation resets.
     lifecycle_gate: Arc<Mutex<()>>,
@@ -251,12 +256,21 @@ impl BroadcasterServiceState {
             snapshot_sessions: BroadcasterSnapshotSessionRegistry::new(),
             redis_publisher,
             state_history: None,
+            gas_price_provider: None,
             lifecycle_gate,
         }
     }
 
     pub fn with_state_history_writer(mut self, state_history: Option<StateHistoryWriter>) -> Self {
         self.state_history = state_history;
+        self
+    }
+
+    pub(crate) fn with_state_history_gas_prices(
+        mut self,
+        gas_price_provider: Option<StateHistoryGasPriceProvider>,
+    ) -> Self {
+        self.gas_price_provider = gas_price_provider;
         self
     }
 
@@ -549,6 +563,7 @@ impl BroadcasterServiceState {
         let _gate = services[0].lifecycle_gate.lock().await;
         let mut chain_id = None;
         let mut backends = Vec::new();
+        let mut backend_index = Vec::new();
         let mut block_numbers = Vec::new();
         let mut rfq_update_timestamps = Vec::new();
         let mut exports = Vec::with_capacity(services.len());
@@ -568,19 +583,16 @@ impl BroadcasterServiceState {
             }
             for (backend, backend_status) in &status.backends {
                 backends.push(*backend);
-                match backend {
-                    BroadcasterBackend::Native | BroadcasterBackend::Vm => {
-                        if let Some(block_number) = backend_status.block_number {
-                            block_numbers.push(block_number);
-                        }
+                let Some(index) =
+                    checkpoint_backend_index_row(*backend, backend_status.block_number)
+                else {
+                    if *backend == BroadcasterBackend::Rfq {
+                        return Ok(None);
                     }
-                    BroadcasterBackend::Rfq => {
-                        let Some(update_timestamp_ms) = backend_status.block_number else {
-                            return Ok(None);
-                        };
-                        rfq_update_timestamps.push(update_timestamp_ms);
-                    }
-                }
+                    continue;
+                };
+                record_checkpoint_cursor(&index, &mut block_numbers, &mut rfq_update_timestamps);
+                backend_index.push(index);
             }
             exports.push(
                 service
@@ -627,6 +639,8 @@ impl BroadcasterServiceState {
             redis_replay_boundary.snapshot_id
         );
         let payloads = snapshot_payload_envelopes(snapshot)?;
+        backend_index.sort_by_key(|index| index.backend);
+        backend_index.dedup_by_key(|index| index.backend);
         Ok(Some(CheckpointArchive {
             metadata: CheckpointArchiveMetadata {
                 chain_id,
@@ -636,6 +650,7 @@ impl BroadcasterServiceState {
                 stream_id: redis_replay_boundary.stream_id,
                 source_message_seq: redis_replay_boundary.exclusive_message_seq,
                 backends,
+                backend_index,
             },
             payloads,
         }))
@@ -708,7 +723,19 @@ impl BroadcasterServiceState {
         let Some(state_history) = &self.state_history else {
             return;
         };
-        if let Err(error) = state_history.enqueue_delta(entry, redis_entry_id).await {
+        let result = match &self.gas_price_provider {
+            Some(provider) => {
+                let provider = provider.clone();
+                let lookup_entry = entry.clone();
+                let lookup: StateHistoryGasPriceLookup =
+                    Box::pin(async move { provider.gas_prices_for_entry(&lookup_entry).await });
+                state_history
+                    .enqueue_delta_with_gas_price_lookup(entry, redis_entry_id, lookup)
+                    .await
+            }
+            None => state_history.enqueue_delta(entry, redis_entry_id).await,
+        };
+        if let Err(error) = result {
             warn!(
                 error = %error,
                 "State history writer did not accept broadcaster delta"
@@ -763,6 +790,41 @@ fn snapshot_payload_envelopes(
         .collect()
 }
 
+fn checkpoint_backend_index_row(
+    backend: BroadcasterBackend,
+    cursor: Option<u64>,
+) -> Option<CheckpointPayload> {
+    match backend {
+        BroadcasterBackend::Native | BroadcasterBackend::Vm => {
+            cursor.map(|block_number| CheckpointPayload {
+                backend,
+                block_number: Some(block_number),
+                observed_timestamp_ms: None,
+                gas_price: None,
+            })
+        }
+        BroadcasterBackend::Rfq => cursor.map(|observed_timestamp_ms| CheckpointPayload {
+            backend,
+            block_number: None,
+            observed_timestamp_ms: Some(observed_timestamp_ms),
+            gas_price: None,
+        }),
+    }
+}
+
+fn record_checkpoint_cursor(
+    index: &CheckpointPayload,
+    block_numbers: &mut Vec<u64>,
+    rfq_update_timestamps: &mut Vec<u64>,
+) {
+    if let Some(block_number) = index.block_number {
+        block_numbers.push(block_number);
+    }
+    if let Some(update_timestamp_ms) = index.observed_timestamp_ms {
+        rfq_update_timestamps.push(update_timestamp_ms);
+    }
+}
+
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -775,7 +837,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use anyhow::{anyhow, Result};
+    use anyhow::{anyhow, Context, Result};
     use num_bigint::BigUint;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
@@ -794,6 +856,7 @@ mod tests {
     use super::{
         BroadcasterServiceState, BroadcasterSnapshotSessionRegistry, SnapshotSessionError,
     };
+    use crate::broadcaster::gas_price::StateHistoryGasPriceProvider;
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
     };
@@ -806,6 +869,7 @@ mod tests {
         BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
         BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
     };
+    use state_history::{StateHistoryPgStore, StateHistoryWriter, StateHistoryWriterConfig};
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim(u8);
@@ -1950,6 +2014,57 @@ mod tests {
             format!("{error:#}").contains("snapshot stream_id mismatch"),
             "unexpected error: {error:#}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_history_gas_lookup_does_not_block_accepted_updates() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc_url = format!("http://{}", listener.local_addr()?);
+        let _server = tokio::spawn(async move {
+            if let Ok((_socket, _peer)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer),
+        ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Native]),
+                "active_writer_promoted",
+            )
+            .await?;
+        let state_history = StateHistoryWriter::spawn(
+            StateHistoryPgStore::connect_lazy(
+                "postgres://postgres:postgres@127.0.0.1:1/state_history",
+            )?,
+            StateHistoryWriterConfig {
+                queue_capacity: 16,
+                retry_window: Duration::from_millis(50),
+            },
+        )?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        )
+        .with_state_history_writer(Some(state_history))
+        .with_state_history_gas_prices(Some(StateHistoryGasPriceProvider::new(1, Some(rpc_url))?));
+        service.mark_upstream_connected().await;
+
+        timeout(
+            Duration::from_millis(200),
+            service.apply_update(&native_only_update(10, "native-1")),
+        )
+        .await
+        .context("accepted update waited for optional state-history gas lookup")??;
         Ok(())
     }
 

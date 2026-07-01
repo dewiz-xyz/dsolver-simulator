@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Cursor;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -9,9 +12,10 @@ use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterRedisStreamEntry,
+    BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterPayload,
+    BroadcasterRedisStreamEntry,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::warn;
@@ -40,6 +44,8 @@ pub struct CheckpointArchiveMetadata {
     pub stream_id: String,
     pub source_message_seq: u64,
     pub backends: Vec<BroadcasterBackend>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_index: Vec<CheckpointPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,11 +81,48 @@ impl PayloadEncoding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GasPriceSource {
+    RpcBlock,
+}
+
+impl GasPriceSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RpcBlock => "rpc_block",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "rpc_block" => Ok(Self::RpcBlock),
+            _ => Err(anyhow!("unknown gas price source {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GasPriceMetadata {
+    pub backend: BroadcasterBackend,
+    pub block_number: u64,
+    pub price_wei: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_timestamp_secs: Option<u64>,
+    pub source: GasPriceSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckpointPayload {
     pub backend: BroadcasterBackend,
     pub block_number: Option<u64>,
     pub observed_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_price: Option<GasPriceMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +193,7 @@ pub struct StoredDeltaEntry {
     pub id: i64,
     pub redis_entry_id: Option<String>,
     pub payload: EncodedPayload,
+    pub backend_index: Vec<CheckpointPayload>,
     pub entry: BroadcasterRedisStreamEntry,
 }
 
@@ -293,6 +337,9 @@ pub struct CheckpointWriteOutcome {
     pub payload: EncodedPayload,
 }
 
+pub type StateHistoryGasPriceLookup =
+    Pin<Box<dyn Future<Output = Vec<GasPriceMetadata>> + Send + 'static>>;
+
 #[derive(Clone)]
 pub struct StateHistoryWriter {
     sender: mpsc::Sender<StateHistoryWriteCommand>,
@@ -317,10 +364,21 @@ pub struct StateHistoryCheckpointWriter {
     status: Arc<RwLock<StateHistoryCheckpointWriterSnapshot>>,
 }
 
-#[derive(Debug)]
 struct StateHistoryWriteCommand {
     entry: BroadcasterRedisStreamEntry,
     redis_entry_id: String,
+    gas_prices: StateHistoryGasPrices,
+}
+
+struct ResolvedStateHistoryWriteCommand {
+    entry: BroadcasterRedisStreamEntry,
+    redis_entry_id: String,
+    gas_prices: Vec<GasPriceMetadata>,
+}
+
+enum StateHistoryGasPrices {
+    Ready(Vec<GasPriceMetadata>),
+    Deferred(StateHistoryGasPriceLookup),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,22 +455,46 @@ pub fn decode_checkpoint_archive_bytes(
 pub fn indexed_backends_for_entry(
     entry: &BroadcasterRedisStreamEntry,
 ) -> Result<Vec<CheckpointPayload>> {
+    indexed_backends_for_entry_with_gas_prices(entry, &[])
+}
+
+pub fn indexed_backends_for_entry_with_gas_prices(
+    entry: &BroadcasterRedisStreamEntry,
+    gas_prices: &[GasPriceMetadata],
+) -> Result<Vec<CheckpointPayload>> {
     let backends = parse_backend_scope(&entry.backend_scope)?;
-    Ok(backends
+    let envelope: BroadcasterEnvelope = serde_json::from_str(&entry.payload_json)
+        .context("failed to parse Redis stream entry payload JSON")?;
+    let mut backend_index = backends
         .into_iter()
         .map(|backend| CheckpointPayload {
             backend,
-            block_number: entry.block_number_for_backend(backend),
-            observed_timestamp_ms: entry.observed_timestamp_for_backend(backend),
+            block_number: entry_block_number_for_backend(entry, &envelope.payload, backend),
+            observed_timestamp_ms: entry_observed_timestamp_for_backend(
+                entry,
+                &envelope.payload,
+                backend,
+            ),
+            gas_price: None,
         })
-        .collect())
+        .collect::<Vec<_>>();
+    attach_gas_prices(&mut backend_index, gas_prices)?;
+    Ok(backend_index)
 }
 
 pub fn prepare_delta_message(
     entry: &BroadcasterRedisStreamEntry,
     redis_entry_id: Option<&str>,
 ) -> Result<PreparedDeltaMessage> {
-    let backend_index = indexed_backends_for_entry(entry)?;
+    prepare_delta_message_with_gas_prices(entry, redis_entry_id, &[])
+}
+
+pub fn prepare_delta_message_with_gas_prices(
+    entry: &BroadcasterRedisStreamEntry,
+    redis_entry_id: Option<&str>,
+    gas_prices: &[GasPriceMetadata],
+) -> Result<PreparedDeltaMessage> {
+    let backend_index = indexed_backends_for_entry_with_gas_prices(entry, gas_prices)?;
     let json = serde_json::to_vec(entry).context("failed to serialize Redis stream entry")?;
     let hash = sha256_hex(&json);
     let compressed = zstd::stream::encode_all(Cursor::new(&json), ZSTD_LEVEL)
@@ -580,6 +662,14 @@ impl StateHistoryPgStore {
         Ok(Self::from_pool(pool))
     }
 
+    pub fn connect_lazy(database_url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy(database_url)
+            .context("failed to build lazy state history PostgreSQL pool")?;
+        Ok(Self::from_pool(pool))
+    }
+
     pub async fn run_migrations(database_url: &str) -> Result<()> {
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -602,6 +692,7 @@ impl StateHistoryPgStore {
             "state_history.delta_messages",
             "state_history.delta_backend_index",
             "state_history.checkpoints",
+            "state_history.checkpoint_backend_index",
             "state_history.ingestion_gaps",
         ] {
             let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
@@ -622,13 +713,46 @@ impl StateHistoryPgStore {
         entry: &BroadcasterRedisStreamEntry,
         redis_entry_id: Option<&str>,
     ) -> Result<PersistedDelta> {
-        let prepared = prepare_delta_message(entry, redis_entry_id)?;
+        self.insert_delta_with_gas_prices(entry, redis_entry_id, &[])
+            .await
+    }
+
+    pub async fn insert_delta_with_gas_prices(
+        &self,
+        entry: &BroadcasterRedisStreamEntry,
+        redis_entry_id: Option<&str>,
+        gas_prices: &[GasPriceMetadata],
+    ) -> Result<PersistedDelta> {
+        let prepared = prepare_delta_message_with_gas_prices(entry, redis_entry_id, gas_prices)?;
         let mut tx = self
             .pool
             .begin()
             .await
             .context("failed to begin state history delta transaction")?;
-        let id = sqlx::query_scalar::<_, i64>(
+        let inserted_id = Self::insert_delta_message_row(&mut tx, &prepared).await?;
+        let (id, inserted) = match inserted_id {
+            Some(id) => (id, true),
+            None => (
+                Self::existing_delta_message_id(&mut tx, &prepared).await?,
+                false,
+            ),
+        };
+
+        for index in &prepared.backend_index {
+            Self::insert_delta_backend_index_row(&mut tx, id, &prepared, index).await?;
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit state history delta transaction")?;
+        Ok(PersistedDelta { id, inserted })
+    }
+
+    async fn insert_delta_message_row(
+        tx: &mut Transaction<'_, Postgres>,
+        prepared: &PreparedDeltaMessage,
+    ) -> Result<Option<i64>> {
+        sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO state_history.delta_messages (
                 chain_id, stream_id, snapshot_id, message_seq, redis_entry_id, kind,
@@ -655,66 +779,84 @@ impl StateHistoryPgStore {
         .bind(prepared.payload.encoding.as_str())
         .bind(&prepared.payload_compressed)
         .bind(&prepared.payload.hash)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
-        .context("failed to insert state history delta")?;
+        .context("failed to insert state history delta")
+    }
 
-        let (id, inserted) = match id {
-            Some(id) => (id, true),
-            None => {
-                let row = sqlx::query(
-                    r#"
-                    SELECT id, payload_hash
-                    FROM state_history.delta_messages
-                    WHERE chain_id = $1 AND stream_id = $2 AND message_seq = $3
-                    "#,
-                )
-                .bind(u64_to_i64("chain_id", prepared.chain_id)?)
-                .bind(&prepared.stream_id)
-                .bind(u64_to_i64("message_seq", prepared.message_seq)?)
-                .fetch_one(&mut *tx)
-                .await
-                .context("failed to load existing state history delta")?;
-                let id: i64 = row.get("id");
-                let payload_hash: String = row.get("payload_hash");
-                anyhow::ensure!(
-                    payload_hash == prepared.payload.hash,
-                    "state history delta idempotency conflict for stream {} message_seq {}",
-                    prepared.stream_id,
-                    prepared.message_seq
-                );
-                (id, false)
-            }
-        };
+    async fn existing_delta_message_id(
+        tx: &mut Transaction<'_, Postgres>,
+        prepared: &PreparedDeltaMessage,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, payload_hash
+            FROM state_history.delta_messages
+            WHERE chain_id = $1 AND stream_id = $2 AND message_seq = $3
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", prepared.chain_id)?)
+        .bind(&prepared.stream_id)
+        .bind(u64_to_i64("message_seq", prepared.message_seq)?)
+        .fetch_one(&mut **tx)
+        .await
+        .context("failed to load existing state history delta")?;
+        let id: i64 = row.get("id");
+        let payload_hash: String = row.get("payload_hash");
+        anyhow::ensure!(
+            payload_hash == prepared.payload.hash,
+            "state history delta idempotency conflict for stream {} message_seq {}",
+            prepared.stream_id,
+            prepared.message_seq
+        );
+        Ok(id)
+    }
 
-        for index in &prepared.backend_index {
-            sqlx::query(
-                r#"
-                INSERT INTO state_history.delta_backend_index (
-                    delta_id, chain_id, backend, block_number, observed_timestamp_ms, message_seq
-                )
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (delta_id, backend) DO NOTHING
-                "#,
+    async fn insert_delta_backend_index_row(
+        tx: &mut Transaction<'_, Postgres>,
+        delta_id: i64,
+        prepared: &PreparedDeltaMessage,
+        index: &CheckpointPayload,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO state_history.delta_backend_index (
+                delta_id, chain_id, backend, block_number, observed_timestamp_ms, message_seq,
+                gas_price_wei, gas_price_source, gas_price_block_hash,
+                gas_price_block_timestamp_secs
             )
-            .bind(id)
-            .bind(u64_to_i64("chain_id", prepared.chain_id)?)
-            .bind(index.backend.as_str())
-            .bind(optional_u64_to_i64("block_number", index.block_number)?)
-            .bind(optional_u64_to_i64(
-                "observed_timestamp_ms",
-                index.observed_timestamp_ms,
-            )?)
-            .bind(u64_to_i64("message_seq", prepared.message_seq)?)
-            .execute(&mut *tx)
-            .await
-            .context("failed to insert state history delta backend index")?;
-        }
-
-        tx.commit()
-            .await
-            .context("failed to commit state history delta transaction")?;
-        Ok(PersistedDelta { id, inserted })
+            VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10)
+            ON CONFLICT (delta_id, backend) DO NOTHING
+            "#,
+        )
+        .bind(delta_id)
+        .bind(u64_to_i64("chain_id", prepared.chain_id)?)
+        .bind(index.backend.as_str())
+        .bind(optional_u64_to_i64("block_number", index.block_number)?)
+        .bind(optional_u64_to_i64(
+            "observed_timestamp_ms",
+            index.observed_timestamp_ms,
+        )?)
+        .bind(u64_to_i64("message_seq", prepared.message_seq)?)
+        .bind(index.gas_price.as_ref().map(|gas| gas.price_wei.as_str()))
+        .bind(index.gas_price.as_ref().map(|gas| gas.source.as_str()))
+        .bind(
+            index
+                .gas_price
+                .as_ref()
+                .and_then(|gas| gas.block_hash.as_deref()),
+        )
+        .bind(optional_u64_to_i64(
+            "gas_price_block_timestamp_secs",
+            index
+                .gas_price
+                .as_ref()
+                .and_then(|gas| gas.block_timestamp_secs),
+        )?)
+        .execute(&mut **tx)
+        .await
+        .context("failed to insert state history delta backend index")?;
+        Ok(())
     }
 
     pub async fn record_gap(&self, gap: &IngestionGap) -> Result<i64> {
@@ -759,6 +901,15 @@ impl StateHistoryPgStore {
     }
 
     pub async fn create_checkpoint_manifest(&self, input: &CheckpointManifestInput) -> Result<i64> {
+        anyhow::ensure!(
+            !input.metadata.backend_index.is_empty(),
+            "checkpoint backend index must not be empty"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin state history checkpoint transaction")?;
         let id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO state_history.checkpoints (
@@ -789,9 +940,53 @@ impl StateHistoryPgStore {
         .bind(&input.s3_bucket)
         .bind(&input.s3_key)
         .bind(PayloadEncoding::JsonZstd.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .context("failed to create state history checkpoint manifest")?;
+
+        for index in &input.metadata.backend_index {
+            sqlx::query(
+                r#"
+                INSERT INTO state_history.checkpoint_backend_index (
+                    checkpoint_id, chain_id, backend, block_number, observed_timestamp_ms,
+                    gas_price_wei, gas_price_source, gas_price_block_hash,
+                    gas_price_block_timestamp_secs
+                )
+                VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9)
+                ON CONFLICT (checkpoint_id, backend) DO NOTHING
+                "#,
+            )
+            .bind(id)
+            .bind(u64_to_i64("chain_id", input.metadata.chain_id)?)
+            .bind(index.backend.as_str())
+            .bind(optional_u64_to_i64("block_number", index.block_number)?)
+            .bind(optional_u64_to_i64(
+                "observed_timestamp_ms",
+                index.observed_timestamp_ms,
+            )?)
+            .bind(index.gas_price.as_ref().map(|gas| gas.price_wei.as_str()))
+            .bind(index.gas_price.as_ref().map(|gas| gas.source.as_str()))
+            .bind(
+                index
+                    .gas_price
+                    .as_ref()
+                    .and_then(|gas| gas.block_hash.as_deref()),
+            )
+            .bind(optional_u64_to_i64(
+                "gas_price_block_timestamp_secs",
+                index
+                    .gas_price
+                    .as_ref()
+                    .and_then(|gas| gas.block_timestamp_secs),
+            )?)
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert state history checkpoint backend index")?;
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit state history checkpoint transaction")?;
         Ok(id)
     }
 
@@ -891,24 +1086,53 @@ impl StateHistoryPgStore {
         backends: &[BroadcasterBackend],
         max_rfq_update_timestamp_ms: Option<u64>,
     ) -> Result<Option<CheckpointManifest>> {
+        let block_backends = backends
+            .iter()
+            .copied()
+            .filter(|backend| {
+                matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm)
+            })
+            .collect::<Vec<_>>();
+        let includes_rfq = backends.contains(&BroadcasterBackend::Rfq);
         let row = sqlx::query(
             r#"
             SELECT id, chain_id, block_number, captured_at_timestamp_ms,
                 rfq_update_timestamp_ms, stream_id, source_message_seq, backend_scope,
                 s3_bucket, s3_key, payload_hash, payload_bytes, compressed_bytes, status, error
-            FROM state_history.checkpoints
-            WHERE chain_id = $1
-                AND block_number <= $2
+            FROM state_history.checkpoints checkpoint
+            WHERE checkpoint.chain_id = $1
+                AND checkpoint.block_number <= $2
                 AND status = 'complete'
                 AND ($3::text[] = '{}'::text[] OR backend_scope @> $3::text[])
-                AND (
-                    $4::bigint IS NULL
-                    OR (
-                        rfq_update_timestamp_ms IS NOT NULL
-                        AND rfq_update_timestamp_ms <= $4
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM unnest($5::text[]) AS requested(backend)
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM state_history.checkpoint_backend_index idx
+                        WHERE idx.checkpoint_id = checkpoint.id
+                            AND idx.backend = requested.backend
+                            AND idx.block_number IS NOT NULL
+                            AND idx.block_number <= $2
                     )
                 )
-            ORDER BY block_number DESC, rfq_update_timestamp_ms DESC NULLS LAST,
+                AND (
+                    NOT $6::boolean
+                    OR $4::bigint IS NULL
+                    OR (
+                        checkpoint.rfq_update_timestamp_ms IS NOT NULL
+                        AND checkpoint.rfq_update_timestamp_ms <= $4
+                        AND EXISTS (
+                            SELECT 1
+                            FROM state_history.checkpoint_backend_index idx
+                            WHERE idx.checkpoint_id = checkpoint.id
+                                AND idx.backend = 'rfq'
+                                AND idx.observed_timestamp_ms IS NOT NULL
+                                AND idx.observed_timestamp_ms <= $4
+                        )
+                    )
+                )
+            ORDER BY checkpoint.block_number DESC, checkpoint.rfq_update_timestamp_ms DESC NULLS LAST,
                 captured_at_timestamp_ms DESC
             LIMIT 1
             "#,
@@ -920,11 +1144,18 @@ impl StateHistoryPgStore {
             "max_rfq_update_timestamp_ms",
             max_rfq_update_timestamp_ms,
         )?)
+        .bind(backend_scope_strings(&block_backends))
+        .bind(includes_rfq)
         .fetch_optional(&self.pool)
         .await
         .context("failed to resolve latest state history checkpoint")?;
 
-        row.map(checkpoint_manifest_from_row).transpose()
+        let mut checkpoint = row.map(checkpoint_manifest_from_row).transpose()?;
+        if let Some(checkpoint) = &mut checkpoint {
+            checkpoint.metadata.backend_index =
+                self.checkpoint_backend_index(checkpoint.id).await?;
+        }
+        Ok(checkpoint)
     }
 
     pub async fn resolve_history_range(
@@ -1045,9 +1276,65 @@ impl StateHistoryPgStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
+        let mut deltas = rows
+            .into_iter()
             .map(stored_delta_from_row)
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()?;
+        self.attach_delta_backend_index(&mut deltas).await?;
+        Ok(deltas)
+    }
+
+    async fn attach_delta_backend_index(&self, deltas: &mut [StoredDeltaEntry]) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let delta_ids = deltas.iter().map(|delta| delta.id).collect::<Vec<_>>();
+        let rows = sqlx::query(
+            r#"
+            SELECT delta_id, backend, block_number, observed_timestamp_ms,
+                gas_price_wei::text AS gas_price_wei, gas_price_source,
+                gas_price_block_hash, gas_price_block_timestamp_secs
+            FROM state_history.delta_backend_index
+            WHERE delta_id = ANY($1::bigint[])
+            ORDER BY delta_id ASC, backend ASC
+            "#,
+        )
+        .bind(&delta_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load state history delta backend index")?;
+
+        let mut by_delta_id = BTreeMap::<i64, Vec<CheckpointPayload>>::new();
+        for row in rows {
+            let delta_id: i64 = row.get("delta_id");
+            by_delta_id
+                .entry(delta_id)
+                .or_default()
+                .push(backend_index_from_row(row)?);
+        }
+        for delta in deltas {
+            delta.backend_index = by_delta_id.remove(&delta.id).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_backend_index(&self, checkpoint_id: i64) -> Result<Vec<CheckpointPayload>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT backend, block_number, observed_timestamp_ms,
+                gas_price_wei::text AS gas_price_wei, gas_price_source,
+                gas_price_block_hash, gas_price_block_timestamp_secs
+            FROM state_history.checkpoint_backend_index
+            WHERE checkpoint_id = $1
+            ORDER BY backend ASC
+            "#,
+        )
+        .bind(checkpoint_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load state history checkpoint backend index")?;
+
+        rows.into_iter().map(backend_index_from_row).collect()
     }
 
     async fn recorded_gaps_for_range(
@@ -1403,6 +1690,44 @@ impl StateHistoryWriter {
         entry: BroadcasterRedisStreamEntry,
         redis_entry_id: String,
     ) -> Result<()> {
+        self.enqueue_delta_with_gas_prices(entry, redis_entry_id, Vec::new())
+            .await
+    }
+
+    pub async fn enqueue_delta_with_gas_prices(
+        &self,
+        entry: BroadcasterRedisStreamEntry,
+        redis_entry_id: String,
+        gas_prices: Vec<GasPriceMetadata>,
+    ) -> Result<()> {
+        self.enqueue_delta_command(
+            entry,
+            redis_entry_id,
+            StateHistoryGasPrices::Ready(gas_prices),
+        )
+        .await
+    }
+
+    pub async fn enqueue_delta_with_gas_price_lookup(
+        &self,
+        entry: BroadcasterRedisStreamEntry,
+        redis_entry_id: String,
+        gas_price_lookup: StateHistoryGasPriceLookup,
+    ) -> Result<()> {
+        self.enqueue_delta_command(
+            entry,
+            redis_entry_id,
+            StateHistoryGasPrices::Deferred(gas_price_lookup),
+        )
+        .await
+    }
+
+    async fn enqueue_delta_command(
+        &self,
+        entry: BroadcasterRedisStreamEntry,
+        redis_entry_id: String,
+        gas_prices: StateHistoryGasPrices,
+    ) -> Result<()> {
         if entry.kind != BroadcasterMessageKind::Update {
             return Ok(());
         }
@@ -1411,6 +1736,7 @@ impl StateHistoryWriter {
         let command = StateHistoryWriteCommand {
             entry,
             redis_entry_id: redis_entry_id.clone(),
+            gas_prices,
         };
         match self.sender.try_send(command) {
             Ok(()) => {
@@ -1492,12 +1818,17 @@ async fn persist_delta_with_retry(
     status: Arc<RwLock<StateHistoryWriterSnapshot>>,
     retry_window: Duration,
 ) {
+    let command = command.resolve_gas_prices().await;
     let started_at = Instant::now();
     let mut attempts = 0u64;
     loop {
         attempts = attempts.saturating_add(1);
         match pg_store
-            .insert_delta(&command.entry, Some(&command.redis_entry_id))
+            .insert_delta_with_gas_prices(
+                &command.entry,
+                Some(&command.redis_entry_id),
+                &command.gas_prices,
+            )
             .await
         {
             Ok(_) => {
@@ -1547,6 +1878,25 @@ async fn persist_delta_with_retry(
                 }
                 sleep(writer_retry_backoff(attempts, retry_window - elapsed)).await;
             }
+        }
+    }
+}
+
+impl StateHistoryWriteCommand {
+    async fn resolve_gas_prices(self) -> ResolvedStateHistoryWriteCommand {
+        ResolvedStateHistoryWriteCommand {
+            entry: self.entry,
+            redis_entry_id: self.redis_entry_id,
+            gas_prices: self.gas_prices.resolve().await,
+        }
+    }
+}
+
+impl StateHistoryGasPrices {
+    async fn resolve(self) -> Vec<GasPriceMetadata> {
+        match self {
+            Self::Ready(gas_prices) => gas_prices,
+            Self::Deferred(lookup) => lookup.await,
         }
     }
 }
@@ -1654,6 +2004,7 @@ fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<Checkpoint
             stream_id: row.get("stream_id"),
             source_message_seq: i64_to_u64("source_message_seq", row.get("source_message_seq"))?,
             backends: parse_backend_strings(&backends)?,
+            backend_index: Vec::new(),
         },
         s3_bucket: row.get("s3_bucket"),
         s3_key: row.get("s3_key"),
@@ -1668,6 +2019,94 @@ fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<Checkpoint
 fn parse_backend_strings(values: &[String]) -> Result<Vec<BroadcasterBackend>> {
     let scope = values.join(",");
     parse_backend_scope(&scope)
+}
+
+fn attach_gas_prices(
+    backend_index: &mut [CheckpointPayload],
+    gas_prices: &[GasPriceMetadata],
+) -> Result<()> {
+    let mut used = vec![false; gas_prices.len()];
+    for index in backend_index {
+        let Some(block_number) = index.block_number else {
+            continue;
+        };
+        let Some((position, gas_price)) =
+            gas_prices.iter().enumerate().find(|(position, gas_price)| {
+                !used[*position]
+                    && gas_price.backend == index.backend
+                    && gas_price.block_number == block_number
+            })
+        else {
+            continue;
+        };
+        used[position] = true;
+        index.gas_price = Some(gas_price.clone());
+    }
+    if let Some(unused) = gas_prices
+        .iter()
+        .zip(used)
+        .find_map(|(gas_price, used)| (!used).then_some(gas_price))
+    {
+        anyhow::bail!(
+            "gas price metadata for backend {} block {} does not match the state history backend index",
+            unused.backend,
+            unused.block_number
+        );
+    }
+    Ok(())
+}
+
+fn backend_index_from_row(row: sqlx::postgres::PgRow) -> Result<CheckpointPayload> {
+    let backend: String = row.get("backend");
+    let backend = parse_backend_string(&backend)?;
+    let block_number = optional_i64_to_u64("block_number", row.get("block_number"))?;
+    Ok(CheckpointPayload {
+        backend,
+        block_number,
+        observed_timestamp_ms: optional_i64_to_u64(
+            "observed_timestamp_ms",
+            row.get("observed_timestamp_ms"),
+        )?,
+        gas_price: gas_price_metadata_from_row(&row, backend, block_number)?,
+    })
+}
+
+fn gas_price_metadata_from_row(
+    row: &sqlx::postgres::PgRow,
+    backend: BroadcasterBackend,
+    block_number: Option<u64>,
+) -> Result<Option<GasPriceMetadata>> {
+    let price_wei: Option<String> = row.get("gas_price_wei");
+    let Some(price_wei) = price_wei else {
+        return Ok(None);
+    };
+    let source: Option<String> = row.get("gas_price_source");
+    let block_number = block_number
+        .ok_or_else(|| anyhow!("state history gas metadata is missing its backend block number"))?;
+    Ok(Some(GasPriceMetadata {
+        backend,
+        block_number,
+        price_wei,
+        block_hash: row.get("gas_price_block_hash"),
+        block_timestamp_secs: optional_i64_to_u64(
+            "gas_price_block_timestamp_secs",
+            row.get("gas_price_block_timestamp_secs"),
+        )?,
+        source: GasPriceSource::from_str(
+            source
+                .as_deref()
+                .ok_or_else(|| anyhow!("state history gas metadata is missing its source"))?,
+        )?,
+    }))
+}
+
+fn parse_backend_string(value: &str) -> Result<BroadcasterBackend> {
+    match value {
+        "native" => Ok(BroadcasterBackend::Native),
+        "vm" => Ok(BroadcasterBackend::Vm),
+        "rfq" => Ok(BroadcasterBackend::Rfq),
+        _ => Err(anyhow!("unsupported backend scope value {value}")),
+    }
 }
 
 fn stored_delta_from_row(row: sqlx::postgres::PgRow) -> Result<StoredDeltaEntry> {
@@ -1696,6 +2135,7 @@ fn stored_delta_from_row(row: sqlx::postgres::PgRow) -> Result<StoredDeltaEntry>
             uncompressed_bytes: uncompressed.len(),
             compressed_bytes: payload_compressed.len(),
         },
+        backend_index: Vec::new(),
         entry,
     })
 }
@@ -1718,22 +2158,47 @@ pub fn checkpoint_s3_key(
     }
 }
 
-trait EntryCursorExt {
-    fn block_number_for_backend(&self, backend: BroadcasterBackend) -> Option<u64>;
-    fn observed_timestamp_for_backend(&self, backend: BroadcasterBackend) -> Option<u64>;
+fn entry_block_number_for_backend(
+    entry: &BroadcasterRedisStreamEntry,
+    payload: &BroadcasterPayload,
+    backend: BroadcasterBackend,
+) -> Option<u64> {
+    if !matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm) {
+        return None;
+    }
+    payload_block_number_for_backend(payload, backend).or(entry.block_number)
 }
 
-impl EntryCursorExt for BroadcasterRedisStreamEntry {
-    fn block_number_for_backend(&self, backend: BroadcasterBackend) -> Option<u64> {
-        matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm)
-            .then_some(self.block_number)
-            .flatten()
+fn entry_observed_timestamp_for_backend(
+    entry: &BroadcasterRedisStreamEntry,
+    payload: &BroadcasterPayload,
+    backend: BroadcasterBackend,
+) -> Option<u64> {
+    if backend != BroadcasterBackend::Rfq {
+        return None;
     }
+    payload_block_number_for_backend(payload, backend).or(entry.observed_timestamp_ms)
+}
 
-    fn observed_timestamp_for_backend(&self, backend: BroadcasterBackend) -> Option<u64> {
-        (backend == BroadcasterBackend::Rfq)
-            .then_some(self.observed_timestamp_ms)
-            .flatten()
+fn payload_block_number_for_backend(
+    payload: &BroadcasterPayload,
+    backend: BroadcasterBackend,
+) -> Option<u64> {
+    match payload {
+        BroadcasterPayload::Update(update) => update
+            .partitions
+            .iter()
+            .find(|partition| partition.backend == backend)
+            .map(|partition| partition.block_number),
+        BroadcasterPayload::Heartbeat(heartbeat) => heartbeat
+            .backend_heads
+            .iter()
+            .find(|head| head.backend == backend)
+            .map(|head| head.block_number),
+        BroadcasterPayload::Progress(_)
+        | BroadcasterPayload::SnapshotStart(_)
+        | BroadcasterPayload::SnapshotChunk(_)
+        | BroadcasterPayload::SnapshotEnd(_) => None,
     }
 }
 
@@ -1761,9 +2226,10 @@ mod tests {
 
     use super::{
         decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
-        ingestion_gap_for_entry, optional_u64_to_i64, prepare_delta_message, u64_to_i64,
-        writer_retry_backoff, CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest,
-        CheckpointPayload, CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap,
+        ingestion_gap_for_entry, optional_u64_to_i64, prepare_delta_message,
+        prepare_delta_message_with_gas_prices, u64_to_i64, writer_retry_backoff, CheckpointArchive,
+        CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload, CheckpointStatus,
+        DecodedCheckpointArchive, GasPriceMetadata, GasPriceSource, HistoryRangeGap,
         HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest, WRITER_RETRY_BACKOFF_CAP,
     };
 
@@ -1780,6 +2246,20 @@ mod tests {
                 stream_id: "stream-1".to_string(),
                 source_message_seq: 8,
                 backends: vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                backend_index: vec![
+                    CheckpointPayload {
+                        backend: BroadcasterBackend::Native,
+                        block_number: Some(123),
+                        observed_timestamp_ms: None,
+                        gas_price: None,
+                    },
+                    CheckpointPayload {
+                        backend: BroadcasterBackend::Rfq,
+                        block_number: None,
+                        observed_timestamp_ms: Some(456),
+                        gas_price: None,
+                    },
+                ],
             },
             payloads: vec![first.clone(), second.clone()],
         };
@@ -1799,6 +2279,49 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_archive_round_trips_with_gas_metadata() -> Result<()> {
+        let gas_price = gas_price(BroadcasterBackend::Native, 123, "1500000000");
+        let envelope = update_envelope("stream-1", 7, BroadcasterBackend::Native, 123)?;
+        let archive = CheckpointArchive {
+            metadata: CheckpointArchiveMetadata {
+                chain_id: 8453,
+                block_number: 123,
+                captured_at_timestamp_ms: 1_720_000_000_000,
+                rfq_update_timestamp_ms: None,
+                stream_id: "stream-1".to_string(),
+                source_message_seq: 7,
+                backends: vec![BroadcasterBackend::Native],
+                backend_index: vec![CheckpointPayload {
+                    backend: BroadcasterBackend::Native,
+                    block_number: Some(123),
+                    observed_timestamp_ms: None,
+                    gas_price: Some(gas_price.clone()),
+                }],
+            },
+            payloads: vec![envelope],
+        };
+
+        let decoded = encode_checkpoint_archive(&archive)?.decode()?;
+
+        assert_eq!(decoded.archive.metadata.backend_index.len(), 1);
+        assert_eq!(
+            decoded.archive.metadata.backend_index[0].gas_price.as_ref(),
+            Some(&gas_price)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gas_price_source_rejects_stream_header_until_tycho_exposes_base_fee() -> Result<()> {
+        assert!(GasPriceSource::from_str("stream_header").is_err());
+        assert_eq!(
+            GasPriceSource::from_str("rpc_block")?,
+            GasPriceSource::RpcBlock
+        );
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_decode_rejects_hash_mismatch() -> Result<()> {
         let envelope = update_envelope("stream-1", 7, BroadcasterBackend::Native, 123)?;
         let archive = CheckpointArchive {
@@ -1810,6 +2333,12 @@ mod tests {
                 stream_id: "stream-1".to_string(),
                 source_message_seq: 7,
                 backends: vec![BroadcasterBackend::Native],
+                backend_index: vec![CheckpointPayload {
+                    backend: BroadcasterBackend::Native,
+                    block_number: Some(123),
+                    observed_timestamp_ms: None,
+                    gas_price: None,
+                }],
             },
             payloads: vec![envelope],
         };
@@ -1836,6 +2365,7 @@ mod tests {
                 backend: BroadcasterBackend::Native,
                 block_number: Some(124),
                 observed_timestamp_ms: None,
+                gas_price: None,
             }]
         );
         assert_eq!(
@@ -1844,6 +2374,7 @@ mod tests {
                 backend: BroadcasterBackend::Rfq,
                 block_number: None,
                 observed_timestamp_ms: Some(789),
+                gas_price: None,
             }]
         );
 
@@ -1868,6 +2399,52 @@ mod tests {
         );
         assert_eq!(prepared.backend_scope, vec![BroadcasterBackend::Native]);
         assert_eq!(prepared.backend_index[0].block_number, Some(125));
+
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_delta_message_attaches_per_backend_gas_metadata() -> Result<()> {
+        let envelope = mixed_update_envelope("stream-1", 12, 125, 126)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+        let native_gas = gas_price(BroadcasterBackend::Native, 125, "1500000000");
+        let vm_gas = gas_price(BroadcasterBackend::Vm, 126, "1600000000");
+
+        let prepared = prepare_delta_message_with_gas_prices(
+            &entry,
+            Some("7-12"),
+            &[native_gas.clone(), vm_gas.clone()],
+        )?;
+
+        assert_eq!(prepared.backend_index.len(), 2);
+        assert_eq!(
+            prepared.backend_index[0].backend,
+            BroadcasterBackend::Native
+        );
+        assert_eq!(prepared.backend_index[0].block_number, Some(125));
+        assert_eq!(
+            prepared.backend_index[0].gas_price.as_ref(),
+            Some(&native_gas)
+        );
+        assert_eq!(prepared.backend_index[1].backend, BroadcasterBackend::Vm);
+        assert_eq!(prepared.backend_index[1].block_number, Some(126));
+        assert_eq!(prepared.backend_index[1].gas_price.as_ref(), Some(&vm_gas));
+
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_delta_message_allows_missing_gas_metadata_for_rfq() -> Result<()> {
+        let envelope = update_envelope("stream-1", 13, BroadcasterBackend::Rfq, 789)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        let prepared = prepare_delta_message_with_gas_prices(&entry, Some("7-13"), &[])?;
+
+        assert_eq!(prepared.backend_index.len(), 1);
+        assert_eq!(prepared.backend_index[0].backend, BroadcasterBackend::Rfq);
+        assert_eq!(prepared.backend_index[0].block_number, None);
+        assert_eq!(prepared.backend_index[0].observed_timestamp_ms, Some(789));
+        assert_eq!(prepared.backend_index[0].gas_price, None);
 
         Ok(())
     }
@@ -2047,6 +2624,20 @@ mod tests {
                 stream_id: "stream-1".to_string(),
                 source_message_seq: 42,
                 backends: vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                backend_index: vec![
+                    CheckpointPayload {
+                        backend: BroadcasterBackend::Native,
+                        block_number: Some(block_number),
+                        observed_timestamp_ms: None,
+                        gas_price: None,
+                    },
+                    CheckpointPayload {
+                        backend: BroadcasterBackend::Rfq,
+                        block_number: None,
+                        observed_timestamp_ms: rfq_update_timestamp_ms,
+                        gas_price: None,
+                    },
+                ],
             },
             s3_bucket: "state-history".to_string(),
             s3_key: "checkpoint.zst".to_string(),
@@ -2116,6 +2707,70 @@ mod tests {
             message_seq,
             simulator_core::broadcaster::BroadcasterPayload::Update(update),
         ))
+    }
+
+    fn mixed_update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        native_block_number: u64,
+        vm_block_number: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        let update = BroadcasterUpdateMessage::new(vec![
+            BroadcasterUpdatePartition::new(
+                BroadcasterBackend::Native,
+                native_block_number,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sync_statuses(BroadcasterBackend::Native),
+            ),
+            BroadcasterUpdatePartition::new(
+                BroadcasterBackend::Vm,
+                vm_block_number,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sync_statuses(BroadcasterBackend::Vm),
+            ),
+        ])?;
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        ))
+    }
+
+    fn gas_price(
+        backend: BroadcasterBackend,
+        block_number: u64,
+        price_wei: &str,
+    ) -> GasPriceMetadata {
+        GasPriceMetadata {
+            backend,
+            block_number,
+            price_wei: price_wei.to_string(),
+            block_hash: Some(format!("0x{block_number:064x}")),
+            block_timestamp_secs: Some(1_720_000_000),
+            source: GasPriceSource::RpcBlock,
+        }
+    }
+
+    fn sync_statuses(
+        backend: BroadcasterBackend,
+    ) -> BTreeMap<String, BroadcasterProtocolSyncStatus> {
+        let protocol = match backend {
+            BroadcasterBackend::Native => "uniswap_v2",
+            BroadcasterBackend::Vm => "vm:curve",
+            BroadcasterBackend::Rfq => "rfq:bebop",
+        };
+        BTreeMap::from([(
+            protocol.to_string(),
+            BroadcasterProtocolSyncStatus {
+                kind: BroadcasterProtocolSyncStatusKind::Started,
+                block: None,
+                reason: None,
+            },
+        )])
     }
 
     #[test]

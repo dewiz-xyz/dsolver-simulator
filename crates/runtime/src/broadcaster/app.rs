@@ -7,9 +7,11 @@ use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
 use state_history::{
-    S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore, StateHistoryWriter,
+    CheckpointArchive, S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore,
+    StateHistoryWriter,
 };
 
+use crate::broadcaster::gas_price::StateHistoryGasPriceProvider;
 use crate::broadcaster::redis_publisher::{
     BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, TokioRedisStreamWriter,
 };
@@ -178,6 +180,8 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
     let redis_publisher = build_redis_publisher(chain.id(), heartbeat_interval).await?;
     let (state_history, state_history_checkpoints) = build_state_history(&config).await?;
+    let gas_price_provider =
+        build_gas_price_provider(chain.id(), config.rpc_url.clone(), &state_history)?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -188,27 +192,29 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         .as_ref()
         .map(|_| BroadcasterUpstreamState::default());
     let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
-    let raw_service = BroadcasterServiceState::with_lifecycle_gate(
-        config.tuning.snapshot_max_payload_bytes,
+    let raw_service = build_broadcaster_state(
+        &config,
         raw_cache,
         raw_upstream_state,
-        Arc::clone(&redis_publisher),
-        Arc::clone(&publication_gate),
-    )
-    .with_state_history_writer(state_history.clone());
+        &redis_publisher,
+        &publication_gate,
+        &state_history,
+        &gas_price_provider,
+    );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
 
     let rfq_service =
         if let (Some(rfq_cache), Some(rfq_upstream_state)) = (rfq_cache, rfq_upstream_state) {
-            let service = BroadcasterServiceState::with_lifecycle_gate(
-                config.tuning.snapshot_max_payload_bytes,
+            let service = build_broadcaster_state(
+                &config,
                 rfq_cache,
                 rfq_upstream_state,
-                Arc::clone(&redis_publisher),
-                Arc::clone(&publication_gate),
-            )
-            .with_state_history_writer(state_history.clone());
+                &redis_publisher,
+                &publication_gate,
+                &state_history,
+                &gas_price_provider,
+            );
             let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
                 tokens: Arc::clone(&tokens),
                 chain,
@@ -233,27 +239,14 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         } else {
             None
         };
-    let generation_services = match &rfq_service {
-        Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
-        None => vec![raw_service.clone()],
-    };
-    // New broadcasters start passive and warm their caches first. This task is
-    // the local promotion loop; /status stays non-ready until it wins the fence.
-    spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
-    spawn_broadcaster_stream_task(
+    spawn_broadcaster_runtime_tasks(
         &config,
-        supervisor_cfg.clone(),
-        Arc::clone(&raw_health),
-        raw_service.clone(),
-        generation_services.clone(),
-        vec![raw_service.clone()],
-    );
-    spawn_heartbeat_task(generation_services, heartbeat_interval);
-    maybe_spawn_state_history_checkpoint_task(
-        &config,
+        supervisor_cfg,
+        raw_health,
         &raw_service,
         rfq_service.as_ref(),
         state_history_checkpoints.clone(),
+        gas_price_provider,
     );
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
     let app_state = BroadcasterAppState::with_snapshot_session_ttl(
@@ -268,6 +261,59 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     );
 
     Ok(BroadcasterServiceParts { config, app_state })
+}
+
+fn spawn_broadcaster_runtime_tasks(
+    config: &BroadcasterConfig,
+    supervisor_cfg: StreamSupervisorConfig,
+    raw_health: Arc<StreamHealth>,
+    raw_service: &BroadcasterServiceState,
+    rfq_service: Option<&BroadcasterServiceState>,
+    state_history_checkpoints: Option<StateHistoryCheckpointWriter>,
+    gas_price_provider: Option<StateHistoryGasPriceProvider>,
+) {
+    let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
+    let generation_services = match rfq_service {
+        Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
+        None => vec![raw_service.clone()],
+    };
+    spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
+    spawn_broadcaster_stream_task(
+        config,
+        supervisor_cfg,
+        raw_health,
+        raw_service.clone(),
+        generation_services.clone(),
+        vec![raw_service.clone()],
+    );
+    spawn_heartbeat_task(generation_services, heartbeat_interval);
+    maybe_spawn_state_history_checkpoint_task(
+        config,
+        raw_service,
+        rfq_service,
+        state_history_checkpoints,
+        gas_price_provider,
+    );
+}
+
+fn build_broadcaster_state(
+    config: &BroadcasterConfig,
+    cache: BroadcasterSnapshotCache,
+    upstream: BroadcasterUpstreamState,
+    redis_publisher: &Arc<BroadcasterRedisPublisher>,
+    publication_gate: &Arc<tokio::sync::Mutex<()>>,
+    state_history: &Option<StateHistoryWriter>,
+    gas_price_provider: &Option<StateHistoryGasPriceProvider>,
+) -> BroadcasterServiceState {
+    BroadcasterServiceState::with_lifecycle_gate(
+        config.tuning.snapshot_max_payload_bytes,
+        cache,
+        upstream,
+        Arc::clone(redis_publisher),
+        Arc::clone(publication_gate),
+    )
+    .with_state_history_writer(state_history.clone())
+    .with_state_history_gas_prices(gas_price_provider.clone())
 }
 
 async fn build_state_history(
@@ -294,9 +340,21 @@ async fn build_state_history(
     Ok((Some(writer), Some(checkpoints)))
 }
 
+fn build_gas_price_provider(
+    chain_id: u64,
+    rpc_url: Option<String>,
+    state_history: &Option<StateHistoryWriter>,
+) -> Result<Option<StateHistoryGasPriceProvider>> {
+    state_history
+        .as_ref()
+        .map(|_| StateHistoryGasPriceProvider::new(chain_id, rpc_url))
+        .transpose()
+}
+
 fn spawn_state_history_checkpoint_task(
     services: Vec<BroadcasterServiceState>,
     checkpoints: StateHistoryCheckpointWriter,
+    gas_price_provider: Option<StateHistoryGasPriceProvider>,
     checkpoint_block_interval: u64,
     poll_interval: Duration,
 ) {
@@ -318,7 +376,10 @@ fn spawn_state_history_checkpoint_task(
             match BroadcasterServiceState::create_state_history_checkpoint_for_services(&services)
                 .await
             {
-                Ok(Some(archive)) => {
+                Ok(Some(mut archive)) => {
+                    if let Some(provider) = &gas_price_provider {
+                        attach_checkpoint_gas_prices(&mut archive, provider).await;
+                    }
                     let block_number = archive.metadata.block_number;
                     match checkpoints.write_checkpoint(archive).await {
                         Ok(outcome) => {
@@ -358,6 +419,7 @@ fn maybe_spawn_state_history_checkpoint_task(
     raw_service: &BroadcasterServiceState,
     rfq_service: Option<&BroadcasterServiceState>,
     checkpoints: Option<StateHistoryCheckpointWriter>,
+    gas_price_provider: Option<StateHistoryGasPriceProvider>,
 ) {
     let (Some(checkpoints), Some(history_config)) = (checkpoints, config.state_history.as_ref())
     else {
@@ -370,9 +432,24 @@ fn maybe_spawn_state_history_checkpoint_task(
     spawn_state_history_checkpoint_task(
         services,
         checkpoints,
+        gas_price_provider,
         history_config.checkpoint_block_interval,
         Duration::from_secs(history_config.checkpoint_poll_interval_secs),
     );
+}
+
+async fn attach_checkpoint_gas_prices(
+    archive: &mut CheckpointArchive,
+    provider: &StateHistoryGasPriceProvider,
+) {
+    for index in &mut archive.metadata.backend_index {
+        let Some(block_number) = index.block_number else {
+            continue;
+        };
+        index.gas_price = provider
+            .gas_price_for_backend(index.backend, block_number)
+            .await;
+    }
 }
 
 async fn checkpoint_block_candidate(services: &[BroadcasterServiceState]) -> Option<u64> {
@@ -719,6 +796,7 @@ mod tests {
             hashflow_filename: "./hashflow.csv".to_string(),
             liquorice_url: None,
             api_key: "test-api-key".to_string(),
+            rpc_url: None,
             tvl_threshold: 100.0,
             tvl_keep_threshold: 20.0,
             port: 3001,
