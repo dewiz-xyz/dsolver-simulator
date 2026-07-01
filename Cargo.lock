@@ -5933,6 +5933,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simulator-core",
+ "state-history",
  "tokio",
  "tokio-stream",
  "tokio-util",
