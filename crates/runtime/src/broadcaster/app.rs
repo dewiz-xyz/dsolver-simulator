@@ -2,10 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::info;
+use tokio::time::sleep;
+use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
-use state_history::{StateHistoryPgStore, StateHistoryWriter};
+use state_history::{
+    S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore, StateHistoryWriter,
+};
 
 use crate::broadcaster::redis_publisher::{
     BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, TokioRedisStreamWriter,
@@ -42,12 +45,17 @@ pub struct BroadcasterAppState {
     rfq_service: Option<BroadcasterServiceState>,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
     state_history: Option<StateHistoryWriter>,
+    state_history_checkpoints: Option<StateHistoryCheckpointWriter>,
     tokens: Arc<TokenStore>,
     chain_id: u64,
     snapshot_session_ttl: Duration,
 }
 
 impl BroadcasterAppState {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "app state is assembled from independent runtime handles at startup"
+    )]
     pub fn with_snapshot_session_ttl(
         raw_service: BroadcasterServiceState,
         rfq_service: Option<BroadcasterServiceState>,
@@ -56,12 +64,14 @@ impl BroadcasterAppState {
         snapshot_session_ttl: Duration,
         redis_publisher: Arc<BroadcasterRedisPublisher>,
         state_history: Option<StateHistoryWriter>,
+        state_history_checkpoints: Option<StateHistoryCheckpointWriter>,
     ) -> Self {
         Self {
             raw_service,
             rfq_service,
             redis_publisher,
             state_history,
+            state_history_checkpoints,
             tokens,
             chain_id,
             snapshot_session_ttl,
@@ -103,7 +113,12 @@ impl BroadcasterAppState {
         }
         snapshot.redis_publisher = Some(redis_status);
         if let Some(state_history) = &self.state_history {
-            snapshot.state_history = Some(state_history.snapshot().await.into());
+            let mut state_history_status: crate::broadcaster::state::BroadcasterStateHistoryStatus =
+                state_history.snapshot().await.into();
+            if let Some(checkpoints) = &self.state_history_checkpoints {
+                state_history_status.checkpoints = Some(checkpoints.snapshot().await.into());
+            }
+            snapshot.state_history = Some(state_history_status);
         }
         snapshot
     }
@@ -162,7 +177,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
     let redis_publisher = build_redis_publisher(chain.id(), heartbeat_interval).await?;
-    let state_history = build_state_history_writer(&config).await?;
+    let (state_history, state_history_checkpoints) = build_state_history(&config).await?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -234,6 +249,12 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         vec![raw_service.clone()],
     );
     spawn_heartbeat_task(generation_services, heartbeat_interval);
+    maybe_spawn_state_history_checkpoint_task(
+        &config,
+        &raw_service,
+        rfq_service.as_ref(),
+        state_history_checkpoints.clone(),
+    );
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
     let app_state = BroadcasterAppState::with_snapshot_session_ttl(
         raw_service,
@@ -243,23 +264,141 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         snapshot_session_ttl,
         redis_publisher,
         state_history,
+        state_history_checkpoints,
     );
 
     Ok(BroadcasterServiceParts { config, app_state })
 }
 
-async fn build_state_history_writer(
+async fn build_state_history(
     config: &BroadcasterConfig,
-) -> Result<Option<StateHistoryWriter>> {
+) -> Result<(
+    Option<StateHistoryWriter>,
+    Option<StateHistoryCheckpointWriter>,
+)> {
     let Some(state_history) = &config.state_history else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let store = StateHistoryPgStore::connect(&state_history.database_url).await?;
     store.validate_schema().await?;
-    Ok(Some(StateHistoryWriter::spawn(
-        store,
-        state_history.writer.clone(),
-    )?))
+    let checkpoint_store = S3CheckpointStore::from_env_config(
+        &state_history.s3_region,
+        state_history.s3_bucket.clone(),
+        state_history.s3_endpoint_url.as_deref(),
+        state_history.s3_force_path_style,
+    )
+    .await?;
+    let writer = StateHistoryWriter::spawn(store.clone(), state_history.writer.clone())?;
+    let checkpoints =
+        StateHistoryCheckpointWriter::new(store, checkpoint_store, state_history.s3_prefix.clone());
+    Ok((Some(writer), Some(checkpoints)))
+}
+
+fn spawn_state_history_checkpoint_task(
+    services: Vec<BroadcasterServiceState>,
+    checkpoints: StateHistoryCheckpointWriter,
+    checkpoint_block_interval: u64,
+    poll_interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut last_checkpoint_block: Option<u64> = None;
+        loop {
+            sleep(poll_interval).await;
+            let Some(current_block) = checkpoint_block_candidate(&services).await else {
+                continue;
+            };
+            if !should_write_state_history_checkpoint(
+                last_checkpoint_block,
+                current_block,
+                checkpoint_block_interval,
+            ) {
+                continue;
+            }
+
+            match BroadcasterServiceState::create_state_history_checkpoint_for_services(&services)
+                .await
+            {
+                Ok(Some(archive)) => {
+                    let block_number = archive.metadata.block_number;
+                    match checkpoints.write_checkpoint(archive).await {
+                        Ok(outcome) => {
+                            last_checkpoint_block = Some(block_number);
+                            info!(
+                                event = "state_history_checkpoint_complete",
+                                block_number,
+                                s3_key = outcome.s3_key.as_str(),
+                                "State history checkpoint completed"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                event = "state_history_checkpoint_failed",
+                                block_number,
+                                error = %error,
+                                "State history checkpoint failed"
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        event = "state_history_checkpoint_capture_failed",
+                        error = %error,
+                        "State history checkpoint capture failed"
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn maybe_spawn_state_history_checkpoint_task(
+    config: &BroadcasterConfig,
+    raw_service: &BroadcasterServiceState,
+    rfq_service: Option<&BroadcasterServiceState>,
+    checkpoints: Option<StateHistoryCheckpointWriter>,
+) {
+    let (Some(checkpoints), Some(history_config)) = (checkpoints, config.state_history.as_ref())
+    else {
+        return;
+    };
+    let services = match rfq_service {
+        Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
+        None => vec![raw_service.clone()],
+    };
+    spawn_state_history_checkpoint_task(
+        services,
+        checkpoints,
+        history_config.checkpoint_block_interval,
+        Duration::from_secs(history_config.checkpoint_poll_interval_secs),
+    );
+}
+
+async fn checkpoint_block_candidate(services: &[BroadcasterServiceState]) -> Option<u64> {
+    let mut block_numbers = Vec::new();
+    for service in services {
+        let status = service.status_snapshot().await;
+        if status.readiness != BroadcasterReadiness::Ready {
+            return None;
+        }
+        block_numbers.extend(status.backends.iter().filter_map(|(backend, status)| {
+            matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm)
+                .then_some(status.block_number)
+                .flatten()
+        }));
+    }
+    block_numbers.into_iter().min()
+}
+
+fn should_write_state_history_checkpoint(
+    last_checkpoint_block: Option<u64>,
+    current_block: u64,
+    checkpoint_block_interval: u64,
+) -> bool {
+    last_checkpoint_block
+        .map(|last| current_block.saturating_sub(last) >= checkpoint_block_interval)
+        .unwrap_or(true)
 }
 
 fn combine_status_snapshots(
@@ -559,7 +698,9 @@ mod tests {
     use simulator_core::broadcaster::BroadcasterBackend;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
-    use super::{raw_configured_backends, rfq_configured_backends};
+    use super::{
+        raw_configured_backends, rfq_configured_backends, should_write_state_history_checkpoint,
+    };
     use crate::config::{BroadcasterConfig, BroadcasterTuning, ChainProfile, MemoryConfig};
 
     fn test_config() -> BroadcasterConfig {
@@ -643,5 +784,17 @@ mod tests {
         config.enable_rfq_pools = false;
 
         assert_eq!(rfq_configured_backends(&config), None);
+    }
+
+    #[test]
+    fn state_history_checkpoint_interval_is_measured_from_last_completed_block() {
+        assert!(should_write_state_history_checkpoint(None, 100, 500));
+        assert!(!should_write_state_history_checkpoint(Some(100), 599, 500));
+        assert!(should_write_state_history_checkpoint(Some(100), 600, 500));
+        assert!(!should_write_state_history_checkpoint(
+            Some(u64::MAX - 10),
+            u64::MAX,
+            500
+        ));
     }
 }

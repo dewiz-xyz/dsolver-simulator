@@ -714,6 +714,7 @@ mod tests {
             Duration::from_secs(300),
             publisher,
             None,
+            None,
         ))
     }
 
@@ -755,6 +756,7 @@ mod tests {
             Duration::from_secs(300),
             publisher,
             None,
+            None,
         ))
     }
 
@@ -783,6 +785,7 @@ mod tests {
             Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
+            None,
             None,
         ))
     }
@@ -820,6 +823,7 @@ mod tests {
             Duration::from_secs(300),
             old_publisher,
             None,
+            None,
         ))
     }
 
@@ -853,6 +857,7 @@ mod tests {
             Duration::from_secs(300),
             publisher,
             None,
+            None,
         ))
     }
 
@@ -875,6 +880,7 @@ mod tests {
             Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
+            None,
             None,
         ))
     }
@@ -899,6 +905,7 @@ mod tests {
             Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
+            None,
             None,
         ))
     }

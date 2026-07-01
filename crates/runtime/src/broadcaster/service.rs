@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
@@ -21,10 +21,10 @@ use crate::broadcaster::state::{
     BroadcasterUpstreamState,
 };
 use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
+    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
     BroadcasterRedisStreamEntry, BroadcasterSnapshotSessionResponse,
 };
-use state_history::StateHistoryWriter;
+use state_history::{CheckpointArchive, CheckpointArchiveMetadata, StateHistoryWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotSessionError {
@@ -537,6 +537,96 @@ impl BroadcasterServiceState {
             .map(Some)
     }
 
+    pub async fn create_state_history_checkpoint_for_services(
+        services: &[Self],
+    ) -> Result<Option<CheckpointArchive>> {
+        anyhow::ensure!(
+            !services.is_empty(),
+            "combined state history checkpoint requires at least one service"
+        );
+        ensure_shared_lifecycle(services, "combined state history checkpoint")?;
+
+        let _gate = services[0].lifecycle_gate.lock().await;
+        let mut chain_id = None;
+        let mut backends = Vec::new();
+        let mut block_numbers = Vec::new();
+        let mut exports = Vec::with_capacity(services.len());
+
+        for service in services {
+            let status = service.status_snapshot().await;
+            if status.readiness != BroadcasterReadiness::Ready {
+                return Ok(None);
+            }
+            match chain_id {
+                Some(expected) => anyhow::ensure!(
+                    status.chain_id == expected,
+                    "combined state history checkpoint chain_id mismatch: expected {expected}, found {}",
+                    status.chain_id
+                ),
+                None => chain_id = Some(status.chain_id),
+            }
+            for (backend, backend_status) in &status.backends {
+                backends.push(*backend);
+                if matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm) {
+                    if let Some(block_number) = backend_status.block_number {
+                        block_numbers.push(block_number);
+                    }
+                }
+            }
+            exports.push(
+                service
+                    .cache
+                    .export_snapshot(service.snapshot_max_payload_bytes)
+                    .await?,
+            );
+        }
+
+        let Some(block_number) = block_numbers.into_iter().min() else {
+            return Ok(None);
+        };
+        backends.sort();
+        backends.dedup();
+        let chain_id = chain_id
+            .ok_or_else(|| anyhow::anyhow!("combined state history checkpoint missing chain_id"))?;
+        let snapshot = combine_snapshot_exports(chain_id, exports)?;
+        let redis_replay_boundary = match services[0].redis_publisher.replay_boundary().await {
+            Ok(boundary) => boundary,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Refusing state history checkpoint without Redis replay boundary"
+                );
+                return Ok(None);
+            }
+        };
+        // Restore starts from this archive and then replays Redis deltas, so
+        // both sides must describe the same broadcaster generation.
+        anyhow::ensure!(
+            snapshot.stream_id == redis_replay_boundary.stream_id,
+            "snapshot stream_id mismatch with Redis replay boundary: snapshot={}, boundary={}",
+            snapshot.stream_id,
+            redis_replay_boundary.stream_id
+        );
+        anyhow::ensure!(
+            snapshot.snapshot_id == redis_replay_boundary.snapshot_id,
+            "snapshot_id mismatch with Redis replay boundary: snapshot={}, boundary={}",
+            snapshot.snapshot_id,
+            redis_replay_boundary.snapshot_id
+        );
+        let payloads = snapshot_payload_envelopes(snapshot)?;
+        Ok(Some(CheckpointArchive {
+            metadata: CheckpointArchiveMetadata {
+                chain_id,
+                block_number,
+                captured_at_timestamp_ms: current_timestamp_ms(),
+                stream_id: redis_replay_boundary.stream_id,
+                source_message_seq: redis_replay_boundary.exclusive_message_seq,
+                backends,
+            },
+            payloads,
+        }))
+    }
+
     pub async fn snapshot_session_payload(
         &self,
         session_id: u64,
@@ -632,6 +722,38 @@ fn ensure_shared_lifecycle(services: &[BroadcasterServiceState], context: &str) 
         "{context} requires one Redis publisher"
     );
     Ok(())
+}
+
+fn snapshot_payload_envelopes(
+    snapshot: BroadcasterSnapshotExport,
+) -> Result<Vec<BroadcasterEnvelope>> {
+    let mut message_seq = 1u64;
+    snapshot
+        .payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let envelope =
+                BroadcasterEnvelope::new(snapshot.stream_id.clone(), message_seq, payload);
+            message_seq = message_seq.saturating_add(1);
+            let bytes = serde_json::to_vec(&envelope)
+                .with_context(|| format!("checkpoint payload {index} is not JSON-serializable"))?;
+            anyhow::ensure!(
+                bytes.len() <= snapshot.max_payload_bytes,
+                "checkpoint payload {index} is {} bytes, above configured max {}",
+                bytes.len(),
+                snapshot.max_payload_bytes
+            );
+            Ok(envelope)
+        })
+        .collect()
+}
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -815,6 +937,60 @@ mod tests {
             .ok_or_else(|| anyhow!("active promoted broadcaster should serve a session"))?;
         assert_eq!(session.redis_replay_boundary, boundary);
         assert_eq!(writer.appends().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_history_checkpoint_captures_snapshot_payloads_and_boundary() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer),
+        ));
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "active_writer_promoted",
+        )
+        .await?;
+        service
+            .apply_update(&native_only_update(11, "native-2"))
+            .await?;
+
+        let checkpoint = BroadcasterServiceState::create_state_history_checkpoint_for_services(
+            std::slice::from_ref(&service),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("ready active service should export a checkpoint"))?;
+        let status = publisher.status_snapshot().await;
+
+        assert_eq!(checkpoint.metadata.chain_id, Chain::Ethereum.id());
+        assert_eq!(checkpoint.metadata.block_number, 11);
+        assert_eq!(checkpoint.metadata.stream_id, status.stream_id);
+        assert_eq!(checkpoint.metadata.source_message_seq, 2);
+        assert_eq!(
+            checkpoint.metadata.backends,
+            vec![BroadcasterBackend::Native]
+        );
+        assert_eq!(
+            checkpoint.payloads.first().map(BroadcasterEnvelope::kind),
+            Some(BroadcasterMessageKind::SnapshotStart)
+        );
+        assert_eq!(
+            checkpoint.payloads.last().map(BroadcasterEnvelope::kind),
+            Some(BroadcasterMessageKind::SnapshotEnd)
+        );
         Ok(())
     }
 
@@ -1705,6 +1881,34 @@ mod tests {
                 if start.snapshot_id == "chain-1-snapshot-2"
                     && start.backends == vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_history_checkpoint_rejects_snapshot_stream_id_boundary_mismatch() -> Result<()> {
+        let (raw_service, rfq_service, _writer, publisher) = ready_raw_and_rfq_services().await?;
+        publisher
+            .reset_generation_boundary(
+                "test_reset",
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+            )
+            .await?;
+
+        let Err(error) = BroadcasterServiceState::create_state_history_checkpoint_for_services(&[
+            raw_service,
+            rfq_service,
+        ])
+        .await
+        else {
+            return Err(anyhow!(
+                "state history checkpoint with mismatched Redis boundary should fail"
+            ));
+        };
+
+        assert!(
+            format!("{error:#}").contains("snapshot stream_id mismatch"),
+            "unexpected error: {error:#}"
+        );
         Ok(())
     }
 

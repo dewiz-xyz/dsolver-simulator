@@ -26,6 +26,7 @@ const DEFAULT_STATE_HISTORY_ENABLED: &str = "false";
 const DEFAULT_STATE_HISTORY_S3_PREFIX: &str = "state-history";
 const DEFAULT_STATE_HISTORY_S3_REGION: &str = "eu-central-1";
 const DEFAULT_STATE_HISTORY_S3_FORCE_PATH_STYLE: &str = "false";
+const DEFAULT_STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS: u64 = 30;
 
 /// Per-chain runtime profile resolved from `CHAIN_ID`.
 #[derive(Clone, Debug)]
@@ -348,8 +349,10 @@ pub struct StateHistoryConfig {
     pub s3_bucket: String,
     pub s3_prefix: String,
     pub s3_region: String,
-    pub s3_endpoint: Option<String>,
+    pub s3_endpoint_url: Option<String>,
     pub s3_force_path_style: bool,
+    pub checkpoint_block_interval: u64,
+    pub checkpoint_poll_interval_secs: u64,
     pub writer: StateHistoryWriterConfig,
 }
 
@@ -551,15 +554,22 @@ pub fn load_state_history_config() -> Option<StateHistoryConfig> {
     let s3_bucket = require_trimmed_env("STATE_HISTORY_S3_BUCKET");
     let s3_prefix = env_or_default("STATE_HISTORY_S3_PREFIX", DEFAULT_STATE_HISTORY_S3_PREFIX);
     let s3_region = env_or_default("STATE_HISTORY_S3_REGION", DEFAULT_STATE_HISTORY_S3_REGION);
-    let s3_endpoint = optional_trimmed_env("STATE_HISTORY_S3_ENDPOINT");
+    let s3_endpoint_url = optional_trimmed_env("STATE_HISTORY_S3_ENDPOINT_URL");
     let s3_force_path_style = parse_env_or_default(
         "STATE_HISTORY_S3_FORCE_PATH_STYLE",
         DEFAULT_STATE_HISTORY_S3_FORCE_PATH_STYLE,
     );
+    let checkpoint_block_interval = parse_value_or_panic(
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        &require_trimmed_env("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL"),
+    );
+    let checkpoint_poll_interval_secs =
+        optional_parsed_env("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS")
+            .unwrap_or(DEFAULT_STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS);
     let mut writer = StateHistoryWriterConfig::default();
     writer.queue_capacity =
-        optional_parsed_env("STATE_HISTORY_WRITER_QUEUE_CAPACITY").unwrap_or(writer.queue_capacity);
-    let retry_window_ms = optional_parsed_env("STATE_HISTORY_WRITER_RETRY_WINDOW_MS")
+        optional_parsed_env("STATE_HISTORY_QUEUE_CAPACITY").unwrap_or(writer.queue_capacity);
+    let retry_window_ms = optional_parsed_env("STATE_HISTORY_WRITE_RETRY_WINDOW_MS")
         .unwrap_or_else(|| {
             writer
                 .retry_window
@@ -571,11 +581,19 @@ pub fn load_state_history_config() -> Option<StateHistoryConfig> {
 
     assert!(
         writer.queue_capacity > 0,
-        "STATE_HISTORY_WRITER_QUEUE_CAPACITY must be > 0"
+        "STATE_HISTORY_QUEUE_CAPACITY must be > 0"
     );
     assert!(
         !writer.retry_window.is_zero(),
-        "STATE_HISTORY_WRITER_RETRY_WINDOW_MS must be > 0"
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"
+    );
+    assert!(
+        checkpoint_block_interval > 0,
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"
+    );
+    assert!(
+        checkpoint_poll_interval_secs > 0,
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"
     );
 
     Some(StateHistoryConfig {
@@ -583,8 +601,10 @@ pub fn load_state_history_config() -> Option<StateHistoryConfig> {
         s3_bucket,
         s3_prefix,
         s3_region,
-        s3_endpoint,
+        s3_endpoint_url,
         s3_force_path_style,
+        checkpoint_block_interval,
+        checkpoint_poll_interval_secs,
         writer,
     })
 }
@@ -896,16 +916,18 @@ mod tests {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         "BROADCASTER_REDIS_MAXLEN",
     ];
-    const STATE_HISTORY_ENV_KEYS: [&str; 9] = [
+    const STATE_HISTORY_ENV_KEYS: [&str; 11] = [
         "STATE_HISTORY_ENABLED",
         "STATE_HISTORY_DATABASE_URL",
         "STATE_HISTORY_S3_BUCKET",
         "STATE_HISTORY_S3_PREFIX",
         "STATE_HISTORY_S3_REGION",
-        "STATE_HISTORY_S3_ENDPOINT",
+        "STATE_HISTORY_S3_ENDPOINT_URL",
         "STATE_HISTORY_S3_FORCE_PATH_STYLE",
-        "STATE_HISTORY_WRITER_QUEUE_CAPACITY",
-        "STATE_HISTORY_WRITER_RETRY_WINDOW_MS",
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS",
+        "STATE_HISTORY_QUEUE_CAPACITY",
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS",
     ];
     const RFQ_CREDENTIAL_ENV_KEYS: [&str; 6] = [
         "BEBOP_USER",
@@ -1796,10 +1818,12 @@ route_policy = " default "
             std::env::set_var("STATE_HISTORY_S3_BUCKET", "state-history");
             std::env::set_var("STATE_HISTORY_S3_PREFIX", "local-history");
             std::env::set_var("STATE_HISTORY_S3_REGION", "us-east-1");
-            std::env::set_var("STATE_HISTORY_S3_ENDPOINT", "http://127.0.0.1:9000");
+            std::env::set_var("STATE_HISTORY_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
             std::env::set_var("STATE_HISTORY_S3_FORCE_PATH_STYLE", "true");
-            std::env::set_var("STATE_HISTORY_WRITER_QUEUE_CAPACITY", "64");
-            std::env::set_var("STATE_HISTORY_WRITER_RETRY_WINDOW_MS", "250");
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL", "500");
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "3");
+            std::env::set_var("STATE_HISTORY_QUEUE_CAPACITY", "64");
+            std::env::set_var("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "250");
             load_state_history_config()
         })
         .unwrap_or_else(|| unreachable!("state history config should be enabled"));
@@ -1811,8 +1835,13 @@ route_policy = " default "
         assert_eq!(config.s3_bucket, "state-history");
         assert_eq!(config.s3_prefix, "local-history");
         assert_eq!(config.s3_region, "us-east-1");
-        assert_eq!(config.s3_endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(
+            config.s3_endpoint_url.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
         assert!(config.s3_force_path_style);
+        assert_eq!(config.checkpoint_block_interval, 500);
+        assert_eq!(config.checkpoint_poll_interval_secs, 3);
         assert_eq!(config.writer.queue_capacity, 64);
         assert_eq!(config.writer.retry_window, Duration::from_millis(250));
     }

@@ -270,6 +270,28 @@ pub struct StateHistoryWriterSnapshot {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateHistoryCheckpointWriterSnapshot {
+    pub healthy: bool,
+    pub attempted_checkpoints: u64,
+    pub completed_checkpoints: u64,
+    pub failed_checkpoints: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_s3_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointWriteOutcome {
+    pub manifest_id: i64,
+    pub s3_key: String,
+    pub payload: EncodedPayload,
+}
+
 #[derive(Clone)]
 pub struct StateHistoryWriter {
     sender: mpsc::Sender<StateHistoryWriteCommand>,
@@ -284,6 +306,14 @@ impl fmt::Debug for StateHistoryWriter {
             .field("queue_capacity", &self.sender.max_capacity())
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Clone)]
+pub struct StateHistoryCheckpointWriter {
+    pg_store: StateHistoryPgStore,
+    checkpoint_store: S3CheckpointStore,
+    s3_prefix: String,
+    status: Arc<RwLock<StateHistoryCheckpointWriterSnapshot>>,
 }
 
 #[derive(Debug)]
@@ -1133,6 +1163,124 @@ impl StateHistoryReader {
         self.checkpoint_store
             .get_checkpoint_archive(&manifest.s3_key, manifest.payload_hash.as_deref())
             .await
+    }
+}
+
+impl StateHistoryCheckpointWriter {
+    pub fn new(
+        pg_store: StateHistoryPgStore,
+        checkpoint_store: S3CheckpointStore,
+        s3_prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            pg_store,
+            checkpoint_store,
+            s3_prefix: s3_prefix.into(),
+            status: Arc::new(RwLock::new(StateHistoryCheckpointWriterSnapshot {
+                healthy: true,
+                ..StateHistoryCheckpointWriterSnapshot::default()
+            })),
+        }
+    }
+
+    pub async fn write_checkpoint(
+        &self,
+        archive: CheckpointArchive,
+    ) -> Result<CheckpointWriteOutcome> {
+        anyhow::ensure!(
+            !archive.metadata.backends.is_empty(),
+            "state history checkpoint backend scope must not be empty"
+        );
+        let s3_key = checkpoint_s3_key(
+            &self.s3_prefix,
+            archive.metadata.chain_id,
+            archive.metadata.block_number,
+            archive.metadata.captured_at_timestamp_ms,
+            &archive.metadata.stream_id,
+        );
+        let input = CheckpointManifestInput {
+            metadata: archive.metadata.clone(),
+            s3_bucket: self.checkpoint_store.bucket().to_string(),
+            s3_key: s3_key.clone(),
+        };
+        let manifest_id = match self.pg_store.create_checkpoint_manifest(&input).await {
+            Ok(manifest_id) => manifest_id,
+            Err(error) => {
+                self.record_checkpoint_failure(
+                    Some(archive.metadata.block_number),
+                    error.to_string(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        {
+            let mut status = self.status.write().await;
+            status.attempted_checkpoints = status.attempted_checkpoints.saturating_add(1);
+        }
+
+        let encoded = match self
+            .checkpoint_store
+            .put_checkpoint_archive(&s3_key, &archive)
+            .await
+        {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let message = format!("{error:#}");
+                let _ = self
+                    .pg_store
+                    .mark_checkpoint_failed(manifest_id, &message)
+                    .await;
+                self.record_checkpoint_failure(Some(archive.metadata.block_number), message)
+                    .await;
+                return Err(error);
+            }
+        };
+        let completion = CheckpointCompletion {
+            payload_hash: encoded.payload.hash.clone(),
+            payload_bytes: encoded.payload.uncompressed_bytes,
+            compressed_bytes: encoded.payload.compressed_bytes,
+            first_delta_id_after: None,
+        };
+        if let Err(error) = self
+            .pg_store
+            .mark_checkpoint_complete(manifest_id, &completion)
+            .await
+        {
+            let message = format!("{error:#}");
+            let _ = self
+                .pg_store
+                .mark_checkpoint_failed(manifest_id, &message)
+                .await;
+            self.record_checkpoint_failure(Some(archive.metadata.block_number), message)
+                .await;
+            return Err(error);
+        }
+
+        let mut status = self.status.write().await;
+        status.healthy = true;
+        status.completed_checkpoints = status.completed_checkpoints.saturating_add(1);
+        status.last_checkpoint_block_number = Some(archive.metadata.block_number);
+        status.last_checkpoint_s3_key = Some(s3_key.clone());
+        status.last_error = None;
+
+        Ok(CheckpointWriteOutcome {
+            manifest_id,
+            s3_key,
+            payload: encoded.payload,
+        })
+    }
+
+    pub async fn snapshot(&self) -> StateHistoryCheckpointWriterSnapshot {
+        self.status.read().await.clone()
+    }
+
+    async fn record_checkpoint_failure(&self, block_number: Option<u64>, message: String) {
+        let mut status = self.status.write().await;
+        status.healthy = false;
+        status.failed_checkpoints = status.failed_checkpoints.saturating_add(1);
+        status.last_checkpoint_block_number = block_number;
+        status.last_error = Some(message);
     }
 }
 

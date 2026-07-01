@@ -21,7 +21,7 @@ use simulator_core::broadcaster::{
 };
 
 use super::redis_publisher::BroadcasterRedisPublisherStatus;
-use state_history::StateHistoryWriterSnapshot;
+use state_history::{StateHistoryCheckpointWriterSnapshot, StateHistoryWriterSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BroadcasterReadiness {
@@ -72,6 +72,18 @@ pub struct BroadcasterStateHistoryStatus {
     pub last_persisted_redis_entry_id: Option<String>,
     pub last_persisted_message_seq: Option<u64>,
     pub last_error: Option<String>,
+    pub checkpoints: Option<BroadcasterStateHistoryCheckpointStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BroadcasterStateHistoryCheckpointStatus {
+    pub healthy: bool,
+    pub attempted_checkpoints: u64,
+    pub completed_checkpoints: u64,
+    pub failed_checkpoints: u64,
+    pub last_checkpoint_block_number: Option<u64>,
+    pub last_checkpoint_s3_key: Option<String>,
+    pub last_error: Option<String>,
 }
 
 impl From<StateHistoryWriterSnapshot> for BroadcasterStateHistoryStatus {
@@ -88,6 +100,21 @@ impl From<StateHistoryWriterSnapshot> for BroadcasterStateHistoryStatus {
             last_persisted_stream_id: snapshot.last_persisted_stream_id,
             last_persisted_redis_entry_id: snapshot.last_persisted_redis_entry_id,
             last_persisted_message_seq: snapshot.last_persisted_message_seq,
+            last_error: snapshot.last_error,
+            checkpoints: None,
+        }
+    }
+}
+
+impl From<StateHistoryCheckpointWriterSnapshot> for BroadcasterStateHistoryCheckpointStatus {
+    fn from(snapshot: StateHistoryCheckpointWriterSnapshot) -> Self {
+        Self {
+            healthy: snapshot.healthy,
+            attempted_checkpoints: snapshot.attempted_checkpoints,
+            completed_checkpoints: snapshot.completed_checkpoints,
+            failed_checkpoints: snapshot.failed_checkpoints,
+            last_checkpoint_block_number: snapshot.last_checkpoint_block_number,
+            last_checkpoint_s3_key: snapshot.last_checkpoint_s3_key,
             last_error: snapshot.last_error,
         }
     }

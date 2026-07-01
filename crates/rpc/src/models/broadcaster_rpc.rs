@@ -65,6 +65,22 @@ pub struct BroadcasterStateHistoryPayload {
     pub last_persisted_message_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<BroadcasterStateHistoryCheckpointPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterStateHistoryCheckpointPayload {
+    pub healthy: bool,
+    pub attempted_checkpoints: u64,
+    pub completed_checkpoints: u64,
+    pub failed_checkpoints: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_s3_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 impl From<BroadcasterStateHistoryStatus> for BroadcasterStateHistoryPayload {
@@ -82,6 +98,17 @@ impl From<BroadcasterStateHistoryStatus> for BroadcasterStateHistoryPayload {
             last_persisted_redis_entry_id: status.last_persisted_redis_entry_id,
             last_persisted_message_seq: status.last_persisted_message_seq,
             last_error: status.last_error,
+            checkpoints: status.checkpoints.map(|checkpoints| {
+                BroadcasterStateHistoryCheckpointPayload {
+                    healthy: checkpoints.healthy,
+                    attempted_checkpoints: checkpoints.attempted_checkpoints,
+                    completed_checkpoints: checkpoints.completed_checkpoints,
+                    failed_checkpoints: checkpoints.failed_checkpoints,
+                    last_checkpoint_block_number: checkpoints.last_checkpoint_block_number,
+                    last_checkpoint_s3_key: checkpoints.last_checkpoint_s3_key,
+                    last_error: checkpoints.last_error,
+                }
+            }),
         }
     }
 }
