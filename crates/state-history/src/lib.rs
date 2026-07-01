@@ -1,6 +1,8 @@
 use std::io::Cursor;
 
 use anyhow::{anyhow, Context, Result};
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::{
@@ -165,6 +167,12 @@ pub struct StateHistoryPgStore {
     pool: PgPool,
 }
 
+#[derive(Clone)]
+pub struct S3CheckpointStore {
+    client: S3Client,
+    bucket: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckpointArchiveWire {
@@ -175,34 +183,7 @@ struct CheckpointArchiveWire {
 
 impl EncodedCheckpointArchive {
     pub fn decode(&self) -> Result<DecodedCheckpointArchive> {
-        let uncompressed = zstd::stream::decode_all(Cursor::new(&self.bytes))
-            .context("failed to decompress checkpoint archive")?;
-        let hash = sha256_hex(&uncompressed);
-        anyhow::ensure!(
-            hash == self.payload.hash,
-            "checkpoint archive hash mismatch: expected {}, decoded {}",
-            self.payload.hash,
-            hash
-        );
-        let wire: CheckpointArchiveWire = serde_json::from_slice(&uncompressed)
-            .context("failed to deserialize checkpoint archive")?;
-        anyhow::ensure!(
-            wire.schema_version == CHECKPOINT_ARCHIVE_SCHEMA_VERSION,
-            "unsupported checkpoint archive schema version {}",
-            wire.schema_version
-        );
-        Ok(DecodedCheckpointArchive {
-            archive: CheckpointArchive {
-                metadata: wire.metadata,
-                payloads: wire.payloads,
-            },
-            payload: EncodedPayload {
-                encoding: PayloadEncoding::JsonZstd,
-                hash,
-                uncompressed_bytes: uncompressed.len(),
-                compressed_bytes: self.bytes.len(),
-            },
-        })
+        decode_checkpoint_archive_bytes(self.bytes.clone(), Some(&self.payload.hash))
     }
 }
 
@@ -225,6 +206,40 @@ pub fn encode_checkpoint_archive(archive: &CheckpointArchive) -> Result<EncodedC
             hash,
             uncompressed_bytes: json.len(),
             compressed_bytes,
+        },
+    })
+}
+
+pub fn decode_checkpoint_archive_bytes(
+    bytes: Vec<u8>,
+    expected_hash: Option<&str>,
+) -> Result<DecodedCheckpointArchive> {
+    let uncompressed = zstd::stream::decode_all(Cursor::new(&bytes))
+        .context("failed to decompress checkpoint archive")?;
+    let hash = sha256_hex(&uncompressed);
+    if let Some(expected_hash) = expected_hash {
+        anyhow::ensure!(
+            hash == expected_hash,
+            "checkpoint archive hash mismatch: expected {expected_hash}, decoded {hash}"
+        );
+    }
+    let wire: CheckpointArchiveWire = serde_json::from_slice(&uncompressed)
+        .context("failed to deserialize checkpoint archive")?;
+    anyhow::ensure!(
+        wire.schema_version == CHECKPOINT_ARCHIVE_SCHEMA_VERSION,
+        "unsupported checkpoint archive schema version {}",
+        wire.schema_version
+    );
+    Ok(DecodedCheckpointArchive {
+        archive: CheckpointArchive {
+            metadata: wire.metadata,
+            payloads: wire.payloads,
+        },
+        payload: EncodedPayload {
+            encoding: PayloadEncoding::JsonZstd,
+            hash,
+            uncompressed_bytes: uncompressed.len(),
+            compressed_bytes: bytes.len(),
         },
     })
 }
@@ -557,6 +572,77 @@ impl StateHistoryPgStore {
     }
 }
 
+impl S3CheckpointStore {
+    pub fn new(client: S3Client, bucket: impl Into<String>) -> Self {
+        Self {
+            client,
+            bucket: bucket.into(),
+        }
+    }
+
+    pub async fn from_env_config(
+        region: &str,
+        bucket: impl Into<String>,
+        endpoint_url: Option<&str>,
+        force_path_style: bool,
+    ) -> Result<Self> {
+        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(region.to_string()))
+            .load()
+            .await;
+        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config);
+        if let Some(endpoint_url) = endpoint_url {
+            builder = builder.endpoint_url(endpoint_url);
+        }
+        builder = builder.force_path_style(force_path_style);
+        Ok(Self::new(S3Client::from_conf(builder.build()), bucket))
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub async fn put_checkpoint_archive(
+        &self,
+        key: &str,
+        archive: &CheckpointArchive,
+    ) -> Result<EncodedCheckpointArchive> {
+        let encoded = encode_checkpoint_archive(archive)?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(encoded.bytes.clone()))
+            .send()
+            .await
+            .with_context(|| format!("failed to upload state history checkpoint {key}"))?;
+        Ok(encoded)
+    }
+
+    pub async fn get_checkpoint_archive(
+        &self,
+        key: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<DecodedCheckpointArchive> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch state history checkpoint {key}"))?;
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("failed to read state history checkpoint {key}"))?
+            .into_bytes()
+            .to_vec();
+        decode_checkpoint_archive_bytes(bytes, expected_hash)
+    }
+}
+
 fn parse_backend_scope(scope: &str) -> Result<Vec<BroadcasterBackend>> {
     anyhow::ensure!(!scope.trim().is_empty(), "backend scope must not be empty");
     let mut backends = Vec::new();
@@ -693,9 +779,9 @@ mod tests {
     };
 
     use super::{
-        encode_checkpoint_archive, indexed_backends_for_entry, optional_u64_to_i64,
-        prepare_delta_message, u64_to_i64, CheckpointArchive, CheckpointArchiveMetadata,
-        CheckpointPayload, DecodedCheckpointArchive,
+        decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
+        optional_u64_to_i64, prepare_delta_message, u64_to_i64, CheckpointArchive,
+        CheckpointArchiveMetadata, CheckpointPayload, DecodedCheckpointArchive,
     };
 
     #[test]
@@ -725,6 +811,30 @@ mod tests {
         assert_eq!(decoded.payload.compressed_bytes, encoded.bytes.len());
         assert!(decoded.payload.uncompressed_bytes > 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_decode_rejects_hash_mismatch() -> Result<()> {
+        let envelope = update_envelope("stream-1", 7, BroadcasterBackend::Native, 123)?;
+        let archive = CheckpointArchive {
+            metadata: CheckpointArchiveMetadata {
+                chain_id: 8453,
+                block_number: 123,
+                captured_at_timestamp_ms: 1_720_000_000_000,
+                stream_id: "stream-1".to_string(),
+                source_message_seq: 7,
+                backends: vec![BroadcasterBackend::Native],
+            },
+            payloads: vec![envelope],
+        };
+        let encoded = encode_checkpoint_archive(&archive)?;
+
+        let error = decode_checkpoint_archive_bytes(encoded.bytes, Some("wrong-hash"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("hash mismatch should fail"))?;
+
+        assert!(error.to_string().contains("hash mismatch"));
         Ok(())
     }
 
