@@ -378,7 +378,7 @@ impl HistoryRangeRequest {
         Ok(self)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         self.validate_shape()?;
         if self.backends.contains(&BroadcasterBackend::Rfq) {
             let start = self
@@ -434,16 +434,18 @@ impl HistoryRangeRequest {
             .unwrap_or(self.start_block_number)
     }
 
-    fn rfq_replay_from_timestamp_ms(
-        &self,
-        checkpoint: Option<&CheckpointManifest>,
-    ) -> Option<u64> {
+    fn rfq_replay_from_timestamp_ms(&self, checkpoint: Option<&CheckpointManifest>) -> Option<u64> {
         if !self.includes_rfq() {
             return None;
         }
         Some(
             checkpoint
-                .map(|checkpoint| checkpoint.metadata.captured_at_timestamp_ms.saturating_add(1))
+                .map(|checkpoint| {
+                    checkpoint
+                        .metadata
+                        .captured_at_timestamp_ms
+                        .saturating_add(1)
+                })
                 .unwrap_or(self.rfq_start_timestamp_ms.unwrap_or_default()),
         )
     }
@@ -775,8 +777,15 @@ impl StateHistoryPgStore {
                 &request.backends,
             )
             .await?;
+        let replay_from_block_number = request.replay_from_block_number(checkpoint.as_ref());
+        let rfq_replay_from_timestamp_ms =
+            request.rfq_replay_from_timestamp_ms(checkpoint.as_ref());
         let mut gaps = self
-            .recorded_gaps_for_range(&request)
+            .recorded_gaps_for_range(
+                &request,
+                replay_from_block_number,
+                rfq_replay_from_timestamp_ms,
+            )
             .await
             .context("failed to load state history gaps for range")?;
         if request.require_checkpoint && checkpoint.is_none() {
@@ -791,12 +800,19 @@ impl StateHistoryPgStore {
             });
         }
         let deltas = self
-            .deltas_for_range(&request, checkpoint.as_ref())
+            .deltas_for_range(
+                &request,
+                checkpoint.as_ref(),
+                replay_from_block_number,
+                rfq_replay_from_timestamp_ms,
+            )
             .await
             .context("failed to load state history deltas for range")?;
         Ok(HistoryRangePlan {
             request,
             checkpoint,
+            replay_from_block_number,
+            rfq_replay_from_timestamp_ms,
             deltas,
             gaps,
         })
@@ -806,14 +822,10 @@ impl StateHistoryPgStore {
         &self,
         request: &HistoryRangeRequest,
         checkpoint: Option<&CheckpointManifest>,
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Vec<StoredDeltaEntry>> {
         let block_backends = request.block_backends();
-        let block_start = checkpoint
-            .map(|checkpoint| checkpoint.metadata.block_number)
-            .unwrap_or(request.start_block_number);
-        let rfq_start = checkpoint
-            .map(|checkpoint| checkpoint.metadata.captured_at_timestamp_ms)
-            .or(request.rfq_start_timestamp_ms);
         let first_delta_id_after =
             checkpoint.and_then(|checkpoint| checkpoint.first_delta_id_after);
         let rows = sqlx::query(
@@ -848,10 +860,16 @@ impl StateHistoryPgStore {
         )
         .bind(u64_to_i64("chain_id", request.chain_id)?)
         .bind(backend_scope_strings(&block_backends))
-        .bind(u64_to_i64("start_block_number", block_start)?)
+        .bind(u64_to_i64(
+            "replay_from_block_number",
+            replay_from_block_number,
+        )?)
         .bind(u64_to_i64("end_block_number", request.end_block_number)?)
         .bind(request.includes_rfq())
-        .bind(optional_u64_to_i64("rfq_start_timestamp_ms", rfq_start)?.unwrap_or(0))
+        .bind(
+            optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
+                .unwrap_or(0),
+        )
         .bind(
             optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
         )
@@ -867,6 +885,8 @@ impl StateHistoryPgStore {
     async fn recorded_gaps_for_range(
         &self,
         request: &HistoryRangeRequest,
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Vec<HistoryRangeGap>> {
         let rows = sqlx::query(
             r#"
@@ -903,15 +923,15 @@ impl StateHistoryPgStore {
         .bind(backend_scope_strings(&request.backends))
         .bind(u64_to_i64("end_block_number", request.end_block_number)?)
         .bind(u64_to_i64(
-            "start_block_number",
-            request.start_block_number,
+            "replay_from_block_number",
+            replay_from_block_number,
         )?)
         .bind(request.includes_rfq())
         .bind(
             optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
         )
         .bind(
-            optional_u64_to_i64("rfq_start_timestamp_ms", request.rfq_start_timestamp_ms)?
+            optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
                 .unwrap_or(0),
         )
         .fetch_all(&self.pool)
@@ -1377,9 +1397,12 @@ mod tests {
     #[test]
     fn history_range_plan_reports_gaps_without_failing_construction() -> Result<()> {
         let request = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Native])?;
+        let replay_from_block_number = request.start_block_number;
         let plan = HistoryRangePlan {
             request,
             checkpoint: None,
+            replay_from_block_number,
+            rfq_replay_from_timestamp_ms: None,
             deltas: Vec::new(),
             gaps: vec![HistoryRangeGap {
                 source: HistoryRangeGapSource::MissingCheckpoint,
@@ -1404,9 +1427,12 @@ mod tests {
     #[test]
     fn history_range_plan_accepts_gap_free_ranges() -> Result<()> {
         let request = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Native])?;
+        let replay_from_block_number = request.start_block_number;
         let plan = HistoryRangePlan {
             request,
             checkpoint: None,
+            replay_from_block_number,
+            rfq_replay_from_timestamp_ms: None,
             deltas: Vec::new(),
             gaps: Vec::new(),
         };
