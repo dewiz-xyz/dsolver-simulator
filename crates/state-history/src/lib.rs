@@ -189,6 +189,7 @@ pub struct HistoryRangeGap {
 pub enum HistoryRangeGapSource {
     MissingCheckpoint,
     RecordedGap,
+    GenerationSwitch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -899,7 +900,20 @@ impl StateHistoryPgStore {
             )
             .await
             .context("failed to load state history gaps for range")?;
-        if checkpoint.is_none() {
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            if let Some(gap) = self
+                .generation_switch_gap_for_range(
+                    &request,
+                    checkpoint,
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await
+                .context("failed to detect state history generation switches")?
+            {
+                gaps.push(gap);
+            }
+        } else {
             gaps.push(HistoryRangeGap {
                 source: HistoryRangeGapSource::MissingCheckpoint,
                 backend_scope: request.backends.clone(),
@@ -1092,6 +1106,72 @@ impl StateHistoryPgStore {
                 })
             })
             .collect::<Result<Vec<_>>>()
+    }
+
+    async fn generation_switch_gap_for_range(
+        &self,
+        request: &HistoryRangeRequest,
+        checkpoint: &CheckpointManifest,
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
+    ) -> Result<Option<HistoryRangeGap>> {
+        let block_backends = request.block_backends();
+        let switched_stream_exists = sqlx::query_scalar::<_, i32>(
+            r#"
+            SELECT 1
+            FROM state_history.delta_backend_index idx
+            JOIN state_history.delta_messages d ON d.id = idx.delta_id
+            WHERE idx.chain_id = $1
+                AND d.stream_id <> $8
+                AND (
+                    (
+                        idx.backend = ANY($2::text[])
+                        AND idx.block_number IS NOT NULL
+                        AND idx.block_number >= $3
+                        AND idx.block_number <= $4
+                    )
+                    OR (
+                        $5::boolean
+                        AND idx.backend = 'rfq'
+                        AND idx.observed_timestamp_ms IS NOT NULL
+                        AND idx.observed_timestamp_ms >= $6
+                        AND idx.observed_timestamp_ms <= $7
+                    )
+                )
+            LIMIT 1
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(backend_scope_strings(&block_backends))
+        .bind(u64_to_i64(
+            "replay_from_block_number",
+            replay_from_block_number,
+        )?)
+        .bind(u64_to_i64("end_block_number", request.end_block_number)?)
+        .bind(request.includes_rfq())
+        .bind(
+            optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
+                .unwrap_or(0),
+        )
+        .bind(
+            optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
+        )
+        .bind(&checkpoint.metadata.stream_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(switched_stream_exists.map(|_| HistoryRangeGap {
+            source: HistoryRangeGapSource::GenerationSwitch,
+            backend_scope: request.backends.clone(),
+            from_block_number: Some(request.start_block_number),
+            to_block_number: Some(request.end_block_number),
+            from_timestamp_ms: request.rfq_start_timestamp_ms,
+            to_timestamp_ms: request.rfq_end_timestamp_ms,
+            reason: format!(
+                "Redis stream generation changed after checkpoint stream {}; replay needs a new checkpoint",
+                checkpoint.metadata.stream_id
+            ),
+        }))
     }
 }
 

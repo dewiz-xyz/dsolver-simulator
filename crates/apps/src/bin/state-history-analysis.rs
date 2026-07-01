@@ -13,9 +13,9 @@ use simulator_core::broadcaster::{
     BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 use state_history::{
-    CheckpointArchive, CheckpointArchiveMetadata, HistoryRangePlan, HistoryRangeRequest,
-    IngestionGap, S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore,
-    StateHistoryReader,
+    CheckpointArchive, CheckpointArchiveMetadata, HistoryRangeGapSource, HistoryRangePlan,
+    HistoryRangeRequest, IngestionGap, S3CheckpointStore, StateHistoryCheckpointWriter,
+    StateHistoryPgStore, StateHistoryReader,
 };
 
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:55432/state_history";
@@ -71,7 +71,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
     let request = synthetic_history_request(chain_id, rfq_cursor_timestamp_ms)?;
     record_pre_checkpoint_gap(&pg_store, chain_id, &stream_id).await?;
     let plan = reader.resolve_range(request.clone()).await?;
-    plan.ensure_gap_free()?;
+    let generation_switch_gaps = assert_generation_switch_gap(&plan)?;
     let selected_checkpoint = plan
         .checkpoint
         .as_ref()
@@ -86,10 +86,15 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
 
     record_visible_gap_fixtures(&pg_store, chain_id, &stream_id, &stale_stream_id).await?;
     let gap_plan = reader.resolve_range(request).await?;
+    let recorded_gaps = gap_plan
+        .gaps
+        .iter()
+        .filter(|gap| gap.source == HistoryRangeGapSource::RecordedGap)
+        .count();
     anyhow::ensure!(
-        gap_plan.gaps.len() == 1,
+        recorded_gaps == 1,
         "expected one recorded synthetic gap, got {}",
-        gap_plan.gaps.len()
+        recorded_gaps
     );
 
     Ok(StateHistoryAnalysisReport {
@@ -102,7 +107,8 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         checkpoint_s3_key: checkpoint.s3_key,
         checkpoint_payload_hash: checkpoint.payload.hash,
         decoded_checkpoint_payloads: decoded.archive.payloads.len(),
-        recorded_gaps: gap_plan.gaps.len(),
+        recorded_gaps,
+        generation_switch_gaps,
     })
 }
 
@@ -169,6 +175,19 @@ fn assert_replay_plan(plan: &HistoryRangePlan, stream_id: &str) -> Result<Vec<u6
         "reader replayed a delta from outside the checkpoint stream"
     );
     Ok(replayed_message_sequences)
+}
+
+fn assert_generation_switch_gap(plan: &HistoryRangePlan) -> Result<usize> {
+    let generation_switch_gaps = plan
+        .gaps
+        .iter()
+        .filter(|gap| gap.source == HistoryRangeGapSource::GenerationSwitch)
+        .count();
+    anyhow::ensure!(
+        generation_switch_gaps == 1,
+        "expected one generation switch gap, got {generation_switch_gaps}"
+    );
+    Ok(generation_switch_gaps)
 }
 
 async fn record_pre_checkpoint_gap(
@@ -450,4 +469,5 @@ struct StateHistoryAnalysisReport {
     checkpoint_payload_hash: String,
     decoded_checkpoint_payloads: usize,
     recorded_gaps: usize,
+    generation_switch_gaps: usize,
 }
