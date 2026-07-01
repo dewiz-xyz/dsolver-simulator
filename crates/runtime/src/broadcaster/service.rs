@@ -550,6 +550,7 @@ impl BroadcasterServiceState {
         let mut chain_id = None;
         let mut backends = Vec::new();
         let mut block_numbers = Vec::new();
+        let mut rfq_update_timestamps = Vec::new();
         let mut exports = Vec::with_capacity(services.len());
 
         for service in services {
@@ -567,9 +568,17 @@ impl BroadcasterServiceState {
             }
             for (backend, backend_status) in &status.backends {
                 backends.push(*backend);
-                if matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm) {
-                    if let Some(block_number) = backend_status.block_number {
-                        block_numbers.push(block_number);
+                match backend {
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm => {
+                        if let Some(block_number) = backend_status.block_number {
+                            block_numbers.push(block_number);
+                        }
+                    }
+                    BroadcasterBackend::Rfq => {
+                        let Some(update_timestamp_ms) = backend_status.block_number else {
+                            return Ok(None);
+                        };
+                        rfq_update_timestamps.push(update_timestamp_ms);
                     }
                 }
             }
@@ -589,6 +598,10 @@ impl BroadcasterServiceState {
         let chain_id = chain_id
             .ok_or_else(|| anyhow::anyhow!("combined state history checkpoint missing chain_id"))?;
         let snapshot = combine_snapshot_exports(chain_id, exports)?;
+        let rfq_update_timestamp_ms = backends
+            .contains(&BroadcasterBackend::Rfq)
+            .then(|| rfq_update_timestamps.into_iter().min())
+            .flatten();
         let redis_replay_boundary = match services[0].redis_publisher.replay_boundary().await {
             Ok(boundary) => boundary,
             Err(error) => {
@@ -619,6 +632,7 @@ impl BroadcasterServiceState {
                 chain_id,
                 block_number,
                 captured_at_timestamp_ms: current_timestamp_ms(),
+                rfq_update_timestamp_ms,
                 stream_id: redis_replay_boundary.stream_id,
                 source_message_seq: redis_replay_boundary.exclusive_message_seq,
                 backends,
@@ -977,6 +991,7 @@ mod tests {
 
         assert_eq!(checkpoint.metadata.chain_id, Chain::Ethereum.id());
         assert_eq!(checkpoint.metadata.block_number, 11);
+        assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, None);
         assert_eq!(checkpoint.metadata.stream_id, status.stream_id);
         assert_eq!(checkpoint.metadata.source_message_seq, 2);
         assert_eq!(
@@ -990,6 +1005,32 @@ mod tests {
         assert_eq!(
             checkpoint.payloads.last().map(BroadcasterEnvelope::kind),
             Some(BroadcasterMessageKind::SnapshotEnd)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_history_checkpoint_uses_rfq_update_timestamp_as_rfq_cursor() -> Result<()> {
+        let (raw_service, rfq_service, _writer, publisher) = ready_raw_and_rfq_services().await?;
+        let checkpoint = BroadcasterServiceState::create_state_history_checkpoint_for_services(&[
+            raw_service,
+            rfq_service,
+        ])
+        .await?
+        .ok_or_else(|| anyhow!("ready raw/RFQ services should export a checkpoint"))?;
+        let status = publisher.status_snapshot().await;
+
+        assert_eq!(checkpoint.metadata.chain_id, Chain::Ethereum.id());
+        assert_eq!(checkpoint.metadata.block_number, 101);
+        assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, Some(202));
+        assert_ne!(
+            checkpoint.metadata.rfq_update_timestamp_ms,
+            Some(checkpoint.metadata.captured_at_timestamp_ms)
+        );
+        assert_eq!(checkpoint.metadata.stream_id, status.stream_id);
+        assert_eq!(
+            checkpoint.metadata.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
         );
         Ok(())
     }

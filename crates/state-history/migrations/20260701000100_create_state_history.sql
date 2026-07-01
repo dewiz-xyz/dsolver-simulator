@@ -43,6 +43,7 @@ CREATE TABLE state_history.checkpoints (
     chain_id BIGINT NOT NULL,
     block_number BIGINT NOT NULL,
     captured_at_timestamp_ms BIGINT NOT NULL,
+    rfq_update_timestamp_ms BIGINT,
     stream_id TEXT NOT NULL,
     source_message_seq BIGINT NOT NULL,
     backend_scope TEXT[] NOT NULL,
@@ -62,6 +63,10 @@ CREATE TABLE state_history.checkpoints (
 CREATE INDEX state_history_checkpoints_lookup_idx
     ON state_history.checkpoints (chain_id, block_number DESC, captured_at_timestamp_ms DESC)
     WHERE status = 'complete';
+
+CREATE INDEX state_history_checkpoints_rfq_lookup_idx
+    ON state_history.checkpoints (chain_id, block_number DESC, rfq_update_timestamp_ms DESC)
+    WHERE status = 'complete' AND rfq_update_timestamp_ms IS NOT NULL;
 
 CREATE TABLE state_history.ingestion_gaps (
     id BIGSERIAL PRIMARY KEY,

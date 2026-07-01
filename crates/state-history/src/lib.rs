@@ -36,6 +36,7 @@ pub struct CheckpointArchiveMetadata {
     pub chain_id: u64,
     pub block_number: u64,
     pub captured_at_timestamp_ms: u64,
+    pub rfq_update_timestamp_ms: Option<u64>,
     pub stream_id: String,
     pub source_message_seq: u64,
     pub backends: Vec<BroadcasterBackend>,
@@ -537,7 +538,7 @@ impl HistoryRangeRequest {
         }
         Some(
             checkpoint
-                .map(|checkpoint| checkpoint.metadata.captured_at_timestamp_ms)
+                .and_then(|checkpoint| checkpoint.metadata.rfq_update_timestamp_ms)
                 .unwrap_or(self.rfq_start_timestamp_ms.unwrap_or_default()),
         )
     }
@@ -761,10 +762,11 @@ impl StateHistoryPgStore {
         let id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO state_history.checkpoints (
-                chain_id, block_number, captured_at_timestamp_ms, stream_id, source_message_seq,
-                backend_scope, s3_bucket, s3_key, payload_encoding, status
+                chain_id, block_number, captured_at_timestamp_ms, rfq_update_timestamp_ms,
+                stream_id, source_message_seq, backend_scope, s3_bucket, s3_key,
+                payload_encoding, status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'writing')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'writing')
             RETURNING id
             "#,
         )
@@ -773,6 +775,10 @@ impl StateHistoryPgStore {
         .bind(u64_to_i64(
             "captured_at_timestamp_ms",
             input.metadata.captured_at_timestamp_ms,
+        )?)
+        .bind(optional_u64_to_i64(
+            "rfq_update_timestamp_ms",
+            input.metadata.rfq_update_timestamp_ms,
         )?)
         .bind(&input.metadata.stream_id)
         .bind(u64_to_i64(
@@ -842,7 +848,7 @@ impl StateHistoryPgStore {
         chain_id: u64,
         block_number: u64,
     ) -> Result<Option<CheckpointManifest>> {
-        self.latest_checkpoint_covering_before_with_capture(chain_id, block_number, &[], None)
+        self.latest_checkpoint_covering_before_with_rfq_cursor(chain_id, block_number, &[], None)
             .await
     }
 
@@ -852,46 +858,58 @@ impl StateHistoryPgStore {
         block_number: u64,
         backends: &[BroadcasterBackend],
     ) -> Result<Option<CheckpointManifest>> {
-        self.latest_checkpoint_covering_before_with_capture(chain_id, block_number, backends, None)
-            .await
+        self.latest_checkpoint_covering_before_with_rfq_cursor(
+            chain_id,
+            block_number,
+            backends,
+            None,
+        )
+        .await
     }
 
     async fn latest_checkpoint_for_request(
         &self,
         request: &HistoryRangeRequest,
     ) -> Result<Option<CheckpointManifest>> {
-        let max_capture_timestamp_ms = request
+        let max_rfq_update_timestamp_ms = request
             .includes_rfq()
             .then_some(request.rfq_start_timestamp_ms)
             .flatten();
-        self.latest_checkpoint_covering_before_with_capture(
+        self.latest_checkpoint_covering_before_with_rfq_cursor(
             request.chain_id,
             request.start_block_number,
             &request.backends,
-            max_capture_timestamp_ms,
+            max_rfq_update_timestamp_ms,
         )
         .await
     }
 
-    async fn latest_checkpoint_covering_before_with_capture(
+    async fn latest_checkpoint_covering_before_with_rfq_cursor(
         &self,
         chain_id: u64,
         block_number: u64,
         backends: &[BroadcasterBackend],
-        max_capture_timestamp_ms: Option<u64>,
+        max_rfq_update_timestamp_ms: Option<u64>,
     ) -> Result<Option<CheckpointManifest>> {
         let row = sqlx::query(
             r#"
-            SELECT id, chain_id, block_number, captured_at_timestamp_ms, stream_id,
-                source_message_seq, backend_scope, s3_bucket, s3_key, payload_hash,
-                payload_bytes, compressed_bytes, status, error
+            SELECT id, chain_id, block_number, captured_at_timestamp_ms,
+                rfq_update_timestamp_ms, stream_id, source_message_seq, backend_scope,
+                s3_bucket, s3_key, payload_hash, payload_bytes, compressed_bytes, status, error
             FROM state_history.checkpoints
             WHERE chain_id = $1
                 AND block_number <= $2
                 AND status = 'complete'
                 AND ($3::text[] = '{}'::text[] OR backend_scope @> $3::text[])
-                AND ($4::bigint IS NULL OR captured_at_timestamp_ms <= $4)
-            ORDER BY block_number DESC, captured_at_timestamp_ms DESC
+                AND (
+                    $4::bigint IS NULL
+                    OR (
+                        rfq_update_timestamp_ms IS NOT NULL
+                        AND rfq_update_timestamp_ms <= $4
+                    )
+                )
+            ORDER BY block_number DESC, rfq_update_timestamp_ms DESC NULLS LAST,
+                captured_at_timestamp_ms DESC
             LIMIT 1
             "#,
         )
@@ -899,8 +917,8 @@ impl StateHistoryPgStore {
         .bind(u64_to_i64("block_number", block_number)?)
         .bind(backend_scope_strings(backends))
         .bind(optional_u64_to_i64(
-            "max_capture_timestamp_ms",
-            max_capture_timestamp_ms,
+            "max_rfq_update_timestamp_ms",
+            max_rfq_update_timestamp_ms,
         )?)
         .fetch_optional(&self.pool)
         .await
@@ -1252,6 +1270,11 @@ impl StateHistoryCheckpointWriter {
         anyhow::ensure!(
             !archive.metadata.backends.is_empty(),
             "state history checkpoint backend scope must not be empty"
+        );
+        anyhow::ensure!(
+            !archive.metadata.backends.contains(&BroadcasterBackend::Rfq)
+                || archive.metadata.rfq_update_timestamp_ms.is_some(),
+            "state history RFQ checkpoints require an RFQ update timestamp"
         );
         let s3_key = checkpoint_s3_key(
             &self.s3_prefix,
@@ -1624,6 +1647,10 @@ fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<Checkpoint
                 "captured_at_timestamp_ms",
                 row.get("captured_at_timestamp_ms"),
             )?,
+            rfq_update_timestamp_ms: optional_i64_to_u64(
+                "rfq_update_timestamp_ms",
+                row.get("rfq_update_timestamp_ms"),
+            )?,
             stream_id: row.get("stream_id"),
             source_message_seq: i64_to_u64("source_message_seq", row.get("source_message_seq"))?,
             backends: parse_backend_strings(&backends)?,
@@ -1749,6 +1776,7 @@ mod tests {
                 chain_id: 8453,
                 block_number: 123,
                 captured_at_timestamp_ms: 1_720_000_000_000,
+                rfq_update_timestamp_ms: Some(456),
                 stream_id: "stream-1".to_string(),
                 source_message_seq: 8,
                 backends: vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
@@ -1778,6 +1806,7 @@ mod tests {
                 chain_id: 8453,
                 block_number: 123,
                 captured_at_timestamp_ms: 1_720_000_000_000,
+                rfq_update_timestamp_ms: None,
                 stream_id: "stream-1".to_string(),
                 source_message_seq: 7,
                 backends: vec![BroadcasterBackend::Native],
@@ -1946,14 +1975,14 @@ mod tests {
             vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
         )?
         .with_rfq_timestamp_range(1_720_000_000_000, 1_720_000_060_000)?;
-        let checkpoint = checkpoint_manifest(90, 1_719_999_990_000);
+        let checkpoint = checkpoint_manifest(90, 1_719_999_990_000, Some(1_719_999_995_000));
 
         assert_eq!(request.replay_from_message_seq(Some(&checkpoint)), Some(43));
         assert_eq!(request.replay_from_message_seq(None), None);
         assert_eq!(request.replay_from_block_number(Some(&checkpoint)), 90);
         assert_eq!(
             request.rfq_replay_from_timestamp_ms(Some(&checkpoint)),
-            Some(1_719_999_990_000)
+            Some(1_719_999_995_000)
         );
         assert_eq!(request.replay_from_block_number(None), 100);
         assert_eq!(
@@ -2003,13 +2032,18 @@ mod tests {
         );
     }
 
-    fn checkpoint_manifest(block_number: u64, captured_at_timestamp_ms: u64) -> CheckpointManifest {
+    fn checkpoint_manifest(
+        block_number: u64,
+        captured_at_timestamp_ms: u64,
+        rfq_update_timestamp_ms: Option<u64>,
+    ) -> CheckpointManifest {
         CheckpointManifest {
             id: 1,
             metadata: CheckpointArchiveMetadata {
                 chain_id: 8453,
                 block_number,
                 captured_at_timestamp_ms,
+                rfq_update_timestamp_ms,
                 stream_id: "stream-1".to_string(),
                 source_message_seq: 42,
                 backends: vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],

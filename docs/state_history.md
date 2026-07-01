@@ -61,7 +61,7 @@ The harness:
 
 The `state-history` crate exposes the reader API for external harnesses:
 
-- `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. When a checkpoint is selected, replay is scoped to that checkpoint's stream and starts at the first message after its recorded source sequence.
+- `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. When a checkpoint is selected, replay is scoped to that checkpoint's stream and starts at the first message after its recorded source sequence. RFQ ranges use the checkpoint's RFQ update timestamp, not its wall-clock capture time, as the RFQ replay cursor.
 - `StateHistoryReader::fetch_checkpoint` fetches and verifies the S3 object for a complete manifest.
 - `HistoryRangePlan::ensure_gap_free` turns recorded or missing-checkpoint gaps into a hard error for callers that require complete ranges.
 

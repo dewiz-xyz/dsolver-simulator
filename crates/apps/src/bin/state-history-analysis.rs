@@ -50,10 +50,13 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
     let run_id = current_timestamp_ms()?;
     let chain_id = 9_000_000_000u64.saturating_add(run_id % 1_000_000);
     let stream_id = format!("state-history-analysis-{run_id}");
+    let rfq_cursor_timestamp_ms = 1_700_000_000_000u64.saturating_add(run_id % 1_000_000);
     let (inserted_deltas, stale_stream_id) =
-        insert_synthetic_delta_fixtures(&pg_store, chain_id, &stream_id, run_id).await?;
+        insert_synthetic_delta_fixtures(&pg_store, chain_id, &stream_id, rfq_cursor_timestamp_ms)
+            .await?;
 
-    let checkpoint_archive = synthetic_checkpoint_archive(chain_id, &stream_id, run_id)?;
+    let checkpoint_archive =
+        synthetic_checkpoint_archive(chain_id, &stream_id, run_id, rfq_cursor_timestamp_ms)?;
     let checkpoint_writer = StateHistoryCheckpointWriter::new(
         pg_store.clone(),
         checkpoint_store.clone(),
@@ -65,7 +68,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         .context("failed to write synthetic checkpoint")?;
 
     let reader = StateHistoryReader::new(pg_store.clone(), checkpoint_store);
-    let request = synthetic_history_request(chain_id, run_id)?;
+    let request = synthetic_history_request(chain_id, rfq_cursor_timestamp_ms)?;
     record_pre_checkpoint_gap(&pg_store, chain_id, &stream_id).await?;
     let plan = reader.resolve_range(request.clone()).await?;
     plan.ensure_gap_free()?;
@@ -107,9 +110,9 @@ async fn insert_synthetic_delta_fixtures(
     pg_store: &StateHistoryPgStore,
     chain_id: u64,
     stream_id: &str,
-    run_id: u64,
+    rfq_cursor_timestamp_ms: u64,
 ) -> Result<(usize, String)> {
-    let redis_entries = synthetic_delta_entries(chain_id, stream_id, run_id)?;
+    let redis_entries = synthetic_delta_entries(chain_id, stream_id, rfq_cursor_timestamp_ms)?;
     let mut inserted_deltas = 0usize;
     for (index, entry) in redis_entries.iter().enumerate() {
         let redis_entry_id = format!("1-{}", index + 1);
@@ -132,7 +135,10 @@ async fn insert_synthetic_delta_fixtures(
     Ok((inserted_deltas, stale_stream_id))
 }
 
-fn synthetic_history_request(chain_id: u64, run_id: u64) -> Result<HistoryRangeRequest> {
+fn synthetic_history_request(
+    chain_id: u64,
+    rfq_cursor_timestamp_ms: u64,
+) -> Result<HistoryRangeRequest> {
     HistoryRangeRequest::new(
         chain_id,
         100,
@@ -143,7 +149,7 @@ fn synthetic_history_request(chain_id: u64, run_id: u64) -> Result<HistoryRangeR
             BroadcasterBackend::Rfq,
         ],
     )?
-    .with_rfq_timestamp_range(run_id + 1, run_id + 100)
+    .with_rfq_timestamp_range(rfq_cursor_timestamp_ms + 1, rfq_cursor_timestamp_ms + 100)
 }
 
 fn assert_replay_plan(plan: &HistoryRangePlan, stream_id: &str) -> Result<Vec<u64>> {
@@ -252,13 +258,13 @@ async fn s3_client(args: &CliArgs) -> S3Client {
 fn synthetic_delta_entries(
     chain_id: u64,
     stream_id: &str,
-    run_id: u64,
+    rfq_cursor_timestamp_ms: u64,
 ) -> Result<Vec<BroadcasterRedisStreamEntry>> {
     [
         (1, BroadcasterBackend::Native, 100),
         (2, BroadcasterBackend::Native, 100),
         (3, BroadcasterBackend::Vm, 101),
-        (4, BroadcasterBackend::Rfq, run_id + 10),
+        (4, BroadcasterBackend::Rfq, rfq_cursor_timestamp_ms + 10),
     ]
     .into_iter()
     .map(|(message_seq, backend, cursor)| {
@@ -291,6 +297,7 @@ fn synthetic_checkpoint_archive(
     chain_id: u64,
     stream_id: &str,
     captured_at_timestamp_ms: u64,
+    rfq_update_timestamp_ms: u64,
 ) -> Result<CheckpointArchive> {
     let backends = vec![
         BroadcasterBackend::Native,
@@ -303,6 +310,7 @@ fn synthetic_checkpoint_archive(
             chain_id,
             block_number: 100,
             captured_at_timestamp_ms,
+            rfq_update_timestamp_ms: Some(rfq_update_timestamp_ms),
             stream_id: stream_id.to_string(),
             source_message_seq: 1,
             backends: backends.clone(),
