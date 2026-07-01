@@ -687,15 +687,17 @@ fn build_validated_replay_segments(
         if let Some((handoff, previous_message_seq, next_message_seq)) =
             validated_forward_handoff(&current_stream_id, handoffs)
         {
-            if from_message_seq > previous_message_seq {
+            if replay_cursor_is_beyond_handoff_tail(from_message_seq, previous_message_seq) {
                 break;
             }
-            segments.push(HistoryReplaySegment {
-                ordinal: segments.len() as i64,
-                stream_id: current_stream_id,
-                from_message_seq,
-                to_message_seq: Some(previous_message_seq),
-            });
+            if from_message_seq <= previous_message_seq {
+                segments.push(HistoryReplaySegment {
+                    ordinal: segments.len() as i64,
+                    stream_id: current_stream_id,
+                    from_message_seq,
+                    to_message_seq: Some(previous_message_seq),
+                });
+            }
             current_stream_id = handoff.next_stream_id.clone();
             from_message_seq = next_message_seq.saturating_add(1);
             continue;
@@ -745,7 +747,7 @@ fn build_generation_switch_exempt_segments(
                 from_message_seq: 1,
                 to_message_seq: Some(previous_message_seq),
             });
-            if from_message_seq > previous_message_seq {
+            if replay_cursor_is_beyond_handoff_tail(from_message_seq, previous_message_seq) {
                 break;
             }
             current_stream_id = handoff.next_stream_id.clone();
@@ -771,6 +773,13 @@ fn build_generation_switch_exempt_segments(
             segment
         })
         .collect()
+}
+
+fn replay_cursor_is_beyond_handoff_tail(
+    from_message_seq: u64,
+    handoff_tail_message_seq: u64,
+) -> bool {
+    from_message_seq > handoff_tail_message_seq.saturating_add(1)
 }
 
 fn validated_forward_handoff<'a>(
@@ -2703,6 +2712,46 @@ mod tests {
                     stream_id: "chain-8453-stream-1".to_string(),
                     from_message_seq: 1,
                     to_message_seq: Some(4),
+                },
+                HistoryReplaySegment {
+                    ordinal: 1,
+                    stream_id: "chain-8453-stream-2".to_string(),
+                    from_message_seq: 1,
+                    to_message_seq: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn history_segments_continue_when_checkpoint_sits_on_handoff_tail() {
+        let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-1", 3);
+        let handoffs = stored_handoffs([stored_handoff(
+            "chain-8453-stream-1",
+            "1-3",
+            "chain-8453-stream-2",
+            "2-1",
+        )]);
+
+        let segments = build_validated_history_segments(&checkpoint, &handoffs);
+
+        assert_eq!(
+            segments.replay_segments,
+            vec![HistoryReplaySegment {
+                ordinal: 0,
+                stream_id: "chain-8453-stream-2".to_string(),
+                from_message_seq: 2,
+                to_message_seq: None,
+            }]
+        );
+        assert_eq!(
+            segments.generation_switch_exempt_segments,
+            vec![
+                HistoryReplaySegment {
+                    ordinal: 0,
+                    stream_id: "chain-8453-stream-1".to_string(),
+                    from_message_seq: 1,
+                    to_message_seq: Some(3),
                 },
                 HistoryReplaySegment {
                     ordinal: 1,
