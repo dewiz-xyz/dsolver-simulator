@@ -114,6 +114,38 @@ wait_for_tcp() {
   done
 }
 
+wait_for_compose_health() {
+  local label="$1"
+  local service="$2"
+  local timeout_secs="$3"
+  local started_at
+  started_at="$(date +%s)"
+
+  while true; do
+    local container_id
+    container_id="$(
+      cd "$repo"
+      docker compose -p "$compose_project" -f "$compose_file" ps -q "$service"
+    )"
+    if [[ -n "$container_id" ]]; then
+      local status
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id")"
+      if [[ "$status" == "healthy" || "$status" == "running" ]]; then
+        echo "$label health check is $status."
+        return 0
+      fi
+    fi
+
+    local now
+    now="$(date +%s)"
+    if ((now - started_at >= timeout_secs)); then
+      echo "Timed out waiting for $label health check." >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 compose_project="$(compose_project_name)"
 postgres_bind="${STATE_HISTORY_POSTGRES_BIND:-127.0.0.1}"
 postgres_port="${STATE_HISTORY_POSTGRES_PORT:-55432}"
@@ -139,6 +171,8 @@ echo "Starting local state history storage stack..."
 
 wait_for_tcp "Postgres" "$postgres_bind" "$postgres_port" 60
 wait_for_tcp "MinIO" "$minio_bind" "$minio_port" 60
+wait_for_compose_health "Postgres" postgres 60
+wait_for_compose_health "MinIO" minio 60
 
 export STATE_HISTORY_DATABASE_URL="${STATE_HISTORY_DATABASE_URL:-postgres://postgres:postgres@${postgres_bind}:${postgres_port}/state_history}"
 export STATE_HISTORY_S3_BUCKET="${STATE_HISTORY_S3_BUCKET:-state-history}"
