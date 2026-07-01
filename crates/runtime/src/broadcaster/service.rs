@@ -424,14 +424,28 @@ impl BroadcasterServiceState {
         for service in services {
             base_heads.extend(service.cache.backend_heads().await);
         }
-        let boundary = services[0]
+        let promotion = services[0]
             .redis_publisher
-            .promote(base_heads, reason)
+            .promote_with_marker(base_heads, reason)
             .await?;
         for service in services {
-            service.cache.relabel_generation(boundary.generation).await;
+            service
+                .cache
+                .relabel_generation(promotion.boundary.generation)
+                .await;
         }
-        Ok(Some(boundary))
+        if let Some(service) = services
+            .iter()
+            .find(|service| service.state_history.is_some())
+        {
+            service
+                .enqueue_state_history(Some((
+                    promotion.marker_entry.clone(),
+                    promotion.marker_redis_entry_id.clone(),
+                )))
+                .await;
+        }
+        Ok(Some(promotion.boundary))
     }
 
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<()> {
@@ -709,7 +723,7 @@ impl BroadcasterServiceState {
         let Some(state_history) = &self.state_history else {
             return;
         };
-        if let Err(error) = state_history.enqueue_delta(entry, redis_entry_id).await {
+        if let Err(error) = state_history.enqueue_entry(entry, redis_entry_id).await {
             warn!(
                 error = %error,
                 "State history writer did not accept broadcaster delta"
@@ -2323,15 +2337,20 @@ mod tests {
                     .map(crate::broadcaster::redis_publisher::redis_entry_id)
                     .transpose()?
                     .unwrap_or_default();
-                guard.appends.push(entry_from_fields(
+                let marker_entry = entry_from_fields(
                     marker_fields,
                     generation,
                     previous_stream_id,
                     &previous_entry_id,
-                )?);
+                )?;
+                guard.appends.push(marker_entry.clone());
                 Ok(crate::broadcaster::redis_publisher::RedisPromotionResult {
                     generation,
                     entry_id,
+                    previous_stream_id: (!previous_stream_id.is_empty())
+                        .then(|| previous_stream_id.to_string()),
+                    previous_entry_id: (!previous_entry_id.is_empty()).then_some(previous_entry_id),
+                    marker_entry,
                 })
             })
         }

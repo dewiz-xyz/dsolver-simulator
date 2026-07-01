@@ -24,8 +24,8 @@ use super::{
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
-    BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
+    BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry,
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -209,6 +209,78 @@ async fn promotion_after_existing_tail_writes_handoff_marker() -> Result<()> {
         .ok_or_else(|| anyhow!("promotion marker should include handoff proof"))?;
     assert_eq!(handoff.previous_stream_id, old_tail.entry.stream_id);
     assert_eq!(handoff.previous_entry_id, redis_entry_id(&old_tail.entry)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_result_exposes_lua_tail_values_and_resolved_marker() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let normal_marker_fields = super::generation_marker_template_fields(
+        Chain::Ethereum.id(),
+        vec![BroadcasterBackend::Native],
+        "normal".to_string(),
+        None,
+    )?;
+    let handoff_marker_fields = super::generation_marker_template_fields(
+        Chain::Ethereum.id(),
+        vec![BroadcasterBackend::Native],
+        "handoff".to_string(),
+        Some(BroadcasterGenerationHandoff::new(
+            super::PREVIOUS_STREAM_ID_PLACEHOLDER,
+            super::PREVIOUS_ENTRY_ID_PLACEHOLDER,
+            base_heads([BroadcasterBackend::Native]),
+        )?),
+    )?;
+
+    writer
+        .promote(super::RedisPromotionCommand {
+            stream_key: "events",
+            writer_key: "events:writer",
+            writer_generation_key: "events:generation",
+            maxlen: None,
+            writer_token: "old-token",
+            expected_writer_token: None,
+            expected_generation: None,
+            lease_ttl: Duration::from_secs(30),
+            normal_marker_fields: &normal_marker_fields,
+            handoff_marker_fields: &handoff_marker_fields,
+        })
+        .await?;
+
+    let promotion = writer
+        .promote(super::RedisPromotionCommand {
+            stream_key: "events",
+            writer_key: "events:writer",
+            writer_generation_key: "events:generation",
+            maxlen: None,
+            writer_token: "new-token",
+            expected_writer_token: None,
+            expected_generation: None,
+            lease_ttl: Duration::from_secs(30),
+            normal_marker_fields: &normal_marker_fields,
+            handoff_marker_fields: &handoff_marker_fields,
+        })
+        .await?;
+
+    assert_eq!(
+        promotion.previous_stream_id.as_deref(),
+        Some("chain-1-stream-1")
+    );
+    assert_eq!(promotion.previous_entry_id.as_deref(), Some("1-1"));
+    assert_eq!(redis_entry_id(&promotion.marker_entry)?, promotion.entry_id);
+    assert!(!promotion
+        .marker_entry
+        .payload_json
+        .contains(super::PREVIOUS_STREAM_ID_PLACEHOLDER));
+    assert!(!promotion
+        .marker_entry
+        .payload_json
+        .contains(super::PREVIOUS_ENTRY_ID_PLACEHOLDER));
+    let handoff = progress_payload(&promotion.marker_entry)?
+        .handoff
+        .ok_or_else(|| anyhow!("promotion marker should include resolved handoff proof"))?;
+    assert_eq!(handoff.previous_stream_id, "chain-1-stream-1");
+    assert_eq!(handoff.previous_entry_id, "1-1");
     Ok(())
 }
 
@@ -988,12 +1060,6 @@ impl RedisStreamWriter for FakeRedisWriter {
             let generation = guard.active_generation;
             let entry_id = format!("{generation}-1");
             let previous_tail = guard.appends.last().cloned();
-            let marker_fields =
-                if previous_tail.is_some() && !command.handoff_marker_fields.is_empty() {
-                    command.handoff_marker_fields
-                } else {
-                    command.normal_marker_fields
-                };
             let previous_stream_id = previous_tail
                 .as_ref()
                 .map(|append| append.entry.stream_id.as_str())
@@ -1003,17 +1069,23 @@ impl RedisStreamWriter for FakeRedisWriter {
                 .map(|append| redis_entry_id(&append.entry))
                 .transpose()?
                 .unwrap_or_default();
+            let marker_entry = super::promotion_marker_entry_from_fields(
+                command.normal_marker_fields,
+                command.handoff_marker_fields,
+                generation,
+                (!previous_stream_id.is_empty()).then_some(previous_stream_id),
+                (!previous_entry_id.is_empty()).then_some(previous_entry_id.as_str()),
+            )?;
             guard.appends.push(CapturedAppend {
-                entry: entry_from_fields(
-                    marker_fields,
-                    generation,
-                    previous_stream_id,
-                    &previous_entry_id,
-                )?,
+                entry: marker_entry.clone(),
             });
             Ok(super::RedisPromotionResult {
                 generation,
                 entry_id,
+                previous_stream_id: (!previous_stream_id.is_empty())
+                    .then(|| previous_stream_id.to_string()),
+                previous_entry_id: (!previous_entry_id.is_empty()).then_some(previous_entry_id),
+                marker_entry,
             })
         })
     }
@@ -1066,23 +1138,6 @@ impl RedisStreamWriter for FakeRedisWriter {
             Ok(())
         })
     }
-}
-
-fn entry_from_fields(
-    fields: &[(String, String)],
-    generation: u64,
-    previous_stream_id: &str,
-    previous_entry_id: &str,
-) -> Result<BroadcasterRedisStreamEntry> {
-    let mut value = serde_json::Map::new();
-    for (field, field_value) in fields {
-        let field_value = field_value
-            .replace(super::GENERATION_PLACEHOLDER, &generation.to_string())
-            .replace(super::PREVIOUS_STREAM_ID_PLACEHOLDER, previous_stream_id)
-            .replace(super::PREVIOUS_ENTRY_ID_PLACEHOLDER, previous_entry_id);
-        value.insert(field.clone(), serde_json::Value::String(field_value));
-    }
-    serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
 }
 
 async fn ready_cache(

@@ -50,7 +50,9 @@ mod tests {
         broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState},
         models::tokens::TokenStore,
     };
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
+    use simulator_core::broadcaster::{
+        BroadcasterBackend, BroadcasterBackendHead, BroadcasterRedisStreamEntry,
+    };
     use tokio::{
         sync::{Barrier, Mutex},
         task::JoinHandle,
@@ -1006,10 +1008,14 @@ mod tests {
                 state.active_token = Some(command.writer_token.to_string());
                 let generation = state.active_generation;
                 state.append_count = state.append_count.saturating_add(1);
+                let marker_entry = entry_from_fields(command.normal_marker_fields, generation)?;
                 Ok(
                     runtime::broadcaster::redis_publisher::RedisPromotionResult {
                         generation,
                         entry_id: format!("{generation}-1"),
+                        previous_stream_id: None,
+                        previous_entry_id: None,
+                        marker_entry,
                     },
                 )
             })
@@ -1052,6 +1058,18 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    fn entry_from_fields(
+        fields: &[(String, String)],
+        generation: u64,
+    ) -> Result<BroadcasterRedisStreamEntry> {
+        let mut value = serde_json::Map::new();
+        for (field, field_value) in fields {
+            let field_value = field_value.replace("__GENERATION__", &generation.to_string());
+            value.insert(field.clone(), serde_json::Value::String(field_value));
+        }
+        serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
     }
 
     fn redis_publisher_config() -> BroadcasterRedisPublisherConfig {

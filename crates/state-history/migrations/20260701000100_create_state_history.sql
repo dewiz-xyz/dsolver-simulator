@@ -38,6 +38,24 @@ CREATE INDEX state_history_delta_backend_timestamp_idx
     ON state_history.delta_backend_index (chain_id, backend, observed_timestamp_ms, message_seq)
     WHERE observed_timestamp_ms IS NOT NULL;
 
+CREATE TABLE state_history.generation_handoffs (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id BIGINT NOT NULL,
+    handoff_delta_id BIGINT NOT NULL UNIQUE REFERENCES state_history.delta_messages(id) ON DELETE CASCADE,
+    previous_stream_id TEXT NOT NULL,
+    previous_entry_id TEXT NOT NULL,
+    next_stream_id TEXT NOT NULL,
+    next_entry_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    backend_scope TEXT[] NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (chain_id, previous_stream_id),
+    UNIQUE (chain_id, next_stream_id)
+);
+
+CREATE INDEX state_history_generation_handoffs_previous_idx
+    ON state_history.generation_handoffs (chain_id, previous_stream_id);
+
 CREATE TABLE state_history.checkpoints (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,

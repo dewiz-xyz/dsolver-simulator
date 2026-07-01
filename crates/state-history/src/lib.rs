@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
@@ -9,7 +10,8 @@ use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterRedisStreamEntry,
+    BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterPayload,
+    BroadcasterRedisStreamEntry,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio::sync::{mpsc, RwLock};
@@ -151,6 +153,29 @@ pub struct StoredDeltaEntry {
     pub redis_entry_id: Option<String>,
     pub payload: EncodedPayload,
     pub entry: BroadcasterRedisStreamEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredGenerationHandoff {
+    previous_stream_id: String,
+    previous_entry_id: String,
+    next_stream_id: String,
+    next_entry_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedGenerationHandoff {
+    handoff: StoredGenerationHandoff,
+    snapshot_id: String,
+    backend_scope: Vec<BroadcasterBackend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryReplaySegment {
+    ordinal: i64,
+    stream_id: String,
+    from_message_seq: u64,
+    to_message_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +464,57 @@ pub fn prepare_delta_message(
     })
 }
 
+fn prepare_generation_handoff(
+    entry: &BroadcasterRedisStreamEntry,
+    redis_entry_id: Option<&str>,
+) -> Result<Option<PreparedGenerationHandoff>> {
+    if entry.kind != BroadcasterMessageKind::Progress {
+        return Ok(None);
+    }
+    let envelope: BroadcasterEnvelope = serde_json::from_str(&entry.payload_json)
+        .context("failed to decode Redis progress payload for state history handoff")?;
+    let BroadcasterPayload::Progress(progress) = envelope.payload else {
+        return Ok(None);
+    };
+    let Some(handoff) = progress.handoff else {
+        return Ok(None);
+    };
+    let next_entry_id = redis_entry_id
+        .ok_or_else(|| anyhow!("state history handoff marker requires Redis entry id"))?;
+    let Some((previous_generation, _previous_message_seq)) =
+        valid_redis_stream_entry_pair(&handoff.previous_stream_id, &handoff.previous_entry_id)
+    else {
+        return Err(anyhow!(
+            "state history handoff previous stream and entry id are not aligned"
+        ));
+    };
+    let Some((next_generation, next_message_seq)) =
+        valid_redis_stream_entry_pair(&entry.stream_id, next_entry_id)
+    else {
+        return Err(anyhow!(
+            "state history handoff next stream and entry id are not aligned"
+        ));
+    };
+    anyhow::ensure!(
+        next_generation == previous_generation.saturating_add(1),
+        "state history handoff generation must advance exactly once"
+    );
+    anyhow::ensure!(
+        next_message_seq == entry.message_seq && entry.message_seq == 1,
+        "state history handoff marker must be the first entry in the next generation"
+    );
+    Ok(Some(PreparedGenerationHandoff {
+        handoff: StoredGenerationHandoff {
+            previous_stream_id: handoff.previous_stream_id,
+            previous_entry_id: handoff.previous_entry_id,
+            next_stream_id: entry.stream_id.clone(),
+            next_entry_id: next_entry_id.to_string(),
+        },
+        snapshot_id: progress.snapshot_id,
+        backend_scope: progress.backends,
+    }))
+}
+
 impl HistoryRangeRequest {
     pub fn new(
         chain_id: u64,
@@ -559,6 +635,94 @@ impl HistoryRangePlan {
     }
 }
 
+fn build_validated_replay_segments(
+    checkpoint: &CheckpointManifest,
+    handoffs_by_previous_stream: &BTreeMap<String, StoredGenerationHandoff>,
+) -> Vec<HistoryReplaySegment> {
+    let mut segments = vec![HistoryReplaySegment {
+        ordinal: 0,
+        stream_id: checkpoint.metadata.stream_id.clone(),
+        from_message_seq: checkpoint.metadata.source_message_seq.saturating_add(1),
+        to_message_seq: None,
+    }];
+    let mut current_stream_id = checkpoint.metadata.stream_id.as_str();
+    while let Some(handoff) = handoffs_by_previous_stream.get(current_stream_id) {
+        let Some((previous_generation, previous_message_seq)) =
+            valid_redis_stream_entry_pair(&handoff.previous_stream_id, &handoff.previous_entry_id)
+        else {
+            break;
+        };
+        let Some((next_generation, next_message_seq)) =
+            valid_redis_stream_entry_pair(&handoff.next_stream_id, &handoff.next_entry_id)
+        else {
+            break;
+        };
+        if handoff.previous_stream_id != current_stream_id
+            || next_generation != previous_generation.saturating_add(1)
+            || next_message_seq != 1
+        {
+            break;
+        }
+
+        let next_ordinal = segments.len() as i64;
+        if let Some(segment) = segments.last_mut() {
+            segment.to_message_seq = Some(previous_message_seq);
+        }
+        segments.push(HistoryReplaySegment {
+            ordinal: next_ordinal,
+            stream_id: handoff.next_stream_id.clone(),
+            from_message_seq: next_message_seq.saturating_add(1),
+            to_message_seq: None,
+        });
+        current_stream_id = &handoff.next_stream_id;
+    }
+    segments
+}
+
+fn segment_ordinals(segments: &[HistoryReplaySegment]) -> Vec<i64> {
+    segments.iter().map(|segment| segment.ordinal).collect()
+}
+
+fn segment_stream_ids(segments: &[HistoryReplaySegment]) -> Vec<String> {
+    segments
+        .iter()
+        .map(|segment| segment.stream_id.clone())
+        .collect()
+}
+
+fn segment_from_message_seq(segments: &[HistoryReplaySegment]) -> Result<Vec<i64>> {
+    segments
+        .iter()
+        .map(|segment| u64_to_i64("segment.from_message_seq", segment.from_message_seq))
+        .collect()
+}
+
+fn segment_to_message_seq(segments: &[HistoryReplaySegment]) -> Result<Vec<i64>> {
+    segments
+        .iter()
+        .map(|segment| {
+            segment.to_message_seq.map_or(Ok(i64::MAX), |value| {
+                u64_to_i64("segment.to_message_seq", value)
+            })
+        })
+        .collect()
+}
+
+fn valid_redis_stream_entry_pair(stream_id: &str, entry_id: &str) -> Option<(u64, u64)> {
+    let stream_generation = redis_stream_generation(stream_id)?;
+    let (entry_generation, message_seq) = redis_entry_id_parts(entry_id)?;
+    (stream_generation == entry_generation).then_some((stream_generation, message_seq))
+}
+
+fn redis_stream_generation(stream_id: &str) -> Option<u64> {
+    stream_id.rsplit_once("-stream-")?.1.parse().ok()
+}
+
+fn redis_entry_id_parts(entry_id: &str) -> Option<(u64, u64)> {
+    let (generation, message_seq) = entry_id.split_once('-')?;
+    Some((generation.parse().ok()?, message_seq.parse().ok()?))
+}
+
 impl StateHistoryPgStore {
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
@@ -594,6 +758,7 @@ impl StateHistoryPgStore {
         for table in [
             "state_history.delta_messages",
             "state_history.delta_backend_index",
+            "state_history.generation_handoffs",
             "state_history.checkpoints",
             "state_history.ingestion_gaps",
         ] {
@@ -610,18 +775,46 @@ impl StateHistoryPgStore {
         Ok(())
     }
 
-    pub async fn insert_delta(
+    pub async fn insert_entry(
         &self,
         entry: &BroadcasterRedisStreamEntry,
         redis_entry_id: Option<&str>,
     ) -> Result<PersistedDelta> {
+        let handoff = prepare_generation_handoff(entry, redis_entry_id)?;
+        anyhow::ensure!(
+            entry.kind == BroadcasterMessageKind::Update || handoff.is_some(),
+            "state history only persists update entries and generation handoff progress markers"
+        );
         let prepared = prepare_delta_message(entry, redis_entry_id)?;
         let mut tx = self
             .pool
             .begin()
             .await
             .context("failed to begin state history delta transaction")?;
-        let id = sqlx::query_scalar::<_, i64>(
+        let inserted_id = Self::insert_delta_message_row(&mut tx, &prepared).await?;
+
+        let (id, inserted) = match inserted_id {
+            Some(id) => (id, true),
+            None => (Self::existing_delta_id(&mut tx, &prepared).await?, false),
+        };
+
+        Self::insert_backend_index_rows(&mut tx, id, &prepared).await?;
+
+        if let (true, Some(handoff)) = (inserted, handoff) {
+            Self::insert_generation_handoff_row(&mut tx, prepared.chain_id, id, &handoff).await?;
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit state history delta transaction")?;
+        Ok(PersistedDelta { id, inserted })
+    }
+
+    async fn insert_delta_message_row(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        prepared: &PreparedDeltaMessage,
+    ) -> Result<Option<i64>> {
+        sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO state_history.delta_messages (
                 chain_id, stream_id, snapshot_id, message_seq, redis_entry_id, kind,
@@ -648,38 +841,45 @@ impl StateHistoryPgStore {
         .bind(prepared.payload.encoding.as_str())
         .bind(&prepared.payload_compressed)
         .bind(&prepared.payload.hash)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
-        .context("failed to insert state history delta")?;
+        .context("failed to insert state history delta")
+    }
 
-        let (id, inserted) = match id {
-            Some(id) => (id, true),
-            None => {
-                let row = sqlx::query(
-                    r#"
-                    SELECT id, payload_hash
-                    FROM state_history.delta_messages
-                    WHERE chain_id = $1 AND stream_id = $2 AND message_seq = $3
-                    "#,
-                )
-                .bind(u64_to_i64("chain_id", prepared.chain_id)?)
-                .bind(&prepared.stream_id)
-                .bind(u64_to_i64("message_seq", prepared.message_seq)?)
-                .fetch_one(&mut *tx)
-                .await
-                .context("failed to load existing state history delta")?;
-                let id: i64 = row.get("id");
-                let payload_hash: String = row.get("payload_hash");
-                anyhow::ensure!(
-                    payload_hash == prepared.payload.hash,
-                    "state history delta idempotency conflict for stream {} message_seq {}",
-                    prepared.stream_id,
-                    prepared.message_seq
-                );
-                (id, false)
-            }
-        };
+    async fn existing_delta_id(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        prepared: &PreparedDeltaMessage,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, payload_hash
+            FROM state_history.delta_messages
+            WHERE chain_id = $1 AND stream_id = $2 AND message_seq = $3
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", prepared.chain_id)?)
+        .bind(&prepared.stream_id)
+        .bind(u64_to_i64("message_seq", prepared.message_seq)?)
+        .fetch_one(&mut **tx)
+        .await
+        .context("failed to load existing state history delta")?;
 
+        let id: i64 = row.get("id");
+        let payload_hash: String = row.get("payload_hash");
+        anyhow::ensure!(
+            payload_hash == prepared.payload.hash,
+            "state history delta idempotency conflict for stream {} message_seq {}",
+            prepared.stream_id,
+            prepared.message_seq
+        );
+        Ok(id)
+    }
+
+    async fn insert_backend_index_rows(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        delta_id: i64,
+        prepared: &PreparedDeltaMessage,
+    ) -> Result<()> {
         for index in &prepared.backend_index {
             sqlx::query(
                 r#"
@@ -690,7 +890,7 @@ impl StateHistoryPgStore {
                 ON CONFLICT (delta_id, backend) DO NOTHING
                 "#,
             )
-            .bind(id)
+            .bind(delta_id)
             .bind(u64_to_i64("chain_id", prepared.chain_id)?)
             .bind(index.backend.as_str())
             .bind(optional_u64_to_i64("block_number", index.block_number)?)
@@ -699,15 +899,40 @@ impl StateHistoryPgStore {
                 index.observed_timestamp_ms,
             )?)
             .bind(u64_to_i64("message_seq", prepared.message_seq)?)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .context("failed to insert state history delta backend index")?;
         }
+        Ok(())
+    }
 
-        tx.commit()
-            .await
-            .context("failed to commit state history delta transaction")?;
-        Ok(PersistedDelta { id, inserted })
+    async fn insert_generation_handoff_row(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        chain_id: u64,
+        delta_id: i64,
+        handoff: &PreparedGenerationHandoff,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO state_history.generation_handoffs (
+                chain_id, handoff_delta_id, previous_stream_id, previous_entry_id,
+                next_stream_id, next_entry_id, snapshot_id, backend_scope
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(delta_id)
+        .bind(&handoff.handoff.previous_stream_id)
+        .bind(&handoff.handoff.previous_entry_id)
+        .bind(&handoff.handoff.next_stream_id)
+        .bind(&handoff.handoff.next_entry_id)
+        .bind(&handoff.snapshot_id)
+        .bind(backend_scope_strings(&handoff.backend_scope))
+        .execute(&mut **tx)
+        .await
+        .context("failed to insert state history generation handoff")?;
+        Ok(())
     }
 
     pub async fn record_gap(&self, gap: &IngestionGap) -> Result<i64> {
@@ -890,11 +1115,14 @@ impl StateHistoryPgStore {
         let replay_from_block_number = request.replay_from_block_number(checkpoint.as_ref());
         let rfq_replay_from_timestamp_ms =
             request.rfq_replay_from_timestamp_ms(checkpoint.as_ref());
+        let replay_segments = match checkpoint.as_ref() {
+            Some(checkpoint) => Some(self.validated_replay_segments(checkpoint).await?),
+            None => None,
+        };
         let mut gaps = self
             .recorded_gaps_for_range(
                 &request,
-                checkpoint.as_ref(),
-                replay_from_message_seq,
+                replay_segments.as_deref(),
                 replay_from_block_number,
                 rfq_replay_from_timestamp_ms,
             )
@@ -905,6 +1133,7 @@ impl StateHistoryPgStore {
                 .generation_switch_gap_for_range(
                     &request,
                     checkpoint,
+                    replay_segments.as_deref().unwrap_or(&[]),
                     replay_from_block_number,
                     rfq_replay_from_timestamp_ms,
                 )
@@ -927,8 +1156,7 @@ impl StateHistoryPgStore {
         let deltas = self
             .deltas_for_range(
                 &request,
-                checkpoint.as_ref(),
-                replay_from_message_seq,
+                replay_segments.as_deref(),
                 replay_from_block_number,
                 rfq_replay_from_timestamp_ms,
             )
@@ -945,26 +1173,163 @@ impl StateHistoryPgStore {
         })
     }
 
+    async fn validated_replay_segments(
+        &self,
+        checkpoint: &CheckpointManifest,
+    ) -> Result<Vec<HistoryReplaySegment>> {
+        let handoffs = self
+            .generation_handoffs_for_chain(checkpoint.metadata.chain_id)
+            .await?;
+        Ok(build_validated_replay_segments(checkpoint, &handoffs))
+    }
+
+    async fn generation_handoffs_for_chain(
+        &self,
+        chain_id: u64,
+    ) -> Result<BTreeMap<String, StoredGenerationHandoff>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT previous_stream_id, previous_entry_id, next_stream_id, next_entry_id
+            FROM state_history.generation_handoffs
+            WHERE chain_id = $1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load state history generation handoffs")?;
+
+        let mut handoffs = BTreeMap::new();
+        for row in rows {
+            let handoff = StoredGenerationHandoff {
+                previous_stream_id: row.get("previous_stream_id"),
+                previous_entry_id: row.get("previous_entry_id"),
+                next_stream_id: row.get("next_stream_id"),
+                next_entry_id: row.get("next_entry_id"),
+            };
+            handoffs.insert(handoff.previous_stream_id.clone(), handoff);
+        }
+        Ok(handoffs)
+    }
+
     async fn deltas_for_range(
         &self,
         request: &HistoryRangeRequest,
-        checkpoint: Option<&CheckpointManifest>,
-        replay_from_message_seq: Option<u64>,
+        replay_segments: Option<&[HistoryReplaySegment]>,
         replay_from_block_number: u64,
         rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Vec<StoredDeltaEntry>> {
+        let rows = match replay_segments {
+            Some(segments) => {
+                self.deltas_for_segmented_range(
+                    request,
+                    segments,
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await?
+            }
+            None => {
+                self.deltas_for_single_stream_range(
+                    request,
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await?
+            }
+        };
+
+        rows.into_iter()
+            .map(stored_delta_from_row)
+            .collect::<Result<Vec<_>>>()
+    }
+
+    async fn deltas_for_segmented_range(
+        &self,
+        request: &HistoryRangeRequest,
+        segments: &[HistoryReplaySegment],
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
         let block_backends = request.block_backends();
-        let checkpoint_stream_id =
-            checkpoint.map(|checkpoint| checkpoint.metadata.stream_id.as_str());
-        let rows = sqlx::query(
+        sqlx::query(
+            r#"
+            WITH replay_segments AS (
+                SELECT *
+                FROM UNNEST($8::bigint[], $9::text[], $10::bigint[], $11::bigint[])
+                    AS segment(ordinal, stream_id, from_message_seq, to_message_seq)
+            ),
+            selected_deltas AS (
+                SELECT DISTINCT segment.ordinal, idx.delta_id
+                FROM replay_segments segment
+                JOIN state_history.delta_messages d
+                    ON d.stream_id = segment.stream_id
+                    AND d.message_seq >= segment.from_message_seq
+                    AND d.message_seq <= segment.to_message_seq
+                JOIN state_history.delta_backend_index idx ON idx.delta_id = d.id
+                WHERE idx.chain_id = $1
+                    AND (
+                        (
+                            idx.backend = ANY($2::text[])
+                            AND idx.block_number IS NOT NULL
+                            AND idx.block_number >= $3
+                            AND idx.block_number <= $4
+                        )
+                        OR (
+                            $5::boolean
+                            AND idx.backend = 'rfq'
+                            AND idx.observed_timestamp_ms IS NOT NULL
+                            AND idx.observed_timestamp_ms >= $6
+                            AND idx.observed_timestamp_ms <= $7
+                        )
+                    )
+            )
+            SELECT d.id, d.redis_entry_id, d.payload_encoding, d.payload_compressed,
+                d.payload_hash
+            FROM selected_deltas selected
+            JOIN state_history.delta_messages d ON d.id = selected.delta_id
+            ORDER BY selected.ordinal ASC, d.message_seq ASC, d.id ASC
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(backend_scope_strings(&block_backends))
+        .bind(u64_to_i64(
+            "replay_from_block_number",
+            replay_from_block_number,
+        )?)
+        .bind(u64_to_i64("end_block_number", request.end_block_number)?)
+        .bind(request.includes_rfq())
+        .bind(
+            optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
+                .unwrap_or(0),
+        )
+        .bind(
+            optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
+        )
+        .bind(segment_ordinals(segments))
+        .bind(segment_stream_ids(segments))
+        .bind(segment_from_message_seq(segments)?)
+        .bind(segment_to_message_seq(segments)?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load segmented state history deltas")
+    }
+
+    async fn deltas_for_single_stream_range(
+        &self,
+        request: &HistoryRangeRequest,
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let block_backends = request.block_backends();
+        sqlx::query(
             r#"
             WITH selected_deltas AS (
                 SELECT DISTINCT idx.delta_id
                 FROM state_history.delta_backend_index idx
                 JOIN state_history.delta_messages d ON d.id = idx.delta_id
                 WHERE idx.chain_id = $1
-                    AND ($8::text IS NULL OR d.stream_id = $8)
-                    AND ($9::bigint IS NULL OR d.message_seq >= $9)
                     AND (
                         (
                             idx.backend = ANY($2::text[])
@@ -1003,35 +1368,127 @@ impl StateHistoryPgStore {
         .bind(
             optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
         )
-        .bind(checkpoint_stream_id)
-        .bind(optional_u64_to_i64(
-            "replay_from_message_seq",
-            replay_from_message_seq,
-        )?)
         .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(stored_delta_from_row)
-            .collect::<Result<Vec<_>>>()
+        .await
+        .context("failed to load state history deltas")
     }
 
     async fn recorded_gaps_for_range(
         &self,
         request: &HistoryRangeRequest,
-        checkpoint: Option<&CheckpointManifest>,
-        replay_from_message_seq: Option<u64>,
+        replay_segments: Option<&[HistoryReplaySegment]>,
         replay_from_block_number: u64,
         rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Vec<HistoryRangeGap>> {
-        let rows = sqlx::query(
+        let rows = match replay_segments {
+            Some(segments) => {
+                self.recorded_gaps_for_segmented_range(
+                    request,
+                    segments,
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await?
+            }
+            None => {
+                self.recorded_gaps_for_single_stream_range(
+                    request,
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await?
+            }
+        };
+
+        rows.into_iter()
+            .map(Self::recorded_gap_from_row)
+            .collect::<Result<Vec<_>>>()
+    }
+
+    async fn recorded_gaps_for_segmented_range(
+        &self,
+        request: &HistoryRangeRequest,
+        segments: &[HistoryReplaySegment],
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        sqlx::query(
+            r#"
+            WITH replay_segments AS (
+                SELECT *
+                FROM UNNEST($8::bigint[], $9::text[], $10::bigint[], $11::bigint[])
+                    AS segment(ordinal, stream_id, from_message_seq, to_message_seq)
+            )
+            SELECT DISTINCT segment.ordinal, gap.backend_scope, gap.from_block_number,
+                gap.to_block_number, gap.from_timestamp_ms, gap.to_timestamp_ms, gap.reason
+            FROM state_history.ingestion_gaps gap
+            JOIN replay_segments segment
+                ON gap.stream_id = segment.stream_id
+                AND gap.to_message_seq >= segment.from_message_seq
+                AND gap.from_message_seq <= segment.to_message_seq
+            WHERE gap.chain_id = $1
+                AND gap.backend_scope && $2::text[]
+                AND (
+                    (
+                        gap.from_block_number IS NOT NULL
+                        AND gap.to_block_number IS NOT NULL
+                        AND gap.from_block_number <= $3
+                        AND gap.to_block_number >= $4
+                    )
+                    OR (
+                        $5::boolean
+                        AND gap.from_timestamp_ms IS NOT NULL
+                        AND gap.to_timestamp_ms IS NOT NULL
+                        AND gap.from_timestamp_ms <= $6
+                        AND gap.to_timestamp_ms >= $7
+                    )
+                    OR (
+                        gap.from_block_number IS NULL
+                        AND gap.to_block_number IS NULL
+                        AND gap.from_timestamp_ms IS NULL
+                        AND gap.to_timestamp_ms IS NULL
+                    )
+                )
+            ORDER BY segment.ordinal, gap.from_block_number NULLS LAST,
+                gap.from_timestamp_ms NULLS LAST, gap.reason ASC
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(backend_scope_strings(&request.backends))
+        .bind(u64_to_i64("end_block_number", request.end_block_number)?)
+        .bind(u64_to_i64(
+            "replay_from_block_number",
+            replay_from_block_number,
+        )?)
+        .bind(request.includes_rfq())
+        .bind(
+            optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
+        )
+        .bind(
+            optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
+                .unwrap_or(0),
+        )
+        .bind(segment_ordinals(segments))
+        .bind(segment_stream_ids(segments))
+        .bind(segment_from_message_seq(segments)?)
+        .bind(segment_to_message_seq(segments)?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load segmented state history gaps")
+    }
+
+    async fn recorded_gaps_for_single_stream_range(
+        &self,
+        request: &HistoryRangeRequest,
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        sqlx::query(
             r#"
             SELECT backend_scope, from_block_number, to_block_number, from_timestamp_ms,
                 to_timestamp_ms, reason
             FROM state_history.ingestion_gaps
             WHERE chain_id = $1
-                AND ($8::text IS NULL OR stream_id = $8)
-                AND ($9::bigint IS NULL OR to_message_seq >= $9)
                 AND backend_scope && $2::text[]
                 AND (
                     (
@@ -1072,57 +1529,68 @@ impl StateHistoryPgStore {
             optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
                 .unwrap_or(0),
         )
-        .bind(checkpoint.map(|checkpoint| checkpoint.metadata.stream_id.as_str()))
-        .bind(optional_u64_to_i64(
-            "replay_from_message_seq",
-            replay_from_message_seq,
-        )?)
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .context("failed to load state history gaps")
+    }
 
-        rows.into_iter()
-            .map(|row| {
-                let backends: Vec<String> = row.get("backend_scope");
-                Ok(HistoryRangeGap {
-                    source: HistoryRangeGapSource::RecordedGap,
-                    backend_scope: parse_backend_strings(&backends)?,
-                    from_block_number: optional_i64_to_u64(
-                        "from_block_number",
-                        row.get("from_block_number"),
-                    )?,
-                    to_block_number: optional_i64_to_u64(
-                        "to_block_number",
-                        row.get("to_block_number"),
-                    )?,
-                    from_timestamp_ms: optional_i64_to_u64(
-                        "from_timestamp_ms",
-                        row.get("from_timestamp_ms"),
-                    )?,
-                    to_timestamp_ms: optional_i64_to_u64(
-                        "to_timestamp_ms",
-                        row.get("to_timestamp_ms"),
-                    )?,
-                    reason: row.get("reason"),
-                })
-            })
-            .collect::<Result<Vec<_>>>()
+    fn recorded_gap_from_row(row: sqlx::postgres::PgRow) -> Result<HistoryRangeGap> {
+        let backends: Vec<String> = row.get("backend_scope");
+        Ok(HistoryRangeGap {
+            source: HistoryRangeGapSource::RecordedGap,
+            backend_scope: parse_backend_strings(&backends)?,
+            from_block_number: optional_i64_to_u64(
+                "from_block_number",
+                row.get("from_block_number"),
+            )?,
+            to_block_number: optional_i64_to_u64("to_block_number", row.get("to_block_number"))?,
+            from_timestamp_ms: optional_i64_to_u64(
+                "from_timestamp_ms",
+                row.get("from_timestamp_ms"),
+            )?,
+            to_timestamp_ms: optional_i64_to_u64("to_timestamp_ms", row.get("to_timestamp_ms"))?,
+            reason: row.get("reason"),
+        })
     }
 
     async fn generation_switch_gap_for_range(
         &self,
         request: &HistoryRangeRequest,
         checkpoint: &CheckpointManifest,
+        replay_segments: &[HistoryReplaySegment],
         replay_from_block_number: u64,
         rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Option<HistoryRangeGap>> {
         let block_backends = request.block_backends();
+        let segment_ordinals = segment_ordinals(replay_segments);
+        let segment_stream_ids = segment_stream_ids(replay_segments);
+        let segment_from_message_seq = segment_from_message_seq(replay_segments)?;
+        let segment_to_message_seq = segment_to_message_seq(replay_segments)?;
         let switched_stream_exists = sqlx::query_scalar::<_, i32>(
             r#"
+            WITH replay_segments AS (
+                SELECT *
+                FROM UNNEST($8::bigint[], $9::text[], $10::bigint[], $11::bigint[])
+                    AS segment(ordinal, stream_id, from_message_seq, to_message_seq)
+            )
             SELECT 1
             FROM state_history.delta_backend_index idx
             JOIN state_history.delta_messages d ON d.id = idx.delta_id
             WHERE idx.chain_id = $1
-                AND d.stream_id <> $8
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM replay_segments segment
+                    WHERE d.stream_id = segment.stream_id
+                        AND d.message_seq >= segment.from_message_seq
+                        AND d.message_seq <= segment.to_message_seq
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM replay_segments segment
+                    WHERE segment.ordinal = 0
+                        AND d.stream_id = segment.stream_id
+                        AND d.message_seq < segment.from_message_seq
+                )
                 AND (
                     (
                         idx.backend = ANY($2::text[])
@@ -1156,7 +1624,10 @@ impl StateHistoryPgStore {
         .bind(
             optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
         )
-        .bind(&checkpoint.metadata.stream_id)
+        .bind(segment_ordinals)
+        .bind(segment_stream_ids)
+        .bind(segment_from_message_seq)
+        .bind(segment_to_message_seq)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -1430,12 +1901,14 @@ impl StateHistoryWriter {
         })
     }
 
-    pub async fn enqueue_delta(
+    pub async fn enqueue_entry(
         &self,
         entry: BroadcasterRedisStreamEntry,
         redis_entry_id: String,
     ) -> Result<()> {
-        if entry.kind != BroadcasterMessageKind::Update {
+        if entry.kind != BroadcasterMessageKind::Update
+            && prepare_generation_handoff(&entry, Some(&redis_entry_id))?.is_none()
+        {
             return Ok(());
         }
         let stream_id = entry.stream_id.clone();
@@ -1529,7 +2002,7 @@ async fn persist_delta_with_retry(
     loop {
         attempts = attempts.saturating_add(1);
         match pg_store
-            .insert_delta(&command.entry, Some(&command.redis_entry_id))
+            .insert_entry(&command.entry, Some(&command.redis_entry_id))
             .await
         {
             Ok(_) => {
@@ -1792,11 +2265,13 @@ mod tests {
     };
 
     use super::{
-        decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
-        ingestion_gap_for_entry, optional_u64_to_i64, prepare_delta_message, u64_to_i64,
-        writer_retry_backoff, CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest,
-        CheckpointPayload, CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap,
-        HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest, WRITER_RETRY_BACKOFF_CAP,
+        build_validated_replay_segments, decode_checkpoint_archive_bytes,
+        encode_checkpoint_archive, indexed_backends_for_entry, ingestion_gap_for_entry,
+        optional_u64_to_i64, prepare_delta_message, u64_to_i64, writer_retry_backoff,
+        CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload,
+        CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource,
+        HistoryRangePlan, HistoryRangeRequest, HistoryReplaySegment, StoredGenerationHandoff,
+        WRITER_RETRY_BACKOFF_CAP,
     };
 
     #[test]
@@ -2009,6 +2484,68 @@ mod tests {
     }
 
     #[test]
+    fn replay_segments_follow_valid_multi_hop_handoffs() {
+        let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-1", 1);
+        let handoffs = BTreeMap::from([
+            (
+                "chain-8453-stream-1".to_string(),
+                stored_handoff("chain-8453-stream-1", "1-3", "chain-8453-stream-2", "2-1"),
+            ),
+            (
+                "chain-8453-stream-2".to_string(),
+                stored_handoff("chain-8453-stream-2", "2-3", "chain-8453-stream-3", "3-1"),
+            ),
+        ]);
+
+        let segments = build_validated_replay_segments(&checkpoint, &handoffs);
+
+        assert_eq!(
+            segments,
+            vec![
+                HistoryReplaySegment {
+                    ordinal: 0,
+                    stream_id: "chain-8453-stream-1".to_string(),
+                    from_message_seq: 2,
+                    to_message_seq: Some(3),
+                },
+                HistoryReplaySegment {
+                    ordinal: 1,
+                    stream_id: "chain-8453-stream-2".to_string(),
+                    from_message_seq: 2,
+                    to_message_seq: Some(3),
+                },
+                HistoryReplaySegment {
+                    ordinal: 2,
+                    stream_id: "chain-8453-stream-3".to_string(),
+                    from_message_seq: 2,
+                    to_message_seq: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_segments_stop_before_malformed_handoff_generation() {
+        let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-1", 1);
+        let handoffs = BTreeMap::from([(
+            "chain-8453-stream-1".to_string(),
+            stored_handoff("chain-8453-stream-1", "1-3", "chain-8453-stream-3", "3-1"),
+        )]);
+
+        let segments = build_validated_replay_segments(&checkpoint, &handoffs);
+
+        assert_eq!(
+            segments,
+            vec![HistoryReplaySegment {
+                ordinal: 0,
+                stream_id: "chain-8453-stream-1".to_string(),
+                from_message_seq: 2,
+                to_message_seq: None,
+            }]
+        );
+    }
+
+    #[test]
     fn writer_gap_rows_keep_entry_cursors() -> Result<()> {
         let native = update_envelope("stream-1", 9, BroadcasterBackend::Native, 124)?;
         let rfq = update_envelope("stream-1", 10, BroadcasterBackend::Rfq, 789)?;
@@ -2052,6 +2589,29 @@ mod tests {
         captured_at_timestamp_ms: u64,
         rfq_update_timestamp_ms: Option<u64>,
     ) -> CheckpointManifest {
+        checkpoint_manifest_with_stream_and_cursor(
+            "stream-1",
+            42,
+            block_number,
+            captured_at_timestamp_ms,
+            rfq_update_timestamp_ms,
+        )
+    }
+
+    fn checkpoint_manifest_with_stream(
+        stream_id: &str,
+        source_message_seq: u64,
+    ) -> CheckpointManifest {
+        checkpoint_manifest_with_stream_and_cursor(stream_id, source_message_seq, 90, 1, None)
+    }
+
+    fn checkpoint_manifest_with_stream_and_cursor(
+        stream_id: &str,
+        source_message_seq: u64,
+        block_number: u64,
+        captured_at_timestamp_ms: u64,
+        rfq_update_timestamp_ms: Option<u64>,
+    ) -> CheckpointManifest {
         CheckpointManifest {
             id: 1,
             metadata: CheckpointArchiveMetadata {
@@ -2059,8 +2619,8 @@ mod tests {
                 block_number,
                 captured_at_timestamp_ms,
                 rfq_update_timestamp_ms,
-                stream_id: "stream-1".to_string(),
-                source_message_seq: 42,
+                stream_id: stream_id.to_string(),
+                source_message_seq,
                 backends: vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
             },
             s3_bucket: "state-history".to_string(),
@@ -2070,6 +2630,20 @@ mod tests {
             compressed_bytes: Some(8),
             status: CheckpointStatus::Complete,
             error: None,
+        }
+    }
+
+    fn stored_handoff(
+        previous_stream_id: &str,
+        previous_entry_id: &str,
+        next_stream_id: &str,
+        next_entry_id: &str,
+    ) -> StoredGenerationHandoff {
+        StoredGenerationHandoff {
+            previous_stream_id: previous_stream_id.to_string(),
+            previous_entry_id: previous_entry_id.to_string(),
+            next_stream_id: next_stream_id.to_string(),
+            next_entry_id: next_entry_id.to_string(),
         }
     }
 

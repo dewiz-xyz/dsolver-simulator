@@ -6,16 +6,18 @@ use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Region, Client as S3Client};
 use serde::Serialize;
+use tokio::time::{sleep, Duration, Instant};
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolSyncStatus,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
+    BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolSyncStatus,
     BroadcasterProtocolSyncStatusKind, BroadcasterRedisStreamEntry, BroadcasterSnapshotEnd,
     BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 use state_history::{
     CheckpointArchive, CheckpointArchiveMetadata, HistoryRangeGapSource, HistoryRangePlan,
     HistoryRangeRequest, IngestionGap, S3CheckpointStore, StateHistoryCheckpointWriter,
-    StateHistoryPgStore, StateHistoryReader,
+    StateHistoryPgStore, StateHistoryReader, StateHistoryWriter, StateHistoryWriterConfig,
 };
 
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:55432/state_history";
@@ -49,9 +51,9 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
 
     let run_id = current_timestamp_ms()?;
     let chain_id = 9_000_000_000u64.saturating_add(run_id % 1_000_000);
-    let stream_id = format!("state-history-analysis-{run_id}");
+    let stream_id = format!("chain-{chain_id}-stream-1");
     let rfq_cursor_timestamp_ms = 1_700_000_000_000u64.saturating_add(run_id % 1_000_000);
-    let (inserted_deltas, stale_stream_id) =
+    let (inserted_deltas, handoff_stream_id) =
         insert_synthetic_delta_fixtures(&pg_store, chain_id, &stream_id, rfq_cursor_timestamp_ms)
             .await?;
 
@@ -71,20 +73,28 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
     let request = synthetic_history_request(chain_id, rfq_cursor_timestamp_ms)?;
     record_pre_checkpoint_gap(&pg_store, chain_id, &stream_id).await?;
     let plan = reader.resolve_range(request.clone()).await?;
-    let generation_switch_gaps = assert_generation_switch_gap(&plan)?;
+    let valid_generation_switch_gaps = assert_no_generation_switch_gap(&plan)?;
     let selected_checkpoint = plan
         .checkpoint
         .as_ref()
         .ok_or_else(|| anyhow!("expected a complete checkpoint for the synthetic range"))?;
     let decoded = reader.fetch_checkpoint(selected_checkpoint).await?;
 
-    let replayed_message_sequences = assert_replay_plan(&plan, &stream_id)?;
+    let replayed_message_sequences = assert_replay_plan(&plan, &stream_id, &handoff_stream_id)?;
     anyhow::ensure!(
         decoded.archive.payloads.len() == 2,
         "expected checkpoint archive start/end payloads"
     );
 
-    record_visible_gap_fixtures(&pg_store, chain_id, &stream_id, &stale_stream_id).await?;
+    insert_old_generation_continuation_delta(&pg_store, chain_id, &stream_id).await?;
+    let old_generation_plan = reader.resolve_range(request.clone()).await?;
+    assert_generation_switch_gap(&old_generation_plan)?;
+
+    let stale_stream_id = insert_stale_generation_delta(&pg_store, chain_id).await?;
+    let stale_plan = reader.resolve_range(request.clone()).await?;
+    let generation_switch_gaps = assert_generation_switch_gap(&stale_plan)?;
+
+    record_visible_gap_fixtures(&pg_store, chain_id, &handoff_stream_id, &stale_stream_id).await?;
     let gap_plan = reader.resolve_range(request).await?;
     let recorded_gaps = gap_plan
         .gaps
@@ -108,6 +118,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         checkpoint_payload_hash: checkpoint.payload.hash,
         decoded_checkpoint_payloads: decoded.archive.payloads.len(),
         recorded_gaps,
+        valid_generation_switch_gaps,
         generation_switch_gaps,
     })
 }
@@ -123,22 +134,61 @@ async fn insert_synthetic_delta_fixtures(
     for (index, entry) in redis_entries.iter().enumerate() {
         let redis_entry_id = format!("1-{}", index + 1);
         pg_store
-            .insert_delta(entry, Some(&redis_entry_id))
+            .insert_entry(entry, Some(&redis_entry_id))
             .await
             .with_context(|| format!("failed to insert synthetic delta {}", entry.message_seq))?;
         inserted_deltas = inserted_deltas.saturating_add(1);
     }
 
-    let stale_stream_id = format!("{stream_id}-stale");
+    let handoff_stream_id = format!("chain-{chain_id}-stream-2");
+    let handoff_marker = synthetic_handoff_marker(chain_id, stream_id, "1-4", &handoff_stream_id)?;
+    assert_duplicate_handoff_enqueue_is_healthy(pg_store, handoff_marker).await?;
+    inserted_deltas = inserted_deltas.saturating_add(1);
+
+    let post_handoff_entries = synthetic_post_handoff_delta_entries(chain_id, &handoff_stream_id)?;
+    for (index, entry) in post_handoff_entries.iter().enumerate() {
+        let redis_entry_id = format!("2-{}", index + 2);
+        pg_store
+            .insert_entry(entry, Some(&redis_entry_id))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to insert post-handoff synthetic delta {}",
+                    entry.message_seq
+                )
+            })?;
+        inserted_deltas = inserted_deltas.saturating_add(1);
+    }
+
+    Ok((inserted_deltas, handoff_stream_id))
+}
+
+async fn insert_stale_generation_delta(
+    pg_store: &StateHistoryPgStore,
+    chain_id: u64,
+) -> Result<String> {
+    let stale_stream_id = format!("chain-{chain_id}-stream-9");
     let stale_generation_delta =
         synthetic_delta_entry(chain_id, &stale_stream_id, 2, BroadcasterBackend::Vm, 101)?;
     pg_store
-        .insert_delta(&stale_generation_delta, Some("stale-2"))
+        .insert_entry(&stale_generation_delta, Some("9-2"))
         .await
         .context("failed to insert stale-generation synthetic delta")?;
-    inserted_deltas = inserted_deltas.saturating_add(1);
+    Ok(stale_stream_id)
+}
 
-    Ok((inserted_deltas, stale_stream_id))
+async fn insert_old_generation_continuation_delta(
+    pg_store: &StateHistoryPgStore,
+    chain_id: u64,
+    stream_id: &str,
+) -> Result<()> {
+    let old_generation_delta =
+        synthetic_delta_entry(chain_id, stream_id, 5, BroadcasterBackend::Native, 102)?;
+    pg_store
+        .insert_entry(&old_generation_delta, Some("1-5"))
+        .await
+        .context("failed to insert old-generation continuation delta")?;
+    Ok(())
 }
 
 fn synthetic_history_request(
@@ -158,36 +208,58 @@ fn synthetic_history_request(
     .with_rfq_timestamp_range(rfq_cursor_timestamp_ms + 1, rfq_cursor_timestamp_ms + 100)
 }
 
-fn assert_replay_plan(plan: &HistoryRangePlan, stream_id: &str) -> Result<Vec<u64>> {
+fn assert_replay_plan(
+    plan: &HistoryRangePlan,
+    stream_id: &str,
+    handoff_stream_id: &str,
+) -> Result<Vec<u64>> {
+    let replayed_streams_and_sequences = plan
+        .deltas
+        .iter()
+        .map(|delta| (delta.entry.stream_id.as_str(), delta.entry.message_seq))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        replayed_streams_and_sequences
+            == vec![
+                (stream_id, 2),
+                (stream_id, 3),
+                (stream_id, 4),
+                (handoff_stream_id, 2),
+                (handoff_stream_id, 3),
+            ],
+        "expected replay to follow stream-1 before stream-2 even when message_seq is reused, got {replayed_streams_and_sequences:?}"
+    );
     let replayed_message_sequences = plan
         .deltas
         .iter()
         .map(|delta| delta.entry.message_seq)
         .collect::<Vec<_>>();
-    anyhow::ensure!(
-        replayed_message_sequences == vec![2, 3, 4],
-        "expected same-block native, VM, and RFQ deltas after checkpoint, got {replayed_message_sequences:?}"
-    );
-    anyhow::ensure!(
-        plan.deltas
-            .iter()
-            .all(|delta| delta.entry.stream_id == stream_id),
-        "reader replayed a delta from outside the checkpoint stream"
-    );
     Ok(replayed_message_sequences)
 }
 
+fn assert_no_generation_switch_gap(plan: &HistoryRangePlan) -> Result<usize> {
+    let generation_switch_gaps = generation_switch_gap_count(plan);
+    anyhow::ensure!(
+        generation_switch_gaps == 0,
+        "expected valid handoff replay to have no generation switch gaps, got {generation_switch_gaps}"
+    );
+    Ok(generation_switch_gaps)
+}
+
 fn assert_generation_switch_gap(plan: &HistoryRangePlan) -> Result<usize> {
-    let generation_switch_gaps = plan
-        .gaps
-        .iter()
-        .filter(|gap| gap.source == HistoryRangeGapSource::GenerationSwitch)
-        .count();
+    let generation_switch_gaps = generation_switch_gap_count(plan);
     anyhow::ensure!(
         generation_switch_gaps == 1,
         "expected one generation switch gap, got {generation_switch_gaps}"
     );
     Ok(generation_switch_gaps)
+}
+
+fn generation_switch_gap_count(plan: &HistoryRangePlan) -> usize {
+    plan.gaps
+        .iter()
+        .filter(|gap| gap.source == HistoryRangeGapSource::GenerationSwitch)
+        .count()
 }
 
 async fn record_pre_checkpoint_gap(
@@ -215,11 +287,14 @@ async fn record_pre_checkpoint_gap(
 async fn record_visible_gap_fixtures(
     pg_store: &StateHistoryPgStore,
     chain_id: u64,
-    stream_id: &str,
+    handoff_stream_id: &str,
     stale_stream_id: &str,
 ) -> Result<()> {
     for (stream_id, reason) in [
-        (stream_id, "state history analysis synthetic gap"),
+        (
+            handoff_stream_id,
+            "state history analysis post-handoff synthetic gap",
+        ),
         (stale_stream_id, "state history analysis stale-stream gap"),
     ] {
         pg_store
@@ -290,6 +365,88 @@ fn synthetic_delta_entries(
         synthetic_delta_entry(chain_id, stream_id, message_seq, backend, cursor)
     })
     .collect()
+}
+
+fn synthetic_post_handoff_delta_entries(
+    chain_id: u64,
+    stream_id: &str,
+) -> Result<Vec<BroadcasterRedisStreamEntry>> {
+    [
+        (2, BroadcasterBackend::Native, 102),
+        (3, BroadcasterBackend::Vm, 103),
+    ]
+    .into_iter()
+    .map(|(message_seq, backend, cursor)| {
+        synthetic_delta_entry(chain_id, stream_id, message_seq, backend, cursor)
+    })
+    .collect()
+}
+
+fn synthetic_handoff_marker(
+    chain_id: u64,
+    previous_stream_id: &str,
+    previous_entry_id: &str,
+    next_stream_id: &str,
+) -> Result<BroadcasterRedisStreamEntry> {
+    let backends = vec![
+        BroadcasterBackend::Native,
+        BroadcasterBackend::Vm,
+        BroadcasterBackend::Rfq,
+    ];
+    let handoff = BroadcasterGenerationHandoff::new(
+        previous_stream_id,
+        previous_entry_id,
+        vec![
+            BroadcasterBackendHead::new(BroadcasterBackend::Native, 100),
+            BroadcasterBackendHead::new(BroadcasterBackend::Vm, 101),
+            BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 1_700_000_000_000),
+        ],
+    )?;
+    let progress = BroadcasterProgress::new_with_handoff(
+        chain_id,
+        format!("chain-{chain_id}-snapshot-2"),
+        backends,
+        "state history analysis handoff".to_string(),
+        handoff,
+    )?;
+    let envelope =
+        BroadcasterEnvelope::new(next_stream_id, 1, BroadcasterPayload::Progress(progress));
+    BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope).map_err(Into::into)
+}
+
+async fn assert_duplicate_handoff_enqueue_is_healthy(
+    pg_store: &StateHistoryPgStore,
+    marker: BroadcasterRedisStreamEntry,
+) -> Result<()> {
+    let writer = StateHistoryWriter::spawn(
+        pg_store.clone(),
+        StateHistoryWriterConfig {
+            queue_capacity: 4,
+            retry_window: Duration::from_millis(200),
+        },
+    )?;
+    writer
+        .enqueue_entry(marker.clone(), "2-1".to_string())
+        .await?;
+    writer.enqueue_entry(marker, "2-1".to_string()).await?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = writer.snapshot().await;
+        if snapshot.persisted_deltas >= 2 || Instant::now() >= deadline {
+            anyhow::ensure!(
+                snapshot.healthy,
+                "duplicate handoff marker enqueue left writer unhealthy: {:?}",
+                snapshot.last_error
+            );
+            anyhow::ensure!(
+                snapshot.persisted_deltas >= 2,
+                "duplicate handoff marker enqueue was not persisted before timeout"
+            );
+            return Ok(());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn synthetic_delta_entry(
@@ -469,5 +626,6 @@ struct StateHistoryAnalysisReport {
     checkpoint_payload_hash: String,
     decoded_checkpoint_payloads: usize,
     recorded_gaps: usize,
+    valid_generation_switch_gaps: usize,
     generation_switch_gaps: usize,
 }

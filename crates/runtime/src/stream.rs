@@ -1178,7 +1178,9 @@ mod tests {
     use crate::models::state::{StateStore, VmStreamStatus};
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
+    use simulator_core::broadcaster::{
+        BroadcasterBackend, BroadcasterBackendHead, BroadcasterRedisStreamEntry,
+    };
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
     #[test]
@@ -1295,12 +1297,16 @@ mod tests {
     impl RedisStreamWriter for FailAppendRedisWriter {
         fn promote<'a>(
             &'a self,
-            _command: RedisPromotionCommand<'a>,
+            command: RedisPromotionCommand<'a>,
         ) -> futures::future::BoxFuture<'a, anyhow::Result<RedisPromotionResult>> {
             Box::pin(async move {
+                let marker_entry = entry_from_fields(command.normal_marker_fields, 1)?;
                 Ok(RedisPromotionResult {
                     generation: 1,
                     entry_id: "1-1".to_string(),
+                    previous_stream_id: None,
+                    previous_entry_id: None,
+                    marker_entry,
                 })
             })
         }
@@ -1431,5 +1437,17 @@ mod tests {
                 snapshots_emit_emf: false,
             },
         }
+    }
+
+    fn entry_from_fields(
+        fields: &[(String, String)],
+        generation: u64,
+    ) -> anyhow::Result<BroadcasterRedisStreamEntry> {
+        let mut value = serde_json::Map::new();
+        for (field, field_value) in fields {
+            let field_value = field_value.replace("__GENERATION__", &generation.to_string());
+            value.insert(field.clone(), serde_json::Value::String(field_value));
+        }
+        serde_json::from_value(serde_json::Value::Object(value)).map_err(Into::into)
     }
 }
