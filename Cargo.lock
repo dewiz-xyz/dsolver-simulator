@@ -911,6 +911,8 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives 1.5.7",
  "anyhow",
+ "aws-config",
+ "aws-sdk-s3",
  "axum 0.7.9",
  "chrono",
  "futures 0.3.32",
@@ -924,6 +926,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simulator-core",
+ "state-history",
  "tokio",
  "tower",
  "tycho-simulation",

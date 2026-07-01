@@ -246,6 +246,12 @@ are treated as externally managed. To verify the Redis replay path while service
 scripts/verify_broadcaster_redis.sh --repo .
 ```
 
+To verify the opt-in PostgreSQL + S3 state history path locally:
+
+```bash
+scripts/verify_state_history.sh --repo .
+```
+
 To run the live mainnet VM wire e2e, point at an already running mainnet
 broadcaster plus Redis and enable the explicit live-test gate:
 
@@ -272,6 +278,7 @@ Useful helpers:
 - `scripts/start_server.sh` to start the local broadcaster plus simulator stack with repo-local PID and log files
 - `scripts/wait_ready.sh` to poll `/status` and enforce chain, native, VM, and RFQ readiness expectations; native readiness remains the default gate
 - `scripts/verify_broadcaster_redis.sh` to check the broadcaster replay boundary, available Redis stream history, and simulator catch-up status
+- `scripts/verify_state_history.sh` to run the local Postgres + MinIO state history storage harness
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
@@ -282,6 +289,7 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
+- [docs/state_history.md](docs/state_history.md): durable state history storage contract and local validation workflow
 - [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
 - `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
 - `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow

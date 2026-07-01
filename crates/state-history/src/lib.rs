@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -578,6 +579,23 @@ impl StateHistoryPgStore {
             .await
             .context("failed to connect to state history PostgreSQL")?;
         Ok(Self::from_pool(pool))
+    }
+
+    pub async fn run_migrations(database_url: &str) -> Result<()> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(database_url)
+            .await
+            .context("failed to connect to state history PostgreSQL for migrations")?;
+        let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let migrator = sqlx::migrate::Migrator::new(migrations.as_path())
+            .await
+            .context("failed to load state history migrations")?;
+        migrator
+            .run(&pool)
+            .await
+            .context("failed to run state history migrations")?;
+        Ok(())
     }
 
     pub async fn validate_schema(&self) -> Result<()> {
