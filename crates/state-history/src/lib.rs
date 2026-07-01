@@ -1260,7 +1260,10 @@ async fn persist_delta_with_retry(
         {
             Ok(_) => {
                 let mut status = status.write().await;
+                status.healthy = true;
                 status.persisted_deltas = status.persisted_deltas.saturating_add(1);
+                status.last_persisted_stream_id = Some(command.entry.stream_id.clone());
+                status.last_persisted_redis_entry_id = Some(command.redis_entry_id.clone());
                 status.last_persisted_message_seq = Some(command.entry.message_seq);
                 status.last_error = None;
                 return;
@@ -1279,6 +1282,8 @@ async fn persist_delta_with_retry(
                     match record_gap_for_entry(pg_store, &command.entry, &message).await {
                         Ok(_) => {
                             let mut status = status.write().await;
+                            status.healthy = false;
+                            status.failed_deltas = status.failed_deltas.saturating_add(1);
                             status.recorded_gaps = status.recorded_gaps.saturating_add(1);
                             status.last_error = Some(message);
                         }
@@ -1290,7 +1295,10 @@ async fn persist_delta_with_retry(
                                 error = %message,
                                 "Failed to record state history gap"
                             );
-                            status.write().await.last_error = Some(message);
+                            let mut status = status.write().await;
+                            status.healthy = false;
+                            status.failed_deltas = status.failed_deltas.saturating_add(1);
+                            status.last_error = Some(message);
                         }
                     }
                     return;
