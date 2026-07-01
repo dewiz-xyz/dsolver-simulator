@@ -129,7 +129,6 @@ pub struct CheckpointCompletion {
     pub payload_hash: String,
     pub payload_bytes: usize,
     pub compressed_bytes: usize,
-    pub first_delta_id_after: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +141,6 @@ pub struct CheckpointManifest {
     pub payload_bytes: Option<i64>,
     pub compressed_bytes: Option<i64>,
     pub status: CheckpointStatus,
-    pub first_delta_id_after: Option<i64>,
     pub error: Option<String>,
 }
 
@@ -803,7 +801,6 @@ impl StateHistoryPgStore {
                 payload_hash = $2,
                 payload_bytes = $3,
                 compressed_bytes = $4,
-                first_delta_id_after = $5,
                 error = NULL,
                 completed_at = now()
             WHERE id = $1
@@ -816,7 +813,6 @@ impl StateHistoryPgStore {
             "compressed_bytes",
             completion.compressed_bytes,
         )?)
-        .bind(completion.first_delta_id_after)
         .execute(&self.pool)
         .await
         .context("failed to mark state history checkpoint complete")?;
@@ -888,7 +884,7 @@ impl StateHistoryPgStore {
             r#"
             SELECT id, chain_id, block_number, captured_at_timestamp_ms, stream_id,
                 source_message_seq, backend_scope, s3_bucket, s3_key, payload_hash,
-                payload_bytes, compressed_bytes, status, first_delta_id_after, error
+                payload_bytes, compressed_bytes, status, error
             FROM state_history.checkpoints
             WHERE chain_id = $1
                 AND block_number <= $2
@@ -1306,7 +1302,6 @@ impl StateHistoryCheckpointWriter {
             payload_hash: encoded.payload.hash.clone(),
             payload_bytes: encoded.payload.uncompressed_bytes,
             compressed_bytes: encoded.payload.compressed_bytes,
-            first_delta_id_after: None,
         };
         if let Err(error) = self
             .pg_store
@@ -1639,7 +1634,6 @@ fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<Checkpoint
         payload_bytes: row.get("payload_bytes"),
         compressed_bytes: row.get("compressed_bytes"),
         status: CheckpointStatus::from_str(&status)?,
-        first_delta_id_after: row.get("first_delta_id_after"),
         error: row.get("error"),
     })
 }
@@ -2026,7 +2020,6 @@ mod tests {
             payload_bytes: Some(10),
             compressed_bytes: Some(8),
             status: CheckpointStatus::Complete,
-            first_delta_id_after: Some(7),
             error: None,
         }
     }

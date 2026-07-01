@@ -53,7 +53,6 @@ CREATE TABLE state_history.checkpoints (
     payload_bytes BIGINT,
     compressed_bytes BIGINT,
     status TEXT NOT NULL CHECK (status IN ('writing', 'complete', 'failed')),
-    first_delta_id_after BIGINT REFERENCES state_history.delta_messages(id),
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
