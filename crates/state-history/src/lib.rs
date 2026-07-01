@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
@@ -9,9 +10,16 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterRedisStreamEntry,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::{sleep, Duration, Instant};
+use tracing::warn;
 
 const CHECKPOINT_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const ZSTD_LEVEL: i32 = 3;
+const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 8_192;
+const DEFAULT_WRITER_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const WRITER_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(100);
+const WRITER_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -223,6 +231,55 @@ pub struct S3CheckpointStore {
 pub struct StateHistoryReader {
     pg_store: StateHistoryPgStore,
     checkpoint_store: S3CheckpointStore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateHistoryWriterConfig {
+    pub queue_capacity: usize,
+    pub retry_window: Duration,
+}
+
+impl Default for StateHistoryWriterConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: DEFAULT_WRITER_QUEUE_CAPACITY,
+            retry_window: DEFAULT_WRITER_RETRY_WINDOW,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateHistoryWriterSnapshot {
+    pub healthy: bool,
+    pub queue_capacity: usize,
+    pub retry_window_ms: u64,
+    pub enqueued_deltas: u64,
+    pub persisted_deltas: u64,
+    pub recorded_gaps: u64,
+    pub dropped_deltas: u64,
+    pub failed_deltas: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_stream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_redis_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_message_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct StateHistoryWriter {
+    sender: mpsc::Sender<StateHistoryWriteCommand>,
+    pg_store: StateHistoryPgStore,
+    status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+}
+
+#[derive(Debug)]
+struct StateHistoryWriteCommand {
+    entry: BroadcasterRedisStreamEntry,
+    redis_entry_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1069,6 +1126,217 @@ impl StateHistoryReader {
     }
 }
 
+impl StateHistoryWriter {
+    pub fn spawn(pg_store: StateHistoryPgStore, config: StateHistoryWriterConfig) -> Result<Self> {
+        anyhow::ensure!(
+            config.queue_capacity > 0,
+            "state history writer queue capacity must be greater than zero"
+        );
+        anyhow::ensure!(
+            !config.retry_window.is_zero(),
+            "state history writer retry window must be greater than zero"
+        );
+        let (sender, receiver) = mpsc::channel(config.queue_capacity);
+        let status = Arc::new(RwLock::new(StateHistoryWriterSnapshot {
+            healthy: true,
+            queue_capacity: config.queue_capacity,
+            retry_window_ms: config.retry_window.as_millis() as u64,
+            ..StateHistoryWriterSnapshot::default()
+        }));
+        tokio::spawn(run_state_history_writer(
+            pg_store.clone(),
+            receiver,
+            status.clone(),
+            config.retry_window,
+        ));
+        Ok(Self {
+            sender,
+            pg_store,
+            status,
+        })
+    }
+
+    pub async fn enqueue_delta(
+        &self,
+        entry: BroadcasterRedisStreamEntry,
+        redis_entry_id: String,
+    ) -> Result<()> {
+        if entry.kind != BroadcasterMessageKind::Update {
+            return Ok(());
+        }
+        let stream_id = entry.stream_id.clone();
+        let message_seq = entry.message_seq;
+        let command = StateHistoryWriteCommand {
+            entry,
+            redis_entry_id: redis_entry_id.clone(),
+        };
+        match self.sender.try_send(command) {
+            Ok(()) => {
+                let mut status = self.status.write().await;
+                status.enqueued_deltas = status.enqueued_deltas.saturating_add(1);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                let mut status = self.status.write().await;
+                status.record_enqueue_failure(format!(
+                    "state history writer queue full at stream {stream_id} message_seq {message_seq}"
+                ));
+                drop(status);
+                // Live updates should not wait on long-term history storage. If the queue is full,
+                // mark the hole and let the broadcaster keep moving.
+                self.record_gap_detached(command.entry, "state history writer queue full");
+                Err(anyhow!("state history writer queue full"))
+            }
+            Err(mpsc::error::TrySendError::Closed(command)) => {
+                let mut status = self.status.write().await;
+                status.record_enqueue_failure(format!(
+                    "state history writer task stopped at stream {stream_id} message_seq {message_seq}"
+                ));
+                drop(status);
+                self.record_gap_detached(command.entry, "state history writer task stopped");
+                Err(anyhow!("state history writer task stopped"))
+            }
+        }
+    }
+
+    pub async fn snapshot(&self) -> StateHistoryWriterSnapshot {
+        self.status.read().await.clone()
+    }
+
+    fn record_gap_detached(&self, entry: BroadcasterRedisStreamEntry, reason: &'static str) {
+        let pg_store = self.pg_store.clone();
+        let status = self.status.clone();
+        tokio::spawn(async move {
+            if let Err(error) = record_gap_for_entry(&pg_store, &entry, reason).await {
+                let message = format!("{error:#}");
+                warn!(
+                    event = "state_history_gap_record_failed",
+                    error = %message,
+                    "Failed to record state history gap"
+                );
+                let mut status = status.write().await;
+                status.healthy = false;
+                status.last_error = Some(message);
+            } else {
+                let mut status = status.write().await;
+                status.recorded_gaps = status.recorded_gaps.saturating_add(1);
+            }
+        });
+    }
+}
+
+impl StateHistoryWriterSnapshot {
+    fn record_enqueue_failure(&mut self, message: String) {
+        self.healthy = false;
+        self.dropped_deltas = self.dropped_deltas.saturating_add(1);
+        self.last_error = Some(message);
+    }
+}
+
+async fn run_state_history_writer(
+    pg_store: StateHistoryPgStore,
+    mut receiver: mpsc::Receiver<StateHistoryWriteCommand>,
+    status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+    retry_window: Duration,
+) {
+    while let Some(command) = receiver.recv().await {
+        persist_delta_with_retry(&pg_store, command, status.clone(), retry_window).await;
+    }
+}
+
+async fn persist_delta_with_retry(
+    pg_store: &StateHistoryPgStore,
+    command: StateHistoryWriteCommand,
+    status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+    retry_window: Duration,
+) {
+    let started_at = Instant::now();
+    let mut attempts = 0u64;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match pg_store
+            .insert_delta(&command.entry, Some(&command.redis_entry_id))
+            .await
+        {
+            Ok(_) => {
+                let mut status = status.write().await;
+                status.persisted_deltas = status.persisted_deltas.saturating_add(1);
+                status.last_persisted_message_seq = Some(command.entry.message_seq);
+                status.last_error = None;
+                return;
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                let elapsed = started_at.elapsed();
+                warn!(
+                    event = "state_history_delta_write_failed",
+                    message_seq = command.entry.message_seq,
+                    attempt = attempts,
+                    error = %message,
+                    "State history delta write failed"
+                );
+                if elapsed >= retry_window {
+                    match record_gap_for_entry(pg_store, &command.entry, &message).await {
+                        Ok(_) => {
+                            let mut status = status.write().await;
+                            status.recorded_gaps = status.recorded_gaps.saturating_add(1);
+                            status.last_error = Some(message);
+                        }
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            warn!(
+                                event = "state_history_gap_record_failed",
+                                message_seq = command.entry.message_seq,
+                                error = %message,
+                                "Failed to record state history gap"
+                            );
+                            status.write().await.last_error = Some(message);
+                        }
+                    }
+                    return;
+                }
+                sleep(writer_retry_backoff(attempts, retry_window - elapsed)).await;
+            }
+        }
+    }
+}
+
+async fn record_gap_for_entry(
+    pg_store: &StateHistoryPgStore,
+    entry: &BroadcasterRedisStreamEntry,
+    reason: &str,
+) -> Result<i64> {
+    let gap = ingestion_gap_for_entry(entry, reason)?;
+    pg_store.record_gap(&gap).await
+}
+
+fn ingestion_gap_for_entry(
+    entry: &BroadcasterRedisStreamEntry,
+    reason: &str,
+) -> Result<IngestionGap> {
+    let backend_scope = parse_backend_scope(&entry.backend_scope)?;
+    Ok(IngestionGap {
+        chain_id: entry.chain_id,
+        stream_id: entry.stream_id.clone(),
+        from_message_seq: entry.message_seq,
+        to_message_seq: entry.message_seq,
+        backend_scope,
+        from_block_number: entry.block_number,
+        to_block_number: entry.block_number,
+        from_timestamp_ms: entry.observed_timestamp_ms,
+        to_timestamp_ms: entry.observed_timestamp_ms,
+        reason: reason.to_string(),
+    })
+}
+
+fn writer_retry_backoff(attempts: u64, remaining: Duration) -> Duration {
+    let multiplier = 1u32.checked_shl(attempts.min(8) as u32).unwrap_or(u32::MAX);
+    let backoff = WRITER_RETRY_BACKOFF_BASE
+        .saturating_mul(multiplier)
+        .min(WRITER_RETRY_BACKOFF_CAP);
+    backoff.min(remaining)
+}
+
 fn parse_backend_scope(scope: &str) -> Result<Vec<BroadcasterBackend>> {
     anyhow::ensure!(!scope.trim().is_empty(), "backend scope must not be empty");
     let mut backends = Vec::new();
@@ -1240,10 +1508,10 @@ mod tests {
 
     use super::{
         decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
-        optional_u64_to_i64, prepare_delta_message, u64_to_i64, CheckpointArchive,
-        CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload, CheckpointStatus,
-        DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource, HistoryRangePlan,
-        HistoryRangeRequest,
+        ingestion_gap_for_entry, optional_u64_to_i64, prepare_delta_message, u64_to_i64,
+        writer_retry_backoff, CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest,
+        CheckpointPayload, CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap,
+        HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest, WRITER_RETRY_BACKOFF_CAP,
     };
 
     #[test]
@@ -1464,6 +1732,45 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn writer_gap_rows_keep_entry_cursors() -> Result<()> {
+        let native = update_envelope("stream-1", 9, BroadcasterBackend::Native, 124)?;
+        let rfq = update_envelope("stream-1", 10, BroadcasterBackend::Rfq, 789)?;
+        let native_gap = ingestion_gap_for_entry(
+            &BroadcasterRedisStreamEntry::from_envelope(8453, &native)?,
+            "storage unavailable",
+        )?;
+        let rfq_gap = ingestion_gap_for_entry(
+            &BroadcasterRedisStreamEntry::from_envelope(8453, &rfq)?,
+            "storage unavailable",
+        )?;
+
+        assert_eq!(native_gap.backend_scope, vec![BroadcasterBackend::Native]);
+        assert_eq!(native_gap.from_block_number, Some(124));
+        assert_eq!(native_gap.from_timestamp_ms, None);
+        assert_eq!(rfq_gap.backend_scope, vec![BroadcasterBackend::Rfq]);
+        assert_eq!(rfq_gap.from_block_number, None);
+        assert_eq!(rfq_gap.from_timestamp_ms, Some(789));
+        assert_eq!(rfq_gap.reason, "storage unavailable");
+
+        Ok(())
+    }
+
+    #[test]
+    fn writer_retry_backoff_is_bounded_by_cap_and_remaining_window() {
+        assert!(
+            writer_retry_backoff(1, std::time::Duration::from_secs(30)) > std::time::Duration::ZERO
+        );
+        assert_eq!(
+            writer_retry_backoff(100, std::time::Duration::from_secs(30)),
+            WRITER_RETRY_BACKOFF_CAP
+        );
+        assert_eq!(
+            writer_retry_backoff(100, std::time::Duration::from_millis(25)),
+            std::time::Duration::from_millis(25)
+        );
     }
 
     fn checkpoint_manifest(block_number: u64, captured_at_timestamp_ms: u64) -> CheckpointManifest {
