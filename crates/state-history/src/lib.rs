@@ -1241,8 +1241,9 @@ mod tests {
     use super::{
         decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
         optional_u64_to_i64, prepare_delta_message, u64_to_i64, CheckpointArchive,
-        CheckpointArchiveMetadata, CheckpointPayload, DecodedCheckpointArchive, HistoryRangeGap,
-        HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest,
+        CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload, CheckpointStatus,
+        DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource, HistoryRangePlan,
+        HistoryRangeRequest,
     };
 
     #[test]
@@ -1438,6 +1439,53 @@ mod tests {
         };
 
         plan.ensure_gap_free()
+    }
+
+    #[test]
+    fn history_range_uses_checkpoint_as_replay_start() -> Result<()> {
+        let request = HistoryRangeRequest::new(
+            8453,
+            100,
+            200,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        )?
+        .with_rfq_timestamp_range(1_720_000_000_000, 1_720_000_060_000)?;
+        let checkpoint = checkpoint_manifest(90, 1_719_999_990_000);
+
+        assert_eq!(request.replay_from_block_number(Some(&checkpoint)), 91);
+        assert_eq!(
+            request.rfq_replay_from_timestamp_ms(Some(&checkpoint)),
+            Some(1_719_999_990_001)
+        );
+        assert_eq!(request.replay_from_block_number(None), 100);
+        assert_eq!(
+            request.rfq_replay_from_timestamp_ms(None),
+            Some(1_720_000_000_000)
+        );
+
+        Ok(())
+    }
+
+    fn checkpoint_manifest(block_number: u64, captured_at_timestamp_ms: u64) -> CheckpointManifest {
+        CheckpointManifest {
+            id: 1,
+            metadata: CheckpointArchiveMetadata {
+                chain_id: 8453,
+                block_number,
+                captured_at_timestamp_ms,
+                stream_id: "stream-1".to_string(),
+                source_message_seq: 42,
+                backends: vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+            },
+            s3_bucket: "state-history".to_string(),
+            s3_key: "checkpoint.zst".to_string(),
+            payload_hash: Some("hash".to_string()),
+            payload_bytes: Some(10),
+            compressed_bytes: Some(8),
+            status: CheckpointStatus::Complete,
+            first_delta_id_after: Some(7),
+            error: None,
+        }
     }
 
     #[test]
