@@ -5,6 +5,8 @@ use anyhow::Result;
 use tracing::info;
 use tycho_simulation::utils::load_all_tokens;
 
+use state_history::{StateHistoryPgStore, StateHistoryWriter};
+
 use crate::broadcaster::redis_publisher::{
     BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, TokioRedisStreamWriter,
 };
@@ -39,6 +41,7 @@ pub struct BroadcasterAppState {
     raw_service: BroadcasterServiceState,
     rfq_service: Option<BroadcasterServiceState>,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
+    state_history: Option<StateHistoryWriter>,
     tokens: Arc<TokenStore>,
     chain_id: u64,
     snapshot_session_ttl: Duration,
@@ -52,11 +55,13 @@ impl BroadcasterAppState {
         chain_id: u64,
         snapshot_session_ttl: Duration,
         redis_publisher: Arc<BroadcasterRedisPublisher>,
+        state_history: Option<StateHistoryWriter>,
     ) -> Self {
         Self {
             raw_service,
             rfq_service,
             redis_publisher,
+            state_history,
             tokens,
             chain_id,
             snapshot_session_ttl,
@@ -97,6 +102,9 @@ impl BroadcasterAppState {
             snapshot.readiness = redis_readiness(redis_status.mode);
         }
         snapshot.redis_publisher = Some(redis_status);
+        if let Some(state_history) = &self.state_history {
+            snapshot.state_history = Some(state_history.snapshot().await.into());
+        }
         snapshot
     }
 
@@ -154,6 +162,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
     let redis_publisher = build_redis_publisher(chain.id(), heartbeat_interval).await?;
+    let state_history = build_state_history_writer(&config).await?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -170,7 +179,8 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         raw_upstream_state,
         Arc::clone(&redis_publisher),
         Arc::clone(&publication_gate),
-    );
+    )
+    .with_state_history_writer(state_history.clone());
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
 
@@ -182,7 +192,8 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
                 rfq_upstream_state,
                 Arc::clone(&redis_publisher),
                 Arc::clone(&publication_gate),
-            );
+            )
+            .with_state_history_writer(state_history.clone());
             let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
                 tokens: Arc::clone(&tokens),
                 chain,
@@ -231,9 +242,24 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         chain.id(),
         snapshot_session_ttl,
         redis_publisher,
+        state_history,
     );
 
     Ok(BroadcasterServiceParts { config, app_state })
+}
+
+async fn build_state_history_writer(
+    config: &BroadcasterConfig,
+) -> Result<Option<StateHistoryWriter>> {
+    let Some(state_history) = &config.state_history else {
+        return Ok(None);
+    };
+    let store = StateHistoryPgStore::connect(&state_history.database_url).await?;
+    store.validate_schema().await?;
+    Ok(Some(StateHistoryWriter::spawn(
+        store,
+        state_history.writer.clone(),
+    )?))
 }
 
 fn combine_status_snapshots(
@@ -581,6 +607,7 @@ mod tests {
                 token_min_quality: 0,
                 snapshot_session_ttl_secs: 300,
             },
+            state_history: None,
             bebop_user: "bebop-user".to_string(),
             bebop_key: "bebop-key".to_string(),
             hashflow_user: String::new(),

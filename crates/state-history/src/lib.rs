@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -274,6 +275,15 @@ pub struct StateHistoryWriter {
     sender: mpsc::Sender<StateHistoryWriteCommand>,
     pg_store: StateHistoryPgStore,
     status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+}
+
+impl fmt::Debug for StateHistoryWriter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StateHistoryWriter")
+            .field("queue_capacity", &self.sender.max_capacity())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]

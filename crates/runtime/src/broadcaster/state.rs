@@ -21,6 +21,7 @@ use simulator_core::broadcaster::{
 };
 
 use super::redis_publisher::BroadcasterRedisPublisherStatus;
+use state_history::StateHistoryWriterSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BroadcasterReadiness {
@@ -54,6 +55,42 @@ pub struct BroadcasterStatusSnapshot {
     pub snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
+    pub state_history: Option<BroadcasterStateHistoryStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BroadcasterStateHistoryStatus {
+    pub healthy: bool,
+    pub queue_capacity: usize,
+    pub retry_window_ms: u64,
+    pub enqueued_deltas: u64,
+    pub persisted_deltas: u64,
+    pub recorded_gaps: u64,
+    pub dropped_deltas: u64,
+    pub failed_deltas: u64,
+    pub last_persisted_stream_id: Option<String>,
+    pub last_persisted_redis_entry_id: Option<String>,
+    pub last_persisted_message_seq: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+impl From<StateHistoryWriterSnapshot> for BroadcasterStateHistoryStatus {
+    fn from(snapshot: StateHistoryWriterSnapshot) -> Self {
+        Self {
+            healthy: snapshot.healthy,
+            queue_capacity: snapshot.queue_capacity,
+            retry_window_ms: snapshot.retry_window_ms,
+            enqueued_deltas: snapshot.enqueued_deltas,
+            persisted_deltas: snapshot.persisted_deltas,
+            recorded_gaps: snapshot.recorded_gaps,
+            dropped_deltas: snapshot.dropped_deltas,
+            failed_deltas: snapshot.failed_deltas,
+            last_persisted_stream_id: snapshot.last_persisted_stream_id,
+            last_persisted_redis_entry_id: snapshot.last_persisted_redis_entry_id,
+            last_persisted_message_seq: snapshot.last_persisted_message_seq,
+            last_error: snapshot.last_error,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +449,7 @@ impl BroadcasterSnapshotCache {
             snapshot_sessions,
             backends,
             redis_publisher: None,
+            state_history: None,
         }
     }
 

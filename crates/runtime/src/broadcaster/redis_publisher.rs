@@ -579,10 +579,13 @@ impl BroadcasterRedisPublisher {
         }
     }
 
-    pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
+    pub async fn publish_accepted_payload(
+        &self,
+        payload: BroadcasterPayload,
+    ) -> Result<Option<(BroadcasterRedisStreamEntry, String)>> {
         let mut guard = self.inner.lock().await;
         match guard.mode {
-            BroadcasterRedisPublisherMode::Passive => return Ok(()),
+            BroadcasterRedisPublisherMode::Passive => return Ok(None),
             BroadcasterRedisPublisherMode::Retired => {
                 return Err(anyhow!(
                     "Redis broadcaster publisher is retired; this process is no longer the active writer"
@@ -607,7 +610,7 @@ impl BroadcasterRedisPublisher {
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
         match self.append_payload_locked(&mut guard, payload).await {
-            Ok(_) => Ok(()),
+            Ok(entry) => Ok(Some(entry)),
             Err(error) => {
                 let message = format!("{error:#}");
                 if is_stale_writer_error(&error) {

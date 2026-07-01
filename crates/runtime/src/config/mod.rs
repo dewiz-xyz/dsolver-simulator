@@ -3,7 +3,9 @@ use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use state_history::StateHistoryWriterConfig;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 mod logging;
@@ -20,6 +22,10 @@ const DEFAULT_BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES: &str = "8388608";
 const DEFAULT_BROADCASTER_REDIS_BLOCK_MS: &str = "5000";
 const DEFAULT_BROADCASTER_REDIS_READ_COUNT: &str = "128";
 const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
+const DEFAULT_STATE_HISTORY_ENABLED: &str = "false";
+const DEFAULT_STATE_HISTORY_S3_PREFIX: &str = "state-history";
+const DEFAULT_STATE_HISTORY_S3_REGION: &str = "eu-central-1";
+const DEFAULT_STATE_HISTORY_S3_FORCE_PATH_STYLE: &str = "false";
 
 /// Per-chain runtime profile resolved from `CHAIN_ID`.
 #[derive(Clone, Debug)]
@@ -161,6 +167,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     let stream = load_stream_config();
     let memory = MemoryConfig::from_env();
     let tuning = load_broadcaster_tuning();
+    let state_history = load_state_history_config();
     let chain_profile = ChainProfile {
         chain: resolved_chain.chain_profile.chain,
         native_protocols: resolved_chain.chain_profile.native_protocols,
@@ -201,6 +208,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         readiness_stale_secs: stream.readiness_stale_secs,
         memory,
         tuning,
+        state_history,
         bebop_key,
         bebop_user,
         hashflow_key,
@@ -332,6 +340,17 @@ pub struct BroadcasterRedisConfig {
     pub read_count: u64,
     pub append_retry_window_ms: u64,
     pub maxlen: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateHistoryConfig {
+    pub database_url: String,
+    pub s3_bucket: String,
+    pub s3_prefix: String,
+    pub s3_region: String,
+    pub s3_endpoint: Option<String>,
+    pub s3_force_path_style: bool,
+    pub writer: StateHistoryWriterConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,6 +540,53 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         append_retry_window_ms,
         maxlen,
     }
+}
+
+pub fn load_state_history_config() -> Option<StateHistoryConfig> {
+    if !parse_env_or_default::<bool>("STATE_HISTORY_ENABLED", DEFAULT_STATE_HISTORY_ENABLED) {
+        return None;
+    }
+
+    let database_url = require_trimmed_env("STATE_HISTORY_DATABASE_URL");
+    let s3_bucket = require_trimmed_env("STATE_HISTORY_S3_BUCKET");
+    let s3_prefix = env_or_default("STATE_HISTORY_S3_PREFIX", DEFAULT_STATE_HISTORY_S3_PREFIX);
+    let s3_region = env_or_default("STATE_HISTORY_S3_REGION", DEFAULT_STATE_HISTORY_S3_REGION);
+    let s3_endpoint = optional_trimmed_env("STATE_HISTORY_S3_ENDPOINT");
+    let s3_force_path_style = parse_env_or_default(
+        "STATE_HISTORY_S3_FORCE_PATH_STYLE",
+        DEFAULT_STATE_HISTORY_S3_FORCE_PATH_STYLE,
+    );
+    let mut writer = StateHistoryWriterConfig::default();
+    writer.queue_capacity =
+        optional_parsed_env("STATE_HISTORY_WRITER_QUEUE_CAPACITY").unwrap_or(writer.queue_capacity);
+    let retry_window_ms = optional_parsed_env("STATE_HISTORY_WRITER_RETRY_WINDOW_MS")
+        .unwrap_or_else(|| {
+            writer
+                .retry_window
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        });
+    writer.retry_window = Duration::from_millis(retry_window_ms);
+
+    assert!(
+        writer.queue_capacity > 0,
+        "STATE_HISTORY_WRITER_QUEUE_CAPACITY must be > 0"
+    );
+    assert!(
+        !writer.retry_window.is_zero(),
+        "STATE_HISTORY_WRITER_RETRY_WINDOW_MS must be > 0"
+    );
+
+    Some(StateHistoryConfig {
+        database_url,
+        s3_bucket,
+        s3_prefix,
+        s3_region,
+        s3_endpoint,
+        s3_force_path_style,
+        writer,
+    })
 }
 
 #[expect(
@@ -713,6 +779,7 @@ pub struct BroadcasterConfig {
     pub readiness_stale_secs: u64,
     pub memory: MemoryConfig,
     pub tuning: BroadcasterTuning,
+    pub state_history: Option<StateHistoryConfig>,
     pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
@@ -829,6 +896,17 @@ mod tests {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         "BROADCASTER_REDIS_MAXLEN",
     ];
+    const STATE_HISTORY_ENV_KEYS: [&str; 9] = [
+        "STATE_HISTORY_ENABLED",
+        "STATE_HISTORY_DATABASE_URL",
+        "STATE_HISTORY_S3_BUCKET",
+        "STATE_HISTORY_S3_PREFIX",
+        "STATE_HISTORY_S3_REGION",
+        "STATE_HISTORY_S3_ENDPOINT",
+        "STATE_HISTORY_S3_FORCE_PATH_STYLE",
+        "STATE_HISTORY_WRITER_QUEUE_CAPACITY",
+        "STATE_HISTORY_WRITER_RETRY_WINDOW_MS",
+    ];
     const RFQ_CREDENTIAL_ENV_KEYS: [&str; 6] = [
         "BEBOP_USER",
         "BEBOP_KEY",
@@ -852,6 +930,12 @@ mod tests {
 
     fn clear_broadcaster_redis_env() {
         for key in BROADCASTER_REDIS_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn clear_state_history_env() {
+        for key in STATE_HISTORY_ENV_KEYS {
             std::env::remove_var(key);
         }
     }
@@ -961,6 +1045,7 @@ mod tests {
         let saved_env: Vec<_> = CONFIG_TEST_ENV_KEYS
             .iter()
             .chain(BROADCASTER_REDIS_ENV_KEYS.iter())
+            .chain(STATE_HISTORY_ENV_KEYS.iter())
             .map(|key| (*key, std::env::var(key).ok()))
             .collect();
         let original_dir = std::env::current_dir()
@@ -976,6 +1061,7 @@ mod tests {
         std::env::remove_var("HASHFLOW_FILENAME_CSV");
         std::env::remove_var("TOKEN_SNAPSHOT_TIMEOUT_MS");
         clear_broadcaster_redis_env();
+        clear_state_history_env();
         match broadcaster_base_url {
             Some(value) => std::env::set_var("TYCHO_BROADCASTER_URL", value),
             None => std::env::remove_var("TYCHO_BROADCASTER_URL"),
@@ -1690,6 +1776,45 @@ route_policy = " default "
         assert_eq!(config.read_count, 64);
         assert_eq!(config.append_retry_window_ms, 7_000);
         assert_eq!(config.maxlen, Some(4_096));
+    }
+
+    #[test]
+    fn load_state_history_config_is_disabled_by_default() {
+        let config = with_isolated_config_env(None, load_state_history_config);
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn load_state_history_config_reads_required_values_and_overrides() {
+        let config = with_isolated_config_env(None, || {
+            std::env::set_var("STATE_HISTORY_ENABLED", "true");
+            std::env::set_var(
+                "STATE_HISTORY_DATABASE_URL",
+                "postgres://postgres:postgres@127.0.0.1:5432/state_history",
+            );
+            std::env::set_var("STATE_HISTORY_S3_BUCKET", "state-history");
+            std::env::set_var("STATE_HISTORY_S3_PREFIX", "local-history");
+            std::env::set_var("STATE_HISTORY_S3_REGION", "us-east-1");
+            std::env::set_var("STATE_HISTORY_S3_ENDPOINT", "http://127.0.0.1:9000");
+            std::env::set_var("STATE_HISTORY_S3_FORCE_PATH_STYLE", "true");
+            std::env::set_var("STATE_HISTORY_WRITER_QUEUE_CAPACITY", "64");
+            std::env::set_var("STATE_HISTORY_WRITER_RETRY_WINDOW_MS", "250");
+            load_state_history_config()
+        })
+        .unwrap_or_else(|| unreachable!("state history config should be enabled"));
+
+        assert_eq!(
+            config.database_url,
+            "postgres://postgres:postgres@127.0.0.1:5432/state_history"
+        );
+        assert_eq!(config.s3_bucket, "state-history");
+        assert_eq!(config.s3_prefix, "local-history");
+        assert_eq!(config.s3_region, "us-east-1");
+        assert_eq!(config.s3_endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert!(config.s3_force_path_style);
+        assert_eq!(config.writer.queue_capacity, 64);
+        assert_eq!(config.writer.retry_window, Duration::from_millis(250));
     }
 
     #[test]

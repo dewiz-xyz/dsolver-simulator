@@ -22,8 +22,9 @@ use crate::broadcaster::state::{
 };
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
-    BroadcasterSnapshotSessionResponse,
+    BroadcasterRedisStreamEntry, BroadcasterSnapshotSessionResponse,
 };
+use state_history::StateHistoryWriter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotSessionError {
@@ -229,6 +230,7 @@ pub struct BroadcasterServiceState {
     upstream: BroadcasterUpstreamState,
     snapshot_sessions: BroadcasterSnapshotSessionRegistry,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
+    state_history: Option<StateHistoryWriter>,
     // This gate keeps snapshot export plus replay-boundary capture atomic with respect to
     // updates, heartbeats, and generation resets.
     lifecycle_gate: Arc<Mutex<()>>,
@@ -248,8 +250,14 @@ impl BroadcasterServiceState {
             upstream,
             snapshot_sessions: BroadcasterSnapshotSessionRegistry::new(),
             redis_publisher,
+            state_history: None,
             lifecycle_gate,
         }
+    }
+
+    pub fn with_state_history_writer(mut self, state_history: Option<StateHistoryWriter>) -> Self {
+        self.state_history = state_history;
+        self
     }
 
     pub async fn mark_upstream_connected(&self) {
@@ -429,9 +437,11 @@ impl BroadcasterServiceState {
     pub async fn apply_update(&self, update: &TychoUpdate) -> Result<()> {
         let _gate = self.lifecycle_gate.lock().await;
         let staged = self.cache.stage_update(update).await?;
-        self.publish_to_redis(BroadcasterPayload::Update(staged.message().clone()))
+        let accepted = self
+            .publish_to_redis(BroadcasterPayload::Update(staged.message().clone()))
             .await?;
         self.cache.commit_staged_update(staged).await;
+        self.enqueue_state_history(accepted).await;
         self.upstream.record_update().await;
         Ok(())
     }
@@ -439,9 +449,11 @@ impl BroadcasterServiceState {
     pub async fn apply_feed_message(&self, feed: &FeedMessage<BlockHeader>) -> Result<()> {
         let _gate = self.lifecycle_gate.lock().await;
         let staged = self.cache.stage_feed_message(feed)?;
-        self.publish_to_redis(BroadcasterPayload::Update(staged.message().clone()))
+        let accepted = self
+            .publish_to_redis(BroadcasterPayload::Update(staged.message().clone()))
             .await?;
         self.cache.commit_staged_update(staged).await;
+        self.enqueue_state_history(accepted).await;
         self.upstream.record_update().await;
         Ok(())
     }
@@ -546,16 +558,24 @@ impl BroadcasterServiceState {
     }
 
     pub async fn status_snapshot(&self) -> BroadcasterStatusSnapshot {
-        self.cache
+        let mut snapshot = self
+            .cache
             .status_snapshot(
                 self.snapshot_max_payload_bytes,
                 self.upstream.snapshot().await,
                 self.snapshot_sessions.snapshot().await,
             )
-            .await
+            .await;
+        if let Some(state_history) = &self.state_history {
+            snapshot.state_history = Some(state_history.snapshot().await.into());
+        }
+        snapshot
     }
 
-    async fn publish_to_redis(&self, payload: BroadcasterPayload) -> Result<()> {
+    async fn publish_to_redis(
+        &self,
+        payload: BroadcasterPayload,
+    ) -> Result<Option<(BroadcasterRedisStreamEntry, String)>> {
         let result = self
             .redis_publisher
             .publish_accepted_payload(payload)
@@ -575,6 +595,21 @@ impl BroadcasterServiceState {
                 .await;
         }
         result.context("failed to publish accepted broadcaster delta to Redis")
+    }
+
+    async fn enqueue_state_history(&self, accepted: Option<(BroadcasterRedisStreamEntry, String)>) {
+        let Some((entry, redis_entry_id)) = accepted else {
+            return;
+        };
+        let Some(state_history) = &self.state_history else {
+            return;
+        };
+        if let Err(error) = state_history.enqueue_delta(entry, redis_entry_id).await {
+            warn!(
+                error = %error,
+                "State history writer did not accept broadcaster delta"
+            );
+        }
     }
 
     #[cfg(test)]
