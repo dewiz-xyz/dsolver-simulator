@@ -86,6 +86,18 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         "expected checkpoint archive start/end payloads"
     );
 
+    let post_handoff_checkpoint_generation_switch_gaps =
+        assert_post_handoff_checkpoint_does_not_report_generation_switch(
+            &checkpoint_writer,
+            &reader,
+            &request,
+            chain_id,
+            &handoff_stream_id,
+            run_id.saturating_add(1),
+            rfq_cursor_timestamp_ms,
+        )
+        .await?;
+
     insert_old_generation_continuation_delta(&pg_store, chain_id, &stream_id).await?;
     let old_generation_plan = reader.resolve_range(request.clone()).await?;
     assert_generation_switch_gap(&old_generation_plan)?;
@@ -119,6 +131,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         decoded_checkpoint_payloads: decoded.archive.payloads.len(),
         recorded_gaps,
         valid_generation_switch_gaps,
+        post_handoff_checkpoint_generation_switch_gaps,
         generation_switch_gaps,
     })
 }
@@ -251,6 +264,40 @@ fn assert_generation_switch_gap(plan: &HistoryRangePlan) -> Result<usize> {
     anyhow::ensure!(
         generation_switch_gaps == 1,
         "expected one generation switch gap, got {generation_switch_gaps}"
+    );
+    Ok(generation_switch_gaps)
+}
+
+async fn assert_post_handoff_checkpoint_does_not_report_generation_switch(
+    checkpoint_writer: &StateHistoryCheckpointWriter,
+    reader: &StateHistoryReader,
+    request: &HistoryRangeRequest,
+    chain_id: u64,
+    handoff_stream_id: &str,
+    captured_at_timestamp_ms: u64,
+    rfq_cursor_timestamp_ms: u64,
+) -> Result<usize> {
+    let post_handoff_checkpoint = checkpoint_writer
+        .write_checkpoint(synthetic_checkpoint_archive_with_cursor(
+            chain_id,
+            handoff_stream_id,
+            captured_at_timestamp_ms,
+            rfq_cursor_timestamp_ms,
+            100,
+            2,
+        )?)
+        .await
+        .context("failed to write post-handoff synthetic checkpoint")?;
+    let post_handoff_checkpoint_plan = reader.resolve_range(request.clone()).await?;
+    let generation_switch_gaps = assert_no_generation_switch_gap(&post_handoff_checkpoint_plan)?;
+    let selected_post_handoff_checkpoint = post_handoff_checkpoint_plan
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| anyhow!("expected post-handoff checkpoint to cover synthetic range"))?;
+    anyhow::ensure!(
+        selected_post_handoff_checkpoint.id == post_handoff_checkpoint.manifest_id,
+        "expected post-handoff checkpoint to be selected, got {}",
+        selected_post_handoff_checkpoint.id
     );
     Ok(generation_switch_gaps)
 }
@@ -475,6 +522,24 @@ fn synthetic_checkpoint_archive(
     captured_at_timestamp_ms: u64,
     rfq_update_timestamp_ms: u64,
 ) -> Result<CheckpointArchive> {
+    synthetic_checkpoint_archive_with_cursor(
+        chain_id,
+        stream_id,
+        captured_at_timestamp_ms,
+        rfq_update_timestamp_ms,
+        100,
+        1,
+    )
+}
+
+fn synthetic_checkpoint_archive_with_cursor(
+    chain_id: u64,
+    stream_id: &str,
+    captured_at_timestamp_ms: u64,
+    rfq_update_timestamp_ms: u64,
+    block_number: u64,
+    source_message_seq: u64,
+) -> Result<CheckpointArchive> {
     let backends = vec![
         BroadcasterBackend::Native,
         BroadcasterBackend::Vm,
@@ -484,11 +549,11 @@ fn synthetic_checkpoint_archive(
     Ok(CheckpointArchive {
         metadata: CheckpointArchiveMetadata {
             chain_id,
-            block_number: 100,
+            block_number,
             captured_at_timestamp_ms,
             rfq_update_timestamp_ms: Some(rfq_update_timestamp_ms),
             stream_id: stream_id.to_string(),
-            source_message_seq: 1,
+            source_message_seq,
             backends: backends.clone(),
         },
         payloads: vec![
@@ -627,5 +692,6 @@ struct StateHistoryAnalysisReport {
     decoded_checkpoint_payloads: usize,
     recorded_gaps: usize,
     valid_generation_switch_gaps: usize,
+    post_handoff_checkpoint_generation_switch_gaps: usize,
     generation_switch_gaps: usize,
 }

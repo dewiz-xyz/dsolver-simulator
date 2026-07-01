@@ -53,9 +53,6 @@ CREATE TABLE state_history.generation_handoffs (
     UNIQUE (chain_id, next_stream_id)
 );
 
-CREATE INDEX state_history_generation_handoffs_previous_idx
-    ON state_history.generation_handoffs (chain_id, previous_stream_id);
-
 CREATE TABLE state_history.checkpoints (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,

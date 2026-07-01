@@ -163,6 +163,12 @@ struct StoredGenerationHandoff {
     next_entry_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct StoredGenerationHandoffs {
+    by_previous_stream: BTreeMap<String, StoredGenerationHandoff>,
+    by_next_stream: BTreeMap<String, StoredGenerationHandoff>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedGenerationHandoff {
     handoff: StoredGenerationHandoff,
@@ -176,6 +182,12 @@ struct HistoryReplaySegment {
     stream_id: String,
     from_message_seq: u64,
     to_message_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedHistorySegments {
+    replay_segments: Vec<HistoryReplaySegment>,
+    generation_switch_exempt_segments: Vec<HistoryReplaySegment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,48 +647,169 @@ impl HistoryRangePlan {
     }
 }
 
+impl StoredGenerationHandoffs {
+    fn new(handoffs: impl IntoIterator<Item = StoredGenerationHandoff>) -> Self {
+        let mut stored = Self::default();
+        for handoff in handoffs {
+            stored
+                .by_previous_stream
+                .insert(handoff.previous_stream_id.clone(), handoff.clone());
+            stored
+                .by_next_stream
+                .insert(handoff.next_stream_id.clone(), handoff);
+        }
+        stored
+    }
+}
+
+fn build_validated_history_segments(
+    checkpoint: &CheckpointManifest,
+    handoffs: &StoredGenerationHandoffs,
+) -> ValidatedHistorySegments {
+    let replay_segments = build_validated_replay_segments(checkpoint, handoffs);
+    let generation_switch_exempt_segments =
+        build_generation_switch_exempt_segments(checkpoint, handoffs);
+    ValidatedHistorySegments {
+        replay_segments,
+        generation_switch_exempt_segments,
+    }
+}
+
 fn build_validated_replay_segments(
     checkpoint: &CheckpointManifest,
-    handoffs_by_previous_stream: &BTreeMap<String, StoredGenerationHandoff>,
+    handoffs: &StoredGenerationHandoffs,
 ) -> Vec<HistoryReplaySegment> {
-    let mut segments = vec![HistoryReplaySegment {
-        ordinal: 0,
-        stream_id: checkpoint.metadata.stream_id.clone(),
-        from_message_seq: checkpoint.metadata.source_message_seq.saturating_add(1),
-        to_message_seq: None,
-    }];
-    let mut current_stream_id = checkpoint.metadata.stream_id.as_str();
-    while let Some(handoff) = handoffs_by_previous_stream.get(current_stream_id) {
-        let Some((previous_generation, previous_message_seq)) =
-            valid_redis_stream_entry_pair(&handoff.previous_stream_id, &handoff.previous_entry_id)
-        else {
-            break;
-        };
-        let Some((next_generation, next_message_seq)) =
-            valid_redis_stream_entry_pair(&handoff.next_stream_id, &handoff.next_entry_id)
-        else {
-            break;
-        };
-        if handoff.previous_stream_id != current_stream_id
-            || next_generation != previous_generation.saturating_add(1)
-            || next_message_seq != 1
+    let mut segments = Vec::new();
+    let mut current_stream_id = checkpoint.metadata.stream_id.clone();
+    let mut from_message_seq = checkpoint.metadata.source_message_seq.saturating_add(1);
+
+    loop {
+        if let Some((handoff, previous_message_seq, next_message_seq)) =
+            validated_forward_handoff(&current_stream_id, handoffs)
         {
-            break;
+            if from_message_seq > previous_message_seq {
+                break;
+            }
+            segments.push(HistoryReplaySegment {
+                ordinal: segments.len() as i64,
+                stream_id: current_stream_id,
+                from_message_seq,
+                to_message_seq: Some(previous_message_seq),
+            });
+            current_stream_id = handoff.next_stream_id.clone();
+            from_message_seq = next_message_seq.saturating_add(1);
+            continue;
         }
 
-        let next_ordinal = segments.len() as i64;
-        if let Some(segment) = segments.last_mut() {
-            segment.to_message_seq = Some(previous_message_seq);
-        }
         segments.push(HistoryReplaySegment {
-            ordinal: next_ordinal,
-            stream_id: handoff.next_stream_id.clone(),
-            from_message_seq: next_message_seq.saturating_add(1),
+            ordinal: segments.len() as i64,
+            stream_id: current_stream_id,
+            from_message_seq,
             to_message_seq: None,
         });
-        current_stream_id = &handoff.next_stream_id;
+        break;
     }
+
     segments
+}
+
+fn build_generation_switch_exempt_segments(
+    checkpoint: &CheckpointManifest,
+    handoffs: &StoredGenerationHandoffs,
+) -> Vec<HistoryReplaySegment> {
+    let mut ancestor_segments = Vec::new();
+    let mut current_stream_id = checkpoint.metadata.stream_id.clone();
+    while let Some((handoff, previous_message_seq, _next_message_seq)) =
+        validated_backward_handoff(&current_stream_id, handoffs)
+    {
+        ancestor_segments.push(HistoryReplaySegment {
+            ordinal: 0,
+            stream_id: handoff.previous_stream_id.clone(),
+            from_message_seq: 1,
+            to_message_seq: Some(previous_message_seq),
+        });
+        current_stream_id = handoff.previous_stream_id.clone();
+    }
+    ancestor_segments.reverse();
+
+    let mut current_and_descendants = Vec::new();
+    let mut current_stream_id = checkpoint.metadata.stream_id.clone();
+    let mut from_message_seq = checkpoint.metadata.source_message_seq.saturating_add(1);
+    loop {
+        if let Some((handoff, previous_message_seq, next_message_seq)) =
+            validated_forward_handoff(&current_stream_id, handoffs)
+        {
+            current_and_descendants.push(HistoryReplaySegment {
+                ordinal: 0,
+                stream_id: current_stream_id,
+                from_message_seq: 1,
+                to_message_seq: Some(previous_message_seq),
+            });
+            if from_message_seq > previous_message_seq {
+                break;
+            }
+            current_stream_id = handoff.next_stream_id.clone();
+            from_message_seq = next_message_seq.saturating_add(1);
+            continue;
+        }
+
+        current_and_descendants.push(HistoryReplaySegment {
+            ordinal: 0,
+            stream_id: current_stream_id,
+            from_message_seq: 1,
+            to_message_seq: None,
+        });
+        break;
+    }
+
+    ancestor_segments
+        .into_iter()
+        .chain(current_and_descendants)
+        .enumerate()
+        .map(|(ordinal, mut segment)| {
+            segment.ordinal = ordinal as i64;
+            segment
+        })
+        .collect()
+}
+
+fn validated_forward_handoff<'a>(
+    current_stream_id: &str,
+    handoffs: &'a StoredGenerationHandoffs,
+) -> Option<(&'a StoredGenerationHandoff, u64, u64)> {
+    let handoff = handoffs.by_previous_stream.get(current_stream_id)?;
+    let (previous_generation, previous_message_seq, next_generation, next_message_seq) =
+        validated_handoff_parts(handoff)?;
+    (handoff.previous_stream_id == current_stream_id
+        && next_generation == previous_generation.saturating_add(1)
+        && next_message_seq == 1)
+        .then_some((handoff, previous_message_seq, next_message_seq))
+}
+
+fn validated_backward_handoff<'a>(
+    current_stream_id: &str,
+    handoffs: &'a StoredGenerationHandoffs,
+) -> Option<(&'a StoredGenerationHandoff, u64, u64)> {
+    let handoff = handoffs.by_next_stream.get(current_stream_id)?;
+    let (previous_generation, previous_message_seq, next_generation, next_message_seq) =
+        validated_handoff_parts(handoff)?;
+    (handoff.next_stream_id == current_stream_id
+        && next_generation == previous_generation.saturating_add(1)
+        && next_message_seq == 1)
+        .then_some((handoff, previous_message_seq, next_message_seq))
+}
+
+fn validated_handoff_parts(handoff: &StoredGenerationHandoff) -> Option<(u64, u64, u64, u64)> {
+    let (previous_generation, previous_message_seq) =
+        valid_redis_stream_entry_pair(&handoff.previous_stream_id, &handoff.previous_entry_id)?;
+    let (next_generation, next_message_seq) =
+        valid_redis_stream_entry_pair(&handoff.next_stream_id, &handoff.next_entry_id)?;
+    Some((
+        previous_generation,
+        previous_message_seq,
+        next_generation,
+        next_message_seq,
+    ))
 }
 
 fn segment_ordinals(segments: &[HistoryReplaySegment]) -> Vec<i64> {
@@ -1115,14 +1248,16 @@ impl StateHistoryPgStore {
         let replay_from_block_number = request.replay_from_block_number(checkpoint.as_ref());
         let rfq_replay_from_timestamp_ms =
             request.rfq_replay_from_timestamp_ms(checkpoint.as_ref());
-        let replay_segments = match checkpoint.as_ref() {
-            Some(checkpoint) => Some(self.validated_replay_segments(checkpoint).await?),
+        let history_segments = match checkpoint.as_ref() {
+            Some(checkpoint) => Some(self.validated_history_segments(checkpoint).await?),
             None => None,
         };
         let mut gaps = self
             .recorded_gaps_for_range(
                 &request,
-                replay_segments.as_deref(),
+                history_segments
+                    .as_ref()
+                    .map(|segments| segments.replay_segments.as_slice()),
                 replay_from_block_number,
                 rfq_replay_from_timestamp_ms,
             )
@@ -1133,7 +1268,10 @@ impl StateHistoryPgStore {
                 .generation_switch_gap_for_range(
                     &request,
                     checkpoint,
-                    replay_segments.as_deref().unwrap_or(&[]),
+                    history_segments
+                        .as_ref()
+                        .map(|segments| segments.generation_switch_exempt_segments.as_slice())
+                        .unwrap_or(&[]),
                     replay_from_block_number,
                     rfq_replay_from_timestamp_ms,
                 )
@@ -1156,7 +1294,9 @@ impl StateHistoryPgStore {
         let deltas = self
             .deltas_for_range(
                 &request,
-                replay_segments.as_deref(),
+                history_segments
+                    .as_ref()
+                    .map(|segments| segments.replay_segments.as_slice()),
                 replay_from_block_number,
                 rfq_replay_from_timestamp_ms,
             )
@@ -1173,20 +1313,20 @@ impl StateHistoryPgStore {
         })
     }
 
-    async fn validated_replay_segments(
+    async fn validated_history_segments(
         &self,
         checkpoint: &CheckpointManifest,
-    ) -> Result<Vec<HistoryReplaySegment>> {
+    ) -> Result<ValidatedHistorySegments> {
         let handoffs = self
             .generation_handoffs_for_chain(checkpoint.metadata.chain_id)
             .await?;
-        Ok(build_validated_replay_segments(checkpoint, &handoffs))
+        Ok(build_validated_history_segments(checkpoint, &handoffs))
     }
 
     async fn generation_handoffs_for_chain(
         &self,
         chain_id: u64,
-    ) -> Result<BTreeMap<String, StoredGenerationHandoff>> {
+    ) -> Result<StoredGenerationHandoffs> {
         let rows = sqlx::query(
             r#"
             SELECT previous_stream_id, previous_entry_id, next_stream_id, next_entry_id
@@ -1200,7 +1340,7 @@ impl StateHistoryPgStore {
         .await
         .context("failed to load state history generation handoffs")?;
 
-        let mut handoffs = BTreeMap::new();
+        let mut handoffs = Vec::new();
         for row in rows {
             let handoff = StoredGenerationHandoff {
                 previous_stream_id: row.get("previous_stream_id"),
@@ -1208,9 +1348,9 @@ impl StateHistoryPgStore {
                 next_stream_id: row.get("next_stream_id"),
                 next_entry_id: row.get("next_entry_id"),
             };
-            handoffs.insert(handoff.previous_stream_id.clone(), handoff);
+            handoffs.push(handoff);
         }
-        Ok(handoffs)
+        Ok(StoredGenerationHandoffs::new(handoffs))
     }
 
     async fn deltas_for_range(
@@ -1557,18 +1697,18 @@ impl StateHistoryPgStore {
         &self,
         request: &HistoryRangeRequest,
         checkpoint: &CheckpointManifest,
-        replay_segments: &[HistoryReplaySegment],
+        switch_exempt_segments: &[HistoryReplaySegment],
         replay_from_block_number: u64,
         rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Option<HistoryRangeGap>> {
         let block_backends = request.block_backends();
-        let segment_ordinals = segment_ordinals(replay_segments);
-        let segment_stream_ids = segment_stream_ids(replay_segments);
-        let segment_from_message_seq = segment_from_message_seq(replay_segments)?;
-        let segment_to_message_seq = segment_to_message_seq(replay_segments)?;
+        let segment_ordinals = segment_ordinals(switch_exempt_segments);
+        let segment_stream_ids = segment_stream_ids(switch_exempt_segments);
+        let segment_from_message_seq = segment_from_message_seq(switch_exempt_segments)?;
+        let segment_to_message_seq = segment_to_message_seq(switch_exempt_segments)?;
         let switched_stream_exists = sqlx::query_scalar::<_, i32>(
             r#"
-            WITH replay_segments AS (
+            WITH switch_exempt_segments AS (
                 SELECT *
                 FROM UNNEST($8::bigint[], $9::text[], $10::bigint[], $11::bigint[])
                     AS segment(ordinal, stream_id, from_message_seq, to_message_seq)
@@ -1579,17 +1719,10 @@ impl StateHistoryPgStore {
             WHERE idx.chain_id = $1
                 AND NOT EXISTS (
                     SELECT 1
-                    FROM replay_segments segment
+                    FROM switch_exempt_segments segment
                     WHERE d.stream_id = segment.stream_id
                         AND d.message_seq >= segment.from_message_seq
                         AND d.message_seq <= segment.to_message_seq
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM replay_segments segment
-                    WHERE segment.ordinal = 0
-                        AND d.stream_id = segment.stream_id
-                        AND d.message_seq < segment.from_message_seq
                 )
                 AND (
                     (
@@ -2265,13 +2398,13 @@ mod tests {
     };
 
     use super::{
-        build_validated_replay_segments, decode_checkpoint_archive_bytes,
-        encode_checkpoint_archive, indexed_backends_for_entry, ingestion_gap_for_entry,
-        optional_u64_to_i64, prepare_delta_message, u64_to_i64, writer_retry_backoff,
-        CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload,
-        CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource,
-        HistoryRangePlan, HistoryRangeRequest, HistoryReplaySegment, StoredGenerationHandoff,
-        WRITER_RETRY_BACKOFF_CAP,
+        build_validated_history_segments, build_validated_replay_segments,
+        decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
+        ingestion_gap_for_entry, optional_u64_to_i64, prepare_delta_message, u64_to_i64,
+        writer_retry_backoff, CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest,
+        CheckpointPayload, CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap,
+        HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest, HistoryReplaySegment,
+        StoredGenerationHandoff, StoredGenerationHandoffs, WRITER_RETRY_BACKOFF_CAP,
     };
 
     #[test]
@@ -2486,15 +2619,9 @@ mod tests {
     #[test]
     fn replay_segments_follow_valid_multi_hop_handoffs() {
         let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-1", 1);
-        let handoffs = BTreeMap::from([
-            (
-                "chain-8453-stream-1".to_string(),
-                stored_handoff("chain-8453-stream-1", "1-3", "chain-8453-stream-2", "2-1"),
-            ),
-            (
-                "chain-8453-stream-2".to_string(),
-                stored_handoff("chain-8453-stream-2", "2-3", "chain-8453-stream-3", "3-1"),
-            ),
+        let handoffs = stored_handoffs([
+            stored_handoff("chain-8453-stream-1", "1-3", "chain-8453-stream-2", "2-1"),
+            stored_handoff("chain-8453-stream-2", "2-3", "chain-8453-stream-3", "3-1"),
         ]);
 
         let segments = build_validated_replay_segments(&checkpoint, &handoffs);
@@ -2527,9 +2654,11 @@ mod tests {
     #[test]
     fn replay_segments_stop_before_malformed_handoff_generation() {
         let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-1", 1);
-        let handoffs = BTreeMap::from([(
-            "chain-8453-stream-1".to_string(),
-            stored_handoff("chain-8453-stream-1", "1-3", "chain-8453-stream-3", "3-1"),
+        let handoffs = stored_handoffs([stored_handoff(
+            "chain-8453-stream-1",
+            "1-3",
+            "chain-8453-stream-3",
+            "3-1",
         )]);
 
         let segments = build_validated_replay_segments(&checkpoint, &handoffs);
@@ -2541,6 +2670,70 @@ mod tests {
                 stream_id: "chain-8453-stream-1".to_string(),
                 from_message_seq: 2,
                 to_message_seq: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn history_segments_exempt_validated_ancestors_for_switch_detection() {
+        let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-2", 2);
+        let handoffs = stored_handoffs([stored_handoff(
+            "chain-8453-stream-1",
+            "1-4",
+            "chain-8453-stream-2",
+            "2-1",
+        )]);
+
+        let segments = build_validated_history_segments(&checkpoint, &handoffs);
+
+        assert_eq!(
+            segments.replay_segments,
+            vec![HistoryReplaySegment {
+                ordinal: 0,
+                stream_id: "chain-8453-stream-2".to_string(),
+                from_message_seq: 3,
+                to_message_seq: None,
+            }]
+        );
+        assert_eq!(
+            segments.generation_switch_exempt_segments,
+            vec![
+                HistoryReplaySegment {
+                    ordinal: 0,
+                    stream_id: "chain-8453-stream-1".to_string(),
+                    from_message_seq: 1,
+                    to_message_seq: Some(4),
+                },
+                HistoryReplaySegment {
+                    ordinal: 1,
+                    stream_id: "chain-8453-stream-2".to_string(),
+                    from_message_seq: 1,
+                    to_message_seq: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn history_segments_cap_checkpoint_stream_at_forward_handoff_tail() {
+        let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-1", 5);
+        let handoffs = stored_handoffs([stored_handoff(
+            "chain-8453-stream-1",
+            "1-3",
+            "chain-8453-stream-2",
+            "2-1",
+        )]);
+
+        let segments = build_validated_history_segments(&checkpoint, &handoffs);
+
+        assert_eq!(segments.replay_segments, Vec::new());
+        assert_eq!(
+            segments.generation_switch_exempt_segments,
+            vec![HistoryReplaySegment {
+                ordinal: 0,
+                stream_id: "chain-8453-stream-1".to_string(),
+                from_message_seq: 1,
+                to_message_seq: Some(3),
             }]
         );
     }
@@ -2645,6 +2838,12 @@ mod tests {
             next_stream_id: next_stream_id.to_string(),
             next_entry_id: next_entry_id.to_string(),
         }
+    }
+
+    fn stored_handoffs(
+        handoffs: impl IntoIterator<Item = StoredGenerationHandoff>,
+    ) -> StoredGenerationHandoffs {
+        StoredGenerationHandoffs::new(handoffs)
     }
 
     #[test]
