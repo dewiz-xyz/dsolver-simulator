@@ -136,6 +136,52 @@ pub struct CheckpointManifest {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeltaEntry {
+    pub id: i64,
+    pub redis_entry_id: Option<String>,
+    pub payload: EncodedPayload,
+    pub entry: BroadcasterRedisStreamEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRangeRequest {
+    pub chain_id: u64,
+    pub start_block_number: u64,
+    pub end_block_number: u64,
+    pub rfq_start_timestamp_ms: Option<u64>,
+    pub rfq_end_timestamp_ms: Option<u64>,
+    pub backends: Vec<BroadcasterBackend>,
+    pub require_checkpoint: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRangePlan {
+    pub request: HistoryRangeRequest,
+    pub checkpoint: Option<CheckpointManifest>,
+    pub replay_from_block_number: u64,
+    pub rfq_replay_from_timestamp_ms: Option<u64>,
+    pub deltas: Vec<StoredDeltaEntry>,
+    pub gaps: Vec<HistoryRangeGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRangeGap {
+    pub source: HistoryRangeGapSource,
+    pub backend_scope: Vec<BroadcasterBackend>,
+    pub from_block_number: Option<u64>,
+    pub to_block_number: Option<u64>,
+    pub from_timestamp_ms: Option<u64>,
+    pub to_timestamp_ms: Option<u64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRangeGapSource {
+    MissingCheckpoint,
+    RecordedGap,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointStatus {
     Writing,
@@ -171,6 +217,12 @@ pub struct StateHistoryPgStore {
 pub struct S3CheckpointStore {
     client: S3Client,
     bucket: String,
+}
+
+#[derive(Clone)]
+pub struct StateHistoryReader {
+    pg_store: StateHistoryPgStore,
+    checkpoint_store: S3CheckpointStore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +339,132 @@ pub fn prepare_delta_message(
         payload_compressed: compressed,
         backend_index,
     })
+}
+
+impl HistoryRangeRequest {
+    pub fn new(
+        chain_id: u64,
+        start_block_number: u64,
+        end_block_number: u64,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<Self> {
+        let request = Self {
+            chain_id,
+            start_block_number,
+            end_block_number,
+            rfq_start_timestamp_ms: None,
+            rfq_end_timestamp_ms: None,
+            backends,
+            require_checkpoint: true,
+        };
+        request.validate_shape()?;
+        Ok(request)
+    }
+
+    pub fn with_rfq_timestamp_range(
+        mut self,
+        start_timestamp_ms: u64,
+        end_timestamp_ms: u64,
+    ) -> Result<Self> {
+        self.rfq_start_timestamp_ms = Some(start_timestamp_ms);
+        self.rfq_end_timestamp_ms = Some(end_timestamp_ms);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn without_checkpoint_requirement(mut self) -> Result<Self> {
+        self.require_checkpoint = false;
+        self.validate_shape()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_shape()?;
+        if self.backends.contains(&BroadcasterBackend::Rfq) {
+            let start = self
+                .rfq_start_timestamp_ms
+                .ok_or_else(|| anyhow!("RFQ history ranges require a start timestamp"))?;
+            let end = self
+                .rfq_end_timestamp_ms
+                .ok_or_else(|| anyhow!("RFQ history ranges require an end timestamp"))?;
+            anyhow::ensure!(
+                start <= end,
+                "RFQ history range start timestamp must be <= end timestamp"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.start_block_number <= self.end_block_number,
+            "history range start block must be <= end block"
+        );
+        anyhow::ensure!(
+            !self.backends.is_empty(),
+            "history range backend scope must not be empty"
+        );
+        let mut sorted = self.backends.clone();
+        sorted.sort();
+        sorted.dedup();
+        anyhow::ensure!(
+            sorted == self.backends,
+            "history range backend scope must be sorted and unique"
+        );
+        Ok(())
+    }
+
+    fn block_backends(&self) -> Vec<BroadcasterBackend> {
+        self.backends
+            .iter()
+            .copied()
+            .filter(|backend| {
+                matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm)
+            })
+            .collect()
+    }
+
+    fn includes_rfq(&self) -> bool {
+        self.backends.contains(&BroadcasterBackend::Rfq)
+    }
+
+    fn replay_from_block_number(&self, checkpoint: Option<&CheckpointManifest>) -> u64 {
+        checkpoint
+            .map(|checkpoint| checkpoint.metadata.block_number.saturating_add(1))
+            .unwrap_or(self.start_block_number)
+    }
+
+    fn rfq_replay_from_timestamp_ms(
+        &self,
+        checkpoint: Option<&CheckpointManifest>,
+    ) -> Option<u64> {
+        if !self.includes_rfq() {
+            return None;
+        }
+        Some(
+            checkpoint
+                .map(|checkpoint| checkpoint.metadata.captured_at_timestamp_ms.saturating_add(1))
+                .unwrap_or(self.rfq_start_timestamp_ms.unwrap_or_default()),
+        )
+    }
+}
+
+impl HistoryRangePlan {
+    pub fn ensure_gap_free(&self) -> Result<()> {
+        if self.gaps.is_empty() {
+            return Ok(());
+        }
+        let reasons = self
+            .gaps
+            .iter()
+            .map(|gap| gap.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(anyhow!(
+            "state history range has {} gap(s): {reasons}",
+            self.gaps.len()
+        ))
+    }
 }
 
 impl StateHistoryPgStore {
@@ -551,24 +729,220 @@ impl StateHistoryPgStore {
         chain_id: u64,
         block_number: u64,
     ) -> Result<Option<CheckpointManifest>> {
+        self.latest_checkpoint_covering_before(chain_id, block_number, &[])
+            .await
+    }
+
+    pub async fn latest_checkpoint_covering_before(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        backends: &[BroadcasterBackend],
+    ) -> Result<Option<CheckpointManifest>> {
         let row = sqlx::query(
             r#"
             SELECT id, chain_id, block_number, captured_at_timestamp_ms, stream_id,
                 source_message_seq, backend_scope, s3_bucket, s3_key, payload_hash,
                 payload_bytes, compressed_bytes, status, first_delta_id_after, error
             FROM state_history.checkpoints
-            WHERE chain_id = $1 AND block_number <= $2 AND status = 'complete'
+            WHERE chain_id = $1
+                AND block_number <= $2
+                AND status = 'complete'
+                AND ($3::text[] = '{}'::text[] OR backend_scope @> $3::text[])
             ORDER BY block_number DESC, captured_at_timestamp_ms DESC
             LIMIT 1
             "#,
         )
         .bind(u64_to_i64("chain_id", chain_id)?)
         .bind(u64_to_i64("block_number", block_number)?)
+        .bind(backend_scope_strings(backends))
         .fetch_optional(&self.pool)
         .await
         .context("failed to resolve latest state history checkpoint")?;
 
         row.map(checkpoint_manifest_from_row).transpose()
+    }
+
+    pub async fn resolve_history_range(
+        &self,
+        request: HistoryRangeRequest,
+    ) -> Result<HistoryRangePlan> {
+        request.validate()?;
+        let checkpoint = self
+            .latest_checkpoint_covering_before(
+                request.chain_id,
+                request.start_block_number,
+                &request.backends,
+            )
+            .await?;
+        let mut gaps = self
+            .recorded_gaps_for_range(&request)
+            .await
+            .context("failed to load state history gaps for range")?;
+        if request.require_checkpoint && checkpoint.is_none() {
+            gaps.push(HistoryRangeGap {
+                source: HistoryRangeGapSource::MissingCheckpoint,
+                backend_scope: request.backends.clone(),
+                from_block_number: Some(request.start_block_number),
+                to_block_number: Some(request.end_block_number),
+                from_timestamp_ms: request.rfq_start_timestamp_ms,
+                to_timestamp_ms: request.rfq_end_timestamp_ms,
+                reason: "no complete checkpoint covers the requested range".to_string(),
+            });
+        }
+        let deltas = self
+            .deltas_for_range(&request, checkpoint.as_ref())
+            .await
+            .context("failed to load state history deltas for range")?;
+        Ok(HistoryRangePlan {
+            request,
+            checkpoint,
+            deltas,
+            gaps,
+        })
+    }
+
+    async fn deltas_for_range(
+        &self,
+        request: &HistoryRangeRequest,
+        checkpoint: Option<&CheckpointManifest>,
+    ) -> Result<Vec<StoredDeltaEntry>> {
+        let block_backends = request.block_backends();
+        let block_start = checkpoint
+            .map(|checkpoint| checkpoint.metadata.block_number)
+            .unwrap_or(request.start_block_number);
+        let rfq_start = checkpoint
+            .map(|checkpoint| checkpoint.metadata.captured_at_timestamp_ms)
+            .or(request.rfq_start_timestamp_ms);
+        let first_delta_id_after =
+            checkpoint.and_then(|checkpoint| checkpoint.first_delta_id_after);
+        let rows = sqlx::query(
+            r#"
+            WITH selected_deltas AS (
+                SELECT DISTINCT delta_id
+                FROM state_history.delta_backend_index
+                WHERE chain_id = $1
+                    AND (
+                        (
+                            backend = ANY($2::text[])
+                            AND block_number IS NOT NULL
+                            AND block_number >= $3
+                            AND block_number <= $4
+                        )
+                        OR (
+                            $5::boolean
+                            AND backend = 'rfq'
+                            AND observed_timestamp_ms IS NOT NULL
+                            AND observed_timestamp_ms >= $6
+                            AND observed_timestamp_ms <= $7
+                        )
+                    )
+            )
+            SELECT d.id, d.redis_entry_id, d.payload_encoding, d.payload_compressed,
+                d.payload_hash
+            FROM selected_deltas selected
+            JOIN state_history.delta_messages d ON d.id = selected.delta_id
+            WHERE ($8::bigint IS NULL OR d.id >= $8)
+            ORDER BY d.message_seq ASC, d.id ASC
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(backend_scope_strings(&block_backends))
+        .bind(u64_to_i64("start_block_number", block_start)?)
+        .bind(u64_to_i64("end_block_number", request.end_block_number)?)
+        .bind(request.includes_rfq())
+        .bind(optional_u64_to_i64("rfq_start_timestamp_ms", rfq_start)?.unwrap_or(0))
+        .bind(
+            optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
+        )
+        .bind(first_delta_id_after)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(stored_delta_from_row)
+            .collect::<Result<Vec<_>>>()
+    }
+
+    async fn recorded_gaps_for_range(
+        &self,
+        request: &HistoryRangeRequest,
+    ) -> Result<Vec<HistoryRangeGap>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT backend_scope, from_block_number, to_block_number, from_timestamp_ms,
+                to_timestamp_ms, reason
+            FROM state_history.ingestion_gaps
+            WHERE chain_id = $1
+                AND backend_scope && $2::text[]
+                AND (
+                    (
+                        from_block_number IS NOT NULL
+                        AND to_block_number IS NOT NULL
+                        AND from_block_number <= $3
+                        AND to_block_number >= $4
+                    )
+                    OR (
+                        $5::boolean
+                        AND from_timestamp_ms IS NOT NULL
+                        AND to_timestamp_ms IS NOT NULL
+                        AND from_timestamp_ms <= $6
+                        AND to_timestamp_ms >= $7
+                    )
+                    OR (
+                        from_block_number IS NULL
+                        AND to_block_number IS NULL
+                        AND from_timestamp_ms IS NULL
+                        AND to_timestamp_ms IS NULL
+                    )
+                )
+            ORDER BY from_block_number NULLS LAST, from_timestamp_ms NULLS LAST, reason ASC
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(backend_scope_strings(&request.backends))
+        .bind(u64_to_i64("end_block_number", request.end_block_number)?)
+        .bind(u64_to_i64(
+            "start_block_number",
+            request.start_block_number,
+        )?)
+        .bind(request.includes_rfq())
+        .bind(
+            optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
+        )
+        .bind(
+            optional_u64_to_i64("rfq_start_timestamp_ms", request.rfq_start_timestamp_ms)?
+                .unwrap_or(0),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let backends: Vec<String> = row.get("backend_scope");
+                Ok(HistoryRangeGap {
+                    source: HistoryRangeGapSource::RecordedGap,
+                    backend_scope: parse_backend_strings(&backends)?,
+                    from_block_number: optional_i64_to_u64(
+                        "from_block_number",
+                        row.get("from_block_number"),
+                    )?,
+                    to_block_number: optional_i64_to_u64(
+                        "to_block_number",
+                        row.get("to_block_number"),
+                    )?,
+                    from_timestamp_ms: optional_i64_to_u64(
+                        "from_timestamp_ms",
+                        row.get("from_timestamp_ms"),
+                    )?,
+                    to_timestamp_ms: optional_i64_to_u64(
+                        "to_timestamp_ms",
+                        row.get("to_timestamp_ms"),
+                    )?,
+                    reason: row.get("reason"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
     }
 }
 
@@ -643,6 +1017,38 @@ impl S3CheckpointStore {
     }
 }
 
+impl StateHistoryReader {
+    pub fn new(pg_store: StateHistoryPgStore, checkpoint_store: S3CheckpointStore) -> Self {
+        Self {
+            pg_store,
+            checkpoint_store,
+        }
+    }
+
+    pub async fn resolve_range(&self, request: HistoryRangeRequest) -> Result<HistoryRangePlan> {
+        self.pg_store.resolve_history_range(request).await
+    }
+
+    pub async fn fetch_checkpoint(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<DecodedCheckpointArchive> {
+        anyhow::ensure!(
+            manifest.status == CheckpointStatus::Complete,
+            "only complete state history checkpoints can be fetched"
+        );
+        anyhow::ensure!(
+            manifest.s3_bucket == self.checkpoint_store.bucket(),
+            "checkpoint bucket {} does not match configured bucket {}",
+            manifest.s3_bucket,
+            self.checkpoint_store.bucket()
+        );
+        self.checkpoint_store
+            .get_checkpoint_archive(&manifest.s3_key, manifest.payload_hash.as_deref())
+            .await
+    }
+}
+
 fn parse_backend_scope(scope: &str) -> Result<Vec<BroadcasterBackend>> {
     anyhow::ensure!(!scope.trim().is_empty(), "backend scope must not be empty");
     let mut backends = Vec::new();
@@ -687,6 +1093,10 @@ fn i64_to_u64(field: &str, value: i64) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{field} is negative"))
 }
 
+fn optional_i64_to_u64(field: &str, value: Option<i64>) -> Result<Option<u64>> {
+    value.map(|value| i64_to_u64(field, value)).transpose()
+}
+
 fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<CheckpointManifest> {
     let status: String = row.get("status");
     let backends: Vec<String> = row.get("backend_scope");
@@ -717,6 +1127,36 @@ fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<Checkpoint
 fn parse_backend_strings(values: &[String]) -> Result<Vec<BroadcasterBackend>> {
     let scope = values.join(",");
     parse_backend_scope(&scope)
+}
+
+fn stored_delta_from_row(row: sqlx::postgres::PgRow) -> Result<StoredDeltaEntry> {
+    let encoding: String = row.get("payload_encoding");
+    anyhow::ensure!(
+        encoding == PayloadEncoding::JsonZstd.as_str(),
+        "unsupported state history delta payload encoding {encoding}"
+    );
+    let payload_compressed: Vec<u8> = row.get("payload_compressed");
+    let uncompressed = zstd::stream::decode_all(Cursor::new(&payload_compressed))
+        .context("failed to decompress state history delta payload")?;
+    let hash = sha256_hex(&uncompressed);
+    let expected_hash: String = row.get("payload_hash");
+    anyhow::ensure!(
+        hash == expected_hash,
+        "state history delta payload hash mismatch: expected {expected_hash}, decoded {hash}"
+    );
+    let entry = serde_json::from_slice(&uncompressed)
+        .context("failed to deserialize state history delta payload")?;
+    Ok(StoredDeltaEntry {
+        id: row.get("id"),
+        redis_entry_id: row.get("redis_entry_id"),
+        payload: EncodedPayload {
+            encoding: PayloadEncoding::JsonZstd,
+            hash,
+            uncompressed_bytes: uncompressed.len(),
+            compressed_bytes: payload_compressed.len(),
+        },
+        entry,
+    })
 }
 
 pub fn checkpoint_s3_key(
@@ -781,7 +1221,8 @@ mod tests {
     use super::{
         decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
         optional_u64_to_i64, prepare_delta_message, u64_to_i64, CheckpointArchive,
-        CheckpointArchiveMetadata, CheckpointPayload, DecodedCheckpointArchive,
+        CheckpointArchiveMetadata, CheckpointPayload, DecodedCheckpointArchive, HistoryRangeGap,
+        HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest,
     };
 
     #[test]
@@ -885,6 +1326,92 @@ mod tests {
         assert_eq!(prepared.backend_index[0].block_number, Some(125));
 
         Ok(())
+    }
+
+    #[test]
+    fn history_range_request_validates_blocks_backends_and_rfq_bounds() -> Result<()> {
+        let request = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Native])?;
+        assert!(request.validate().is_ok());
+
+        let error = HistoryRangeRequest::new(8453, 200, 100, vec![BroadcasterBackend::Native])
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("reversed block range should fail"))?;
+        assert!(error.to_string().contains("start block"));
+
+        let error = HistoryRangeRequest::new(
+            8453,
+            100,
+            200,
+            vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("unsorted backends should fail"))?;
+        assert!(error.to_string().contains("sorted and unique"));
+
+        let rfq_without_timestamps =
+            HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Rfq])?;
+        let error = rfq_without_timestamps
+            .validate()
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("RFQ range without timestamps should fail"))?;
+        assert!(error.to_string().contains("start timestamp"));
+
+        let rfq_request = HistoryRangeRequest::new(
+            8453,
+            100,
+            200,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        )?
+        .with_rfq_timestamp_range(1_720_000_000_000, 1_720_000_060_000)?;
+        assert!(rfq_request.validate().is_ok());
+
+        let error = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Rfq])?
+            .with_rfq_timestamp_range(20, 10)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("reversed RFQ timestamps should fail"))?;
+        assert!(error.to_string().contains("start timestamp"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_plan_reports_gaps_without_failing_construction() -> Result<()> {
+        let request = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Native])?;
+        let plan = HistoryRangePlan {
+            request,
+            checkpoint: None,
+            deltas: Vec::new(),
+            gaps: vec![HistoryRangeGap {
+                source: HistoryRangeGapSource::MissingCheckpoint,
+                backend_scope: vec![BroadcasterBackend::Native],
+                from_block_number: Some(100),
+                to_block_number: Some(200),
+                from_timestamp_ms: None,
+                to_timestamp_ms: None,
+                reason: "no complete checkpoint covers the requested range".to_string(),
+            }],
+        };
+
+        let error = plan.ensure_gap_free().err().ok_or_else(|| {
+            anyhow::anyhow!("gap-free enforcement should reject a plan with gaps")
+        })?;
+        assert!(error.to_string().contains("1 gap"));
+        assert!(error.to_string().contains("no complete checkpoint"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn history_range_plan_accepts_gap_free_ranges() -> Result<()> {
+        let request = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Native])?;
+        let plan = HistoryRangePlan {
+            request,
+            checkpoint: None,
+            deltas: Vec::new(),
+            gaps: Vec::new(),
+        };
+
+        plan.ensure_gap_free()
     }
 
     #[test]
