@@ -169,6 +169,7 @@ pub struct HistoryRangeRequest {
 pub struct HistoryRangePlan {
     pub request: HistoryRangeRequest,
     pub checkpoint: Option<CheckpointManifest>,
+    pub replay_from_message_seq: Option<u64>,
     pub replay_from_block_number: u64,
     pub rfq_replay_from_timestamp_ms: Option<u64>,
     pub deltas: Vec<StoredDeltaEntry>,
@@ -528,7 +529,7 @@ impl HistoryRangeRequest {
 
     fn replay_from_block_number(&self, checkpoint: Option<&CheckpointManifest>) -> u64 {
         checkpoint
-            .map(|checkpoint| checkpoint.metadata.block_number.saturating_add(1))
+            .map(|checkpoint| checkpoint.metadata.block_number)
             .unwrap_or(self.start_block_number)
     }
 
@@ -538,14 +539,13 @@ impl HistoryRangeRequest {
         }
         Some(
             checkpoint
-                .map(|checkpoint| {
-                    checkpoint
-                        .metadata
-                        .captured_at_timestamp_ms
-                        .saturating_add(1)
-                })
+                .map(|checkpoint| checkpoint.metadata.captured_at_timestamp_ms)
                 .unwrap_or(self.rfq_start_timestamp_ms.unwrap_or_default()),
         )
+    }
+
+    fn replay_from_message_seq(&self, checkpoint: Option<&CheckpointManifest>) -> Option<u64> {
+        checkpoint.map(|checkpoint| checkpoint.metadata.source_message_seq.saturating_add(1))
     }
 }
 
@@ -846,7 +846,7 @@ impl StateHistoryPgStore {
         chain_id: u64,
         block_number: u64,
     ) -> Result<Option<CheckpointManifest>> {
-        self.latest_checkpoint_covering_before(chain_id, block_number, &[])
+        self.latest_checkpoint_covering_before_with_capture(chain_id, block_number, &[], None)
             .await
     }
 
@@ -855,6 +855,34 @@ impl StateHistoryPgStore {
         chain_id: u64,
         block_number: u64,
         backends: &[BroadcasterBackend],
+    ) -> Result<Option<CheckpointManifest>> {
+        self.latest_checkpoint_covering_before_with_capture(chain_id, block_number, backends, None)
+            .await
+    }
+
+    async fn latest_checkpoint_for_request(
+        &self,
+        request: &HistoryRangeRequest,
+    ) -> Result<Option<CheckpointManifest>> {
+        let max_capture_timestamp_ms = request
+            .includes_rfq()
+            .then_some(request.rfq_start_timestamp_ms)
+            .flatten();
+        self.latest_checkpoint_covering_before_with_capture(
+            request.chain_id,
+            request.start_block_number,
+            &request.backends,
+            max_capture_timestamp_ms,
+        )
+        .await
+    }
+
+    async fn latest_checkpoint_covering_before_with_capture(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        backends: &[BroadcasterBackend],
+        max_capture_timestamp_ms: Option<u64>,
     ) -> Result<Option<CheckpointManifest>> {
         let row = sqlx::query(
             r#"
@@ -866,6 +894,7 @@ impl StateHistoryPgStore {
                 AND block_number <= $2
                 AND status = 'complete'
                 AND ($3::text[] = '{}'::text[] OR backend_scope @> $3::text[])
+                AND ($4::bigint IS NULL OR captured_at_timestamp_ms <= $4)
             ORDER BY block_number DESC, captured_at_timestamp_ms DESC
             LIMIT 1
             "#,
@@ -873,6 +902,10 @@ impl StateHistoryPgStore {
         .bind(u64_to_i64("chain_id", chain_id)?)
         .bind(u64_to_i64("block_number", block_number)?)
         .bind(backend_scope_strings(backends))
+        .bind(optional_u64_to_i64(
+            "max_capture_timestamp_ms",
+            max_capture_timestamp_ms,
+        )?)
         .fetch_optional(&self.pool)
         .await
         .context("failed to resolve latest state history checkpoint")?;
@@ -885,19 +918,16 @@ impl StateHistoryPgStore {
         request: HistoryRangeRequest,
     ) -> Result<HistoryRangePlan> {
         request.validate()?;
-        let checkpoint = self
-            .latest_checkpoint_covering_before(
-                request.chain_id,
-                request.start_block_number,
-                &request.backends,
-            )
-            .await?;
+        let checkpoint = self.latest_checkpoint_for_request(&request).await?;
+        let replay_from_message_seq = request.replay_from_message_seq(checkpoint.as_ref());
         let replay_from_block_number = request.replay_from_block_number(checkpoint.as_ref());
         let rfq_replay_from_timestamp_ms =
             request.rfq_replay_from_timestamp_ms(checkpoint.as_ref());
         let mut gaps = self
             .recorded_gaps_for_range(
                 &request,
+                checkpoint.as_ref(),
+                replay_from_message_seq,
                 replay_from_block_number,
                 rfq_replay_from_timestamp_ms,
             )
@@ -918,6 +948,7 @@ impl StateHistoryPgStore {
             .deltas_for_range(
                 &request,
                 checkpoint.as_ref(),
+                replay_from_message_seq,
                 replay_from_block_number,
                 rfq_replay_from_timestamp_ms,
             )
@@ -926,6 +957,7 @@ impl StateHistoryPgStore {
         Ok(HistoryRangePlan {
             request,
             checkpoint,
+            replay_from_message_seq,
             replay_from_block_number,
             rfq_replay_from_timestamp_ms,
             deltas,
@@ -937,31 +969,35 @@ impl StateHistoryPgStore {
         &self,
         request: &HistoryRangeRequest,
         checkpoint: Option<&CheckpointManifest>,
+        replay_from_message_seq: Option<u64>,
         replay_from_block_number: u64,
         rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Vec<StoredDeltaEntry>> {
         let block_backends = request.block_backends();
-        let first_delta_id_after =
-            checkpoint.and_then(|checkpoint| checkpoint.first_delta_id_after);
+        let checkpoint_stream_id =
+            checkpoint.map(|checkpoint| checkpoint.metadata.stream_id.as_str());
         let rows = sqlx::query(
             r#"
             WITH selected_deltas AS (
-                SELECT DISTINCT delta_id
-                FROM state_history.delta_backend_index
-                WHERE chain_id = $1
+                SELECT DISTINCT idx.delta_id
+                FROM state_history.delta_backend_index idx
+                JOIN state_history.delta_messages d ON d.id = idx.delta_id
+                WHERE idx.chain_id = $1
+                    AND ($8::text IS NULL OR d.stream_id = $8)
+                    AND ($9::bigint IS NULL OR d.message_seq >= $9)
                     AND (
                         (
-                            backend = ANY($2::text[])
-                            AND block_number IS NOT NULL
-                            AND block_number >= $3
-                            AND block_number <= $4
+                            idx.backend = ANY($2::text[])
+                            AND idx.block_number IS NOT NULL
+                            AND idx.block_number >= $3
+                            AND idx.block_number <= $4
                         )
                         OR (
                             $5::boolean
-                            AND backend = 'rfq'
-                            AND observed_timestamp_ms IS NOT NULL
-                            AND observed_timestamp_ms >= $6
-                            AND observed_timestamp_ms <= $7
+                            AND idx.backend = 'rfq'
+                            AND idx.observed_timestamp_ms IS NOT NULL
+                            AND idx.observed_timestamp_ms >= $6
+                            AND idx.observed_timestamp_ms <= $7
                         )
                     )
             )
@@ -969,7 +1005,6 @@ impl StateHistoryPgStore {
                 d.payload_hash
             FROM selected_deltas selected
             JOIN state_history.delta_messages d ON d.id = selected.delta_id
-            WHERE ($8::bigint IS NULL OR d.id >= $8)
             ORDER BY d.message_seq ASC, d.id ASC
             "#,
         )
@@ -988,7 +1023,11 @@ impl StateHistoryPgStore {
         .bind(
             optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
         )
-        .bind(first_delta_id_after)
+        .bind(checkpoint_stream_id)
+        .bind(optional_u64_to_i64(
+            "replay_from_message_seq",
+            replay_from_message_seq,
+        )?)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1000,6 +1039,8 @@ impl StateHistoryPgStore {
     async fn recorded_gaps_for_range(
         &self,
         request: &HistoryRangeRequest,
+        checkpoint: Option<&CheckpointManifest>,
+        replay_from_message_seq: Option<u64>,
         replay_from_block_number: u64,
         rfq_replay_from_timestamp_ms: Option<u64>,
     ) -> Result<Vec<HistoryRangeGap>> {
@@ -1009,6 +1050,8 @@ impl StateHistoryPgStore {
                 to_timestamp_ms, reason
             FROM state_history.ingestion_gaps
             WHERE chain_id = $1
+                AND ($8::text IS NULL OR stream_id = $8)
+                AND ($9::bigint IS NULL OR to_message_seq >= $9)
                 AND backend_scope && $2::text[]
                 AND (
                     (
@@ -1049,6 +1092,11 @@ impl StateHistoryPgStore {
             optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
                 .unwrap_or(0),
         )
+        .bind(checkpoint.map(|checkpoint| checkpoint.metadata.stream_id.as_str()))
+        .bind(optional_u64_to_i64(
+            "replay_from_message_seq",
+            replay_from_message_seq,
+        )?)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1854,6 +1902,7 @@ mod tests {
         let plan = HistoryRangePlan {
             request,
             checkpoint: None,
+            replay_from_message_seq: None,
             replay_from_block_number,
             rfq_replay_from_timestamp_ms: None,
             deltas: Vec::new(),
@@ -1884,6 +1933,7 @@ mod tests {
         let plan = HistoryRangePlan {
             request,
             checkpoint: None,
+            replay_from_message_seq: None,
             replay_from_block_number,
             rfq_replay_from_timestamp_ms: None,
             deltas: Vec::new(),
@@ -1904,10 +1954,12 @@ mod tests {
         .with_rfq_timestamp_range(1_720_000_000_000, 1_720_000_060_000)?;
         let checkpoint = checkpoint_manifest(90, 1_719_999_990_000);
 
-        assert_eq!(request.replay_from_block_number(Some(&checkpoint)), 91);
+        assert_eq!(request.replay_from_message_seq(Some(&checkpoint)), Some(43));
+        assert_eq!(request.replay_from_message_seq(None), None);
+        assert_eq!(request.replay_from_block_number(Some(&checkpoint)), 90);
         assert_eq!(
             request.rfq_replay_from_timestamp_ms(Some(&checkpoint)),
-            Some(1_719_999_990_001)
+            Some(1_719_999_990_000)
         );
         assert_eq!(request.replay_from_block_number(None), 100);
         assert_eq!(

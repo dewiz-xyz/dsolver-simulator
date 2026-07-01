@@ -13,8 +13,9 @@ use simulator_core::broadcaster::{
     BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 use state_history::{
-    CheckpointArchive, CheckpointArchiveMetadata, HistoryRangeRequest, IngestionGap,
-    S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore, StateHistoryReader,
+    CheckpointArchive, CheckpointArchiveMetadata, HistoryRangePlan, HistoryRangeRequest,
+    IngestionGap, S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore,
+    StateHistoryReader,
 };
 
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:55432/state_history";
@@ -49,16 +50,8 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
     let run_id = current_timestamp_ms()?;
     let chain_id = 9_000_000_000u64.saturating_add(run_id % 1_000_000);
     let stream_id = format!("state-history-analysis-{run_id}");
-    let redis_entries = synthetic_delta_entries(chain_id, &stream_id, run_id)?;
-    let mut persisted_delta_ids = Vec::new();
-    for (index, entry) in redis_entries.iter().enumerate() {
-        let redis_entry_id = format!("1-{}", index + 1);
-        let persisted = pg_store
-            .insert_delta(entry, Some(&redis_entry_id))
-            .await
-            .with_context(|| format!("failed to insert synthetic delta {}", entry.message_seq))?;
-        persisted_delta_ids.push(persisted.id);
-    }
+    let (inserted_deltas, stale_stream_id) =
+        insert_synthetic_delta_fixtures(&pg_store, chain_id, &stream_id, run_id).await?;
 
     let checkpoint_archive = synthetic_checkpoint_archive(chain_id, &stream_id, run_id)?;
     let checkpoint_writer = StateHistoryCheckpointWriter::new(
@@ -72,17 +65,8 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         .context("failed to write synthetic checkpoint")?;
 
     let reader = StateHistoryReader::new(pg_store.clone(), checkpoint_store);
-    let request = HistoryRangeRequest::new(
-        chain_id,
-        100,
-        110,
-        vec![
-            BroadcasterBackend::Native,
-            BroadcasterBackend::Vm,
-            BroadcasterBackend::Rfq,
-        ],
-    )?
-    .with_rfq_timestamp_range(run_id + 1, run_id + 100)?;
+    let request = synthetic_history_request(chain_id, run_id)?;
+    record_pre_checkpoint_gap(&pg_store, chain_id, &stream_id).await?;
     let plan = reader.resolve_range(request.clone()).await?;
     plan.ensure_gap_free()?;
     let selected_checkpoint = plan
@@ -91,34 +75,13 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         .ok_or_else(|| anyhow!("expected a complete checkpoint for the synthetic range"))?;
     let decoded = reader.fetch_checkpoint(selected_checkpoint).await?;
 
-    let replayed_message_sequences = plan
-        .deltas
-        .iter()
-        .map(|delta| delta.entry.message_seq)
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        replayed_message_sequences == vec![2, 3],
-        "expected VM and RFQ deltas after checkpoint, got {replayed_message_sequences:?}"
-    );
+    let replayed_message_sequences = assert_replay_plan(&plan, &stream_id)?;
     anyhow::ensure!(
         decoded.archive.payloads.len() == 2,
         "expected checkpoint archive start/end payloads"
     );
 
-    pg_store
-        .record_gap(&IngestionGap {
-            chain_id,
-            stream_id: stream_id.clone(),
-            from_message_seq: 9,
-            to_message_seq: 9,
-            backend_scope: vec![BroadcasterBackend::Native],
-            from_block_number: Some(108),
-            to_block_number: Some(109),
-            from_timestamp_ms: None,
-            to_timestamp_ms: None,
-            reason: "state history analysis synthetic gap".to_string(),
-        })
-        .await?;
+    record_visible_gap_fixtures(&pg_store, chain_id, &stream_id, &stale_stream_id).await?;
     let gap_plan = reader.resolve_range(request).await?;
     anyhow::ensure!(
         gap_plan.gaps.len() == 1,
@@ -130,7 +93,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         status: "passed",
         chain_id,
         stream_id,
-        inserted_deltas: persisted_delta_ids.len(),
+        inserted_deltas,
         replayed_message_sequences,
         checkpoint_manifest_id: checkpoint.manifest_id,
         checkpoint_s3_key: checkpoint.s3_key,
@@ -138,6 +101,118 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         decoded_checkpoint_payloads: decoded.archive.payloads.len(),
         recorded_gaps: gap_plan.gaps.len(),
     })
+}
+
+async fn insert_synthetic_delta_fixtures(
+    pg_store: &StateHistoryPgStore,
+    chain_id: u64,
+    stream_id: &str,
+    run_id: u64,
+) -> Result<(usize, String)> {
+    let redis_entries = synthetic_delta_entries(chain_id, stream_id, run_id)?;
+    let mut inserted_deltas = 0usize;
+    for (index, entry) in redis_entries.iter().enumerate() {
+        let redis_entry_id = format!("1-{}", index + 1);
+        pg_store
+            .insert_delta(entry, Some(&redis_entry_id))
+            .await
+            .with_context(|| format!("failed to insert synthetic delta {}", entry.message_seq))?;
+        inserted_deltas = inserted_deltas.saturating_add(1);
+    }
+
+    let stale_stream_id = format!("{stream_id}-stale");
+    let stale_generation_delta =
+        synthetic_delta_entry(chain_id, &stale_stream_id, 2, BroadcasterBackend::Vm, 101)?;
+    pg_store
+        .insert_delta(&stale_generation_delta, Some("stale-2"))
+        .await
+        .context("failed to insert stale-generation synthetic delta")?;
+    inserted_deltas = inserted_deltas.saturating_add(1);
+
+    Ok((inserted_deltas, stale_stream_id))
+}
+
+fn synthetic_history_request(chain_id: u64, run_id: u64) -> Result<HistoryRangeRequest> {
+    HistoryRangeRequest::new(
+        chain_id,
+        100,
+        110,
+        vec![
+            BroadcasterBackend::Native,
+            BroadcasterBackend::Vm,
+            BroadcasterBackend::Rfq,
+        ],
+    )?
+    .with_rfq_timestamp_range(run_id + 1, run_id + 100)
+}
+
+fn assert_replay_plan(plan: &HistoryRangePlan, stream_id: &str) -> Result<Vec<u64>> {
+    let replayed_message_sequences = plan
+        .deltas
+        .iter()
+        .map(|delta| delta.entry.message_seq)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        replayed_message_sequences == vec![2, 3, 4],
+        "expected same-block native, VM, and RFQ deltas after checkpoint, got {replayed_message_sequences:?}"
+    );
+    anyhow::ensure!(
+        plan.deltas
+            .iter()
+            .all(|delta| delta.entry.stream_id == stream_id),
+        "reader replayed a delta from outside the checkpoint stream"
+    );
+    Ok(replayed_message_sequences)
+}
+
+async fn record_pre_checkpoint_gap(
+    pg_store: &StateHistoryPgStore,
+    chain_id: u64,
+    stream_id: &str,
+) -> Result<()> {
+    pg_store
+        .record_gap(&IngestionGap {
+            chain_id,
+            stream_id: stream_id.to_string(),
+            from_message_seq: 1,
+            to_message_seq: 1,
+            backend_scope: vec![BroadcasterBackend::Native],
+            from_block_number: Some(100),
+            to_block_number: Some(100),
+            from_timestamp_ms: None,
+            to_timestamp_ms: None,
+            reason: "state history analysis pre-checkpoint gap".to_string(),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn record_visible_gap_fixtures(
+    pg_store: &StateHistoryPgStore,
+    chain_id: u64,
+    stream_id: &str,
+    stale_stream_id: &str,
+) -> Result<()> {
+    for (stream_id, reason) in [
+        (stream_id, "state history analysis synthetic gap"),
+        (stale_stream_id, "state history analysis stale-stream gap"),
+    ] {
+        pg_store
+            .record_gap(&IngestionGap {
+                chain_id,
+                stream_id: stream_id.to_string(),
+                from_message_seq: 9,
+                to_message_seq: 9,
+                backend_scope: vec![BroadcasterBackend::Native],
+                from_block_number: Some(108),
+                to_block_number: Some(109),
+                from_timestamp_ms: None,
+                to_timestamp_ms: None,
+                reason: reason.to_string(),
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 async fn ensure_bucket_exists(args: &CliArgs) -> Result<()> {
@@ -181,8 +256,9 @@ fn synthetic_delta_entries(
 ) -> Result<Vec<BroadcasterRedisStreamEntry>> {
     [
         (1, BroadcasterBackend::Native, 100),
-        (2, BroadcasterBackend::Vm, 101),
-        (3, BroadcasterBackend::Rfq, run_id + 10),
+        (2, BroadcasterBackend::Native, 100),
+        (3, BroadcasterBackend::Vm, 101),
+        (4, BroadcasterBackend::Rfq, run_id + 10),
     ]
     .into_iter()
     .map(|(message_seq, backend, cursor)| {
