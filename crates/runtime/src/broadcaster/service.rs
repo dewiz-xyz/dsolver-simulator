@@ -505,12 +505,11 @@ impl BroadcasterServiceState {
                 ),
                 None => chain_id = Some(status.chain_id),
             }
-            exports.push(
-                service
-                    .cache
-                    .export_snapshot(service.snapshot_max_payload_bytes)
-                    .await?,
-            );
+            let export = service
+                .cache
+                .export_snapshot(service.snapshot_max_payload_bytes)
+                .await?;
+            exports.push(export);
         }
 
         let chain_id = chain_id.ok_or_else(|| {
@@ -549,7 +548,7 @@ impl BroadcasterServiceState {
         let _gate = services[0].lifecycle_gate.lock().await;
         let mut chain_id = None;
         let mut backends = Vec::new();
-        let mut block_numbers = Vec::new();
+        let mut block_number = None;
         let mut rfq_update_timestamps = Vec::new();
         let mut exports = Vec::with_capacity(services.len());
 
@@ -570,8 +569,13 @@ impl BroadcasterServiceState {
                 backends.push(*backend);
                 match backend {
                     BroadcasterBackend::Native | BroadcasterBackend::Vm => {
-                        if let Some(block_number) = backend_status.block_number {
-                            block_numbers.push(block_number);
+                        let Some(backend_block_number) = backend_status.block_number else {
+                            return Ok(None);
+                        };
+                        match block_number {
+                            Some(expected) if expected != backend_block_number => return Ok(None),
+                            Some(_) => {}
+                            None => block_number = Some(backend_block_number),
                         }
                     }
                     BroadcasterBackend::Rfq => {
@@ -582,15 +586,14 @@ impl BroadcasterServiceState {
                     }
                 }
             }
-            exports.push(
-                service
-                    .cache
-                    .export_snapshot(service.snapshot_max_payload_bytes)
-                    .await?,
-            );
+            let export = service
+                .cache
+                .export_snapshot(service.snapshot_max_payload_bytes)
+                .await?;
+            exports.push(export);
         }
 
-        let Some(block_number) = block_numbers.into_iter().min() else {
+        let Some(block_number) = block_number else {
             return Ok(None);
         };
         backends.sort();
@@ -612,8 +615,6 @@ impl BroadcasterServiceState {
                 return Ok(None);
             }
         };
-        // Restore starts from this archive and then replays Redis deltas, so
-        // both sides must describe the same broadcaster generation.
         anyhow::ensure!(
             snapshot.stream_id == redis_replay_boundary.stream_id,
             "snapshot stream_id mismatch with Redis replay boundary: snapshot={}, boundary={}",
@@ -955,8 +956,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_history_checkpoint_captures_snapshot_payloads_and_boundary() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+    async fn state_history_checkpoint_waits_for_aligned_blocks_and_captures_boundary() -> Result<()>
+    {
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        );
         let writer = ServiceFakeRedisWriter::default();
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
             publisher_config(),
@@ -973,13 +978,20 @@ mod tests {
         service
             .apply_update(&native_only_update(10, "native-1"))
             .await?;
+        service.apply_update(&vm_only_update(20, "vm-1")).await?;
         BroadcasterServiceState::promote_when_ready(
             std::slice::from_ref(&service),
             "active_writer_promoted",
         )
         .await?;
+        let checkpoint = BroadcasterServiceState::create_state_history_checkpoint_for_services(
+            std::slice::from_ref(&service),
+        )
+        .await?;
+        assert!(checkpoint.is_none());
+
         service
-            .apply_update(&native_only_update(11, "native-2"))
+            .apply_update(&native_update_state(20, "native-1", 2))
             .await?;
 
         let checkpoint = BroadcasterServiceState::create_state_history_checkpoint_for_services(
@@ -990,13 +1002,13 @@ mod tests {
         let status = publisher.status_snapshot().await;
 
         assert_eq!(checkpoint.metadata.chain_id, Chain::Ethereum.id());
-        assert_eq!(checkpoint.metadata.block_number, 11);
+        assert_eq!(checkpoint.metadata.block_number, 20);
         assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, None);
         assert_eq!(checkpoint.metadata.stream_id, status.stream_id);
         assert_eq!(checkpoint.metadata.source_message_seq, 2);
         assert_eq!(
             checkpoint.metadata.backends,
-            vec![BroadcasterBackend::Native]
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm]
         );
         assert_eq!(
             checkpoint.payloads.first().map(BroadcasterEnvelope::kind),
@@ -2454,7 +2466,14 @@ mod tests {
     }
 
     fn native_only_update(block_number: u64, component_id: &str) -> Update {
-        let protocol = "uniswap_v2";
+        backend_only_update(block_number, component_id, "uniswap_v2")
+    }
+
+    fn vm_only_update(block_number: u64, component_id: &str) -> Update {
+        backend_only_update(block_number, component_id, "vm:curve")
+    }
+
+    fn backend_only_update(block_number: u64, component_id: &str, protocol: &str) -> Update {
         let mut new_pairs = HashMap::new();
         new_pairs.insert(
             component_id.to_string(),

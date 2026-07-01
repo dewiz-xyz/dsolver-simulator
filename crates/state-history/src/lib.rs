@@ -161,7 +161,6 @@ pub struct HistoryRangeRequest {
     pub rfq_start_timestamp_ms: Option<u64>,
     pub rfq_end_timestamp_ms: Option<u64>,
     pub backends: Vec<BroadcasterBackend>,
-    pub require_checkpoint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,7 +452,6 @@ impl HistoryRangeRequest {
             rfq_start_timestamp_ms: None,
             rfq_end_timestamp_ms: None,
             backends,
-            require_checkpoint: true,
         };
         request.validate_shape()?;
         Ok(request)
@@ -467,12 +465,6 @@ impl HistoryRangeRequest {
         self.rfq_start_timestamp_ms = Some(start_timestamp_ms);
         self.rfq_end_timestamp_ms = Some(end_timestamp_ms);
         self.validate()?;
-        Ok(self)
-    }
-
-    pub fn without_checkpoint_requirement(mut self) -> Result<Self> {
-        self.require_checkpoint = false;
-        self.validate_shape()?;
         Ok(self)
     }
 
@@ -843,30 +835,6 @@ impl StateHistoryPgStore {
         Ok(())
     }
 
-    pub async fn latest_checkpoint_before(
-        &self,
-        chain_id: u64,
-        block_number: u64,
-    ) -> Result<Option<CheckpointManifest>> {
-        self.latest_checkpoint_covering_before_with_rfq_cursor(chain_id, block_number, &[], None)
-            .await
-    }
-
-    pub async fn latest_checkpoint_covering_before(
-        &self,
-        chain_id: u64,
-        block_number: u64,
-        backends: &[BroadcasterBackend],
-    ) -> Result<Option<CheckpointManifest>> {
-        self.latest_checkpoint_covering_before_with_rfq_cursor(
-            chain_id,
-            block_number,
-            backends,
-            None,
-        )
-        .await
-    }
-
     async fn latest_checkpoint_for_request(
         &self,
         request: &HistoryRangeRequest,
@@ -875,22 +843,6 @@ impl StateHistoryPgStore {
             .includes_rfq()
             .then_some(request.rfq_start_timestamp_ms)
             .flatten();
-        self.latest_checkpoint_covering_before_with_rfq_cursor(
-            request.chain_id,
-            request.start_block_number,
-            &request.backends,
-            max_rfq_update_timestamp_ms,
-        )
-        .await
-    }
-
-    async fn latest_checkpoint_covering_before_with_rfq_cursor(
-        &self,
-        chain_id: u64,
-        block_number: u64,
-        backends: &[BroadcasterBackend],
-        max_rfq_update_timestamp_ms: Option<u64>,
-    ) -> Result<Option<CheckpointManifest>> {
         let row = sqlx::query(
             r#"
             SELECT id, chain_id, block_number, captured_at_timestamp_ms,
@@ -913,9 +865,9 @@ impl StateHistoryPgStore {
             LIMIT 1
             "#,
         )
-        .bind(u64_to_i64("chain_id", chain_id)?)
-        .bind(u64_to_i64("block_number", block_number)?)
-        .bind(backend_scope_strings(backends))
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(u64_to_i64("block_number", request.start_block_number)?)
+        .bind(backend_scope_strings(&request.backends))
         .bind(optional_u64_to_i64(
             "max_rfq_update_timestamp_ms",
             max_rfq_update_timestamp_ms,
@@ -947,7 +899,7 @@ impl StateHistoryPgStore {
             )
             .await
             .context("failed to load state history gaps for range")?;
-        if request.require_checkpoint && checkpoint.is_none() {
+        if checkpoint.is_none() {
             gaps.push(HistoryRangeGap {
                 source: HistoryRangeGapSource::MissingCheckpoint,
                 backend_scope: request.backends.clone(),
@@ -1947,23 +1899,6 @@ mod tests {
         assert!(error.to_string().contains("no complete checkpoint"));
 
         Ok(())
-    }
-
-    #[test]
-    fn history_range_plan_accepts_gap_free_ranges() -> Result<()> {
-        let request = HistoryRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Native])?;
-        let replay_from_block_number = request.start_block_number;
-        let plan = HistoryRangePlan {
-            request,
-            checkpoint: None,
-            replay_from_message_seq: None,
-            replay_from_block_number,
-            rfq_replay_from_timestamp_ms: None,
-            deltas: Vec::new(),
-            gaps: Vec::new(),
-        };
-
-        plan.ensure_gap_free()
     }
 
     #[test]

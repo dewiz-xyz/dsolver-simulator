@@ -15,7 +15,7 @@ State history is disabled unless `STATE_HISTORY_ENABLED=true`.
 
 When enabled, broadcaster startup connects to PostgreSQL, validates that migrations have already been applied, builds the S3 checkpoint store, and starts the async history writer. Live serving does not wait for history storage. If the queue fills or a write exhausts its retry window, the writer records an explicit gap when PostgreSQL is available and reports the failure in `/status.state_history`.
 
-Checkpoints are captured by block interval. A checkpoint contains the combined raw/RFQ snapshot payloads from the broadcaster cache and is anchored to the active Redis replay boundary. Upload failure marks the checkpoint manifest `failed`; delta history continues.
+Checkpoints are captured by block interval. A checkpoint contains the combined raw/RFQ snapshot payloads from the broadcaster cache and is anchored to the active Redis replay boundary. Native and VM checkpoints are only captured when their block cursors are aligned. Upload failure marks the checkpoint manifest `failed`; delta history continues.
 
 ## Configuration
 
