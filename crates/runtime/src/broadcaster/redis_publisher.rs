@@ -20,6 +20,7 @@ use simulator_core::broadcaster::{
     BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterRedisReplayBoundary,
     BroadcasterRedisStreamEntry,
 };
+use state_history::StateHistoryWriter;
 
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
@@ -449,6 +450,7 @@ pub struct BroadcasterRedisPublisher {
     writer_key: String,
     writer_generation_key: String,
     writer_token: String,
+    state_history: Option<StateHistoryWriter>,
     inner: Arc<Mutex<BroadcasterRedisPublisherState>>,
 }
 
@@ -585,6 +587,7 @@ impl BroadcasterRedisPublisher {
             writer_key,
             writer_generation_key,
             writer_token: new_writer_token(),
+            state_history: None,
             inner: Arc::new(Mutex::new(BroadcasterRedisPublisherState {
                 mode,
                 generation,
@@ -599,6 +602,11 @@ impl BroadcasterRedisPublisher {
                 last_error: None,
             })),
         }
+    }
+
+    pub fn with_state_history_writer(mut self, state_history: Option<StateHistoryWriter>) -> Self {
+        self.state_history = state_history;
+        self
     }
 
     pub async fn publish_accepted_payload(
@@ -632,7 +640,10 @@ impl BroadcasterRedisPublisher {
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
         match self.append_payload_locked(&mut guard, payload).await {
-            Ok(entry) => Ok(Some(entry)),
+            Ok((entry, entry_id)) => {
+                self.enqueue_state_history(&entry, &entry_id).await;
+                Ok(Some((entry, entry_id)))
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 if is_stale_writer_error(&error) {
@@ -898,6 +909,8 @@ impl BroadcasterRedisPublisher {
             "Redis broadcaster generation promoted"
         );
         let boundary = self.replay_boundary_locked(&guard)?;
+        self.enqueue_state_history(&promotion.marker_entry, &promotion.entry_id)
+            .await;
         Ok(BroadcasterRedisPromotion {
             boundary,
             marker_entry: promotion.marker_entry,
@@ -1026,6 +1039,25 @@ impl BroadcasterRedisPublisher {
             error = %error,
             "Redis broadcaster stream append retry window exhausted"
         );
+    }
+
+    async fn enqueue_state_history(
+        &self,
+        entry: &BroadcasterRedisStreamEntry,
+        redis_entry_id: &str,
+    ) {
+        let Some(state_history) = &self.state_history else {
+            return;
+        };
+        if let Err(error) = state_history
+            .enqueue_entry(entry.clone(), redis_entry_id.to_string())
+            .await
+        {
+            warn!(
+                error = %error,
+                "State history writer did not accept Redis broadcaster entry"
+            );
+        }
     }
 }
 

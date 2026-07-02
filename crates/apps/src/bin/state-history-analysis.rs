@@ -74,6 +74,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
     record_pre_checkpoint_gap(&pg_store, chain_id, &stream_id).await?;
     let plan = reader.resolve_range(request.clone()).await?;
     let valid_generation_switch_gaps = assert_no_generation_switch_gap(&plan)?;
+    let unproven_ingestion_gaps = assert_unproven_ingestion_gap(&plan)?;
     let selected_checkpoint = plan
         .checkpoint
         .as_ref()
@@ -135,6 +136,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         checkpoint_payload_hash: checkpoint.payload.hash,
         decoded_checkpoint_payloads: decoded.archive.payloads.len(),
         recorded_gaps,
+        unproven_ingestion_gaps,
         valid_generation_switch_gaps,
         post_handoff_checkpoint_generation_switch_gaps,
         unseen_generation_gap_switch_gaps,
@@ -308,10 +310,26 @@ async fn assert_post_handoff_checkpoint_does_not_report_generation_switch(
     Ok(generation_switch_gaps)
 }
 
+fn assert_unproven_ingestion_gap(plan: &HistoryRangePlan) -> Result<usize> {
+    let unproven_ingestion_gaps = unproven_ingestion_gap_count(plan);
+    anyhow::ensure!(
+        unproven_ingestion_gaps >= 1,
+        "expected synthetic open stream to report unproven ingestion coverage"
+    );
+    Ok(unproven_ingestion_gaps)
+}
+
 fn generation_switch_gap_count(plan: &HistoryRangePlan) -> usize {
     plan.gaps
         .iter()
         .filter(|gap| gap.source == HistoryRangeGapSource::GenerationSwitch)
+        .count()
+}
+
+fn unproven_ingestion_gap_count(plan: &HistoryRangePlan) -> usize {
+    plan.gaps
+        .iter()
+        .filter(|gap| gap.source == HistoryRangeGapSource::UnprovenIngestion)
         .count()
 }
 
@@ -715,6 +733,7 @@ struct StateHistoryAnalysisReport {
     checkpoint_payload_hash: String,
     decoded_checkpoint_payloads: usize,
     recorded_gaps: usize,
+    unproven_ingestion_gaps: usize,
     valid_generation_switch_gaps: usize,
     post_handoff_checkpoint_generation_switch_gaps: usize,
     unseen_generation_gap_switch_gaps: usize,

@@ -158,6 +158,13 @@ impl BroadcasterAppState {
             tokens,
         }
     }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        if let Some(state_history) = &self.state_history {
+            state_history.shutdown(Duration::from_secs(10)).await?;
+        }
+        Ok(())
+    }
 }
 
 pub struct BroadcasterServiceParts {
@@ -176,8 +183,9 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let tokens = load_token_store(&config).await?;
     let raw_backends = raw_configured_backends(&config);
     let heartbeat_interval = Duration::from_secs(config.tuning.heartbeat_interval_secs);
-    let redis_publisher = build_redis_publisher(chain.id(), heartbeat_interval).await?;
     let (state_history, state_history_checkpoints) = build_state_history(&config).await?;
+    let redis_publisher =
+        build_redis_publisher(chain.id(), heartbeat_interval, state_history.clone()).await?;
     let raw_cache = BroadcasterSnapshotCache::new(chain.id(), raw_backends.clone());
     let raw_upstream_state = BroadcasterUpstreamState::default();
     let rfq_backends = rfq_configured_backends(&config);
@@ -194,8 +202,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         raw_upstream_state,
         Arc::clone(&redis_publisher),
         Arc::clone(&publication_gate),
-    )
-    .with_state_history_writer(state_history.clone());
+    );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
 
@@ -207,8 +214,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
                 rfq_upstream_state,
                 Arc::clone(&redis_publisher),
                 Arc::clone(&publication_gate),
-            )
-            .with_state_history_writer(state_history.clone());
+            );
             let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
                 tokens: Arc::clone(&tokens),
                 chain,
@@ -461,17 +467,21 @@ fn redis_readiness(mode: &str) -> BroadcasterReadiness {
 async fn build_redis_publisher(
     chain_id: u64,
     heartbeat_interval: Duration,
+    state_history: Option<StateHistoryWriter>,
 ) -> Result<Arc<BroadcasterRedisPublisher>> {
     let redis_config = load_broadcaster_redis_config();
     let writer = Arc::new(TokioRedisStreamWriter::connect(&redis_config.redis_url).await?);
-    let publisher = Arc::new(BroadcasterRedisPublisher::new(
-        BroadcasterRedisPublisherConfig::from_redis_config(
-            &redis_config,
-            chain_id,
-            heartbeat_interval,
-        ),
-        writer,
-    ));
+    let publisher = Arc::new(
+        BroadcasterRedisPublisher::new(
+            BroadcasterRedisPublisherConfig::from_redis_config(
+                &redis_config,
+                chain_id,
+                heartbeat_interval,
+            ),
+            writer,
+        )
+        .with_state_history_writer(state_history),
+    );
     Ok(publisher)
 }
 

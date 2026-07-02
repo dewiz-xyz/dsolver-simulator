@@ -6,6 +6,7 @@ CREATE TABLE state_history.delta_messages (
     stream_id TEXT NOT NULL,
     snapshot_id TEXT,
     message_seq BIGINT NOT NULL,
+    prev_persistable_message_seq BIGINT,
     redis_entry_id TEXT,
     kind TEXT NOT NULL,
     backend_scope TEXT[] NOT NULL,
@@ -16,7 +17,11 @@ CREATE TABLE state_history.delta_messages (
     payload_hash TEXT NOT NULL,
     runtime_published_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (chain_id, stream_id, message_seq)
+    UNIQUE (chain_id, stream_id, message_seq),
+    CHECK (
+        prev_persistable_message_seq IS NULL
+        OR prev_persistable_message_seq < message_seq
+    )
 );
 
 CREATE TABLE state_history.delta_backend_index (
@@ -37,6 +42,21 @@ CREATE INDEX state_history_delta_backend_block_idx
 CREATE INDEX state_history_delta_backend_timestamp_idx
     ON state_history.delta_backend_index (chain_id, backend, observed_timestamp_ms, message_seq)
     WHERE observed_timestamp_ms IS NOT NULL;
+
+CREATE TABLE state_history.stream_cursors (
+    chain_id BIGINT NOT NULL,
+    stream_id TEXT NOT NULL,
+    last_observed_seq BIGINT NOT NULL,
+    last_persistable_seq BIGINT NOT NULL,
+    last_persisted_seq BIGINT NOT NULL,
+    native_head_block BIGINT,
+    vm_head_block BIGINT,
+    rfq_head_timestamp_ms BIGINT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chain_id, stream_id),
+    CHECK (last_persisted_seq <= last_persistable_seq),
+    CHECK (last_persistable_seq <= last_observed_seq)
+);
 
 CREATE TABLE state_history.generation_handoffs (
     id BIGSERIAL PRIMARY KEY,

@@ -4,7 +4,7 @@ State history is an opt-in long-term store for accepted broadcaster state change
 
 ## What Is Stored
 
-- PostgreSQL stores accepted state-changing broadcaster Redis entries, per-backend indexes, checkpoint manifests, and explicit ingestion gaps.
+- PostgreSQL stores accepted state-changing broadcaster Redis entries, per-backend indexes, stream cursors, checkpoint manifests, and explicit ingestion gaps.
 - S3 stores compressed combined checkpoints built from the broadcaster snapshot payload model.
 - Native and VM history use block-number cursors.
 - RFQ history uses the RFQ update timestamp cursor. This stores RFQ state for historical indicative `/simulate` reconstruction. It does not store signed quote replay material for `/encode`.
@@ -13,9 +13,13 @@ State history is an opt-in long-term store for accepted broadcaster state change
 
 State history is disabled unless `STATE_HISTORY_ENABLED=true`.
 
-When enabled, broadcaster startup connects to PostgreSQL, validates that migrations have already been applied, builds the S3 checkpoint store, and starts the async history writer. Live serving does not wait for history storage. If the queue fills or a write exhausts its retry window, the writer records an explicit gap when PostgreSQL is available and reports the failure in `/status.state_history`.
+When enabled, broadcaster startup connects to PostgreSQL, validates that migrations have already been applied, builds the S3 checkpoint store, and starts the async history writer. Live serving does not wait for history storage. After Redis accepts an update, heartbeat, or generation-progress marker, the Redis publisher sends it to the async history writer in the same order. If the queue fills or a write exhausts its retry window, the writer records an explicit gap when PostgreSQL is available and reports the failure in `/status.state_history`.
 
-Checkpoints are captured by block interval. A checkpoint contains the combined raw/RFQ snapshot payloads from the broadcaster cache and is anchored to the active Redis replay boundary. Native and VM checkpoints are only captured when their block cursors are aligned. Upload failure marks the checkpoint manifest `failed`; delta history continues.
+Checkpoints are captured by block interval. A checkpoint contains the combined raw/RFQ snapshot payloads from the broadcaster cache and is anchored to the active Redis replay boundary. Passive and stale writers do not export checkpoints. Native and VM checkpoints are only captured when their block cursors are aligned. Upload failure marks the checkpoint manifest `failed`; delta history continues.
+
+The reader fails closed. A range with no complete checkpoint returns no deltas and reports `MissingCheckpoint`. A range with a checkpoint also needs a persisted delta chain and stream cursor proof. If PostgreSQL cannot prove every persistable message was written, every closed handoff stream was observed through its tail, and the open stream is proven through the requested native, VM, and RFQ heads, the plan reports `UnprovenIngestion`. Recorded `ingestion_gaps` remain telemetry and are still surfaced when they overlap the requested range.
+
+There is one accepted residual window: if the last command on an otherwise idle stream is lost and no later command or heartbeat arrives, the reader cannot observe the loss until the next heartbeat interval advances the stream cursor. Strict PostgreSQL-before-live-serving is intentionally out of scope.
 
 ## Configuration
 
@@ -55,14 +59,15 @@ The harness:
 - writes and fetches a combined checkpoint;
 - resolves a history range through the reader API;
 - verifies the gap-free helper;
-- records one synthetic gap and verifies that the reader reports it.
+- records one synthetic gap and verifies that the reader reports it;
+- verifies that the reader reports unproven ingestion when synthetic cursors do not prove the open stream through the requested head.
 
 ## Reader Contract
 
 The `state-history` crate exposes the reader API for external harnesses:
 
-- `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. When a checkpoint is selected, replay is scoped to that checkpoint's stream and starts at the first message after its recorded source sequence. RFQ ranges use the checkpoint's RFQ update timestamp, not its wall-clock capture time, as the RFQ replay cursor.
+- `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. When a checkpoint is selected, replay is scoped to the validated Redis stream handoff chain and starts at the first message after the checkpoint's recorded source sequence. RFQ ranges use the checkpoint's RFQ update timestamp, not its wall-clock capture time, as the RFQ replay cursor.
 - `StateHistoryReader::fetch_checkpoint` fetches and verifies the S3 object for a complete manifest.
-- `HistoryRangePlan::ensure_gap_free` turns recorded or missing-checkpoint gaps into a hard error for callers that require complete ranges.
+- `HistoryRangePlan::ensure_gap_free` turns recorded gaps, missing checkpoints, generation switches, or unproven ingestion into a hard error for callers that require complete ranges.
 
 The reader does not materialize simulator state. External backtesting tools apply the checkpoint payloads and streamed deltas.

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
-use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
@@ -10,11 +12,12 @@ use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterPayload,
-    BroadcasterRedisStreamEntry,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
+    BroadcasterPayload, BroadcasterRedisStreamEntry,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
 use tracing::warn;
 
@@ -22,6 +25,8 @@ const CHECKPOINT_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const ZSTD_LEVEL: i32 = 3;
 const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 8_192;
 const DEFAULT_WRITER_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const DEFAULT_GAP_RECORD_TASK_LIMIT: usize = 16;
+const PERSISTABLE_PREV_CACHE_LIMIT: usize = 1_024;
 const WRITER_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(100);
 const WRITER_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(2);
 
@@ -90,6 +95,7 @@ pub struct PreparedDeltaMessage {
     pub stream_id: String,
     pub snapshot_id: Option<String>,
     pub message_seq: u64,
+    pub prev_persistable_message_seq: Option<u64>,
     pub redis_entry_id: Option<String>,
     pub kind: BroadcasterMessageKind,
     pub backend_scope: Vec<BroadcasterBackend>,
@@ -191,6 +197,17 @@ struct ValidatedHistorySegments {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryStreamCursor {
+    stream_id: String,
+    last_observed_seq: u64,
+    last_persistable_seq: u64,
+    last_persisted_seq: u64,
+    native_head_block: Option<u64>,
+    vm_head_block: Option<u64>,
+    rfq_head_timestamp_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRangeRequest {
     pub chain_id: u64,
     pub start_block_number: u64,
@@ -227,6 +244,7 @@ pub enum HistoryRangeGapSource {
     MissingCheckpoint,
     RecordedGap,
     GenerationSwitch,
+    UnprovenIngestion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +353,10 @@ pub struct StateHistoryWriter {
     sender: mpsc::Sender<StateHistoryWriteCommand>,
     pg_store: StateHistoryPgStore,
     status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+    persistable_by_stream: Arc<Mutex<BTreeMap<(u64, String), PersistableStreamCursor>>>,
+    gap_record_permits: Arc<Semaphore>,
+    shutdown: Arc<WriterShutdown>,
+    task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl fmt::Debug for StateHistoryWriter {
@@ -355,9 +377,106 @@ pub struct StateHistoryCheckpointWriter {
 }
 
 #[derive(Debug)]
-struct StateHistoryWriteCommand {
-    entry: BroadcasterRedisStreamEntry,
-    redis_entry_id: String,
+enum StateHistoryWriteCommand {
+    Persist {
+        entry: Box<BroadcasterRedisStreamEntry>,
+        redis_entry_id: String,
+        prev_persistable_message_seq: Option<u64>,
+        observation: StreamObservation,
+    },
+    Observe(StreamObservation),
+}
+
+impl StateHistoryWriteCommand {
+    fn is_persist(&self) -> bool {
+        matches!(self, Self::Persist { .. })
+    }
+
+    fn stream_id(&self) -> &str {
+        match self {
+            Self::Persist { entry, .. } => &entry.stream_id,
+            Self::Observe(observation) => &observation.stream_id,
+        }
+    }
+
+    fn message_seq(&self) -> u64 {
+        match self {
+            Self::Persist { entry, .. } => entry.message_seq,
+            Self::Observe(observation) => observation.message_seq,
+        }
+    }
+
+    fn into_persist_entry(self) -> Option<BroadcasterRedisStreamEntry> {
+        match self {
+            Self::Persist { entry, .. } => Some(*entry),
+            Self::Observe(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamObservation {
+    chain_id: u64,
+    stream_id: String,
+    message_seq: u64,
+    last_persistable_seq: u64,
+    heads: BackendHeadObservation,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BackendHeadObservation {
+    native_head_block: Option<u64>,
+    vm_head_block: Option<u64>,
+    rfq_head_timestamp_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct PersistableStreamCursor {
+    last_message_seq: u64,
+    prev_by_message_seq: BTreeMap<u64, Option<u64>>,
+}
+
+struct WriterShutdown {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl Default for WriterShutdown {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+}
+
+impl WriterShutdown {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        if self.cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+impl PersistableStreamCursor {
+    fn trim_prev_cache(&mut self) {
+        if self.prev_by_message_seq.len() <= PERSISTABLE_PREV_CACHE_LIMIT {
+            return;
+        }
+        let retain_from = self
+            .last_message_seq
+            .saturating_sub(PERSISTABLE_PREV_CACHE_LIMIT as u64);
+        self.prev_by_message_seq
+            .retain(|message_seq, _| *message_seq >= retain_from);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,19 +554,60 @@ pub fn indexed_backends_for_entry(
     entry: &BroadcasterRedisStreamEntry,
 ) -> Result<Vec<CheckpointPayload>> {
     let backends = parse_backend_scope(&entry.backend_scope)?;
-    Ok(backends
-        .into_iter()
-        .map(|backend| CheckpointPayload {
-            backend,
-            block_number: entry.block_number_for_backend(backend),
-            observed_timestamp_ms: entry.observed_timestamp_for_backend(backend),
-        })
-        .collect())
+    let envelope = decode_entry_envelope(entry)?;
+    match envelope.payload {
+        BroadcasterPayload::Update(update) => {
+            let partition_backends = update
+                .partitions
+                .iter()
+                .map(|partition| partition.backend)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                partition_backends == backends,
+                "state history update partition backends do not match Redis backend_scope"
+            );
+            Ok(update
+                .partitions
+                .into_iter()
+                .map(|partition| match partition.backend {
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm => CheckpointPayload {
+                        backend: partition.backend,
+                        block_number: Some(partition.block_number),
+                        observed_timestamp_ms: None,
+                    },
+                    BroadcasterBackend::Rfq => CheckpointPayload {
+                        backend: partition.backend,
+                        block_number: None,
+                        observed_timestamp_ms: Some(partition.block_number),
+                    },
+                })
+                .collect())
+        }
+        BroadcasterPayload::Progress(_) => Ok(backends
+            .into_iter()
+            .map(|backend| CheckpointPayload {
+                backend,
+                block_number: None,
+                observed_timestamp_ms: None,
+            })
+            .collect()),
+        _ => Err(anyhow!(
+            "state history only indexes update entries and progress markers"
+        )),
+    }
 }
 
 pub fn prepare_delta_message(
     entry: &BroadcasterRedisStreamEntry,
     redis_entry_id: Option<&str>,
+) -> Result<PreparedDeltaMessage> {
+    prepare_delta_message_with_prev(entry, redis_entry_id, None)
+}
+
+fn prepare_delta_message_with_prev(
+    entry: &BroadcasterRedisStreamEntry,
+    redis_entry_id: Option<&str>,
+    prev_persistable_message_seq: Option<u64>,
 ) -> Result<PreparedDeltaMessage> {
     let backend_index = indexed_backends_for_entry(entry)?;
     let json = serde_json::to_vec(entry).context("failed to serialize Redis stream entry")?;
@@ -460,6 +620,7 @@ pub fn prepare_delta_message(
         stream_id: entry.stream_id.clone(),
         snapshot_id: entry.snapshot_id.clone(),
         message_seq: entry.message_seq,
+        prev_persistable_message_seq,
         redis_entry_id: redis_entry_id.map(str::to_string),
         kind: entry.kind,
         backend_scope: backend_index.iter().map(|index| index.backend).collect(),
@@ -525,6 +686,71 @@ fn prepare_generation_handoff(
         snapshot_id: progress.snapshot_id,
         backend_scope: progress.backends,
     }))
+}
+
+impl StreamObservation {
+    fn for_entry(entry: &BroadcasterRedisStreamEntry, last_persistable_seq: u64) -> Result<Self> {
+        let envelope = decode_entry_envelope(entry)?;
+        let heads = match envelope.payload {
+            BroadcasterPayload::Update(update) => {
+                BackendHeadObservation::from_update_partitions(update.partitions.iter())
+            }
+            BroadcasterPayload::Heartbeat(heartbeat) => {
+                BackendHeadObservation::from_backend_heads(heartbeat.backend_heads.iter())
+            }
+            BroadcasterPayload::Progress(progress) => progress
+                .handoff
+                .map(|handoff| {
+                    BackendHeadObservation::from_backend_heads(handoff.base_heads.iter())
+                })
+                .unwrap_or_default(),
+            _ => BackendHeadObservation::default(),
+        };
+        Ok(Self {
+            chain_id: entry.chain_id,
+            stream_id: entry.stream_id.clone(),
+            message_seq: entry.message_seq,
+            last_persistable_seq,
+            heads,
+        })
+    }
+}
+
+impl BackendHeadObservation {
+    fn from_update_partitions<'a>(
+        partitions: impl IntoIterator<
+            Item = &'a simulator_core::broadcaster::BroadcasterUpdatePartition,
+        >,
+    ) -> Self {
+        let mut observation = Self::default();
+        for partition in partitions {
+            observation.observe_backend_head(partition.backend, partition.block_number);
+        }
+        observation
+    }
+
+    fn from_backend_heads<'a>(heads: impl IntoIterator<Item = &'a BroadcasterBackendHead>) -> Self {
+        let mut observation = Self::default();
+        for head in heads {
+            observation.observe_backend_head(head.backend, head.block_number);
+        }
+        observation
+    }
+
+    fn observe_backend_head(&mut self, backend: BroadcasterBackend, cursor: u64) {
+        match backend {
+            BroadcasterBackend::Native => {
+                self.native_head_block = max_optional_u64(self.native_head_block, Some(cursor));
+            }
+            BroadcasterBackend::Vm => {
+                self.vm_head_block = max_optional_u64(self.vm_head_block, Some(cursor));
+            }
+            BroadcasterBackend::Rfq => {
+                self.rfq_head_timestamp_ms =
+                    max_optional_u64(self.rfq_head_timestamp_ms, Some(cursor));
+            }
+        }
+    }
 }
 
 impl HistoryRangeRequest {
@@ -865,6 +1091,123 @@ fn ingestion_gap_within_segments(
     })
 }
 
+fn verify_ingestion_coverage_from_cursors(
+    request: &HistoryRangeRequest,
+    segments: &[HistoryReplaySegment],
+    cursors: &[HistoryStreamCursor],
+) -> Vec<HistoryRangeGap> {
+    if segments.is_empty() {
+        return vec![unproven_ingestion_gap(
+            request,
+            "state history has no replay segment to prove ingestion coverage",
+        )];
+    }
+
+    let cursors_by_stream = cursors
+        .iter()
+        .map(|cursor| (cursor.stream_id.as_str(), cursor))
+        .collect::<BTreeMap<_, _>>();
+    for segment in segments {
+        let Some(cursor) = cursors_by_stream.get(segment.stream_id.as_str()).copied() else {
+            return vec![unproven_ingestion_gap(
+                request,
+                format!(
+                    "state history cursor is missing for stream {}",
+                    segment.stream_id
+                ),
+            )];
+        };
+        if cursor.last_persistable_seq != cursor.last_persisted_seq {
+            return vec![unproven_ingestion_gap(
+                request,
+                format!(
+                    "state history cursor for stream {} has persistable seq {} but persisted seq {}",
+                    cursor.stream_id, cursor.last_persistable_seq, cursor.last_persisted_seq
+                ),
+            )];
+        }
+        if let Some(tail) = segment.to_message_seq {
+            if cursor.last_observed_seq < tail {
+                return vec![unproven_ingestion_gap(
+                    request,
+                    format!(
+                        "state history closed stream {} is only observed through seq {}, below handoff tail {}",
+                        cursor.stream_id, cursor.last_observed_seq, tail
+                    ),
+                )];
+            }
+        } else if let Some(reason) = cursor.unproven_head_reason(request) {
+            return vec![unproven_ingestion_gap(request, reason)];
+        }
+    }
+
+    Vec::new()
+}
+
+impl HistoryStreamCursor {
+    fn unproven_head_reason(&self, request: &HistoryRangeRequest) -> Option<String> {
+        for backend in &request.backends {
+            match backend {
+                BroadcasterBackend::Native => {
+                    if self
+                        .native_head_block
+                        .is_none_or(|head| head < request.end_block_number)
+                    {
+                        return Some(format!(
+                            "state history native head for stream {} is not proven through block {}",
+                            self.stream_id, request.end_block_number
+                        ));
+                    }
+                }
+                BroadcasterBackend::Vm => {
+                    if self
+                        .vm_head_block
+                        .is_none_or(|head| head < request.end_block_number)
+                    {
+                        return Some(format!(
+                            "state history VM head for stream {} is not proven through block {}",
+                            self.stream_id, request.end_block_number
+                        ));
+                    }
+                }
+                BroadcasterBackend::Rfq => {
+                    let Some(rfq_end_timestamp_ms) = request.rfq_end_timestamp_ms else {
+                        return Some(format!(
+                            "state history RFQ head for stream {} cannot be proven without an RFQ end timestamp",
+                            self.stream_id
+                        ));
+                    };
+                    if self
+                        .rfq_head_timestamp_ms
+                        .is_none_or(|head| head < rfq_end_timestamp_ms)
+                    {
+                        return Some(format!(
+                            "state history RFQ head for stream {} is not proven through timestamp {}",
+                            self.stream_id, rfq_end_timestamp_ms
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+fn unproven_ingestion_gap(
+    request: &HistoryRangeRequest,
+    reason: impl Into<String>,
+) -> HistoryRangeGap {
+    HistoryRangeGap {
+        source: HistoryRangeGapSource::UnprovenIngestion,
+        backend_scope: request.backends.clone(),
+        from_block_number: Some(request.start_block_number),
+        to_block_number: Some(request.end_block_number),
+        from_timestamp_ms: request.rfq_start_timestamp_ms,
+        to_timestamp_ms: request.rfq_end_timestamp_ms,
+        reason: reason.into(),
+    }
+}
+
 fn valid_redis_stream_entry_pair(stream_id: &str, entry_id: &str) -> Option<(u64, u64)> {
     let stream_generation = redis_stream_generation(stream_id)?;
     let (entry_generation, message_seq) = redis_entry_id_parts(entry_id)?;
@@ -900,11 +1243,7 @@ impl StateHistoryPgStore {
             .connect(database_url)
             .await
             .context("failed to connect to state history PostgreSQL for migrations")?;
-        let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-        let migrator = sqlx::migrate::Migrator::new(migrations.as_path())
-            .await
-            .context("failed to load state history migrations")?;
-        migrator
+        sqlx::migrate!("./migrations")
             .run(&pool)
             .await
             .context("failed to run state history migrations")?;
@@ -918,6 +1257,7 @@ impl StateHistoryPgStore {
             "state_history.generation_handoffs",
             "state_history.checkpoints",
             "state_history.ingestion_gaps",
+            "state_history.stream_cursors",
         ] {
             let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
                 .bind(table)
@@ -937,12 +1277,59 @@ impl StateHistoryPgStore {
         entry: &BroadcasterRedisStreamEntry,
         redis_entry_id: Option<&str>,
     ) -> Result<PersistedDelta> {
+        let prev_persistable_message_seq = self.latest_persisted_message_seq_before(entry).await?;
+        self.insert_entry_with_prev(
+            entry,
+            redis_entry_id,
+            prev_persistable_message_seq,
+            StreamObservation::for_entry(entry, entry.message_seq)?,
+        )
+        .await
+    }
+
+    async fn latest_persisted_message_seq_before(
+        &self,
+        entry: &BroadcasterRedisStreamEntry,
+    ) -> Result<Option<u64>> {
+        let value = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT message_seq
+            FROM state_history.delta_messages
+            WHERE chain_id = $1
+                AND stream_id = $2
+                AND message_seq < $3
+            ORDER BY message_seq DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", entry.chain_id)?)
+        .bind(&entry.stream_id)
+        .bind(u64_to_i64("message_seq", entry.message_seq)?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load previous state history delta")?;
+        value
+            .map(|value| i64_to_u64("message_seq", value))
+            .transpose()
+    }
+
+    async fn insert_entry_with_prev(
+        &self,
+        entry: &BroadcasterRedisStreamEntry,
+        redis_entry_id: Option<&str>,
+        prev_persistable_message_seq: Option<u64>,
+        observation: StreamObservation,
+    ) -> Result<PersistedDelta> {
         let handoff = prepare_generation_handoff(entry, redis_entry_id)?;
         anyhow::ensure!(
-            entry.kind == BroadcasterMessageKind::Update || handoff.is_some(),
-            "state history only persists update entries and generation handoff progress markers"
+            matches!(
+                entry.kind,
+                BroadcasterMessageKind::Update | BroadcasterMessageKind::Progress
+            ),
+            "state history only persists update entries and progress markers"
         );
-        let prepared = prepare_delta_message(entry, redis_entry_id)?;
+        let prepared =
+            prepare_delta_message_with_prev(entry, redis_entry_id, prev_persistable_message_seq)?;
         let mut tx = self
             .pool
             .begin()
@@ -960,6 +1347,7 @@ impl StateHistoryPgStore {
         if let (true, Some(handoff)) = (inserted, handoff) {
             Self::insert_generation_handoff_row(&mut tx, prepared.chain_id, id, &handoff).await?;
         }
+        Self::upsert_stream_cursor(&mut tx, &observation, Some(prepared.message_seq)).await?;
 
         tx.commit()
             .await
@@ -974,11 +1362,11 @@ impl StateHistoryPgStore {
         sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO state_history.delta_messages (
-                chain_id, stream_id, snapshot_id, message_seq, redis_entry_id, kind,
-                backend_scope, block_number, observed_timestamp_ms, payload_encoding,
-                payload_compressed, payload_hash, runtime_published_at
+                chain_id, stream_id, snapshot_id, message_seq, prev_persistable_message_seq,
+                redis_entry_id, kind, backend_scope, block_number, observed_timestamp_ms,
+                payload_encoding, payload_compressed, payload_hash, runtime_published_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
             ON CONFLICT (chain_id, stream_id, message_seq) DO NOTHING
             RETURNING id
             "#,
@@ -987,6 +1375,10 @@ impl StateHistoryPgStore {
         .bind(&prepared.stream_id)
         .bind(&prepared.snapshot_id)
         .bind(u64_to_i64("message_seq", prepared.message_seq)?)
+        .bind(optional_u64_to_i64(
+            "prev_persistable_message_seq",
+            prepared.prev_persistable_message_seq,
+        )?)
         .bind(&prepared.redis_entry_id)
         .bind(prepared.kind.as_str())
         .bind(backend_scope_strings(&prepared.backend_scope))
@@ -1009,7 +1401,7 @@ impl StateHistoryPgStore {
     ) -> Result<i64> {
         let row = sqlx::query(
             r#"
-            SELECT id, payload_hash
+            SELECT id, payload_hash, prev_persistable_message_seq
             FROM state_history.delta_messages
             WHERE chain_id = $1 AND stream_id = $2 AND message_seq = $3
             "#,
@@ -1023,9 +1415,19 @@ impl StateHistoryPgStore {
 
         let id: i64 = row.get("id");
         let payload_hash: String = row.get("payload_hash");
+        let prev_persistable_message_seq = optional_i64_to_u64(
+            "prev_persistable_message_seq",
+            row.get("prev_persistable_message_seq"),
+        )?;
         anyhow::ensure!(
             payload_hash == prepared.payload.hash,
             "state history delta idempotency conflict for stream {} message_seq {}",
+            prepared.stream_id,
+            prepared.message_seq
+        );
+        anyhow::ensure!(
+            prev_persistable_message_seq == prepared.prev_persistable_message_seq,
+            "state history persisted chain conflict for stream {} message_seq {}",
             prepared.stream_id,
             prepared.message_seq
         );
@@ -1089,6 +1491,105 @@ impl StateHistoryPgStore {
         .execute(&mut **tx)
         .await
         .context("failed to insert state history generation handoff")?;
+        Ok(())
+    }
+
+    async fn observe_stream(&self, observation: &StreamObservation) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin state history cursor transaction")?;
+        Self::upsert_stream_cursor(&mut tx, observation, None).await?;
+        tx.commit()
+            .await
+            .context("failed to commit state history cursor transaction")?;
+        Ok(())
+    }
+
+    async fn upsert_stream_cursor(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        observation: &StreamObservation,
+        persisted_seq: Option<u64>,
+    ) -> Result<()> {
+        let persisted_seq = persisted_seq.unwrap_or(0);
+        sqlx::query(
+            r#"
+            INSERT INTO state_history.stream_cursors (
+                chain_id, stream_id, last_observed_seq, last_persistable_seq,
+                last_persisted_seq, native_head_block, vm_head_block,
+                rfq_head_timestamp_ms, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            ON CONFLICT (chain_id, stream_id) DO UPDATE
+            SET last_observed_seq = GREATEST(
+                    state_history.stream_cursors.last_observed_seq,
+                    EXCLUDED.last_observed_seq
+                ),
+                last_persistable_seq = GREATEST(
+                    state_history.stream_cursors.last_persistable_seq,
+                    EXCLUDED.last_persistable_seq
+                ),
+                last_persisted_seq = GREATEST(
+                    state_history.stream_cursors.last_persisted_seq,
+                    EXCLUDED.last_persisted_seq
+                ),
+                native_head_block = CASE
+                    WHEN EXCLUDED.native_head_block IS NULL
+                        THEN state_history.stream_cursors.native_head_block
+                    WHEN state_history.stream_cursors.native_head_block IS NULL
+                        THEN EXCLUDED.native_head_block
+                    ELSE GREATEST(
+                        state_history.stream_cursors.native_head_block,
+                        EXCLUDED.native_head_block
+                    )
+                END,
+                vm_head_block = CASE
+                    WHEN EXCLUDED.vm_head_block IS NULL
+                        THEN state_history.stream_cursors.vm_head_block
+                    WHEN state_history.stream_cursors.vm_head_block IS NULL
+                        THEN EXCLUDED.vm_head_block
+                    ELSE GREATEST(
+                        state_history.stream_cursors.vm_head_block,
+                        EXCLUDED.vm_head_block
+                    )
+                END,
+                rfq_head_timestamp_ms = CASE
+                    WHEN EXCLUDED.rfq_head_timestamp_ms IS NULL
+                        THEN state_history.stream_cursors.rfq_head_timestamp_ms
+                    WHEN state_history.stream_cursors.rfq_head_timestamp_ms IS NULL
+                        THEN EXCLUDED.rfq_head_timestamp_ms
+                    ELSE GREATEST(
+                        state_history.stream_cursors.rfq_head_timestamp_ms,
+                        EXCLUDED.rfq_head_timestamp_ms
+                    )
+                END,
+                updated_at = now()
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", observation.chain_id)?)
+        .bind(&observation.stream_id)
+        .bind(u64_to_i64("last_observed_seq", observation.message_seq)?)
+        .bind(u64_to_i64(
+            "last_persistable_seq",
+            observation.last_persistable_seq,
+        )?)
+        .bind(u64_to_i64("last_persisted_seq", persisted_seq)?)
+        .bind(optional_u64_to_i64(
+            "native_head_block",
+            observation.heads.native_head_block,
+        )?)
+        .bind(optional_u64_to_i64(
+            "vm_head_block",
+            observation.heads.vm_head_block,
+        )?)
+        .bind(optional_u64_to_i64(
+            "rfq_head_timestamp_ms",
+            observation.heads.rfq_head_timestamp_ms,
+        )?)
+        .execute(&mut **tx)
+        .await
+        .context("failed to update state history stream cursor")?;
         Ok(())
     }
 
@@ -1276,26 +1777,29 @@ impl StateHistoryPgStore {
             Some(checkpoint) => Some(self.validated_history_segments(checkpoint).await?),
             None => None,
         };
-        let mut gaps = self
-            .recorded_gaps_for_range(
-                &request,
-                history_segments
-                    .as_ref()
-                    .map(|segments| segments.replay_segments.as_slice()),
-                replay_from_block_number,
-                rfq_replay_from_timestamp_ms,
-            )
-            .await
-            .context("failed to load state history gaps for range")?;
+        let mut gaps = Vec::new();
+        let deltas;
         if let Some(checkpoint) = checkpoint.as_ref() {
+            let Some(segments) = history_segments.as_ref() else {
+                return Err(anyhow!(
+                    "checkpointed state history range is missing validated replay segments"
+                ));
+            };
+            gaps.extend(
+                self.recorded_gaps_for_range(
+                    &request,
+                    Some(segments.replay_segments.as_slice()),
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await
+                .context("failed to load state history gaps for range")?,
+            );
             if let Some(gap) = self
                 .generation_switch_gap_for_range(
                     &request,
                     checkpoint,
-                    history_segments
-                        .as_ref()
-                        .map(|segments| segments.generation_switch_exempt_segments.as_slice())
-                        .unwrap_or(&[]),
+                    segments.generation_switch_exempt_segments.as_slice(),
                     replay_from_block_number,
                     rfq_replay_from_timestamp_ms,
                 )
@@ -1304,6 +1808,20 @@ impl StateHistoryPgStore {
             {
                 gaps.push(gap);
             }
+            gaps.extend(
+                self.ingestion_coverage_gaps_for_range(&request, &segments.replay_segments)
+                    .await
+                    .context("failed to verify state history ingestion coverage")?,
+            );
+            deltas = self
+                .deltas_for_range(
+                    &request,
+                    Some(segments.replay_segments.as_slice()),
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await
+                .context("failed to load state history deltas for range")?;
         } else {
             gaps.push(HistoryRangeGap {
                 source: HistoryRangeGapSource::MissingCheckpoint,
@@ -1314,18 +1832,8 @@ impl StateHistoryPgStore {
                 to_timestamp_ms: request.rfq_end_timestamp_ms,
                 reason: "no complete checkpoint covers the requested range".to_string(),
             });
+            deltas = Vec::new();
         }
-        let deltas = self
-            .deltas_for_range(
-                &request,
-                history_segments
-                    .as_ref()
-                    .map(|segments| segments.replay_segments.as_slice()),
-                replay_from_block_number,
-                rfq_replay_from_timestamp_ms,
-            )
-            .await
-            .context("failed to load state history deltas for range")?;
         Ok(HistoryRangePlan {
             request,
             checkpoint,
@@ -1345,6 +1853,143 @@ impl StateHistoryPgStore {
             .generation_handoffs_for_chain(checkpoint.metadata.chain_id)
             .await?;
         Ok(build_validated_history_segments(checkpoint, &handoffs))
+    }
+
+    async fn ingestion_coverage_gaps_for_range(
+        &self,
+        request: &HistoryRangeRequest,
+        replay_segments: &[HistoryReplaySegment],
+    ) -> Result<Vec<HistoryRangeGap>> {
+        let mut gaps = Vec::new();
+        if self
+            .persisted_chain_gap_exists(request.chain_id, replay_segments)
+            .await?
+        {
+            gaps.push(unproven_ingestion_gap(
+                request,
+                "state history persisted delta chain is incomplete for the requested range",
+            ));
+        }
+        let cursors = self
+            .stream_cursors_for_segments(request.chain_id, replay_segments)
+            .await?;
+        gaps.extend(verify_ingestion_coverage_from_cursors(
+            request,
+            replay_segments,
+            &cursors,
+        ));
+        Ok(gaps)
+    }
+
+    async fn persisted_chain_gap_exists(
+        &self,
+        chain_id: u64,
+        replay_segments: &[HistoryReplaySegment],
+    ) -> Result<bool> {
+        if replay_segments.is_empty() {
+            return Ok(false);
+        }
+        let exists = sqlx::query_scalar::<_, i32>(
+            r#"
+            WITH replay_segments AS (
+                SELECT *
+                FROM UNNEST($2::bigint[], $3::text[], $4::bigint[], $5::bigint[])
+                    AS segment(ordinal, stream_id, from_message_seq, to_message_seq)
+            ),
+            scoped_deltas AS (
+                SELECT
+                    segment.ordinal,
+                    segment.from_message_seq,
+                    d.message_seq,
+                    d.prev_persistable_message_seq,
+                    LAG(d.message_seq) OVER (
+                        PARTITION BY segment.ordinal
+                        ORDER BY d.message_seq ASC
+                    ) AS previous_persisted_seq
+                FROM replay_segments segment
+                JOIN state_history.delta_messages d
+                    ON d.chain_id = $1
+                    AND d.stream_id = segment.stream_id
+                    AND d.message_seq >= segment.from_message_seq
+                    AND d.message_seq <= segment.to_message_seq
+            )
+            SELECT 1
+            FROM scoped_deltas
+            WHERE (
+                    previous_persisted_seq IS NULL
+                    AND prev_persistable_message_seq IS NOT NULL
+                    AND prev_persistable_message_seq >= from_message_seq
+                )
+                OR (
+                    previous_persisted_seq IS NOT NULL
+                    AND prev_persistable_message_seq IS DISTINCT FROM previous_persisted_seq
+                )
+            LIMIT 1
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(segment_ordinals(replay_segments))
+        .bind(segment_stream_ids(replay_segments))
+        .bind(segment_from_message_seq(replay_segments)?)
+        .bind(segment_to_message_seq(replay_segments)?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to verify state history persisted chain")?;
+        Ok(exists.is_some())
+    }
+
+    async fn stream_cursors_for_segments(
+        &self,
+        chain_id: u64,
+        replay_segments: &[HistoryReplaySegment],
+    ) -> Result<Vec<HistoryStreamCursor>> {
+        let stream_ids = segment_stream_ids(replay_segments);
+        if stream_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT stream_id, last_observed_seq, last_persistable_seq, last_persisted_seq,
+                native_head_block, vm_head_block, rfq_head_timestamp_ms
+            FROM state_history.stream_cursors
+            WHERE chain_id = $1
+                AND stream_id = ANY($2::text[])
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(stream_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load state history stream cursors")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(HistoryStreamCursor {
+                    stream_id: row.get("stream_id"),
+                    last_observed_seq: i64_to_u64(
+                        "last_observed_seq",
+                        row.get("last_observed_seq"),
+                    )?,
+                    last_persistable_seq: i64_to_u64(
+                        "last_persistable_seq",
+                        row.get("last_persistable_seq"),
+                    )?,
+                    last_persisted_seq: i64_to_u64(
+                        "last_persisted_seq",
+                        row.get("last_persisted_seq"),
+                    )?,
+                    native_head_block: optional_i64_to_u64(
+                        "native_head_block",
+                        row.get("native_head_block"),
+                    )?,
+                    vm_head_block: optional_i64_to_u64("vm_head_block", row.get("vm_head_block"))?,
+                    rfq_head_timestamp_ms: optional_i64_to_u64(
+                        "rfq_head_timestamp_ms",
+                        row.get("rfq_head_timestamp_ms"),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     async fn generation_handoffs_for_chain(
@@ -1762,6 +2407,10 @@ impl StateHistoryPgStore {
                         AND idx.observed_timestamp_ms >= $6
                         AND idx.observed_timestamp_ms <= $7
                     )
+                    OR (
+                        d.kind = 'progress'
+                        AND idx.backend = ANY($12::text[])
+                    )
                 )
             LIMIT 1
             "#,
@@ -1785,6 +2434,7 @@ impl StateHistoryPgStore {
         .bind(segment_stream_ids)
         .bind(segment_from_message_seq)
         .bind(segment_to_message_seq)
+        .bind(backend_scope_strings(&request.backends))
         .fetch_optional(&self.pool)
         .await?;
 
@@ -2030,6 +2680,10 @@ impl StateHistoryCheckpointWriter {
             s3_bucket: self.checkpoint_store.bucket().to_string(),
             s3_key: s3_key.clone(),
         };
+        {
+            let mut status = self.status.write().await;
+            status.attempted_checkpoints = status.attempted_checkpoints.saturating_add(1);
+        }
         let manifest_id = match self.pg_store.create_checkpoint_manifest(&input).await {
             Ok(manifest_id) => manifest_id,
             Err(error) => {
@@ -2041,10 +2695,6 @@ impl StateHistoryCheckpointWriter {
                 return Err(error);
             }
         };
-        {
-            let mut status = self.status.write().await;
-            status.attempted_checkpoints = status.attempted_checkpoints.saturating_add(1);
-        }
 
         let encoded = match self
             .checkpoint_store
@@ -2105,8 +2755,10 @@ impl StateHistoryCheckpointWriter {
         let mut status = self.status.write().await;
         status.healthy = false;
         status.failed_checkpoints = status.failed_checkpoints.saturating_add(1);
-        status.last_checkpoint_block_number = block_number;
-        status.last_error = Some(message);
+        status.last_error = Some(match block_number {
+            Some(block_number) => format!("checkpoint block {block_number} failed: {message}"),
+            None => message,
+        });
     }
 }
 
@@ -2127,16 +2779,22 @@ impl StateHistoryWriter {
             retry_window_ms: config.retry_window.as_millis() as u64,
             ..StateHistoryWriterSnapshot::default()
         }));
-        tokio::spawn(run_state_history_writer(
+        let shutdown = Arc::new(WriterShutdown::default());
+        let task = tokio::spawn(run_state_history_writer(
             pg_store.clone(),
             receiver,
             status.clone(),
             config.retry_window,
+            shutdown.clone(),
         ));
         Ok(Self {
             sender,
             pg_store,
             status,
+            persistable_by_stream: Arc::new(Mutex::new(BTreeMap::new())),
+            gap_record_permits: Arc::new(Semaphore::new(DEFAULT_GAP_RECORD_TASK_LIMIT)),
+            shutdown,
+            task: Arc::new(Mutex::new(Some(task))),
         })
     }
 
@@ -2145,41 +2803,96 @@ impl StateHistoryWriter {
         entry: BroadcasterRedisStreamEntry,
         redis_entry_id: String,
     ) -> Result<()> {
-        if entry.kind != BroadcasterMessageKind::Update
-            && prepare_generation_handoff(&entry, Some(&redis_entry_id))?.is_none()
-        {
-            return Ok(());
-        }
-        let stream_id = entry.stream_id.clone();
-        let message_seq = entry.message_seq;
-        let command = StateHistoryWriteCommand {
-            entry,
-            redis_entry_id: redis_entry_id.clone(),
+        let command = match entry.kind {
+            BroadcasterMessageKind::Update | BroadcasterMessageKind::Progress => {
+                let observation = StreamObservation::for_entry(&entry, entry.message_seq)?;
+                let key = (entry.chain_id, entry.stream_id.clone());
+                let mut persistable_by_stream = self.persistable_by_stream.lock().await;
+                let cursor = persistable_by_stream.entry(key).or_default();
+                let prev_persistable_message_seq = if let Some(prev) =
+                    cursor.prev_by_message_seq.get(&entry.message_seq)
+                {
+                    *prev
+                } else {
+                    anyhow::ensure!(
+                            cursor.last_message_seq < entry.message_seq,
+                            "state history persistable messages must be enqueued in stream order: stream {} prev {} next {}",
+                            entry.stream_id,
+                            cursor.last_message_seq,
+                            entry.message_seq
+                        );
+                    let prev = (cursor.last_message_seq > 0).then_some(cursor.last_message_seq);
+                    cursor.last_message_seq = entry.message_seq;
+                    cursor.prev_by_message_seq.insert(entry.message_seq, prev);
+                    cursor.trim_prev_cache();
+                    prev
+                };
+                StateHistoryWriteCommand::Persist {
+                    entry: Box::new(entry),
+                    redis_entry_id: redis_entry_id.clone(),
+                    prev_persistable_message_seq,
+                    observation,
+                }
+            }
+            BroadcasterMessageKind::Heartbeat => {
+                let key = (entry.chain_id, entry.stream_id.clone());
+                let last_persistable_seq = self
+                    .persistable_by_stream
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|cursor| cursor.last_message_seq)
+                    .unwrap_or_default();
+                StateHistoryWriteCommand::Observe(StreamObservation::for_entry(
+                    &entry,
+                    last_persistable_seq,
+                )?)
+            }
+            BroadcasterMessageKind::SnapshotStart
+            | BroadcasterMessageKind::SnapshotChunk
+            | BroadcasterMessageKind::SnapshotEnd => return Ok(()),
         };
+        let is_persist = command.is_persist();
+        let stream_id = command.stream_id().to_string();
+        let message_seq = command.message_seq();
         match self.sender.try_send(command) {
             Ok(()) => {
-                let mut status = self.status.write().await;
-                status.enqueued_deltas = status.enqueued_deltas.saturating_add(1);
+                if is_persist {
+                    let mut status = self.status.write().await;
+                    status.enqueued_deltas = status.enqueued_deltas.saturating_add(1);
+                }
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(command)) => {
                 let mut status = self.status.write().await;
-                status.record_enqueue_failure(format!(
+                let message = format!(
                     "state history writer queue full at stream {stream_id} message_seq {message_seq}"
-                ));
+                );
+                if command.is_persist() {
+                    status.record_enqueue_failure(message);
+                } else {
+                    status.record_observe_enqueue_failure(message);
+                }
                 drop(status);
-                // Live updates should not wait on long-term history storage. If the queue is full,
-                // mark the hole and let the broadcaster keep moving.
-                self.record_gap_detached(command.entry, "state history writer queue full");
+                if let Some(entry) = command.into_persist_entry() {
+                    self.record_gap_detached(entry, "state history writer queue full");
+                }
                 Err(anyhow!("state history writer queue full"))
             }
             Err(mpsc::error::TrySendError::Closed(command)) => {
                 let mut status = self.status.write().await;
-                status.record_enqueue_failure(format!(
+                let message = format!(
                     "state history writer task stopped at stream {stream_id} message_seq {message_seq}"
-                ));
+                );
+                if command.is_persist() {
+                    status.record_enqueue_failure(message);
+                } else {
+                    status.record_observe_enqueue_failure(message);
+                }
                 drop(status);
-                self.record_gap_detached(command.entry, "state history writer task stopped");
+                if let Some(entry) = command.into_persist_entry() {
+                    self.record_gap_detached(entry, "state history writer task stopped");
+                }
                 Err(anyhow!("state history writer task stopped"))
             }
         }
@@ -2189,10 +2902,40 @@ impl StateHistoryWriter {
         self.status.read().await.clone()
     }
 
+    pub async fn shutdown(&self, drain_timeout: Duration) -> Result<()> {
+        self.shutdown.cancel();
+        let Some(mut task) = self.task.lock().await.take() else {
+            return Ok(());
+        };
+        tokio::select! {
+            result = &mut task => match result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(anyhow!("state history writer task failed: {error}")),
+            },
+            _ = sleep(drain_timeout) => {
+                task.abort();
+                Err(anyhow!(
+                "state history writer shutdown drain timed out after {} ms",
+                drain_timeout.as_millis()
+                ))
+            }
+        }
+    }
+
     fn record_gap_detached(&self, entry: BroadcasterRedisStreamEntry, reason: &'static str) {
+        let Ok(permit) = self.gap_record_permits.clone().try_acquire_owned() else {
+            warn!(
+                event = "state_history_gap_record_dropped",
+                stream_id = entry.stream_id.as_str(),
+                message_seq = entry.message_seq,
+                "State history gap recorder is saturated"
+            );
+            return;
+        };
         let pg_store = self.pg_store.clone();
         let status = self.status.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = record_gap_for_entry(&pg_store, &entry, reason).await {
                 let message = format!("{error:#}");
                 warn!(
@@ -2201,7 +2944,6 @@ impl StateHistoryWriter {
                     "Failed to record state history gap"
                 );
                 let mut status = status.write().await;
-                status.healthy = false;
                 status.last_error = Some(message);
             } else {
                 let mut status = status.write().await;
@@ -2217,6 +2959,11 @@ impl StateHistoryWriterSnapshot {
         self.dropped_deltas = self.dropped_deltas.saturating_add(1);
         self.last_error = Some(message);
     }
+
+    fn record_observe_enqueue_failure(&mut self, message: String) {
+        self.healthy = false;
+        self.last_error = Some(message);
+    }
 }
 
 async fn run_state_history_writer(
@@ -2224,15 +2971,64 @@ async fn run_state_history_writer(
     mut receiver: mpsc::Receiver<StateHistoryWriteCommand>,
     status: Arc<RwLock<StateHistoryWriterSnapshot>>,
     retry_window: Duration,
+    shutdown: Arc<WriterShutdown>,
 ) {
-    while let Some(command) = receiver.recv().await {
-        persist_delta_with_retry(&pg_store, command, status.clone(), retry_window).await;
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                receiver.close();
+                while let Some(command) = receiver.recv().await {
+                    process_write_command_with_retry(&pg_store, command, status.clone(), retry_window).await;
+                }
+                return;
+            }
+            command = receiver.recv() => {
+                let Some(command) = command else {
+                    return;
+                };
+                process_write_command_with_retry(&pg_store, command, status.clone(), retry_window).await;
+            }
+        }
+    }
+}
+
+async fn process_write_command_with_retry(
+    pg_store: &StateHistoryPgStore,
+    command: StateHistoryWriteCommand,
+    status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+    retry_window: Duration,
+) {
+    match command {
+        StateHistoryWriteCommand::Persist {
+            entry,
+            redis_entry_id,
+            prev_persistable_message_seq,
+            observation,
+        } => {
+            persist_delta_with_retry(
+                pg_store,
+                *entry,
+                redis_entry_id,
+                prev_persistable_message_seq,
+                observation,
+                status,
+                retry_window,
+            )
+            .await;
+        }
+        StateHistoryWriteCommand::Observe(observation) => {
+            observe_stream_with_retry(pg_store, observation, status, retry_window).await;
+        }
     }
 }
 
 async fn persist_delta_with_retry(
     pg_store: &StateHistoryPgStore,
-    command: StateHistoryWriteCommand,
+    entry: BroadcasterRedisStreamEntry,
+    redis_entry_id: String,
+    prev_persistable_message_seq: Option<u64>,
+    observation: StreamObservation,
     status: Arc<RwLock<StateHistoryWriterSnapshot>>,
     retry_window: Duration,
 ) {
@@ -2241,16 +3037,21 @@ async fn persist_delta_with_retry(
     loop {
         attempts = attempts.saturating_add(1);
         match pg_store
-            .insert_entry(&command.entry, Some(&command.redis_entry_id))
+            .insert_entry_with_prev(
+                &entry,
+                Some(&redis_entry_id),
+                prev_persistable_message_seq,
+                observation.clone(),
+            )
             .await
         {
             Ok(_) => {
                 let mut status = status.write().await;
                 status.healthy = true;
                 status.persisted_deltas = status.persisted_deltas.saturating_add(1);
-                status.last_persisted_stream_id = Some(command.entry.stream_id.clone());
-                status.last_persisted_redis_entry_id = Some(command.redis_entry_id.clone());
-                status.last_persisted_message_seq = Some(command.entry.message_seq);
+                status.last_persisted_stream_id = Some(entry.stream_id.clone());
+                status.last_persisted_redis_entry_id = Some(redis_entry_id.clone());
+                status.last_persisted_message_seq = Some(entry.message_seq);
                 status.last_error = None;
                 return;
             }
@@ -2259,13 +3060,13 @@ async fn persist_delta_with_retry(
                 let elapsed = started_at.elapsed();
                 warn!(
                     event = "state_history_delta_write_failed",
-                    message_seq = command.entry.message_seq,
+                    message_seq = entry.message_seq,
                     attempt = attempts,
                     error = %message,
                     "State history delta write failed"
                 );
-                if elapsed >= retry_window {
-                    match record_gap_for_entry(pg_store, &command.entry, &message).await {
+                if is_permanent_persistence_error(&error) || elapsed >= retry_window {
+                    match record_gap_for_entry(pg_store, &entry, &message).await {
                         Ok(_) => {
                             let mut status = status.write().await;
                             status.healthy = false;
@@ -2277,7 +3078,7 @@ async fn persist_delta_with_retry(
                             let message = format!("{error:#}");
                             warn!(
                                 event = "state_history_gap_record_failed",
-                                message_seq = command.entry.message_seq,
+                                message_seq = entry.message_seq,
                                 error = %message,
                                 "Failed to record state history gap"
                             );
@@ -2293,6 +3094,68 @@ async fn persist_delta_with_retry(
             }
         }
     }
+}
+
+async fn observe_stream_with_retry(
+    pg_store: &StateHistoryPgStore,
+    observation: StreamObservation,
+    status: Arc<RwLock<StateHistoryWriterSnapshot>>,
+    retry_window: Duration,
+) {
+    let started_at = Instant::now();
+    let mut attempts = 0u64;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match pg_store.observe_stream(&observation).await {
+            Ok(()) => {
+                let mut status = status.write().await;
+                status.healthy = true;
+                status.last_error = None;
+                return;
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                let elapsed = started_at.elapsed();
+                warn!(
+                    event = "state_history_cursor_observe_failed",
+                    stream_id = observation.stream_id.as_str(),
+                    message_seq = observation.message_seq,
+                    attempt = attempts,
+                    error = %message,
+                    "State history cursor observe failed"
+                );
+                if is_permanent_persistence_error(&error) || elapsed >= retry_window {
+                    let mut status = status.write().await;
+                    status.healthy = false;
+                    status.last_error = Some(message);
+                    return;
+                }
+                sleep(writer_retry_backoff(attempts, retry_window - elapsed)).await;
+            }
+        }
+    }
+}
+
+fn is_permanent_persistence_error(error: &anyhow::Error) -> bool {
+    let mut saw_sqlx_error = false;
+    for cause in error.chain() {
+        let Some(sqlx_error) = cause.downcast_ref::<sqlx::Error>() else {
+            continue;
+        };
+        saw_sqlx_error = true;
+        if let sqlx::Error::Database(database_error) = sqlx_error {
+            if matches!(
+                database_error.kind(),
+                sqlx::error::ErrorKind::UniqueViolation
+                    | sqlx::error::ErrorKind::ForeignKeyViolation
+                    | sqlx::error::ErrorKind::NotNullViolation
+                    | sqlx::error::ErrorKind::CheckViolation
+            ) {
+                return true;
+            }
+        }
+    }
+    !saw_sqlx_error
 }
 
 async fn record_gap_for_entry(
@@ -2379,6 +3242,14 @@ fn optional_i64_to_u64(field: &str, value: Option<i64>) -> Result<Option<u64>> {
     value.map(|value| i64_to_u64(field, value)).transpose()
 }
 
+fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<CheckpointManifest> {
     let status: String = row.get("status");
     let backends: Vec<String> = row.get("backend_scope");
@@ -2412,6 +3283,10 @@ fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<Checkpoint
 fn parse_backend_strings(values: &[String]) -> Result<Vec<BroadcasterBackend>> {
     let scope = values.join(",");
     parse_backend_scope(&scope)
+}
+
+fn decode_entry_envelope(entry: &BroadcasterRedisStreamEntry) -> Result<BroadcasterEnvelope> {
+    serde_json::from_str(&entry.payload_json).context("failed to decode Redis stream entry payload")
 }
 
 fn stored_delta_from_row(row: sqlx::postgres::PgRow) -> Result<StoredDeltaEntry> {
@@ -2462,25 +3337,6 @@ pub fn checkpoint_s3_key(
     }
 }
 
-trait EntryCursorExt {
-    fn block_number_for_backend(&self, backend: BroadcasterBackend) -> Option<u64>;
-    fn observed_timestamp_for_backend(&self, backend: BroadcasterBackend) -> Option<u64>;
-}
-
-impl EntryCursorExt for BroadcasterRedisStreamEntry {
-    fn block_number_for_backend(&self, backend: BroadcasterBackend) -> Option<u64> {
-        matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm)
-            .then_some(self.block_number)
-            .flatten()
-    }
-
-    fn observed_timestamp_for_backend(&self, backend: BroadcasterBackend) -> Option<u64> {
-        (backend == BroadcasterBackend::Rfq)
-            .then_some(self.observed_timestamp_ms)
-            .flatten()
-    }
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
@@ -2507,11 +3363,14 @@ mod tests {
         build_validated_history_segments, build_validated_replay_segments,
         decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
         ingestion_gap_for_entry, ingestion_gap_within_segments, optional_u64_to_i64,
-        prepare_delta_message, u64_to_i64, writer_retry_backoff, CheckpointArchive,
+        prepare_delta_message, run_state_history_writer, u64_to_i64,
+        verify_ingestion_coverage_from_cursors, writer_retry_backoff, CheckpointArchive,
         CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload, CheckpointStatus,
         DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource, HistoryRangePlan,
-        HistoryRangeRequest, HistoryReplaySegment, StoredGenerationHandoff,
-        StoredGenerationHandoffs, WRITER_RETRY_BACKOFF_CAP,
+        HistoryRangeRequest, HistoryReplaySegment, HistoryStreamCursor, StateHistoryPgStore,
+        StateHistoryWriteCommand, StateHistoryWriter, StateHistoryWriterSnapshot,
+        StoredGenerationHandoff, StoredGenerationHandoffs, WriterShutdown,
+        DEFAULT_GAP_RECORD_TASK_LIMIT, WRITER_RETRY_BACKOFF_CAP,
     };
 
     #[test]
@@ -2594,6 +3453,57 @@ mod tests {
             }]
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_backends_use_each_update_partition_cursor() -> Result<()> {
+        let envelope = multi_backend_update_envelope(
+            "stream-1",
+            12,
+            [
+                (BroadcasterBackend::Native, 124),
+                (BroadcasterBackend::Vm, 127),
+                (BroadcasterBackend::Rfq, 1_720_000_000_000),
+            ],
+        )?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        assert_eq!(
+            indexed_backends_for_entry(&entry)?,
+            vec![
+                CheckpointPayload {
+                    backend: BroadcasterBackend::Native,
+                    block_number: Some(124),
+                    observed_timestamp_ms: None,
+                },
+                CheckpointPayload {
+                    backend: BroadcasterBackend::Vm,
+                    block_number: Some(127),
+                    observed_timestamp_ms: None,
+                },
+                CheckpointPayload {
+                    backend: BroadcasterBackend::Rfq,
+                    block_number: None,
+                    observed_timestamp_ms: Some(1_720_000_000_000),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_backends_reject_update_scope_partition_mismatch() -> Result<()> {
+        let envelope = update_envelope("stream-1", 12, BroadcasterBackend::Native, 124)?;
+        let mut entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+        entry.backend_scope = "native,rfq".to_string();
+
+        let error = indexed_backends_for_entry(&entry)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("scope mismatch should fail"))?;
+
+        assert!(error.to_string().contains("partition backends"));
         Ok(())
     }
 
@@ -2924,6 +3834,143 @@ mod tests {
     }
 
     #[test]
+    fn ingestion_coverage_rejects_cursor_lag() -> Result<()> {
+        let request = HistoryRangeRequest::new(8453, 100, 110, vec![BroadcasterBackend::Native])?;
+        let segments = vec![HistoryReplaySegment {
+            ordinal: 0,
+            stream_id: "chain-8453-stream-1".to_string(),
+            from_message_seq: 2,
+            to_message_seq: None,
+        }];
+        let cursors = vec![HistoryStreamCursor {
+            stream_id: "chain-8453-stream-1".to_string(),
+            last_observed_seq: 5,
+            last_persistable_seq: 5,
+            last_persisted_seq: 4,
+            native_head_block: Some(110),
+            vm_head_block: None,
+            rfq_head_timestamp_ms: None,
+        }];
+
+        let gaps = verify_ingestion_coverage_from_cursors(&request, &segments, &cursors);
+
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].source, HistoryRangeGapSource::UnprovenIngestion);
+        assert!(gaps[0].reason.contains("persistable"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingestion_coverage_rejects_unobserved_closed_stream_tail() -> Result<()> {
+        let request = HistoryRangeRequest::new(8453, 100, 110, vec![BroadcasterBackend::Native])?;
+        let segments = vec![
+            HistoryReplaySegment {
+                ordinal: 0,
+                stream_id: "chain-8453-stream-1".to_string(),
+                from_message_seq: 2,
+                to_message_seq: Some(7),
+            },
+            HistoryReplaySegment {
+                ordinal: 1,
+                stream_id: "chain-8453-stream-2".to_string(),
+                from_message_seq: 2,
+                to_message_seq: None,
+            },
+        ];
+        let cursors = vec![
+            HistoryStreamCursor {
+                stream_id: "chain-8453-stream-1".to_string(),
+                last_observed_seq: 6,
+                last_persistable_seq: 6,
+                last_persisted_seq: 6,
+                native_head_block: Some(107),
+                vm_head_block: None,
+                rfq_head_timestamp_ms: None,
+            },
+            HistoryStreamCursor {
+                stream_id: "chain-8453-stream-2".to_string(),
+                last_observed_seq: 3,
+                last_persistable_seq: 3,
+                last_persisted_seq: 3,
+                native_head_block: Some(110),
+                vm_head_block: None,
+                rfq_head_timestamp_ms: None,
+            },
+        ];
+
+        let gaps = verify_ingestion_coverage_from_cursors(&request, &segments, &cursors);
+
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].source, HistoryRangeGapSource::UnprovenIngestion);
+        assert!(gaps[0].reason.contains("closed stream"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingestion_coverage_rejects_open_stream_before_requested_head() -> Result<()> {
+        let request = HistoryRangeRequest::new(
+            8453,
+            100,
+            110,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        )?
+        .with_rfq_timestamp_range(1_720_000_000_000, 1_720_000_000_500)?;
+        let segments = vec![HistoryReplaySegment {
+            ordinal: 0,
+            stream_id: "chain-8453-stream-1".to_string(),
+            from_message_seq: 2,
+            to_message_seq: None,
+        }];
+        let cursors = vec![HistoryStreamCursor {
+            stream_id: "chain-8453-stream-1".to_string(),
+            last_observed_seq: 5,
+            last_persistable_seq: 5,
+            last_persisted_seq: 5,
+            native_head_block: Some(109),
+            vm_head_block: None,
+            rfq_head_timestamp_ms: Some(1_720_000_000_500),
+        }];
+
+        let gaps = verify_ingestion_coverage_from_cursors(&request, &segments, &cursors);
+
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].source, HistoryRangeGapSource::UnprovenIngestion);
+        assert!(gaps[0].reason.contains("native"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingestion_coverage_accepts_heartbeat_proven_heads() -> Result<()> {
+        let request = HistoryRangeRequest::new(
+            8453,
+            100,
+            110,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        )?
+        .with_rfq_timestamp_range(1_720_000_000_000, 1_720_000_000_500)?;
+        let segments = vec![HistoryReplaySegment {
+            ordinal: 0,
+            stream_id: "chain-8453-stream-1".to_string(),
+            from_message_seq: 2,
+            to_message_seq: None,
+        }];
+        let cursors = vec![HistoryStreamCursor {
+            stream_id: "chain-8453-stream-1".to_string(),
+            last_observed_seq: 6,
+            last_persistable_seq: 5,
+            last_persisted_seq: 5,
+            native_head_block: Some(110),
+            vm_head_block: None,
+            rfq_head_timestamp_ms: Some(1_720_000_000_500),
+        }];
+
+        let gaps = verify_ingestion_coverage_from_cursors(&request, &segments, &cursors);
+
+        assert!(gaps.is_empty(), "unexpected ingestion gaps: {gaps:?}");
+        Ok(())
+    }
+
+    #[test]
     fn writer_gap_rows_keep_entry_cursors() -> Result<()> {
         let native = update_envelope("stream-1", 9, BroadcasterBackend::Native, 124)?;
         let rfq = update_envelope("stream-1", 10, BroadcasterBackend::Rfq, 789)?;
@@ -2960,6 +4007,162 @@ mod tests {
             writer_retry_backoff(100, std::time::Duration::from_millis(25)),
             std::time::Duration::from_millis(25)
         );
+    }
+
+    #[tokio::test]
+    async fn writer_stamps_dropped_persistable_before_try_send() -> Result<()> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let writer = test_state_history_writer(sender, 0)?;
+        let first = BroadcasterRedisStreamEntry::from_envelope(
+            8453,
+            &update_envelope("chain-8453-stream-1", 1, BroadcasterBackend::Native, 100)?,
+        )?;
+        let dropped = BroadcasterRedisStreamEntry::from_envelope(
+            8453,
+            &update_envelope("chain-8453-stream-1", 2, BroadcasterBackend::Native, 101)?,
+        )?;
+        let third = BroadcasterRedisStreamEntry::from_envelope(
+            8453,
+            &update_envelope("chain-8453-stream-1", 3, BroadcasterBackend::Native, 102)?,
+        )?;
+
+        writer.enqueue_entry(first, "1-1".to_string()).await?;
+        let error = writer
+            .enqueue_entry(dropped, "1-2".to_string())
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("full queue should reject second persistable entry"))?;
+        assert!(error.to_string().contains("queue full"));
+
+        let first_command = receiver
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("first command should be queued"))?;
+        match first_command {
+            StateHistoryWriteCommand::Persist {
+                prev_persistable_message_seq,
+                observation,
+                ..
+            } => {
+                assert_eq!(prev_persistable_message_seq, None);
+                assert_eq!(observation.last_persistable_seq, 1);
+            }
+            StateHistoryWriteCommand::Observe(_) => {
+                anyhow::bail!("first update should persist")
+            }
+        }
+
+        writer.enqueue_entry(third, "1-3".to_string()).await?;
+        let third_command = receiver
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("third command should be queued"))?;
+        match third_command {
+            StateHistoryWriteCommand::Persist {
+                prev_persistable_message_seq,
+                observation,
+                ..
+            } => {
+                assert_eq!(prev_persistable_message_seq, Some(2));
+                assert_eq!(observation.last_persistable_seq, 3);
+            }
+            StateHistoryWriteCommand::Observe(_) => {
+                anyhow::bail!("third update should persist")
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_heartbeats_observe_latest_persistable_cursor() -> Result<()> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let writer = test_state_history_writer(sender, DEFAULT_GAP_RECORD_TASK_LIMIT)?;
+        let update = BroadcasterRedisStreamEntry::from_envelope(
+            8453,
+            &update_envelope("chain-8453-stream-1", 1, BroadcasterBackend::Native, 100)?,
+        )?;
+        let heartbeat = BroadcasterRedisStreamEntry::from_envelope(
+            8453,
+            &BroadcasterEnvelope::new(
+                "chain-8453-stream-1",
+                2,
+                simulator_core::broadcaster::BroadcasterPayload::Heartbeat(
+                    simulator_core::broadcaster::BroadcasterHeartbeat::new(
+                        8453,
+                        "snapshot-1",
+                        vec![simulator_core::broadcaster::BroadcasterBackendHead::new(
+                            BroadcasterBackend::Native,
+                            101,
+                        )],
+                    )?,
+                ),
+            ),
+        )?;
+
+        writer.enqueue_entry(update, "1-1".to_string()).await?;
+        writer.enqueue_entry(heartbeat, "1-2".to_string()).await?;
+        let _update_command = receiver
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("update command should be queued"))?;
+        let heartbeat_command = receiver
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("heartbeat command should be queued"))?;
+
+        match heartbeat_command {
+            StateHistoryWriteCommand::Observe(observation) => {
+                assert_eq!(observation.last_persistable_seq, 1);
+                assert_eq!(observation.heads.native_head_block, Some(101));
+            }
+            StateHistoryWriteCommand::Persist { .. } => {
+                anyhow::bail!("heartbeat should only observe")
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_shutdown_signal_is_sticky_and_stops_idle_task() -> Result<()> {
+        let shutdown = std::sync::Arc::new(WriterShutdown::default());
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(50), shutdown.cancelled()).await?;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1/state_history")?;
+        let pg_store = StateHistoryPgStore::from_pool(pool);
+        let status = std::sync::Arc::new(tokio::sync::RwLock::new(StateHistoryWriterSnapshot {
+            healthy: true,
+            queue_capacity: 1,
+            retry_window_ms: 1,
+            ..StateHistoryWriterSnapshot::default()
+        }));
+        let shutdown = std::sync::Arc::new(WriterShutdown::default());
+        let task = tokio::spawn(run_state_history_writer(
+            pg_store.clone(),
+            receiver,
+            status.clone(),
+            std::time::Duration::from_millis(1),
+            shutdown.clone(),
+        ));
+        let writer = StateHistoryWriter {
+            sender,
+            pg_store,
+            status,
+            persistable_by_stream: std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            gap_record_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_GAP_RECORD_TASK_LIMIT,
+            )),
+            shutdown,
+            task: std::sync::Arc::new(tokio::sync::Mutex::new(Some(task))),
+        };
+
+        writer.shutdown(std::time::Duration::from_secs(1)).await?;
+
+        Ok(())
     }
 
     fn checkpoint_manifest(
@@ -3089,6 +4292,75 @@ mod tests {
             message_seq,
             simulator_core::broadcaster::BroadcasterPayload::Update(update),
         ))
+    }
+
+    fn multi_backend_update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        partitions: impl IntoIterator<Item = (BroadcasterBackend, u64)>,
+    ) -> Result<BroadcasterEnvelope> {
+        let update = BroadcasterUpdateMessage::new(
+            partitions
+                .into_iter()
+                .map(|(backend, cursor)| {
+                    BroadcasterUpdatePartition::new(
+                        backend,
+                        cursor,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        sync_statuses_for_started_protocol(backend),
+                    )
+                })
+                .collect(),
+        )?;
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        ))
+    }
+
+    fn sync_statuses_for_started_protocol(
+        backend: BroadcasterBackend,
+    ) -> BTreeMap<String, BroadcasterProtocolSyncStatus> {
+        let protocol = match backend {
+            BroadcasterBackend::Native => "uniswap_v2",
+            BroadcasterBackend::Vm => "vm:curve",
+            BroadcasterBackend::Rfq => "rfq:bebop",
+        };
+        BTreeMap::from([(
+            protocol.to_string(),
+            BroadcasterProtocolSyncStatus {
+                kind: BroadcasterProtocolSyncStatusKind::Started,
+                block: None,
+                reason: None,
+            },
+        )])
+    }
+
+    fn test_state_history_writer(
+        sender: tokio::sync::mpsc::Sender<StateHistoryWriteCommand>,
+        gap_record_task_limit: usize,
+    ) -> Result<StateHistoryWriter> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1/state_history")?;
+        Ok(StateHistoryWriter {
+            sender,
+            pg_store: StateHistoryPgStore::from_pool(pool),
+            status: std::sync::Arc::new(tokio::sync::RwLock::new(StateHistoryWriterSnapshot {
+                healthy: true,
+                queue_capacity: 1,
+                retry_window_ms: 1,
+                ..StateHistoryWriterSnapshot::default()
+            })),
+            persistable_by_stream: std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            gap_record_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                gap_record_task_limit,
+            )),
+            shutdown: std::sync::Arc::new(WriterShutdown::default()),
+            task: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     #[test]
