@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 jemallocator.workspace = true
@@ -21,7 +22,6 @@ rpc = { path = "../rpc" }
 runtime = { path = "../runtime" }
 
 [dev-dependencies]
-alloy-primitives.workspace = true
 chrono.workspace = true
 futures.workspace = true
 jemalloc-ctl.workspace = true

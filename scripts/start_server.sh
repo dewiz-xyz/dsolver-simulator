@@ -23,6 +23,7 @@ repo="."
 log_file=""
 chain_id_arg=""
 env_overrides=()
+rpc_url_overridden=false
 local_broadcaster_start_timeout=300
 local_redis_start_timeout=60
 
@@ -527,6 +528,9 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --env)
+      if [[ "$2" == RPC_URL=* ]]; then
+        rpc_url_overridden=true
+      fi
       env_overrides+=("$2")
       shift 2
       ;;
@@ -606,6 +610,10 @@ fi
 if [[ -z "${CHAIN_ID:-}" ]]; then
   echo "Error: missing chain id. Pass --chain-id or set CHAIN_ID in env/.env." >&2
   exit 2
+fi
+
+if [[ "$CHAIN_ID" == "8453" && "$rpc_url_overridden" == false && -n "${BASE_RPC_URL:-}" ]]; then
+  export RPC_URL="$BASE_RPC_URL"
 fi
 
 if [[ -z "$log_file" ]]; then

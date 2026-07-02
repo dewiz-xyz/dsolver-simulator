@@ -19,6 +19,8 @@ The local analyzer uses a default route matrix:
 - records each `/encode` interaction shape, router-call presence, latency, and oddities without mixing in prep-hop metrics
 - uses chain-specific default routes and amounts, but treats the result as analytical evidence rather than a strict gate
 
+On Base, when RFQ is enabled and ready, the analyzer also builds `bebop-partial-fill-encode`: `USDC -> WETH -> USDC`, with hop 2 split across a required `rfq:bebop` WETH -> USDC leg and a required non-RFQ comparison leg. The `/encode` response is inspected locally by decoding router calldata and checking that the Bebop executor payload packs `originalFilledTakerAmount` in WETH token-in units. Missing Bebop, missing comparison liquidity, missing Bebop calldata, or a taker-amount mismatch is reported as degraded or investigate-worthy evidence.
+
 The matrix is intentionally representative rather than exhaustive. If the report suggests an encode-specific issue, follow up with targeted manual routes instead of assuming the default matrix captured the full contract surface.
 
 ## Common pitfalls

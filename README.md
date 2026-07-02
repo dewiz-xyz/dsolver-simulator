@@ -275,7 +275,7 @@ Useful helpers:
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
-The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so reviewers can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so reviewers can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness. On Base, RFQ-enabled runs also include a Bebop partial-fill encode diagnostic that inspects router calldata for the packed `originalFilledTakerAmount` token-in invariant.
 
 ## Docs Map
 
