@@ -11,6 +11,7 @@ use std::process::Command;
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use alloy_primitives::{hex, Keccak256};
 use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::BigUint;
 use reqwest::{Client, StatusCode, Url};
@@ -31,8 +32,8 @@ use self::presets::{
 };
 use self::report::{
     build_findings, relative_path, render_summary, AnalysisReport, BaselineComparison,
-    LatencySummary, LogSourceSummary, LogSummary, ReadinessReport, ReadinessSnapshot, RunMetadata,
-    ScenarioDiff, ScenarioReport,
+    EncodeInspectionReport, LatencySummary, LogSourceSummary, LogSummary, ReadinessReport,
+    ReadinessSnapshot, RunMetadata, ScenarioDiff, ScenarioReport,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000";
@@ -42,7 +43,7 @@ const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VM_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_RFQ_READY_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SLIPPAGE_BPS: u32 = 25;
-const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 6;
+const SIMULATION_REPORT_SCHEMA_VERSION: u64 = 7;
 const SAMPLE_LIMIT: usize = 4;
 const LOG_SCAN_LINE_LIMIT: usize = 500;
 const LOG_EXCERPT_LIMIT: usize = 40;
@@ -50,6 +51,20 @@ const LOG_BOUNDARY_TAIL_BYTES: u64 = 64;
 const SIMULATOR_LOG_FILE: &str = "logs/tycho-sim-server.log";
 const BROADCASTER_LOG_FILE: &str = "logs/tycho-broadcaster-service.log";
 const EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE: &str = "expected RFQ protocol visibility, saw none";
+const BEBOP_SPLIT_BPS: u32 = 5_000;
+const BPS_DENOMINATOR: u32 = 10_000;
+const ABI_WORD_BYTES: usize = 32;
+const FUNCTION_SELECTOR_BYTES: usize = 4;
+const BEBOP_PACKED_PREFIX_BYTES: usize = 95;
+const BEBOP_PARTIAL_FILL_OFFSET_INDEX: usize = 41;
+const BEBOP_ORIGINAL_TAKER_AMOUNT_START: usize = 42;
+const BEBOP_ORIGINAL_TAKER_AMOUNT_END: usize = 74;
+const SPLIT_SWAP_SIGNATURE: &str =
+    "splitSwap(uint256,address,address,uint256,bool,bool,uint256,address,bool,bytes)";
+const SINGLE_SWAP_SIGNATURE: &str =
+    "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
+const SEQUENTIAL_SWAP_SIGNATURE: &str =
+    "sequentialSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)";
 
 pub async fn run() -> Result<()> {
     let args = CliArgs::parse()?;
@@ -157,6 +172,7 @@ struct RequestObservation {
     elapsed_ms: Option<f64>,
     classification: ObservationClass,
     protocols: Vec<String>,
+    encode_inspections: Vec<EncodeInspectionReport>,
     note: Option<String>,
     request: Value,
     response: Option<Value>,
@@ -188,12 +204,27 @@ struct BaselineLoad {
 struct EncodePrepOutcome {
     report: ScenarioReport,
     selected_pool: Option<SelectedPool>,
+    quote: Option<QuoteResult>,
 }
 
 #[derive(Clone)]
 struct SelectedPool {
     quote: AmountOutResponse,
     protocol: String,
+}
+
+#[derive(Clone, Copy)]
+enum PoolSelection<'a> {
+    Best,
+    RequiredProtocol(&'a str),
+    ExcludeProtocolPrefix(&'a str),
+}
+
+#[derive(Clone)]
+struct BebopInspectionExpectation {
+    token_in: String,
+    token_out: String,
+    expected_taker_amount: String,
 }
 
 struct PreparedEncodeRoute {
@@ -287,6 +318,18 @@ impl CliArgs {
     }
 }
 
+impl<'a> PoolSelection<'a> {
+    fn label(self) -> String {
+        match self {
+            PoolSelection::Best => "best available pool".to_string(),
+            PoolSelection::RequiredProtocol(protocol) => format!("required protocol {protocol}"),
+            PoolSelection::ExcludeProtocolPrefix(prefix) => {
+                format!("pool excluding protocol prefix {prefix}")
+            }
+        }
+    }
+}
+
 impl ScriptPaths {
     fn new(repo: &Path) -> Self {
         let scripts_dir = repo.join("scripts");
@@ -301,6 +344,10 @@ impl ScriptPaths {
 #[expect(
     clippy::too_many_arguments,
     reason = "Run orchestration needs explicit inputs for lifecycle, logs, and artifact roots."
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Run orchestration stays linear so report assembly remains easy to audit."
 )]
 async fn analyze_run(
     client: &Client,
@@ -331,7 +378,17 @@ async fn analyze_run(
         );
     }
 
-    scenarios.extend(run_encode_scenarios(client, repo, evidence_dir, args, &profile).await?);
+    scenarios.extend(
+        run_encode_scenarios(
+            client,
+            repo,
+            evidence_dir,
+            args,
+            &profile,
+            &lifecycle.initial_readiness,
+        )
+        .await?,
+    );
     scenarios.push(
         run_load_probe(
             client,
@@ -574,10 +631,30 @@ async fn run_encode_scenarios(
     evidence_dir: &Path,
     args: &CliArgs,
     profile: &BalancedProfilePreset,
+    readiness: &ReadinessSnapshot,
 ) -> Result<Vec<ScenarioReport>> {
     let mut reports = Vec::new();
     for preset in &profile.encode_routes {
-        reports.extend(run_encode_route_scenario(client, repo, evidence_dir, args, preset).await?);
+        match preset.kind {
+            EncodeRouteKind::BebopPartialFill => {
+                reports.extend(
+                    run_bebop_partial_fill_encode_route(
+                        client,
+                        repo,
+                        evidence_dir,
+                        args,
+                        preset,
+                        readiness,
+                    )
+                    .await?,
+                );
+            }
+            EncodeRouteKind::Simple | EncodeRouteKind::Multi | EncodeRouteKind::Mega => {
+                reports.extend(
+                    run_encode_route_scenario(client, repo, evidence_dir, args, preset).await?,
+                );
+            }
+        }
     }
     Ok(reports)
 }
@@ -621,8 +698,10 @@ async fn run_encode_route_scenario(
         client,
         &encode_url(&args.base_url),
         &encode_request,
+        preset.label,
         &prepared.protocols,
         &prepared.notes,
+        None,
     )
     .await?;
     let encode_artifact = save_observation_artifact(
@@ -643,6 +722,208 @@ async fn run_encode_route_scenario(
         report.protocols_seen.insert(protocol, count);
     }
     report.notes.extend(prepared.notes);
+    reports.push(report);
+    Ok(reports)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "The Bebop encode diagnostic is easier to audit as one linear workflow."
+)]
+async fn run_bebop_partial_fill_encode_route(
+    client: &Client,
+    repo: &Path,
+    evidence_dir: &Path,
+    args: &CliArgs,
+    preset: &EncodeRoutePreset,
+    readiness: &ReadinessSnapshot,
+) -> Result<Vec<ScenarioReport>> {
+    if !rfq_required_probe_ready(readiness) {
+        let mut report = build_skipped_encode_report(
+            preset,
+            "Bebop partial-fill encode probe is not required because RFQ is not enabled and ready.",
+            &[],
+            &BTreeMap::new(),
+        );
+        report.notes.push(format!(
+            "rfq_enabled={} rfq_status={}",
+            readiness.backend_enabled("rfq"),
+            readiness.backend_status("rfq").unwrap_or("unknown")
+        ));
+        return Ok(vec![report]);
+    }
+
+    let Some(segment) = preset.segments.first() else {
+        bail!("encode preset {} has no Bebop segment", preset.label);
+    };
+    let [token_in_symbol, mid_symbol, token_out_symbol] = segment.path else {
+        bail!(
+            "encode preset {} must use a three-token Bebop path",
+            preset.label
+        );
+    };
+
+    let token_in = resolve_token(args.chain_id, token_in_symbol)?;
+    let mid_token = resolve_token(args.chain_id, mid_symbol)?;
+    let token_out = resolve_token(args.chain_id, token_out_symbol)?;
+    let simulate_endpoint = simulate_url(&args.base_url);
+    let mut reports = Vec::with_capacity(3);
+    let notes = Vec::new();
+    let mut protocols = BTreeMap::new();
+
+    let first_request = AmountOutRequest {
+        request_id: format!("{}-hop-1-{}", preset.label, epoch_now_s()?),
+        auction_id: None,
+        token_in: token_in.to_string(),
+        token_out: mid_token.to_string(),
+        amounts: preset
+            .amounts
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+    };
+    let first_hop = run_encode_prep_hop(
+        client,
+        repo,
+        evidence_dir,
+        &simulate_endpoint,
+        &first_request,
+        &format!("{}-hop-1", preset.label),
+        &format!("{} prep hop 1 non-RFQ", preset.label),
+        PoolSelection::ExcludeProtocolPrefix("rfq:"),
+    )
+    .await?;
+    let mut prep_evidence_files = first_hop.report.evidence_files.clone();
+    let Some(first_pool) = first_hop.selected_pool.clone() else {
+        reports.push(first_hop.report);
+        reports.push(build_skipped_encode_report(
+            preset,
+            "Skipping /encode because Bebop prep hop 1 did not produce a non-RFQ pool.",
+            &prep_evidence_files,
+            &protocols,
+        ));
+        return Ok(reports);
+    };
+    reports.push(first_hop.report);
+    *protocols
+        .entry(first_pool.protocol.clone())
+        .or_insert(0usize) += 1;
+
+    let hop_amounts = first_pool
+        .quote
+        .amounts_out
+        .iter()
+        .map(|amount| apply_slippage(amount, DEFAULT_SLIPPAGE_BPS))
+        .collect::<Vec<_>>();
+    let second_request = AmountOutRequest {
+        request_id: format!("{}-hop-2-{}", preset.label, epoch_now_s()?),
+        auction_id: None,
+        token_in: mid_token.to_string(),
+        token_out: token_out.to_string(),
+        amounts: hop_amounts,
+    };
+    let mut second_hop = run_encode_prep_hop(
+        client,
+        repo,
+        evidence_dir,
+        &simulate_endpoint,
+        &second_request,
+        &format!("{}-hop-2", preset.label),
+        &format!("{} prep hop 2 Bebop", preset.label),
+        PoolSelection::RequiredProtocol("rfq:bebop"),
+    )
+    .await?;
+    prep_evidence_files.extend(second_hop.report.evidence_files.clone());
+
+    let comparison_pool = second_hop
+        .quote
+        .as_ref()
+        .and_then(|quote| select_best_pool_excluding_prefix(quote, "rfq:"));
+    if comparison_pool.is_none() {
+        degrade_report_for_missing_required_pool(&mut second_hop.report, "non-RFQ comparison pool");
+    }
+
+    let Some(bebop_pool) = second_hop.selected_pool.clone() else {
+        reports.push(second_hop.report);
+        reports.push(build_skipped_encode_report(
+            preset,
+            "Skipping /encode because prep hop 2 did not surface rfq:bebop.",
+            &prep_evidence_files,
+            &protocols,
+        ));
+        return Ok(reports);
+    };
+    let Some(comparison_pool) = comparison_pool else {
+        reports.push(second_hop.report);
+        reports.push(build_skipped_encode_report(
+            preset,
+            "Skipping /encode because prep hop 2 did not surface a non-RFQ comparison pool.",
+            &prep_evidence_files,
+            &protocols,
+        ));
+        return Ok(reports);
+    };
+    reports.push(second_hop.report);
+
+    for protocol in [
+        bebop_pool.protocol.clone(),
+        comparison_pool.protocol.clone(),
+    ] {
+        *protocols.entry(protocol).or_insert(0usize) += 1;
+    }
+
+    let expected_taker_amount = expected_bebop_taker_amount_from_first_hop(
+        first_pool
+            .quote
+            .amounts_out
+            .first()
+            .map(String::as_str)
+            .unwrap_or("0"),
+    );
+    let encode_request = build_bebop_partial_fill_encode_request(
+        repo,
+        args.chain_id,
+        preset,
+        token_in,
+        mid_token,
+        token_out,
+        &first_pool,
+        &bebop_pool,
+        &comparison_pool,
+        &bebop_encode_probe_min_amount_out(),
+    )?;
+    let expectation = BebopInspectionExpectation {
+        token_in: mid_token.to_string(),
+        token_out: token_out.to_string(),
+        expected_taker_amount,
+    };
+    let encode_observation = execute_encode_request(
+        client,
+        &encode_url(&args.base_url),
+        &encode_request,
+        preset.label,
+        &protocols,
+        &notes,
+        Some(&expectation),
+    )
+    .await?;
+    let encode_artifact = save_observation_artifact(
+        repo,
+        evidence_dir,
+        &format!("encode-route-{}", preset.label),
+        &encode_observation,
+    )?;
+
+    let mut report = build_scenario_report(
+        encode_route_report_kind(preset.kind),
+        preset.label,
+        "/encode",
+        &[encode_observation],
+        &[encode_artifact],
+    );
+    for (protocol, count) in protocols {
+        report.protocols_seen.insert(protocol, count);
+    }
     reports.push(report);
     Ok(reports)
 }
@@ -792,6 +1073,7 @@ async fn prepare_encode_segment(
             &request,
             &artifact_stem,
             &scenario_label,
+            PoolSelection::Best,
         )
         .await?;
         prep_evidence_files.extend(hop.report.evidence_files.clone());
@@ -833,6 +1115,10 @@ async fn prepare_encode_segment(
     }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Prep-hop probing keeps HTTP, artifact, and selection inputs explicit."
+)]
 async fn run_encode_prep_hop(
     client: &Client,
     repo: &Path,
@@ -841,6 +1127,7 @@ async fn run_encode_prep_hop(
     request: &AmountOutRequest,
     artifact_stem: &str,
     scenario_label: &str,
+    selection: PoolSelection<'_>,
 ) -> Result<EncodePrepOutcome> {
     let observation = execute_simulate_request(client, endpoint, request).await;
     let artifact = save_observation_artifact(repo, evidence_dir, artifact_stem, &observation)?;
@@ -851,21 +1138,38 @@ async fn run_encode_prep_hop(
         std::slice::from_ref(&observation),
         std::slice::from_ref(&artifact),
     );
+    let mut decoded_quote = None;
     let selected_pool = match deserialize_quote_result(&observation) {
-        Ok(quote) => match select_best_pool(&quote) {
-            Some(pool) => {
-                report
-                    .notes
-                    .push(format!("selected pool candidate: {}", pool.quote.pool_name));
-                Some(pool)
+        Ok(quote) => {
+            let selected_pool = match selection {
+                PoolSelection::Best => select_best_pool(&quote),
+                PoolSelection::RequiredProtocol(protocol) => {
+                    select_best_pool_by_protocol(&quote, protocol)
+                }
+                PoolSelection::ExcludeProtocolPrefix(prefix) => {
+                    select_best_pool_excluding_prefix(&quote, prefix)
+                }
+            };
+            decoded_quote = Some(quote);
+            match selected_pool {
+                Some(pool) => {
+                    report
+                        .notes
+                        .push(format!("selected pool candidate: {}", pool.quote.pool_name));
+                    Some(pool)
+                }
+                None => {
+                    report.notes.push(format!(
+                        "no usable pool row was available for {}",
+                        selection.label()
+                    ));
+                    if let PoolSelection::RequiredProtocol(protocol) = selection {
+                        degrade_report_for_missing_required_pool(&mut report, protocol);
+                    }
+                    None
+                }
             }
-            None => {
-                report
-                    .notes
-                    .push("no usable pool row was available for route assembly".to_string());
-                None
-            }
-        },
+        }
         Err(error) => {
             report.notes.push(format!(
                 "unable to decode hop response for route assembly: {error:#}"
@@ -876,6 +1180,7 @@ async fn run_encode_prep_hop(
     Ok(EncodePrepOutcome {
         report,
         selected_pool,
+        quote: decoded_quote,
     })
 }
 
@@ -945,6 +1250,68 @@ fn build_encode_route_request(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit route parts keep the partial-fill probe easy to audit."
+)]
+fn build_bebop_partial_fill_encode_request(
+    repo: &Path,
+    chain_id: u64,
+    preset: &EncodeRoutePreset,
+    token_in: &str,
+    mid_token: &str,
+    token_out: &str,
+    first_pool: &SelectedPool,
+    bebop_pool: &SelectedPool,
+    comparison_pool: &SelectedPool,
+    min_amount_out: &str,
+) -> Result<RouteEncodeRequest> {
+    Ok(RouteEncodeRequest {
+        chain_id,
+        token_in: token_in.to_string(),
+        token_out: token_out.to_string(),
+        amount_in: preset.amounts.first().copied().unwrap_or("0").to_string(),
+        min_amount_out: min_amount_out.to_string(),
+        settlement_address: resolve_env_or_default(
+            repo,
+            "COW_SETTLEMENT_CONTRACT",
+            preset.settlement_address,
+        )?,
+        tycho_router_address: resolve_env_or_default(
+            repo,
+            "TYCHO_ROUTER_ADDRESS",
+            preset.tycho_router_address,
+        )?,
+        swap_kind: SwapKind::MultiSwap,
+        segments: vec![SegmentDraft {
+            kind: SwapKind::MultiSwap,
+            share_bps: 0,
+            hops: vec![
+                HopDraft {
+                    token_in: token_in.to_string(),
+                    token_out: mid_token.to_string(),
+                    swaps: vec![encode_pool_swap(first_pool, token_in, mid_token)],
+                },
+                HopDraft {
+                    token_in: mid_token.to_string(),
+                    token_out: token_out.to_string(),
+                    swaps: vec![
+                        encode_pool_swap_with_split(
+                            bebop_pool,
+                            mid_token,
+                            token_out,
+                            BEBOP_SPLIT_BPS,
+                        ),
+                        encode_pool_swap(comparison_pool, mid_token, token_out),
+                    ],
+                },
+            ],
+        }],
+        request_id: Some(format!("encode-probe-{}-{}", preset.label, epoch_now_s()?)),
+        estimated_amount_in: None,
+    })
+}
+
 fn allocate_segment_amounts(
     route_amounts: &[String],
     segments: &[EncodeSegmentPreset],
@@ -996,7 +1363,7 @@ fn route_min_amount_out(segments: &[PreparedEncodeSegment]) -> String {
 const fn encode_route_swap_kind(kind: EncodeRouteKind) -> SwapKind {
     match kind {
         EncodeRouteKind::Simple => SwapKind::SimpleSwap,
-        EncodeRouteKind::Multi => SwapKind::MultiSwap,
+        EncodeRouteKind::Multi | EncodeRouteKind::BebopPartialFill => SwapKind::MultiSwap,
         EncodeRouteKind::Mega => SwapKind::MegaSwap,
     }
 }
@@ -1006,10 +1373,20 @@ const fn encode_route_report_kind(kind: EncodeRouteKind) -> &'static str {
         EncodeRouteKind::Simple => "encode-simple",
         EncodeRouteKind::Multi => "encode-multi",
         EncodeRouteKind::Mega => "encode-mega",
+        EncodeRouteKind::BebopPartialFill => "encode-bebop",
     }
 }
 
 fn encode_pool_swap(pool: &SelectedPool, token_in: &str, token_out: &str) -> PoolSwapDraft {
+    encode_pool_swap_with_split(pool, token_in, token_out, 0)
+}
+
+fn encode_pool_swap_with_split(
+    pool: &SelectedPool,
+    token_in: &str,
+    token_out: &str,
+    split_bps: u32,
+) -> PoolSwapDraft {
     PoolSwapDraft {
         pool: PoolRef {
             // Prefer quote metadata for canonical ids; the analyzer only falls back to known
@@ -1020,7 +1397,7 @@ fn encode_pool_swap(pool: &SelectedPool, token_in: &str, token_out: &str) -> Poo
         },
         token_in: token_in.to_string(),
         token_out: token_out.to_string(),
-        split_bps: 0,
+        split_bps,
     }
 }
 
@@ -1098,6 +1475,7 @@ async fn execute_simulate_request(
             elapsed_ms: None,
             classification: ObservationClass::Error,
             protocols: Vec::new(),
+            encode_inspections: Vec::new(),
             note: Some("transport failure".to_string()),
             request: request_value,
             response: None,
@@ -1111,17 +1489,23 @@ async fn execute_encode_request(
     client: &Client,
     url: &str,
     request: &RouteEncodeRequest,
+    label: &str,
     protocols: &BTreeMap<String, usize>,
     notes: &[String],
+    inspection: Option<&BebopInspectionExpectation>,
 ) -> Result<RequestObservation> {
     let request_value =
         serde_json::to_value(request).context("failed to serialize encode request")?;
     match post_json(client, url, request).await {
         Ok(response) => {
-            let mut observation = classify_encode_response(request_value, response);
+            let mut observation =
+                classify_encode_response(label, request_value, response, inspection);
             observation.protocols = protocols.keys().cloned().collect();
             if !notes.is_empty() {
-                observation.note = Some(notes.join(" "));
+                observation.note = Some(match observation.note {
+                    Some(existing_note) => format!("{existing_note}; {}", notes.join(" ")),
+                    None => notes.join(" "),
+                });
             }
             Ok(observation)
         }
@@ -1131,6 +1515,7 @@ async fn execute_encode_request(
             elapsed_ms: None,
             classification: ObservationClass::Error,
             protocols: protocols.keys().cloned().collect(),
+            encode_inspections: Vec::new(),
             note: Some("transport failure".to_string()),
             request: request_value,
             response: None,
@@ -1157,6 +1542,7 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
             elapsed_ms,
             classification: ObservationClass::Error,
             protocols,
+            encode_inspections: Vec::new(),
             note: Some("non-200 response".to_string()),
             request,
             response: response.json,
@@ -1172,6 +1558,7 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
             elapsed_ms,
             classification: ObservationClass::Error,
             protocols,
+            encode_inspections: Vec::new(),
             note: Some("response did not match QuoteResult".to_string()),
             request,
             response: response.json,
@@ -1233,6 +1620,7 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
         elapsed_ms,
         classification,
         protocols,
+        encode_inspections: Vec::new(),
         note: (!note_parts.is_empty()).then(|| note_parts.join("; ")),
         request,
         response: response.json,
@@ -1241,7 +1629,12 @@ fn classify_simulate_response(request: Value, response: HttpJsonResponse) -> Req
     }
 }
 
-fn classify_encode_response(request: Value, response: HttpJsonResponse) -> RequestObservation {
+fn classify_encode_response(
+    label: &str,
+    request: Value,
+    response: HttpJsonResponse,
+    inspection: Option<&BebopInspectionExpectation>,
+) -> RequestObservation {
     let http_status = Some(response.status_code.as_u16());
     let elapsed_ms = Some(response.elapsed_ms);
 
@@ -1258,6 +1651,7 @@ fn classify_encode_response(request: Value, response: HttpJsonResponse) -> Reque
             elapsed_ms,
             classification: ObservationClass::Error,
             protocols: Vec::new(),
+            encode_inspections: Vec::new(),
             note: Some("encode returned non-200".to_string()),
             request,
             response: response.json,
@@ -1277,6 +1671,7 @@ fn classify_encode_response(request: Value, response: HttpJsonResponse) -> Reque
             elapsed_ms,
             classification: ObservationClass::Error,
             protocols: Vec::new(),
+            encode_inspections: Vec::new(),
             note: Some("encode response did not match RouteEncodeResponse".to_string()),
             request,
             response: response.json,
@@ -1305,23 +1700,299 @@ fn classify_encode_response(request: Value, response: HttpJsonResponse) -> Reque
             }
         }
     }
+    let encode_inspections = inspection.map_or_else(Vec::new, |expectation| {
+        vec![inspect_bebop_calldata(label, &encode_response, expectation)]
+    });
+    if let Some(inspection) = encode_inspections.first() {
+        note_parts.push(format!(
+            "bebop_inspection={} inspected={}",
+            inspection.status, inspection.inspected_bebop_payloads
+        ));
+    }
+    let inspection_matched = encode_inspections
+        .iter()
+        .all(|inspection| inspection.status == "matched");
 
     RequestObservation {
         status_label: Some("encoded".to_string()),
         result_quality: None,
         elapsed_ms,
-        classification: if has_router_call {
+        classification: if has_router_call && inspection_matched {
             ObservationClass::Healthy
         } else {
             ObservationClass::Degraded
         },
         protocols: Vec::new(),
+        encode_inspections,
         note: Some(note_parts.join("; ")),
         request,
         response: response.json,
         http_status,
         error: None,
     }
+}
+
+fn inspect_bebop_calldata(
+    label: &str,
+    response: &RouteEncodeResponse,
+    expectation: &BebopInspectionExpectation,
+) -> EncodeInspectionReport {
+    let expected_token_in = match parse_hex_bytes(&expectation.token_in, 20) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return EncodeInspectionReport {
+                label: label.to_string(),
+                status: "missing".to_string(),
+                inspected_bebop_payloads: 0,
+                original_filled_taker_amount: None,
+                expected_taker_amount: Some(expectation.expected_taker_amount.clone()),
+                partial_fill_offset: None,
+                detail: Some(format!("invalid expected token_in: {error:#}")),
+            };
+        }
+    };
+    let expected_token_out = match parse_hex_bytes(&expectation.token_out, 20) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return EncodeInspectionReport {
+                label: label.to_string(),
+                status: "missing".to_string(),
+                inspected_bebop_payloads: 0,
+                original_filled_taker_amount: None,
+                expected_taker_amount: Some(expectation.expected_taker_amount.clone()),
+                partial_fill_offset: None,
+                detail: Some(format!("invalid expected token_out: {error:#}")),
+            };
+        }
+    };
+
+    let mut payloads = Vec::new();
+    let mut errors = Vec::new();
+    for interaction in response
+        .interactions
+        .iter()
+        .filter(|interaction| interaction.kind == InteractionKind::Call)
+    {
+        match inspect_router_call_for_bebop(
+            &interaction.calldata,
+            &expected_token_in,
+            &expected_token_out,
+        ) {
+            Ok(found) => payloads.extend(found),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    let Some(payload) = payloads.first() else {
+        return EncodeInspectionReport {
+            label: label.to_string(),
+            status: "missing".to_string(),
+            inspected_bebop_payloads: 0,
+            original_filled_taker_amount: None,
+            expected_taker_amount: Some(expectation.expected_taker_amount.clone()),
+            partial_fill_offset: None,
+            detail: Some(if errors.is_empty() {
+                "no Bebop executor payload matched the expected token pair".to_string()
+            } else {
+                format!(
+                    "no Bebop executor payload matched the expected token pair; decode errors: {}",
+                    errors.join("; ")
+                )
+            }),
+        };
+    };
+
+    let status = if payload.original_filled_taker_amount == expectation.expected_taker_amount {
+        "matched"
+    } else {
+        "mismatch"
+    };
+    EncodeInspectionReport {
+        label: label.to_string(),
+        status: status.to_string(),
+        inspected_bebop_payloads: payloads.len(),
+        original_filled_taker_amount: Some(payload.original_filled_taker_amount.clone()),
+        expected_taker_amount: Some(expectation.expected_taker_amount.clone()),
+        partial_fill_offset: Some(payload.partial_fill_offset),
+        detail: (status == "mismatch").then(|| {
+            "originalFilledTakerAmount did not match expected token-in amount".to_string()
+        }),
+    }
+}
+
+struct BebopPayloadFields {
+    original_filled_taker_amount: String,
+    partial_fill_offset: u8,
+}
+
+fn inspect_router_call_for_bebop(
+    calldata_hex: &str,
+    token_in: &[u8],
+    token_out: &[u8],
+) -> Result<Vec<BebopPayloadFields>> {
+    let calldata = parse_hex_bytes(calldata_hex, 0)?;
+    let (swap_encoding, swaps) = extract_router_swaps(&calldata)?;
+    let protocol_payloads = extract_protocol_payloads(swap_encoding, &swaps)?;
+    Ok(protocol_payloads
+        .iter()
+        .filter_map(|payload| decode_bebop_payload(payload, token_in, token_out))
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+enum RouterSwapEncoding {
+    Single,
+    Sequential,
+    Split,
+}
+
+fn extract_router_swaps(calldata: &[u8]) -> Result<(RouterSwapEncoding, Vec<u8>)> {
+    if calldata.len() < FUNCTION_SELECTOR_BYTES {
+        bail!("router calldata is shorter than a function selector");
+    }
+    let selector = &calldata[..FUNCTION_SELECTOR_BYTES];
+    let args = &calldata[FUNCTION_SELECTOR_BYTES..];
+    if selector == function_selector(SPLIT_SWAP_SIGNATURE) {
+        Ok((
+            RouterSwapEncoding::Split,
+            extract_final_dynamic_bytes_arg(args, 10)?,
+        ))
+    } else if selector == function_selector(SEQUENTIAL_SWAP_SIGNATURE) {
+        Ok((
+            RouterSwapEncoding::Sequential,
+            extract_final_dynamic_bytes_arg(args, 9)?,
+        ))
+    } else if selector == function_selector(SINGLE_SWAP_SIGNATURE) {
+        Ok((
+            RouterSwapEncoding::Single,
+            extract_final_dynamic_bytes_arg(args, 9)?,
+        ))
+    } else {
+        bail!("router calldata selector did not match a supported swap function");
+    }
+}
+
+fn extract_final_dynamic_bytes_arg(args: &[u8], arg_count: usize) -> Result<Vec<u8>> {
+    let head_len = arg_count
+        .checked_mul(ABI_WORD_BYTES)
+        .context("ABI head length overflowed")?;
+    if args.len() < head_len {
+        bail!("router calldata args are shorter than the ABI head");
+    }
+    let offset_word_start = (arg_count - 1) * ABI_WORD_BYTES;
+    let offset = abi_word_to_usize(&args[offset_word_start..offset_word_start + ABI_WORD_BYTES])?;
+    let length_word_end = offset
+        .checked_add(ABI_WORD_BYTES)
+        .context("dynamic bytes offset overflowed")?;
+    if args.len() < length_word_end {
+        bail!("dynamic bytes offset points outside calldata");
+    }
+    let length = abi_word_to_usize(&args[offset..length_word_end])?;
+    let bytes_start = length_word_end;
+    let bytes_end = bytes_start
+        .checked_add(length)
+        .context("dynamic bytes length overflowed")?;
+    if args.len() < bytes_end {
+        bail!("dynamic bytes length points outside calldata");
+    }
+    Ok(args[bytes_start..bytes_end].to_vec())
+}
+
+fn extract_protocol_payloads(encoding: RouterSwapEncoding, swaps: &[u8]) -> Result<Vec<Vec<u8>>> {
+    match encoding {
+        RouterSwapEncoding::Single => {
+            if swaps.len() < 20 {
+                bail!("singleSwap payload is shorter than executor address");
+            }
+            Ok(vec![swaps[20..].to_vec()])
+        }
+        RouterSwapEncoding::Sequential => decode_ple_segments(swaps)?
+            .into_iter()
+            .map(|segment| {
+                if segment.len() < 20 {
+                    bail!("sequentialSwap PLE segment is shorter than executor address");
+                }
+                Ok(segment[20..].to_vec())
+            })
+            .collect(),
+        RouterSwapEncoding::Split => decode_ple_segments(swaps)?
+            .into_iter()
+            .map(|segment| {
+                if segment.len() < 25 {
+                    bail!("splitSwap PLE segment is shorter than split executor header");
+                }
+                Ok(segment[25..].to_vec())
+            })
+            .collect(),
+    }
+}
+
+fn decode_ple_segments(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    let mut cursor = 0usize;
+    let mut segments = Vec::new();
+    while cursor < bytes.len() {
+        if bytes.len() - cursor < 2 {
+            bail!("PLE bytes ended inside a length prefix");
+        }
+        let len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        let end = cursor
+            .checked_add(len)
+            .context("PLE segment length overflowed")?;
+        if end > bytes.len() {
+            bail!("PLE segment length points outside swaps bytes");
+        }
+        segments.push(&bytes[cursor..end]);
+        cursor = end;
+    }
+    Ok(segments)
+}
+
+fn decode_bebop_payload(
+    protocol_data: &[u8],
+    token_in: &[u8],
+    token_out: &[u8],
+) -> Option<BebopPayloadFields> {
+    if protocol_data.len() < BEBOP_PACKED_PREFIX_BYTES {
+        return None;
+    }
+    if &protocol_data[0..20] != token_in || &protocol_data[20..40] != token_out {
+        return None;
+    }
+    Some(BebopPayloadFields {
+        original_filled_taker_amount: BigUint::from_bytes_be(
+            &protocol_data[BEBOP_ORIGINAL_TAKER_AMOUNT_START..BEBOP_ORIGINAL_TAKER_AMOUNT_END],
+        )
+        .to_string(),
+        partial_fill_offset: protocol_data[BEBOP_PARTIAL_FILL_OFFSET_INDEX],
+    })
+}
+
+fn parse_hex_bytes(value: &str, expected_len: usize) -> Result<Vec<u8>> {
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(trimmed).with_context(|| format!("invalid hex value {value}"))?;
+    if expected_len > 0 && bytes.len() != expected_len {
+        bail!("expected {expected_len} byte(s), got {}", bytes.len());
+    }
+    Ok(bytes)
+}
+
+fn function_selector(signature: &str) -> [u8; 4] {
+    let mut hasher = Keccak256::new();
+    hasher.update(signature.as_bytes());
+    let hash = hasher.finalize();
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
+fn abi_word_to_usize(word: &[u8]) -> Result<usize> {
+    let mut value = 0usize;
+    for byte in word {
+        value = value
+            .checked_mul(256)
+            .and_then(|current| current.checked_add(*byte as usize))
+            .context("ABI word does not fit in usize")?;
+    }
+    Ok(value)
 }
 
 fn build_scenario_report(
@@ -1339,6 +2010,7 @@ fn build_scenario_report(
     let mut degraded_count = 0;
     let mut error_count = 0;
     let mut notes = Vec::new();
+    let mut encode_inspections = Vec::new();
 
     for observation in observations {
         if let Some(status) = &observation.status_label {
@@ -1352,6 +2024,7 @@ fn build_scenario_report(
         for protocol in &observation.protocols {
             *protocols_seen.entry(protocol.clone()).or_insert(0usize) += 1;
         }
+        encode_inspections.extend(observation.encode_inspections.clone());
         if let Some(latency) = observation.elapsed_ms {
             latencies.push(latency);
         }
@@ -1379,6 +2052,7 @@ fn build_scenario_report(
         result_quality_counts,
         protocols_seen,
         latency_ms: summarize_latencies(&latencies),
+        encode_inspections,
         notes,
         evidence_files: evidence_files.to_vec(),
     }
@@ -1428,32 +2102,55 @@ fn deserialize_quote_result(observation: &RequestObservation) -> Result<QuoteRes
 }
 
 fn select_best_pool(quote: &QuoteResult) -> Option<SelectedPool> {
-    let entry = quote
+    select_best_pool_matching(quote, |_| true)
+}
+
+fn select_best_pool_by_protocol(quote: &QuoteResult, protocol: &str) -> Option<SelectedPool> {
+    select_best_pool_matching(quote, |candidate| candidate == protocol)
+}
+
+fn select_best_pool_excluding_prefix(quote: &QuoteResult, prefix: &str) -> Option<SelectedPool> {
+    select_best_pool_matching(quote, |candidate| !candidate.starts_with(prefix))
+}
+
+fn select_best_pool_matching(
+    quote: &QuoteResult,
+    accepts_protocol: impl Fn(&str) -> bool,
+) -> Option<SelectedPool> {
+    let (entry, protocol) = quote
         .data
         .iter()
-        .filter(|entry| {
-            entry
-                .amounts_out
-                .first()
-                .is_some_and(|amount| amount != "0")
-                && entry.amounts_out.iter().any(|amount| amount != "0")
+        .filter(|entry| usable_pool_entry(entry))
+        .filter_map(|entry| {
+            let protocol = protocol_for_quote_entry(quote, entry);
+            accepts_protocol(&protocol).then_some((entry, protocol))
         })
         .max_by(|left, right| {
-            compare_amount_strings(&left.amounts_out[0], &right.amounts_out[0])
+            compare_amount_strings(&left.0.amounts_out[0], &right.0.amounts_out[0])
         })?;
-
-    let protocol = quote
-        .meta
-        .pool_results
-        .iter()
-        .find(|pool| pool.pool == entry.pool)
-        .map(|pool| pool.protocol.clone())
-        .unwrap_or_else(|| protocol_from_pool_name(&entry.pool_name));
 
     Some(SelectedPool {
         quote: entry.clone(),
         protocol,
     })
+}
+
+fn usable_pool_entry(entry: &AmountOutResponse) -> bool {
+    entry
+        .amounts_out
+        .first()
+        .is_some_and(|amount| amount != "0")
+        && entry.amounts_out.iter().any(|amount| amount != "0")
+}
+
+fn protocol_for_quote_entry(quote: &QuoteResult, entry: &AmountOutResponse) -> String {
+    quote
+        .meta
+        .pool_results
+        .iter()
+        .find(|pool| pool.pool == entry.pool)
+        .map(|pool| pool.protocol.clone())
+        .unwrap_or_else(|| protocol_from_pool_name(&entry.pool_name))
 }
 
 fn compare_amount_strings(left: &str, right: &str) -> std::cmp::Ordering {
@@ -1537,9 +2234,47 @@ fn apply_slippage(amount: &str, bps: u32) -> String {
     let Ok(value) = BigUint::from_str(amount) else {
         return "0".to_string();
     };
-    let safe_bps = BigUint::from(10_000u32.saturating_sub(bps));
+    let safe_bps = BigUint::from(BPS_DENOMINATOR.saturating_sub(bps));
     let scaled = value * safe_bps;
-    (scaled / BigUint::from(10_000u32)).to_string()
+    (scaled / BigUint::from(BPS_DENOMINATOR)).to_string()
+}
+
+fn split_amount_by_bps(amount: &str, bps: u32) -> String {
+    let Ok(value) = BigUint::from_str(amount) else {
+        return "0".to_string();
+    };
+    let scaled = value * BigUint::from(bps);
+    (scaled / BigUint::from(BPS_DENOMINATOR)).to_string()
+}
+
+fn expected_bebop_taker_amount_from_first_hop(first_hop_amount_out: &str) -> String {
+    split_amount_by_bps(first_hop_amount_out, BEBOP_SPLIT_BPS)
+}
+
+fn bebop_encode_probe_min_amount_out() -> String {
+    // This diagnostic validates encoding, not quote quality. Keep the guard permissive
+    // so a worse comparison AMM leg cannot block router calldata inspection.
+    "1".to_string()
+}
+
+fn rfq_required_probe_ready(readiness: &ReadinessSnapshot) -> bool {
+    readiness.backend_enabled("rfq") && readiness.backend_status("rfq") == Some("ready")
+}
+
+fn degrade_report_for_missing_required_pool(report: &mut ScenarioReport, required_pool: &str) {
+    if report.error_count == 0 && report.degraded_count == 0 {
+        report.healthy_count = report.healthy_count.saturating_sub(1);
+        report.degraded_count = 1;
+        report.request_count = report.request_count.max(1);
+    }
+    let descriptor = if required_pool.contains(':') {
+        format!("required protocol {required_pool}")
+    } else {
+        format!("required {required_pool}")
+    };
+    report
+        .notes
+        .push(format!("{descriptor} was not available for route assembly"));
 }
 
 async fn post_json<T: Serialize>(
@@ -2091,6 +2826,7 @@ fn observation_artifact_payload(observation: &RequestObservation) -> Value {
         "elapsed_ms": observation.elapsed_ms,
         "classification": observation_class_label(observation.classification),
         "protocols": observation.protocols,
+        "encode_inspections": observation.encode_inspections,
         "note": observation.note,
         "error": observation.error,
         "request": observation.request,
@@ -2238,20 +2974,23 @@ fn fmt_rate(rate: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_encode_route_request, build_wait_ready_args, capture_log_boundaries,
-        classify_simulate_response, collect_logs, discover_latest_baseline, encode_route_swap_kind,
-        ensure_server_ready, maybe_load_baseline, percentile, protocol_from_pool_name,
-        sanitize_filename, select_best_pool, startup_bind_config, BaselineMode, CliArgs,
-        HttpJsonResponse, ObservationClass, PreparedEncodeHop, PreparedEncodeRoute,
-        PreparedEncodeSegment, ScriptPaths, SelectedPool,
+        apply_slippage, bebop_encode_probe_min_amount_out, build_encode_route_request,
+        build_wait_ready_args, capture_log_boundaries, classify_simulate_response, collect_logs,
+        degrade_report_for_missing_required_pool, discover_latest_baseline, encode_route_swap_kind,
+        ensure_server_ready, expected_bebop_taker_amount_from_first_hop, inspect_bebop_calldata,
+        maybe_load_baseline, percentile, protocol_from_pool_name, sanitize_filename,
+        select_best_pool, select_best_pool_by_protocol, select_best_pool_excluding_prefix,
+        split_amount_by_bps, startup_bind_config, BaselineMode, BebopInspectionExpectation,
+        CliArgs, HttpJsonResponse, ObservationClass, PreparedEncodeHop, PreparedEncodeRoute,
+        PreparedEncodeSegment, ScriptPaths, SelectedPool, BEBOP_SPLIT_BPS, DEFAULT_SLIPPAGE_BPS,
     };
     use crate::sim_analysis::presets::{balanced_profile, EncodeRouteKind};
     use reqwest::Client;
     use reqwest::StatusCode;
     use serde_json::json;
     use simulator_core::models::messages::{
-        AmountOutResponse, PoolOutcomeKind, PoolSimulationOutcome, QuoteMeta, QuoteResult,
-        QuoteResultQuality, QuoteStatus, SwapKind,
+        AmountOutResponse, Interaction, InteractionKind, PoolOutcomeKind, PoolSimulationOutcome,
+        QuoteMeta, QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeResponse, SwapKind,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -2281,6 +3020,132 @@ mod tests {
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o755);
         assert!(fs::set_permissions(path, permissions).is_ok());
+    }
+
+    fn quote_with_protocol_pools(pools: &[(&str, &str, &str)]) -> QuoteResult {
+        QuoteResult {
+            request_id: "req-1".to_string(),
+            data: pools
+                .iter()
+                .enumerate()
+                .map(|(index, (pool, protocol, amount_out))| AmountOutResponse {
+                    pool: (*pool).to_string(),
+                    pool_name: format!("{protocol}::WETH/USDC"),
+                    pool_address: format!("0x{:040x}", index + 1),
+                    amounts_out: vec![(*amount_out).to_string()],
+                    gas_used: vec![1],
+                    block_number: 1,
+                    limit_max_in: None,
+                    slippage: Vec::new(),
+                })
+                .collect(),
+            meta: QuoteMeta {
+                status: QuoteStatus::Ready,
+                result_quality: QuoteResultQuality::Complete,
+                partial_kind: None,
+                block_number: 1,
+                vm_block_number: None,
+                rfq_update_timestamp: Some(1),
+                matching_pools: pools.len(),
+                candidate_pools: pools.len(),
+                total_pools: Some(pools.len()),
+                auction_id: None,
+                pool_results: pools
+                    .iter()
+                    .map(|(pool, protocol, _)| PoolSimulationOutcome {
+                        pool: (*pool).to_string(),
+                        pool_name: format!("{protocol}::WETH/USDC"),
+                        pool_address: "0x0000000000000000000000000000000000000001".to_string(),
+                        protocol: (*protocol).to_string(),
+                        outcome: PoolOutcomeKind::PartialOutput,
+                        reported_steps: 1,
+                        expected_steps: 1,
+                        reason: None,
+                    })
+                    .collect(),
+                vm_unavailable: false,
+                rfq_unavailable: false,
+                failures: Vec::new(),
+            },
+        }
+    }
+
+    fn synthetic_split_swap_response(
+        token_in: [u8; 20],
+        token_out: [u8; 20],
+        original_taker_amount: u128,
+        partial_fill_offset: u8,
+    ) -> RouteEncodeResponse {
+        let mut protocol_data = Vec::new();
+        protocol_data.extend_from_slice(&token_in);
+        protocol_data.extend_from_slice(&token_out);
+        protocol_data.push(1);
+        protocol_data.push(partial_fill_offset);
+        protocol_data.extend_from_slice(&abi_word_u128(original_taker_amount));
+        protocol_data.push(1);
+        protocol_data.extend_from_slice(&[0x44; 20]);
+        protocol_data.extend_from_slice(&[0xaa; 32]);
+
+        let mut payload = Vec::new();
+        payload.push(0);
+        payload.push(1);
+        payload.extend_from_slice(&5_000u32.to_be_bytes()[1..]);
+        payload.extend_from_slice(&[0x33; 20]);
+        payload.extend_from_slice(&protocol_data);
+
+        let mut swaps = Vec::new();
+        swaps.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        swaps.extend_from_slice(&payload);
+
+        let selector = super::function_selector(super::SPLIT_SWAP_SIGNATURE);
+        let mut calldata = Vec::new();
+        calldata.extend_from_slice(&selector);
+        calldata.extend_from_slice(&abi_word_u128(1));
+        calldata.extend_from_slice(&abi_word_address(token_in));
+        calldata.extend_from_slice(&abi_word_address(token_out));
+        calldata.extend_from_slice(&abi_word_u128(1));
+        calldata.extend_from_slice(&abi_word_bool(false));
+        calldata.extend_from_slice(&abi_word_bool(false));
+        calldata.extend_from_slice(&abi_word_u128(2));
+        calldata.extend_from_slice(&abi_word_address([0x55; 20]));
+        calldata.extend_from_slice(&abi_word_bool(false));
+        calldata.extend_from_slice(&abi_word_u128(10 * 32));
+        calldata.extend_from_slice(&abi_dynamic_bytes(&swaps));
+
+        RouteEncodeResponse {
+            interactions: vec![Interaction {
+                kind: InteractionKind::Call,
+                target: "0x0000000000000000000000000000000000000001".to_string(),
+                value: "0".to_string(),
+                calldata: format!("0x{}", alloy_primitives::hex::encode(calldata)),
+            }],
+            debug: None,
+        }
+    }
+
+    fn abi_word_u128(value: u128) -> [u8; 32] {
+        let mut word = [0u8; 32];
+        word[16..].copy_from_slice(&value.to_be_bytes());
+        word
+    }
+
+    fn abi_word_address(address: [u8; 20]) -> [u8; 32] {
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(&address);
+        word
+    }
+
+    fn abi_word_bool(value: bool) -> [u8; 32] {
+        abi_word_u128(u128::from(value))
+    }
+
+    fn abi_dynamic_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&abi_word_u128(bytes.len() as u128));
+        encoded.extend_from_slice(bytes);
+        let padding = (32 - (bytes.len() % 32)) % 32;
+        encoded.extend(std::iter::repeat_n(0, padding));
+        encoded
     }
 
     #[test]
@@ -2386,6 +3251,9 @@ mod tests {
                     prepared_segment(SwapKind::SimpleSwap, 5000, 1),
                     prepared_segment(SwapKind::SimpleSwap, 0, 1),
                 ],
+                EncodeRouteKind::BebopPartialFill => {
+                    vec![prepared_segment(SwapKind::MultiSwap, 0, 2)]
+                }
             },
             protocols: BTreeMap::new(),
             notes: Vec::new(),
@@ -2439,6 +3307,134 @@ mod tests {
         assert_eq!(
             encode_route_swap_kind(EncodeRouteKind::Mega),
             SwapKind::MegaSwap
+        );
+        assert_eq!(
+            encode_route_swap_kind(EncodeRouteKind::BebopPartialFill),
+            SwapKind::MultiSwap
+        );
+    }
+
+    #[test]
+    fn select_best_pool_by_protocol_prefers_bebop_over_other_protocols() {
+        let quote = quote_with_protocol_pools(&[
+            ("hashflow-pool", "rfq:hashflow", "120"),
+            ("aero-pool", "aerodrome_slipstreams", "200"),
+            ("bebop-pool", "rfq:bebop", "100"),
+        ]);
+
+        let selected = select_best_pool_by_protocol(&quote, "rfq:bebop");
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+            Some("bebop-pool")
+        );
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("rfq:bebop")
+        );
+    }
+
+    #[test]
+    fn select_best_pool_excluding_prefix_skips_rfq_pools() {
+        let quote = quote_with_protocol_pools(&[
+            ("bebop-pool", "rfq:bebop", "300"),
+            ("hashflow-pool", "rfq:hashflow", "250"),
+            ("aero-pool", "aerodrome_slipstreams", "100"),
+        ]);
+
+        let selected = select_best_pool_excluding_prefix(&quote, "rfq:");
+
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+            Some("aero-pool")
+        );
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.protocol.as_str()),
+            Some("aerodrome_slipstreams")
+        );
+    }
+
+    #[test]
+    fn missing_required_bebop_pool_marks_encode_prep_degraded() {
+        let mut report =
+            super::build_scenario_report("encode-prep", "bebop prep hop 2", "/simulate", &[], &[]);
+
+        degrade_report_for_missing_required_pool(&mut report, "rfq:bebop");
+
+        assert_eq!(report.healthy_count, 0);
+        assert_eq!(report.degraded_count, 1);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("required protocol rfq:bebop was not available")));
+    }
+
+    #[test]
+    fn bebop_probe_expects_raw_first_hop_split_amount() {
+        let raw_first_hop_amount = "1000000000000000000";
+        let slippage_reduced_amount = apply_slippage(raw_first_hop_amount, DEFAULT_SLIPPAGE_BPS);
+
+        assert_eq!(
+            expected_bebop_taker_amount_from_first_hop(raw_first_hop_amount),
+            "500000000000000000"
+        );
+        assert_ne!(
+            expected_bebop_taker_amount_from_first_hop(raw_first_hop_amount),
+            split_amount_by_bps(&slippage_reduced_amount, BEBOP_SPLIT_BPS)
+        );
+    }
+
+    #[test]
+    fn bebop_probe_uses_permissive_min_amount_out() {
+        assert_eq!(bebop_encode_probe_min_amount_out(), "1");
+    }
+
+    #[test]
+    fn inspect_bebop_calldata_extracts_split_swap_packed_taker_amount() {
+        let token_in = [0x11; 20];
+        let token_out = [0x22; 20];
+        let response =
+            synthetic_split_swap_response(token_in, token_out, 37_364_114_182_137_972, 92);
+        let expectation = BebopInspectionExpectation {
+            token_in: format!("0x{}", alloy_primitives::hex::encode(token_in)),
+            token_out: format!("0x{}", alloy_primitives::hex::encode(token_out)),
+            expected_taker_amount: "37364114182137972".to_string(),
+        };
+
+        let inspection =
+            inspect_bebop_calldata("bebop-partial-fill-encode", &response, &expectation);
+
+        assert_eq!(inspection.status, "matched");
+        assert_eq!(inspection.inspected_bebop_payloads, 1);
+        assert_eq!(
+            inspection.original_filled_taker_amount.as_deref(),
+            Some("37364114182137972")
+        );
+        assert_eq!(inspection.partial_fill_offset, Some(92));
+    }
+
+    #[test]
+    fn inspect_bebop_calldata_reports_output_unit_taker_amount_mismatch() {
+        let token_in = [0x11; 20];
+        let token_out = [0x22; 20];
+        let response = synthetic_split_swap_response(token_in, token_out, 84_452_306, 92);
+        let expectation = BebopInspectionExpectation {
+            token_in: format!("0x{}", alloy_primitives::hex::encode(token_in)),
+            token_out: format!("0x{}", alloy_primitives::hex::encode(token_out)),
+            expected_taker_amount: "37364114182137972".to_string(),
+        };
+
+        let inspection =
+            inspect_bebop_calldata("bebop-partial-fill-encode", &response, &expectation);
+
+        assert_eq!(inspection.status, "mismatch");
+        assert_eq!(
+            inspection.original_filled_taker_amount.as_deref(),
+            Some("84452306")
+        );
+        assert_eq!(
+            inspection.expected_taker_amount.as_deref(),
+            Some("37364114182137972")
         );
     }
 

@@ -25,6 +25,7 @@ pub enum EncodeRouteKind {
     Simple,
     Multi,
     Mega,
+    BebopPartialFill,
 }
 
 #[derive(Clone, Debug)]
@@ -499,6 +500,10 @@ const BASE_MEGA_USDC_AERO: &[EncodeSegmentPreset] = &[
         path: &["USDC", "AERO"],
     },
 ];
+const BASE_BEBOP_PARTIAL_FILL_USDC_WETH_USDC: &[EncodeSegmentPreset] = &[EncodeSegmentPreset {
+    share_bps: 0,
+    path: &["USDC", "WETH", "USDC"],
+}];
 
 fn base_encode_presets() -> Vec<EncodeRoutePreset> {
     let settlement_address = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41";
@@ -564,6 +569,14 @@ fn base_encode_presets() -> Vec<EncodeRoutePreset> {
             "mega-usdc-aero",
             EncodeRouteKind::Mega,
             BASE_MEGA_USDC_AERO,
+            BASE_ENCODE_USDC_AMOUNTS,
+            settlement_address,
+            tycho_router_address,
+        ),
+        encode_route(
+            "bebop-partial-fill-encode",
+            EncodeRouteKind::BebopPartialFill,
+            BASE_BEBOP_PARTIAL_FILL_USDC_WETH_USDC,
             BASE_ENCODE_USDC_AMOUNTS,
             settlement_address,
             tycho_router_address,
@@ -750,6 +763,17 @@ mod tests {
                 .encode_routes
                 .iter()
                 .any(|route| route.kind == EncodeRouteKind::Mega));
+            if chain_id == 8453 {
+                assert!(profile.encode_routes.iter().any(|route| {
+                    route.label == "bebop-partial-fill-encode"
+                        && route.kind == EncodeRouteKind::BebopPartialFill
+                }));
+            } else {
+                assert!(!profile
+                    .encode_routes
+                    .iter()
+                    .any(|route| route.kind == EncodeRouteKind::BebopPartialFill));
+            }
             assert!(profile.encode_routes.iter().all(|route| {
                 route
                     .segments

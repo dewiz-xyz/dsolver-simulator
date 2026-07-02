@@ -35,6 +35,7 @@
   - `cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop`
 - The analyzer starts or reuses the local broadcaster plus simulator stack, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` probes and the balanced `/encode` route matrix, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
 - The `/encode` matrix uses live `/simulate` prep hops to assemble 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain. Prep hops are reported separately as `encode-prep` scenarios.
+- On Base with RFQ enabled and ready, the encode probes include a Bebop partial-fill diagnostic that checks router calldata for the packed `originalFilledTakerAmount` token-in invariant.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
 - Main artifacts:
@@ -42,7 +43,7 @@
   - `report.json` for exact metrics and scenario breakdowns
   - `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts
 - Redis replay fields from simulator `/status` subscriptions are preserved in `report.json` and summarized in `summary.md` when present.
-- RFQ-enabled Ethereum runs should also surface RFQ readiness and any RFQ-visibility findings in `summary.md` and `report.json`.
+- RFQ-enabled runs should also surface RFQ readiness, RFQ-visibility findings, and any Bebop encode-inspection findings in `summary.md` and `report.json`.
 - Baseline comparison is meant to be flexible. Use the latest saved run when it helps, disable it with `--baseline none` when you want a clean one-off read.
 - The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so a reviewer can investigate.
 

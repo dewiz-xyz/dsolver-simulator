@@ -36,6 +36,7 @@ metadata:
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
 - Builds the balanced `/encode` route matrix from live `/simulate` prep hops, covering 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain.
+- On Base with RFQ enabled and ready, runs a Bebop partial-fill `/encode` diagnostic and inspects router calldata for the packed `originalFilledTakerAmount` token-in invariant.
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus simulator and broadcaster log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
@@ -101,7 +102,7 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1
 After the analyzer runs:
 
 1. Read `summary.md` first for the high-level picture.
-2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, and any RFQ readiness or RFQ-visibility findings.
+2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, encode inspections, and any RFQ readiness or RFQ-visibility findings.
 3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts.
 4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
 5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.

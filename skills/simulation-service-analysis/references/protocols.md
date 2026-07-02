@@ -67,6 +67,7 @@ The service subscribes to chain-specific Tycho exchanges at startup (see
   the Bebop and Hashflow pairs. Liquorice credentials are only needed after `rfq:liquorice` is added
   to the active chain list.
 - The local analyzer waits for RFQ readiness automatically when RFQ pools are enabled on either chain.
+- On Base, RFQ-enabled analyzer runs include a Bebop partial-fill encode diagnostic. It is required only when RFQ is enabled and ready, and it reports degraded evidence if `rfq:bebop` or the non-RFQ comparison leg is not visible.
 
 ## Notes that affect local analysis
 
