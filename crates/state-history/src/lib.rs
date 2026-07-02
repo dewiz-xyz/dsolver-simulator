@@ -4161,6 +4161,97 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod test_fixtures {
+    use std::collections::BTreeMap;
+
+    use anyhow::Result;
+    use simulator_core::broadcaster::{
+        BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolSyncStatus,
+        BroadcasterProtocolSyncStatusKind, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    };
+
+    pub(super) fn update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        backend: BroadcasterBackend,
+        cursor: u64,
+    ) -> Result<BroadcasterEnvelope> {
+        let mut sync_statuses = BTreeMap::new();
+        let protocol = match backend {
+            BroadcasterBackend::Native => "uniswap_v2",
+            BroadcasterBackend::Vm => "vm:curve",
+            BroadcasterBackend::Rfq => "rfq:bebop",
+        };
+        sync_statuses.insert(
+            protocol.to_string(),
+            BroadcasterProtocolSyncStatus {
+                kind: BroadcasterProtocolSyncStatusKind::Started,
+                block: None,
+                reason: None,
+            },
+        );
+        let update = BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::new(
+            backend,
+            cursor,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sync_statuses,
+        )])?;
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Update(update),
+        ))
+    }
+
+    pub(super) fn multi_backend_update_envelope(
+        stream_id: &str,
+        message_seq: u64,
+        partitions: impl IntoIterator<Item = (BroadcasterBackend, u64)>,
+    ) -> Result<BroadcasterEnvelope> {
+        let update = BroadcasterUpdateMessage::new(
+            partitions
+                .into_iter()
+                .map(|(backend, cursor)| {
+                    BroadcasterUpdatePartition::new(
+                        backend,
+                        cursor,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        sync_statuses_for_started_protocol(backend),
+                    )
+                })
+                .collect(),
+        )?;
+        Ok(BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Update(update),
+        ))
+    }
+
+    fn sync_statuses_for_started_protocol(
+        backend: BroadcasterBackend,
+    ) -> BTreeMap<String, BroadcasterProtocolSyncStatus> {
+        let protocol = match backend {
+            BroadcasterBackend::Native => "uniswap_v2",
+            BroadcasterBackend::Vm => "vm:curve",
+            BroadcasterBackend::Rfq => "rfq:bebop",
+        };
+        BTreeMap::from([(
+            protocol.to_string(),
+            BroadcasterProtocolSyncStatus {
+                kind: BroadcasterProtocolSyncStatusKind::Started,
+                block: None,
+                reason: None,
+            },
+        )])
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
@@ -4179,6 +4270,7 @@ mod tests {
         tycho_common::Bytes,
     };
 
+    use super::test_fixtures::{multi_backend_update_envelope, update_envelope};
     use super::{
         backtest_boundary_from_rows, block_timestamp_ms_from_seconds, block_timestamps_for_entry,
         block_timestamps_from_checkpoint_archive, build_validated_history_segments,
@@ -5603,86 +5695,6 @@ mod tests {
         );
     }
 
-    fn update_envelope(
-        stream_id: &str,
-        message_seq: u64,
-        backend: BroadcasterBackend,
-        cursor: u64,
-    ) -> Result<BroadcasterEnvelope> {
-        let mut sync_statuses = BTreeMap::new();
-        let protocol = match backend {
-            BroadcasterBackend::Native => "uniswap_v2",
-            BroadcasterBackend::Vm => "vm:curve",
-            BroadcasterBackend::Rfq => "rfq:bebop",
-        };
-        sync_statuses.insert(
-            protocol.to_string(),
-            BroadcasterProtocolSyncStatus {
-                kind: BroadcasterProtocolSyncStatusKind::Started,
-                block: None,
-                reason: None,
-            },
-        );
-        let update = BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::new(
-            backend,
-            cursor,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            sync_statuses,
-        )])?;
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            simulator_core::broadcaster::BroadcasterPayload::Update(update),
-        ))
-    }
-
-    fn multi_backend_update_envelope(
-        stream_id: &str,
-        message_seq: u64,
-        partitions: impl IntoIterator<Item = (BroadcasterBackend, u64)>,
-    ) -> Result<BroadcasterEnvelope> {
-        let update = BroadcasterUpdateMessage::new(
-            partitions
-                .into_iter()
-                .map(|(backend, cursor)| {
-                    BroadcasterUpdatePartition::new(
-                        backend,
-                        cursor,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        sync_statuses_for_started_protocol(backend),
-                    )
-                })
-                .collect(),
-        )?;
-        Ok(BroadcasterEnvelope::new(
-            stream_id,
-            message_seq,
-            simulator_core::broadcaster::BroadcasterPayload::Update(update),
-        ))
-    }
-
-    fn sync_statuses_for_started_protocol(
-        backend: BroadcasterBackend,
-    ) -> BTreeMap<String, BroadcasterProtocolSyncStatus> {
-        let protocol = match backend {
-            BroadcasterBackend::Native => "uniswap_v2",
-            BroadcasterBackend::Vm => "vm:curve",
-            BroadcasterBackend::Rfq => "rfq:bebop",
-        };
-        BTreeMap::from([(
-            protocol.to_string(),
-            BroadcasterProtocolSyncStatus {
-                kind: BroadcasterProtocolSyncStatusKind::Started,
-                block: None,
-                reason: None,
-            },
-        )])
-    }
-
     fn test_state_history_writer(
         sender: tokio::sync::mpsc::Sender<StateHistoryWriteCommand>,
         gap_record_task_limit: usize,
@@ -5796,5 +5808,1386 @@ mod tests {
         let envelope = update_envelope("stream-1", 1, BroadcasterBackend::Native, 10)?;
         assert_eq!(envelope.kind(), BroadcasterMessageKind::Update);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use simulator_core::broadcaster::{
+        BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProgress,
+        BroadcasterRedisStreamEntry,
+    };
+    use sqlx::{PgPool, Row};
+
+    use super::test_fixtures::{multi_backend_update_envelope, update_envelope};
+    use super::{
+        insert_block_timestamp, BlockTimestampMetadata, CheckpointArchiveMetadata,
+        CheckpointCompletion, CheckpointManifest, CheckpointManifestInput, CheckpointStatus,
+        HistoryRangeGapSource, HistoryRangeRequest, HistoryReplaySegment, IngestionGap,
+        StateHistoryPgStore, StreamObservation,
+    };
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn same_stream_newer_seq_supersedes(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                5,
+                BroadcasterBackend::Native,
+                100,
+                0x11,
+            ),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                6,
+                BroadcasterBackend::Native,
+                200,
+                0x22,
+            ),
+        )
+        .await?;
+
+        let record = block_timestamp(&store, 8453, 100).await?;
+        assert_eq!(record.source_message_seq, 6);
+        assert_eq!(record.timestamp_ms, 200);
+        assert_eq!(record.block_hash, vec![0x22; 32]);
+        assert!(record.updated_at > record.created_at);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn same_stream_stale_seq_kept(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                6,
+                BroadcasterBackend::Native,
+                200,
+                0x22,
+            ),
+        )
+        .await?;
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                5,
+                BroadcasterBackend::Native,
+                100,
+                0x11,
+            ),
+        )
+        .await?;
+
+        let record = block_timestamp(&store, 8453, 100).await?;
+        assert_eq!(record.source_message_seq, 6);
+        assert_eq!(record.timestamp_ms, 200);
+        assert_eq!(record.block_hash, vec![0x22; 32]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn same_stream_equal_seq_is_noop(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                6,
+                BroadcasterBackend::Native,
+                200,
+                0x22,
+            ),
+        )
+        .await?;
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                6,
+                BroadcasterBackend::Native,
+                999,
+                0x99,
+            ),
+        )
+        .await?;
+
+        let record = block_timestamp(&store, 8453, 100).await?;
+        assert_eq!(record.source_message_seq, 6);
+        assert_eq!(record.timestamp_ms, 200);
+        assert_eq!(record.block_hash, vec![0x22; 32]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn cross_stream_overwrites_regardless_of_seq(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                6,
+                BroadcasterBackend::Native,
+                200,
+                0x22,
+            ),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-b",
+                1,
+                BroadcasterBackend::Native,
+                300,
+                0x33,
+            ),
+        )
+        .await?;
+
+        let record = block_timestamp(&store, 8453, 100).await?;
+        assert_eq!(record.source_stream_id, "stream-b");
+        assert_eq!(record.source_message_seq, 1);
+        assert_eq!(record.timestamp_ms, 300);
+        assert_eq!(record.block_hash, vec![0x33; 32]);
+        assert!(record.updated_at > record.created_at);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn verbatim_redelivery_advances_provenance_only(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                5,
+                BroadcasterBackend::Native,
+                100,
+                0x11,
+            ),
+        )
+        .await?;
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                6,
+                BroadcasterBackend::Native,
+                100,
+                0x11,
+            ),
+        )
+        .await?;
+
+        let record = block_timestamp(&store, 8453, 100).await?;
+        assert_eq!(record.source_message_seq, 6);
+        assert_eq!(record.timestamp_ms, 100);
+        assert_eq!(record.block_hash, vec![0x11; 32]);
+        assert_eq!(record.updated_at, record.created_at);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn identical_redelivery_same_seq_noop(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                5,
+                BroadcasterBackend::Native,
+                100,
+                0x11,
+            ),
+        )
+        .await?;
+        insert_ts(
+            &store,
+            &ts_meta(
+                8453,
+                100,
+                "stream-a",
+                5,
+                BroadcasterBackend::Native,
+                100,
+                0x11,
+            ),
+        )
+        .await?;
+
+        let record = block_timestamp(&store, 8453, 100).await?;
+        assert_eq!(record.source_message_seq, 5);
+        assert_eq!(record.timestamp_ms, 100);
+        assert_eq!(record.updated_at, record.created_at);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn contiguous_chain_has_no_gap(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(&store, 8453, "s", 10, None, BroadcasterBackend::Native, 110).await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "s",
+            11,
+            Some(10),
+            BroadcasterBackend::Native,
+            111,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "s",
+            12,
+            Some(11),
+            BroadcasterBackend::Native,
+            112,
+        )
+        .await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "s", 10, None)])
+            .await?;
+        assert!(!gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn missing_middle_flags_gap(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(&store, 8453, "s", 10, None, BroadcasterBackend::Native, 110).await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "s",
+            11,
+            Some(10),
+            BroadcasterBackend::Native,
+            111,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "s",
+            13,
+            Some(12),
+            BroadcasterBackend::Native,
+            113,
+        )
+        .await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "s", 10, None)])
+            .await?;
+        assert!(gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn first_delta_prev_ge_from_flags_gap(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(
+            &store,
+            8453,
+            "s",
+            15,
+            Some(12),
+            BroadcasterBackend::Native,
+            115,
+        )
+        .await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "s", 10, None)])
+            .await?;
+        assert!(gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn first_delta_prev_lt_from_ok(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(
+            &store,
+            8453,
+            "s",
+            10,
+            Some(9),
+            BroadcasterBackend::Native,
+            110,
+        )
+        .await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "s", 10, None)])
+            .await?;
+        assert!(!gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn first_delta_prev_null_ok(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(&store, 8453, "s", 10, None, BroadcasterBackend::Native, 110).await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "s", 10, None)])
+            .await?;
+        assert!(!gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn cross_segment_handoff_validates_each_ordinal(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(
+            &store,
+            8453,
+            "old",
+            10,
+            None,
+            BroadcasterBackend::Native,
+            110,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "old",
+            11,
+            Some(10),
+            BroadcasterBackend::Native,
+            111,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "old",
+            12,
+            Some(11),
+            BroadcasterBackend::Native,
+            112,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "new",
+            1,
+            None,
+            BroadcasterBackend::Native,
+            120,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "new",
+            2,
+            Some(1),
+            BroadcasterBackend::Native,
+            121,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "new",
+            3,
+            Some(2),
+            BroadcasterBackend::Native,
+            122,
+        )
+        .await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "old", 10, None), seg(1, "new", 1, None)])
+            .await?;
+        assert!(!gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn handoff_hole_in_second_segment_flags(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_with_prev(
+            &store,
+            8453,
+            "old",
+            10,
+            None,
+            BroadcasterBackend::Native,
+            110,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "old",
+            11,
+            Some(10),
+            BroadcasterBackend::Native,
+            111,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "old",
+            12,
+            Some(11),
+            BroadcasterBackend::Native,
+            112,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "new",
+            1,
+            None,
+            BroadcasterBackend::Native,
+            120,
+        )
+        .await?;
+        persist_with_prev(
+            &store,
+            8453,
+            "new",
+            3,
+            Some(2),
+            BroadcasterBackend::Native,
+            122,
+        )
+        .await?;
+
+        let gap = store
+            .persisted_chain_gap_exists(8453, &[seg(0, "old", 10, None), seg(1, "new", 1, None)])
+            .await?;
+        assert!(gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn empty_segments_is_no_gap(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+
+        let gap = store.persisted_chain_gap_exists(8453, &[]).await?;
+        assert!(!gap);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn skips_writing_and_failed(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let writing = checkpoint_meta(
+            "writing",
+            100,
+            1_000,
+            None,
+            vec![BroadcasterBackend::Native],
+        );
+        store
+            .create_checkpoint_manifest(&checkpoint_input(writing))
+            .await?;
+        let failed = checkpoint_meta("failed", 100, 1_001, None, vec![BroadcasterBackend::Native]);
+        let failed_id = store
+            .create_checkpoint_manifest(&checkpoint_input(failed))
+            .await?;
+        store.mark_checkpoint_failed(failed_id, "failed").await?;
+        let complete_id = complete_checkpoint(
+            &store,
+            checkpoint_meta("complete", 90, 900, None, vec![BroadcasterBackend::Native]),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, complete_id);
+        assert_eq!(checkpoint.metadata.block_number, 90);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn respects_block_upper_bound(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let eligible_id = complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-90", 90, 900, None, vec![BroadcasterBackend::Native]),
+        )
+        .await?;
+        complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-110", 110, 1_100, None, vec![BroadcasterBackend::Native]),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, eligible_id);
+        assert_eq!(checkpoint.metadata.block_number, 90);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn picks_highest_eligible_block(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-80", 80, 800, None, vec![BroadcasterBackend::Native]),
+        )
+        .await?;
+        let expected_id = complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-95", 95, 950, None, vec![BroadcasterBackend::Native]),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, expected_id);
+        assert_eq!(checkpoint.metadata.block_number, 95);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn scope_containment(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let expected_id = complete_checkpoint(
+            &store,
+            checkpoint_meta(
+                "cp-native-vm",
+                100,
+                1_000,
+                None,
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+            ),
+        )
+        .await?;
+        complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-vm", 100, 1_001, None, vec![BroadcasterBackend::Vm]),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, expected_id);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn scope_requires_all_requested(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let expected_id = complete_checkpoint(
+            &store,
+            checkpoint_meta(
+                "cp-native-vm-rfq",
+                100,
+                1_000,
+                Some(4_000),
+                vec![
+                    BroadcasterBackend::Native,
+                    BroadcasterBackend::Vm,
+                    BroadcasterBackend::Rfq,
+                ],
+            ),
+        )
+        .await?;
+        complete_checkpoint(
+            &store,
+            checkpoint_meta(
+                "cp-native-vm",
+                100,
+                1_001,
+                None,
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+            ),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &rfq_request(
+                8453,
+                100,
+                200,
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                5_000,
+                9_000,
+            )?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, expected_id);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn rfq_cursor_upper_bound(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let scope = vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq];
+        let expected_id = complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-a", 100, 1_000, Some(4_000), scope.clone()),
+        )
+        .await?;
+        complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-b", 100, 1_001, Some(6_000), scope.clone()),
+        )
+        .await?;
+        complete_checkpoint(&store, checkpoint_meta("cp-c", 100, 1_002, None, scope)).await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &rfq_request(
+                8453,
+                100,
+                200,
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                5_000,
+                9_000,
+            )?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, expected_id);
+        assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, Some(4_000));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn tiebreak_rfq_then_captured(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let scope = vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq];
+        complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-a", 100, 1_000, Some(4_000), scope.clone()),
+        )
+        .await?;
+        let expected_id = complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-b", 100, 2_000, Some(4_000), scope),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &rfq_request(
+                8453,
+                100,
+                200,
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                9_000,
+                10_000,
+            )?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, expected_id);
+        assert_eq!(checkpoint.metadata.captured_at_timestamp_ms, 2_000);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn rfq_desc_nulls_last_when_no_rfq_request(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let scope = vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq];
+        complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-a", 100, 1_000, None, scope.clone()),
+        )
+        .await?;
+        let expected_id = complete_checkpoint(
+            &store,
+            checkpoint_meta("cp-b", 100, 1_000, Some(5_000), scope),
+        )
+        .await?;
+
+        let checkpoint = latest_checkpoint(
+            &store,
+            &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+        )
+        .await?;
+        assert_eq!(checkpoint.id, expected_id);
+        assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, Some(5_000));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn uncovered_delta_flags_switch(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s2", 5, BroadcasterBackend::Native, 150).await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &base_switch_request()?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                None,
+            )
+            .await?;
+        assert_generation_switch(gap, "cp-stream")?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn covered_delta_passes(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s1", 5, BroadcasterBackend::Native, 150).await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &base_switch_request()?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                None,
+            )
+            .await?;
+        assert!(gap.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn out_of_range_uncovered_delta_ignored(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s2", 5, BroadcasterBackend::Native, 50).await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &base_switch_request()?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                None,
+            )
+            .await?;
+        assert!(gap.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn recorded_gap_outside_exempt_flags(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        store
+            .record_gap(&gap_row(
+                8453,
+                "s2",
+                2,
+                4,
+                vec![BroadcasterBackend::Native],
+                Some((120, 130)),
+                None,
+            ))
+            .await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &base_switch_request()?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                None,
+            )
+            .await?;
+        assert_generation_switch(gap, "cp-stream")?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn recorded_gap_within_exempt_passes(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        store
+            .record_gap(&gap_row(
+                8453,
+                "s1",
+                2,
+                4,
+                vec![BroadcasterBackend::Native],
+                Some((120, 130)),
+                None,
+            ))
+            .await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &base_switch_request()?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                None,
+            )
+            .await?;
+        assert!(gap.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn rfq_delta_in_window_flags_switch(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s2", 5, BroadcasterBackend::Rfq, 1_500).await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &rfq_request(
+                    8453,
+                    100,
+                    200,
+                    vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                    1_000,
+                    2_000,
+                )?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                Some(1_000),
+            )
+            .await?;
+        assert_generation_switch(gap, "cp-stream")?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn progress_marker_backend_flags_switch(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist_progress(&store, 8453, "s2", 5, vec![BroadcasterBackend::Native]).await?;
+
+        let gap = store
+            .generation_switch_gap_for_range(
+                &base_switch_request()?,
+                &manifest("cp-stream"),
+                &[seg(0, "s1", 1, Some(10))],
+                100,
+                None,
+            )
+            .await?;
+        assert_generation_switch(gap, "cp-stream")?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn orders_by_ordinal_then_seq_over_id(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let new_1 = persist(&store, 8453, "new", 1, BroadcasterBackend::Native, 100).await?;
+        let new_2 = persist(&store, 8453, "new", 2, BroadcasterBackend::Native, 101).await?;
+        let old_1 = persist(&store, 8453, "old", 1, BroadcasterBackend::Native, 100).await?;
+        let old_2 = persist(&store, 8453, "old", 2, BroadcasterBackend::Native, 101).await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+                &[seg(0, "old", 1, Some(100)), seg(1, "new", 1, Some(100))],
+                100,
+                None,
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![old_1, old_2, new_1, new_2]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn orders_by_message_seq_within_segment(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let seq_3 = persist(&store, 8453, "s", 3, BroadcasterBackend::Native, 103).await?;
+        let seq_1 = persist(&store, 8453, "s", 1, BroadcasterBackend::Native, 101).await?;
+        let seq_2 = persist(&store, 8453, "s", 2, BroadcasterBackend::Native, 102).await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+                &[seg(0, "s", 1, Some(100))],
+                100,
+                None,
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![seq_1, seq_2, seq_3]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn block_bounds_inclusive(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s", 1, BroadcasterBackend::Native, 99).await?;
+        let at_start = persist(&store, 8453, "s", 2, BroadcasterBackend::Native, 100).await?;
+        let at_end = persist(&store, 8453, "s", 3, BroadcasterBackend::Native, 200).await?;
+        persist(&store, 8453, "s", 4, BroadcasterBackend::Native, 201).await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+                &[seg(0, "s", 1, Some(100))],
+                100,
+                None,
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![at_start, at_end]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn segment_seq_bounds_inclusive(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s", 4, BroadcasterBackend::Native, 104).await?;
+        let seq_5 = persist(&store, 8453, "s", 5, BroadcasterBackend::Native, 105).await?;
+        let seq_8 = persist(&store, 8453, "s", 8, BroadcasterBackend::Native, 108).await?;
+        persist(&store, 8453, "s", 9, BroadcasterBackend::Native, 109).await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+                &[seg(0, "s", 5, Some(8))],
+                100,
+                None,
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![seq_5, seq_8]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn backend_scope_honors_request(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let native = persist(&store, 8453, "s", 1, BroadcasterBackend::Native, 100).await?;
+        persist(&store, 8453, "s", 2, BroadcasterBackend::Vm, 100).await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &block_request(8453, 100, 200, vec![BroadcasterBackend::Native])?,
+                &[seg(0, "s", 1, Some(100))],
+                100,
+                None,
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![native]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn dedup_multi_backend_index(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        let delta = persist_multi_backend(
+            &store,
+            8453,
+            "s",
+            1,
+            [
+                (BroadcasterBackend::Native, 100),
+                (BroadcasterBackend::Vm, 100),
+            ],
+        )
+        .await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &block_request(
+                    8453,
+                    100,
+                    200,
+                    vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+                )?,
+                &[seg(0, "s", 1, Some(100))],
+                100,
+                None,
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![delta]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL Postgres; run scripts/verify_state_history_postgres.sh"]
+    async fn rfq_timestamp_window_inclusive(pool: sqlx::PgPool) -> Result<()> {
+        let store = store(pool);
+        persist(&store, 8453, "s", 1, BroadcasterBackend::Rfq, 999).await?;
+        let rfq_start = persist(&store, 8453, "s", 2, BroadcasterBackend::Rfq, 1_000).await?;
+        let rfq_end = persist(&store, 8453, "s", 3, BroadcasterBackend::Rfq, 2_000).await?;
+        persist(&store, 8453, "s", 4, BroadcasterBackend::Rfq, 2_001).await?;
+        let native = persist(&store, 8453, "s", 5, BroadcasterBackend::Native, 150).await?;
+
+        let rows = store
+            .deltas_for_segmented_range(
+                &rfq_request(
+                    8453,
+                    100,
+                    200,
+                    vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+                    1_000,
+                    2_000,
+                )?,
+                &[seg(0, "s", 1, Some(100))],
+                100,
+                Some(1_000),
+            )
+            .await?;
+        assert_eq!(ids(rows), vec![rfq_start, rfq_end, native]);
+        Ok(())
+    }
+
+    fn store(pool: PgPool) -> StateHistoryPgStore {
+        StateHistoryPgStore::from_pool(pool)
+    }
+
+    async fn persist(
+        store: &StateHistoryPgStore,
+        chain_id: u64,
+        stream_id: &str,
+        message_seq: u64,
+        backend: BroadcasterBackend,
+        cursor: u64,
+    ) -> Result<i64> {
+        let envelope = update_envelope(stream_id, message_seq, backend, cursor)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope)?;
+        let redis_entry_id = format!("1-{message_seq}");
+        Ok(store.insert_entry(&entry, Some(&redis_entry_id)).await?.id)
+    }
+
+    async fn persist_with_prev(
+        store: &StateHistoryPgStore,
+        chain_id: u64,
+        stream_id: &str,
+        message_seq: u64,
+        prev_persistable_message_seq: Option<u64>,
+        backend: BroadcasterBackend,
+        cursor: u64,
+    ) -> Result<i64> {
+        let envelope = update_envelope(stream_id, message_seq, backend, cursor)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope)?;
+        let observation = StreamObservation::for_entry(&entry, message_seq)?;
+        let redis_entry_id = format!("1-{message_seq}");
+        Ok(store
+            .insert_entry_with_prev(
+                &entry,
+                Some(&redis_entry_id),
+                prev_persistable_message_seq,
+                observation,
+            )
+            .await?
+            .id)
+    }
+
+    async fn persist_multi_backend(
+        store: &StateHistoryPgStore,
+        chain_id: u64,
+        stream_id: &str,
+        message_seq: u64,
+        partitions: impl IntoIterator<Item = (BroadcasterBackend, u64)>,
+    ) -> Result<i64> {
+        let envelope = multi_backend_update_envelope(stream_id, message_seq, partitions)?;
+        let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope)?;
+        let redis_entry_id = format!("1-{message_seq}");
+        Ok(store.insert_entry(&entry, Some(&redis_entry_id)).await?.id)
+    }
+
+    async fn persist_progress(
+        store: &StateHistoryPgStore,
+        chain_id: u64,
+        stream_id: &str,
+        message_seq: u64,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<i64> {
+        let progress =
+            BroadcasterProgress::new(chain_id, "snapshot-1", backends, "generation progress")?;
+        let envelope = BroadcasterEnvelope::new(
+            stream_id,
+            message_seq,
+            BroadcasterPayload::Progress(progress),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope)?;
+        let redis_entry_id = format!("1-{message_seq}");
+        Ok(store.insert_entry(&entry, Some(&redis_entry_id)).await?.id)
+    }
+
+    async fn insert_ts(
+        store: &StateHistoryPgStore,
+        metadata: &BlockTimestampMetadata,
+    ) -> Result<()> {
+        let mut tx = store.pool.begin().await?;
+        insert_block_timestamp(&mut tx, metadata).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn ts_meta(
+        chain_id: u64,
+        block_number: u64,
+        stream_id: &str,
+        message_seq: u64,
+        backend: BroadcasterBackend,
+        timestamp_ms: u64,
+        seed: u8,
+    ) -> BlockTimestampMetadata {
+        BlockTimestampMetadata {
+            chain_id,
+            block_number,
+            timestamp_ms,
+            block_hash: vec![seed; 32],
+            parent_hash: vec![seed.saturating_add(1); 32],
+            source_stream_id: stream_id.to_string(),
+            source_message_seq: message_seq,
+            source_backend: backend,
+            source_protocol: "uniswap_v2".to_string(),
+        }
+    }
+
+    fn seg(
+        ordinal: i64,
+        stream_id: &str,
+        from_message_seq: u64,
+        to_message_seq: Option<u64>,
+    ) -> HistoryReplaySegment {
+        HistoryReplaySegment {
+            ordinal,
+            stream_id: stream_id.to_string(),
+            from_message_seq,
+            to_message_seq,
+        }
+    }
+
+    fn block_request(
+        chain_id: u64,
+        start_block_number: u64,
+        end_block_number: u64,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<HistoryRangeRequest> {
+        HistoryRangeRequest::new(chain_id, start_block_number, end_block_number, backends)
+    }
+
+    fn rfq_request(
+        chain_id: u64,
+        start_block_number: u64,
+        end_block_number: u64,
+        backends: Vec<BroadcasterBackend>,
+        start_timestamp_ms: u64,
+        end_timestamp_ms: u64,
+    ) -> Result<HistoryRangeRequest> {
+        HistoryRangeRequest::new(chain_id, start_block_number, end_block_number, backends)?
+            .with_rfq_timestamp_range(start_timestamp_ms, end_timestamp_ms)
+    }
+
+    fn base_switch_request() -> Result<HistoryRangeRequest> {
+        block_request(8453, 100, 200, vec![BroadcasterBackend::Native])
+    }
+
+    fn manifest(stream_id: &str) -> CheckpointManifest {
+        CheckpointManifest {
+            id: 1,
+            metadata: CheckpointArchiveMetadata {
+                chain_id: 8453,
+                block_number: 100,
+                captured_at_timestamp_ms: 1_000,
+                rfq_update_timestamp_ms: None,
+                stream_id: stream_id.to_string(),
+                source_message_seq: 1,
+                backends: vec![BroadcasterBackend::Native],
+            },
+            s3_bucket: "state-history".to_string(),
+            s3_key: "checkpoint.zst".to_string(),
+            payload_hash: Some("hash".to_string()),
+            payload_bytes: Some(10),
+            compressed_bytes: Some(8),
+            status: CheckpointStatus::Complete,
+            error: None,
+        }
+    }
+
+    async fn complete_checkpoint(
+        store: &StateHistoryPgStore,
+        metadata: CheckpointArchiveMetadata,
+    ) -> Result<i64> {
+        let id = store
+            .create_checkpoint_manifest(&checkpoint_input(metadata))
+            .await?;
+        store
+            .mark_checkpoint_complete_with_block_timestamps(
+                id,
+                &CheckpointCompletion {
+                    payload_hash: "hash".to_string(),
+                    payload_bytes: 10,
+                    compressed_bytes: 8,
+                },
+                &[],
+            )
+            .await?;
+        Ok(id)
+    }
+
+    fn checkpoint_meta(
+        stream_id: &str,
+        block_number: u64,
+        captured_at_timestamp_ms: u64,
+        rfq_update_timestamp_ms: Option<u64>,
+        backends: Vec<BroadcasterBackend>,
+    ) -> CheckpointArchiveMetadata {
+        CheckpointArchiveMetadata {
+            chain_id: 8453,
+            block_number,
+            captured_at_timestamp_ms,
+            rfq_update_timestamp_ms,
+            stream_id: stream_id.to_string(),
+            source_message_seq: 42,
+            backends,
+        }
+    }
+
+    fn checkpoint_input(metadata: CheckpointArchiveMetadata) -> CheckpointManifestInput {
+        let s3_key = format!("{}.zst", metadata.stream_id);
+        CheckpointManifestInput {
+            metadata,
+            s3_bucket: "state-history".to_string(),
+            s3_key,
+        }
+    }
+
+    async fn latest_checkpoint(
+        store: &StateHistoryPgStore,
+        request: &HistoryRangeRequest,
+    ) -> Result<CheckpointManifest> {
+        store
+            .latest_checkpoint_for_request(request)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected checkpoint"))
+    }
+
+    fn gap_row(
+        chain_id: u64,
+        stream_id: &str,
+        from_message_seq: u64,
+        to_message_seq: u64,
+        backend_scope: Vec<BroadcasterBackend>,
+        block_range: Option<(u64, u64)>,
+        timestamp_range: Option<(u64, u64)>,
+    ) -> IngestionGap {
+        let (from_block_number, to_block_number) = match block_range {
+            Some((from, to)) => (Some(from), Some(to)),
+            None => (None, None),
+        };
+        let (from_timestamp_ms, to_timestamp_ms) = match timestamp_range {
+            Some((from, to)) => (Some(from), Some(to)),
+            None => (None, None),
+        };
+        IngestionGap {
+            chain_id,
+            stream_id: stream_id.to_string(),
+            from_message_seq,
+            to_message_seq,
+            backend_scope,
+            from_block_number,
+            to_block_number,
+            from_timestamp_ms,
+            to_timestamp_ms,
+            reason: "fixture gap".to_string(),
+        }
+    }
+
+    async fn block_timestamp(
+        store: &StateHistoryPgStore,
+        chain_id: u64,
+        block_number: u64,
+    ) -> Result<super::BlockTimestampRecord> {
+        store
+            .block_timestamp_record(chain_id, block_number)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected block timestamp"))
+    }
+
+    fn assert_generation_switch(
+        gap: Option<super::HistoryRangeGap>,
+        checkpoint_stream: &str,
+    ) -> Result<()> {
+        let gap = gap.ok_or_else(|| anyhow::anyhow!("expected generation-switch gap"))?;
+        assert_eq!(gap.source, HistoryRangeGapSource::GenerationSwitch);
+        assert!(gap.reason.contains(checkpoint_stream));
+        Ok(())
+    }
+
+    fn ids(rows: Vec<sqlx::postgres::PgRow>) -> Vec<i64> {
+        rows.into_iter().map(|row| row.get("id")).collect()
     }
 }
