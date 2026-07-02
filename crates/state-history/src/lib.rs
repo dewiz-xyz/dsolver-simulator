@@ -850,6 +850,21 @@ fn segment_to_message_seq(segments: &[HistoryReplaySegment]) -> Result<Vec<i64>>
         .collect()
 }
 
+fn ingestion_gap_within_segments(
+    segments: &[HistoryReplaySegment],
+    stream_id: &str,
+    from_message_seq: u64,
+    to_message_seq: u64,
+) -> bool {
+    segments.iter().any(|segment| {
+        segment.stream_id == stream_id
+            && from_message_seq >= segment.from_message_seq
+            && segment
+                .to_message_seq
+                .is_none_or(|tail| to_message_seq <= tail)
+    })
+}
+
 fn valid_redis_stream_entry_pair(stream_id: &str, entry_id: &str) -> Option<(u64, u64)> {
     let stream_generation = redis_stream_generation(stream_id)?;
     let (entry_generation, message_seq) = redis_entry_id_parts(entry_id)?;
@@ -1773,7 +1788,17 @@ impl StateHistoryPgStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(switched_stream_exists.map(|_| HistoryRangeGap {
+        let switched = switched_stream_exists.is_some()
+            || self
+                .unexempt_ingestion_gap_exists(
+                    request,
+                    switch_exempt_segments,
+                    replay_from_block_number,
+                    rfq_replay_from_timestamp_ms,
+                )
+                .await?;
+
+        Ok(switched.then(|| HistoryRangeGap {
             source: HistoryRangeGapSource::GenerationSwitch,
             backend_scope: request.backends.clone(),
             from_block_number: Some(request.start_block_number),
@@ -1785,6 +1810,78 @@ impl StateHistoryPgStore {
                 checkpoint.metadata.stream_id
             ),
         }))
+    }
+
+    async fn unexempt_ingestion_gap_exists(
+        &self,
+        request: &HistoryRangeRequest,
+        switch_exempt_segments: &[HistoryReplaySegment],
+        replay_from_block_number: u64,
+        rfq_replay_from_timestamp_ms: Option<u64>,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            r#"
+            SELECT stream_id, from_message_seq, to_message_seq
+            FROM state_history.ingestion_gaps
+            WHERE chain_id = $1
+                AND backend_scope && $2::text[]
+                AND (
+                    (
+                        from_block_number IS NOT NULL
+                        AND to_block_number IS NOT NULL
+                        AND from_block_number <= $3
+                        AND to_block_number >= $4
+                    )
+                    OR (
+                        $5::boolean
+                        AND from_timestamp_ms IS NOT NULL
+                        AND to_timestamp_ms IS NOT NULL
+                        AND from_timestamp_ms <= $6
+                        AND to_timestamp_ms >= $7
+                    )
+                    OR (
+                        from_block_number IS NULL
+                        AND to_block_number IS NULL
+                        AND from_timestamp_ms IS NULL
+                        AND to_timestamp_ms IS NULL
+                    )
+                )
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(backend_scope_strings(&request.backends))
+        .bind(u64_to_i64("end_block_number", request.end_block_number)?)
+        .bind(u64_to_i64(
+            "replay_from_block_number",
+            replay_from_block_number,
+        )?)
+        .bind(request.includes_rfq())
+        .bind(
+            optional_u64_to_i64("rfq_end_timestamp_ms", request.rfq_end_timestamp_ms)?.unwrap_or(0),
+        )
+        .bind(
+            optional_u64_to_i64("rfq_replay_from_timestamp_ms", rfq_replay_from_timestamp_ms)?
+                .unwrap_or(0),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load state history gaps for generation switch detection")?;
+
+        for row in rows {
+            let stream_id: String = row.get("stream_id");
+            let from_message_seq = i64_to_u64("from_message_seq", row.get("from_message_seq"))?;
+            let to_message_seq = i64_to_u64("to_message_seq", row.get("to_message_seq"))?;
+            if !ingestion_gap_within_segments(
+                switch_exempt_segments,
+                &stream_id,
+                from_message_seq,
+                to_message_seq,
+            ) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -2409,11 +2506,12 @@ mod tests {
     use super::{
         build_validated_history_segments, build_validated_replay_segments,
         decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
-        ingestion_gap_for_entry, optional_u64_to_i64, prepare_delta_message, u64_to_i64,
-        writer_retry_backoff, CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest,
-        CheckpointPayload, CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap,
-        HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest, HistoryReplaySegment,
-        StoredGenerationHandoff, StoredGenerationHandoffs, WRITER_RETRY_BACKOFF_CAP,
+        ingestion_gap_for_entry, ingestion_gap_within_segments, optional_u64_to_i64,
+        prepare_delta_message, u64_to_i64, writer_retry_backoff, CheckpointArchive,
+        CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload, CheckpointStatus,
+        DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource, HistoryRangePlan,
+        HistoryRangeRequest, HistoryReplaySegment, StoredGenerationHandoff,
+        StoredGenerationHandoffs, WRITER_RETRY_BACKOFF_CAP,
     };
 
     #[test]
@@ -2721,6 +2819,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unseen_generation_gap_rows_are_not_exempt_from_switch_detection() {
+        let checkpoint = checkpoint_manifest_with_stream("chain-8453-stream-2", 2);
+        let handoffs = stored_handoffs([stored_handoff(
+            "chain-8453-stream-1",
+            "1-4",
+            "chain-8453-stream-2",
+            "2-1",
+        )]);
+        let segments = build_validated_history_segments(&checkpoint, &handoffs);
+        let exempt = segments.generation_switch_exempt_segments.as_slice();
+
+        assert!(!ingestion_gap_within_segments(
+            exempt,
+            "chain-8453-stream-3",
+            1,
+            1
+        ));
+        assert!(!ingestion_gap_within_segments(
+            exempt,
+            "chain-8453-stream-1",
+            3,
+            6
+        ));
+        assert!(ingestion_gap_within_segments(
+            exempt,
+            "chain-8453-stream-1",
+            2,
+            4
+        ));
+        assert!(ingestion_gap_within_segments(
+            exempt,
+            "chain-8453-stream-2",
+            5,
+            9
+        ));
     }
 
     #[test]

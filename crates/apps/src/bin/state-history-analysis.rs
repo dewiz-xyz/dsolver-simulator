@@ -98,6 +98,11 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         )
         .await?;
 
+    record_unseen_generation_gap(&pg_store, chain_id).await?;
+    let unseen_generation_gap_plan = reader.resolve_range(request.clone()).await?;
+    let unseen_generation_gap_switch_gaps =
+        assert_generation_switch_gap(&unseen_generation_gap_plan)?;
+
     insert_old_generation_continuation_delta(&pg_store, chain_id, &stream_id).await?;
     let old_generation_plan = reader.resolve_range(request.clone()).await?;
     assert_generation_switch_gap(&old_generation_plan)?;
@@ -132,6 +137,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         recorded_gaps,
         valid_generation_switch_gaps,
         post_handoff_checkpoint_generation_switch_gaps,
+        unseen_generation_gap_switch_gaps,
         generation_switch_gaps,
     })
 }
@@ -359,6 +365,24 @@ async fn record_visible_gap_fixtures(
             })
             .await?;
     }
+    Ok(())
+}
+
+async fn record_unseen_generation_gap(pg_store: &StateHistoryPgStore, chain_id: u64) -> Result<()> {
+    pg_store
+        .record_gap(&IngestionGap {
+            chain_id,
+            stream_id: format!("chain-{chain_id}-stream-3"),
+            from_message_seq: 1,
+            to_message_seq: 1,
+            backend_scope: vec![BroadcasterBackend::Native],
+            from_block_number: Some(108),
+            to_block_number: Some(109),
+            from_timestamp_ms: None,
+            to_timestamp_ms: None,
+            reason: "state history analysis unseen-generation gap".to_string(),
+        })
+        .await?;
     Ok(())
 }
 
@@ -693,5 +717,6 @@ struct StateHistoryAnalysisReport {
     recorded_gaps: usize,
     valid_generation_switch_gaps: usize,
     post_handoff_checkpoint_generation_switch_gaps: usize,
+    unseen_generation_gap_switch_gaps: usize,
     generation_switch_gaps: usize,
 }
