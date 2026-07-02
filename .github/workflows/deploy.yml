@@ -93,7 +93,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build & push broadcaster image
-        if: matrix.target == 'quoter-base'
+        if: matrix.target == 'quoter-base' || matrix.target == 'staging-solve-base'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -111,3 +111,16 @@ jobs:
           CLUSTER: ${{ matrix.target }}
         run: |
           aws ecs update-service --cluster "$CLUSTER" --service tycho-simulator --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text
+
+      - name: Force deploy broadcaster ECS service
+        if: matrix.target == 'quoter-base' || matrix.target == 'staging-solve-base'
+        env:
+          CLUSTER: ${{ matrix.target }}
+        run: |
+          # The broadcaster service may not exist yet because its infra lands separately, so skip instead of failing.
+          STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services broadcaster --region ${{ env.AWS_REGION }} --query 'services[0].status' --output text 2>/dev/null || echo "MISSING")
+          if [ "$STATUS" = "ACTIVE" ]; then
+            aws ecs update-service --cluster "$CLUSTER" --service broadcaster --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text
+          else
+            echo "broadcaster service not ACTIVE in $CLUSTER (status: $STATUS), skipping force deploy"
+          fi
