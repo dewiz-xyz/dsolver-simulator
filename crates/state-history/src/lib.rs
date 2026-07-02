@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Cursor;
 use std::sync::{
@@ -9,17 +9,19 @@ use std::sync::{
 use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
-    BroadcasterPayload, BroadcasterRedisStreamEntry,
+    BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
+    BroadcasterRedisStreamEntry,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row};
 use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const CHECKPOINT_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const ZSTD_LEVEL: i32 = 3;
@@ -110,6 +112,7 @@ pub struct PreparedDeltaMessage {
 pub struct PersistedDelta {
     pub id: i64,
     pub inserted: bool,
+    pub skipped_block_timestamp_records: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +232,39 @@ pub struct HistoryRangePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacktestRangeRequest {
+    pub chain_id: u64,
+    pub start_block_number: u64,
+    pub end_block_number: u64,
+    pub backends: Vec<BroadcasterBackend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacktestRangePlan {
+    pub request: BacktestRangeRequest,
+    pub start_block_timestamp_ms: Option<u64>,
+    pub end_block_timestamp_ms: Option<u64>,
+    pub history: HistoryRangePlan,
+}
+
+// Chain timestamps for start, end, and end + 1, fetched in one query. The next
+// block timestamp bounds the RFQ range because RFQ updates observed during the
+// end block's head tenure carry cursors past the end block's own timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BacktestBoundaryTimestamps {
+    start_block_timestamp_ms: u64,
+    end_block_timestamp_ms: u64,
+    next_block_timestamp_ms: u64,
+}
+
+impl BacktestBoundaryTimestamps {
+    fn rfq_end_timestamp_ms(&self) -> u64 {
+        // Safe: assembly rejects next <= end, so next is at least 1.
+        self.next_block_timestamp_ms - 1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRangeGap {
     pub source: HistoryRangeGapSource,
     pub backend_scope: Vec<BroadcasterBackend>,
@@ -291,6 +327,36 @@ pub struct StateHistoryReader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockTimestampMetadata {
+    chain_id: u64,
+    block_number: u64,
+    timestamp_ms: u64,
+    block_hash: Vec<u8>,
+    parent_hash: Vec<u8>,
+    source_stream_id: String,
+    source_message_seq: u64,
+    source_backend: BroadcasterBackend,
+    source_protocol: String,
+}
+
+// Full readback of a stored block timestamp row, timestamps at PG precision so
+// harness checks can compare created_at and updated_at without ms truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockTimestampRecord {
+    pub chain_id: u64,
+    pub block_number: u64,
+    pub timestamp_ms: u64,
+    pub block_hash: Vec<u8>,
+    pub parent_hash: Vec<u8>,
+    pub source_stream_id: String,
+    pub source_message_seq: u64,
+    pub source_backend: BroadcasterBackend,
+    pub source_protocol: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateHistoryWriterConfig {
     pub queue_capacity: usize,
     pub retry_window: Duration,
@@ -316,6 +382,7 @@ pub struct StateHistoryWriterSnapshot {
     pub recorded_gaps: u64,
     pub dropped_deltas: u64,
     pub failed_deltas: u64,
+    pub skipped_block_timestamp_records: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_persisted_stream_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -333,6 +400,7 @@ pub struct StateHistoryCheckpointWriterSnapshot {
     pub attempted_checkpoints: u64,
     pub completed_checkpoints: u64,
     pub failed_checkpoints: u64,
+    pub skipped_block_timestamp_records: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_checkpoint_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -753,6 +821,253 @@ impl BackendHeadObservation {
     }
 }
 
+// Shared block-timestamp extraction over live deltas and checkpoint archives. Rows are
+// keyed by height so one collection window yields at most one upsert per block, and
+// conflicting same-height content poisons that height for the rest of the window.
+#[derive(Debug, Default)]
+struct BlockTimestampCollector {
+    rows: BTreeMap<u64, BlockTimestampMetadata>,
+    conflicted: BTreeSet<u64>,
+    skipped_records: u64,
+}
+
+#[derive(Debug, Default)]
+struct CollectedBlockTimestamps {
+    // Ascending block_number so multi-row transactions share one lock order.
+    rows: Vec<BlockTimestampMetadata>,
+    skipped_records: u64,
+}
+
+impl BlockTimestampCollector {
+    fn record_skip(&mut self) {
+        self.skipped_records = self.skipped_records.saturating_add(1);
+    }
+
+    fn stage(&mut self, candidate: BlockTimestampMetadata) {
+        if self.conflicted.contains(&candidate.block_number) {
+            return;
+        }
+        match self.rows.entry(candidate.block_number) {
+            btree_map::Entry::Vacant(slot) => {
+                slot.insert(candidate);
+            }
+            btree_map::Entry::Occupied(slot) => {
+                let staged = slot.get();
+                if staged.timestamp_ms == candidate.timestamp_ms
+                    && staged.block_hash == candidate.block_hash
+                    && staged.parent_hash == candidate.parent_hash
+                {
+                    // Identical content, first-seen candidate keeps provenance.
+                    return;
+                }
+                // The envelope disagrees with itself about this height, likely a mid-reorg
+                // capture. Persisting either version would pin arbitrary data, so drop the
+                // height and let a later envelope supply it.
+                warn!(
+                    event = "state_history_block_timestamp_conflict_skipped",
+                    chain_id = candidate.chain_id,
+                    block_number = candidate.block_number,
+                    "Skipping block timestamp height with conflicting records in one collection window"
+                );
+                slot.remove();
+                self.conflicted.insert(candidate.block_number);
+                self.record_skip();
+            }
+        }
+    }
+
+    fn finish(self) -> CollectedBlockTimestamps {
+        CollectedBlockTimestamps {
+            rows: self.rows.into_values().collect(),
+            skipped_records: self.skipped_records,
+        }
+    }
+}
+
+fn collect_block_timestamps_from_payload(
+    collector: &mut BlockTimestampCollector,
+    chain_id: u64,
+    source_stream_id: &str,
+    source_message_seq: u64,
+    payload: &BroadcasterPayload,
+) {
+    match payload {
+        BroadcasterPayload::Update(update) => {
+            for partition in &update.partitions {
+                collect_block_timestamps_from_partition(
+                    collector,
+                    chain_id,
+                    source_stream_id,
+                    source_message_seq,
+                    partition.backend,
+                    &partition.messages,
+                    &partition.sync_statuses,
+                );
+            }
+        }
+        BroadcasterPayload::SnapshotChunk(chunk) => {
+            for partition in &chunk.partitions {
+                collect_block_timestamps_from_partition(
+                    collector,
+                    chain_id,
+                    source_stream_id,
+                    source_message_seq,
+                    partition.backend,
+                    &partition.messages,
+                    &partition.sync_statuses,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_block_timestamps_from_partition(
+    collector: &mut BlockTimestampCollector,
+    chain_id: u64,
+    source_stream_id: &str,
+    source_message_seq: u64,
+    backend: BroadcasterBackend,
+    messages: &[BroadcasterProtocolMessage],
+    sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
+) {
+    // Only chain backends carry block headers. This filter is load-bearing on the
+    // snapshot path: source_backend has a CHECK IN ('native','vm') constraint, so an
+    // RFQ row would abort the surrounding transaction.
+    if !matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm) {
+        return;
+    }
+    for message in messages {
+        let header = &message.message.header;
+        let Some(timestamp_ms) = block_timestamp_ms_from_seconds(header.timestamp) else {
+            warn_block_timestamp_overflow(chain_id, header.number, header.timestamp);
+            collector.record_skip();
+            continue;
+        };
+        collector.stage(BlockTimestampMetadata {
+            chain_id,
+            block_number: header.number,
+            timestamp_ms,
+            block_hash: header.hash.as_ref().to_vec(),
+            parent_hash: header.parent_hash.as_ref().to_vec(),
+            source_stream_id: source_stream_id.to_string(),
+            source_message_seq,
+            source_backend: backend,
+            source_protocol: message.protocol.clone(),
+        });
+    }
+    for (protocol, status) in sync_statuses {
+        let Some(block) = &status.block else {
+            continue;
+        };
+        let Some(timestamp_ms) = block_timestamp_ms_from_seconds(block.timestamp) else {
+            warn_block_timestamp_overflow(chain_id, block.number, block.timestamp);
+            collector.record_skip();
+            continue;
+        };
+        collector.stage(BlockTimestampMetadata {
+            chain_id,
+            block_number: block.number,
+            timestamp_ms,
+            block_hash: block.hash.as_ref().to_vec(),
+            parent_hash: block.parent_hash.as_ref().to_vec(),
+            source_stream_id: source_stream_id.to_string(),
+            source_message_seq,
+            source_backend: backend,
+            source_protocol: protocol.clone(),
+        });
+    }
+}
+
+fn warn_block_timestamp_overflow(chain_id: u64, block_number: u64, timestamp_seconds: u64) {
+    warn!(
+        event = "state_history_block_timestamp_overflow_skipped",
+        chain_id,
+        block_number,
+        timestamp_seconds,
+        "Skipping block timestamp that does not fit the millisecond BIGINT range"
+    );
+}
+
+fn block_timestamps_for_entry(
+    entry: &BroadcasterRedisStreamEntry,
+    backend_scope: &[BroadcasterBackend],
+) -> CollectedBlockTimestamps {
+    // RFQ-only entries cannot carry block headers, skip the payload decode entirely.
+    if !backend_scope
+        .iter()
+        .any(|backend| matches!(backend, BroadcasterBackend::Native | BroadcasterBackend::Vm))
+    {
+        return CollectedBlockTimestamps::default();
+    }
+    let envelope: BroadcasterEnvelope = match serde_json::from_str(&entry.payload_json) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            // Timestamp metadata is best effort, a bad payload must never fail the delta write.
+            warn!(
+                event = "state_history_block_timestamp_payload_undecodable",
+                stream_id = %entry.stream_id,
+                message_seq = entry.message_seq,
+                error = %error,
+                "Skipping block timestamp extraction for undecodable delta payload"
+            );
+            return CollectedBlockTimestamps {
+                rows: Vec::new(),
+                skipped_records: 1,
+            };
+        }
+    };
+    let mut collector = BlockTimestampCollector::default();
+    collect_block_timestamps_from_payload(
+        &mut collector,
+        entry.chain_id,
+        &entry.stream_id,
+        entry.message_seq,
+        &envelope.payload,
+    );
+    collector.finish()
+}
+
+fn block_timestamps_from_checkpoint_archive(
+    archive: &CheckpointArchive,
+) -> Result<CollectedBlockTimestamps> {
+    // One collector across every envelope so the conflict-skip rule is archive-wide,
+    // a mid-reorg capture that disagrees across chunks poisons the height, not just
+    // one chunk. Provenance uses the metadata replay-boundary cursor instead of the
+    // synthetic per-archive seqs so supersession stays ordered against live deltas
+    // of the same stream.
+    let mut collector = BlockTimestampCollector::default();
+    for envelope in &archive.payloads {
+        collect_block_timestamps_from_payload(
+            &mut collector,
+            archive.metadata.chain_id,
+            &archive.metadata.stream_id,
+            archive.metadata.source_message_seq,
+            &envelope.payload,
+        );
+    }
+    let collected = collector.finish();
+    // Every complete checkpoint must anchor a block_timestamps row at its boundary
+    // height, otherwise backtest ranges starting there are unresolvable. Failing
+    // here keeps the checkpoint retryable on the next poll.
+    anyhow::ensure!(
+        collected
+            .rows
+            .iter()
+            .any(|row| row.block_number == archive.metadata.block_number),
+        "checkpoint archive carries no usable block timestamp for boundary block {}",
+        archive.metadata.block_number
+    );
+    Ok(collected)
+}
+
+fn block_timestamp_ms_from_seconds(timestamp_seconds: u64) -> Option<u64> {
+    let timestamp_ms = timestamp_seconds.checked_mul(1_000)?;
+    // The stored column is BIGINT, values that cannot round-trip through i64 are unusable.
+    i64::try_from(timestamp_ms).ok()?;
+    Some(timestamp_ms)
+}
+
 impl HistoryRangeRequest {
     pub fn new(
         chain_id: u64,
@@ -853,6 +1168,114 @@ impl HistoryRangeRequest {
     fn replay_from_message_seq(&self, checkpoint: Option<&CheckpointManifest>) -> Option<u64> {
         checkpoint.map(|checkpoint| checkpoint.metadata.source_message_seq.saturating_add(1))
     }
+}
+
+impl BacktestRangeRequest {
+    pub fn new(
+        chain_id: u64,
+        start_block_number: u64,
+        end_block_number: u64,
+        backends: Vec<BroadcasterBackend>,
+    ) -> Result<Self> {
+        let request = Self {
+            chain_id,
+            start_block_number,
+            end_block_number,
+            backends,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    // Fields are pub, so resolve_backtest_range re-runs this on literally built requests.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.end_block_number < u64::MAX,
+            "backtest range end block must be below u64::MAX to bound the RFQ range with the next block"
+        );
+        // HistoryRangeRequest owns the shared shape rules, keep a single validator.
+        HistoryRangeRequest::new(
+            self.chain_id,
+            self.start_block_number,
+            self.end_block_number,
+            self.backends.clone(),
+        )
+        .map(drop)
+    }
+
+    fn includes_rfq(&self) -> bool {
+        self.backends.contains(&BroadcasterBackend::Rfq)
+    }
+
+    fn to_history_range_request(
+        &self,
+        boundary: Option<&BacktestBoundaryTimestamps>,
+    ) -> Result<HistoryRangeRequest> {
+        let request = HistoryRangeRequest::new(
+            self.chain_id,
+            self.start_block_number,
+            self.end_block_number,
+            self.backends.clone(),
+        )?;
+        if !self.includes_rfq() {
+            return Ok(request);
+        }
+
+        let boundary = boundary.ok_or_else(|| {
+            anyhow!("RFQ backtest ranges require resolved boundary block timestamps")
+        })?;
+        request.with_rfq_timestamp_range(
+            boundary.start_block_timestamp_ms,
+            boundary.rfq_end_timestamp_ms(),
+        )
+    }
+}
+
+// Pure so the boundary error taxonomy is unit-testable without Postgres.
+fn backtest_boundary_from_rows(
+    request: &BacktestRangeRequest,
+    rows: &[(u64, u64)],
+) -> Result<BacktestBoundaryTimestamps> {
+    let next_block_number = request.end_block_number.checked_add(1).ok_or_else(|| {
+        anyhow!("backtest range end block must be below u64::MAX to bound the RFQ range with the next block")
+    })?;
+    let timestamp_for = |block_number: u64| {
+        rows.iter()
+            .find(|(row_block_number, _)| *row_block_number == block_number)
+            .map(|(_, timestamp_ms)| *timestamp_ms)
+    };
+    let start_block_timestamp_ms = timestamp_for(request.start_block_number).ok_or_else(|| {
+        anyhow!(
+            "missing state history block timestamp for start block {}",
+            request.start_block_number
+        )
+    })?;
+    let end_block_timestamp_ms = timestamp_for(request.end_block_number).ok_or_else(|| {
+        anyhow!(
+            "missing state history block timestamp for end block {}",
+            request.end_block_number
+        )
+    })?;
+    let next_block_timestamp_ms = timestamp_for(next_block_number).ok_or_else(|| {
+        anyhow!(
+            "missing state history block timestamp for block {next_block_number} needed to bound \
+             the RFQ range for end block {}; ranges ending at the recorded head are unresolvable \
+             until the next block is stored",
+            request.end_block_number
+        )
+    })?;
+    // Also guards the rfq_end_timestamp_ms subtraction against next_ts == 0.
+    anyhow::ensure!(
+        next_block_timestamp_ms > end_block_timestamp_ms,
+        "state history block timestamp for block {next_block_number} ({next_block_timestamp_ms}) \
+         must be greater than the end block {} timestamp ({end_block_timestamp_ms})",
+        request.end_block_number
+    );
+    Ok(BacktestBoundaryTimestamps {
+        start_block_timestamp_ms,
+        end_block_timestamp_ms,
+        next_block_timestamp_ms,
+    })
 }
 
 impl HistoryRangePlan {
@@ -1255,6 +1678,7 @@ impl StateHistoryPgStore {
             "state_history.delta_messages",
             "state_history.delta_backend_index",
             "state_history.generation_handoffs",
+            "state_history.block_timestamps",
             "state_history.checkpoints",
             "state_history.ingestion_gaps",
             "state_history.stream_cursors",
@@ -1270,6 +1694,65 @@ impl StateHistoryPgStore {
             );
         }
         Ok(())
+    }
+
+    async fn backtest_boundary_timestamps(
+        &self,
+        request: &BacktestRangeRequest,
+    ) -> Result<BacktestBoundaryTimestamps> {
+        // Defensive even though validate() rejects u64::MAX, request fields are pub.
+        let next_block_number = request.end_block_number.checked_add(1).ok_or_else(|| {
+            anyhow!("backtest range end block must be below u64::MAX to bound the RFQ range with the next block")
+        })?;
+        let block_numbers = vec![
+            u64_to_i64("start_block_number", request.start_block_number)?,
+            u64_to_i64("end_block_number", request.end_block_number)?,
+            u64_to_i64("next_block_number", next_block_number)?,
+        ];
+        let rows = sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT block_number, timestamp_ms
+            FROM state_history.block_timestamps
+            WHERE chain_id = $1 AND block_number = ANY($2::BIGINT[])
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", request.chain_id)?)
+        .bind(&block_numbers)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to resolve state history backtest boundary timestamps")?;
+        let rows = rows
+            .into_iter()
+            .map(|(block_number, timestamp_ms)| {
+                Ok((
+                    i64_to_u64("block_number", block_number)?,
+                    i64_to_u64("timestamp_ms", timestamp_ms)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        backtest_boundary_from_rows(request, &rows)
+    }
+
+    pub async fn block_timestamp_record(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+    ) -> Result<Option<BlockTimestampRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT chain_id, block_number, timestamp_ms, block_hash, parent_hash,
+                source_stream_id, source_message_seq, source_backend, source_protocol,
+                created_at, updated_at
+            FROM state_history.block_timestamps
+            WHERE chain_id = $1 AND block_number = $2
+            "#,
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(u64_to_i64("block_number", block_number)?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load state history block timestamp record")?;
+        row.map(block_timestamp_record_from_row).transpose()
     }
 
     pub async fn insert_entry(
@@ -1330,6 +1813,7 @@ impl StateHistoryPgStore {
         );
         let prepared =
             prepare_delta_message_with_prev(entry, redis_entry_id, prev_persistable_message_seq)?;
+        let collected = block_timestamps_for_entry(entry, &prepared.backend_scope);
         let mut tx = self
             .pool
             .begin()
@@ -1348,11 +1832,18 @@ impl StateHistoryPgStore {
             Self::insert_generation_handoff_row(&mut tx, prepared.chain_id, id, &handoff).await?;
         }
         Self::upsert_stream_cursor(&mut tx, &observation, Some(prepared.message_seq)).await?;
+        for timestamp in &collected.rows {
+            insert_block_timestamp(&mut tx, timestamp).await?;
+        }
 
         tx.commit()
             .await
             .context("failed to commit state history delta transaction")?;
-        Ok(PersistedDelta { id, inserted })
+        Ok(PersistedDelta {
+            id,
+            inserted,
+            skipped_block_timestamp_records: collected.skipped_records,
+        })
     }
 
     async fn insert_delta_message_row(
@@ -1671,12 +2162,21 @@ impl StateHistoryPgStore {
         Ok(id)
     }
 
-    pub async fn mark_checkpoint_complete(
+    async fn mark_checkpoint_complete_with_block_timestamps(
         &self,
         checkpoint_id: i64,
         completion: &CheckpointCompletion,
+        block_timestamps: &[BlockTimestampMetadata],
     ) -> Result<()> {
-        sqlx::query(
+        // Completion and timestamp rows share one transaction so snapshot-derived
+        // rows become visible iff the checkpoint is complete. A failed upsert rolls
+        // the manifest back to 'writing' and the caller marks it failed.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin state history checkpoint completion transaction")?;
+        let updated = sqlx::query(
             r#"
             UPDATE state_history.checkpoints
             SET status = 'complete',
@@ -1695,10 +2195,19 @@ impl StateHistoryPgStore {
             "compressed_bytes",
             completion.compressed_bytes,
         )?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .context("failed to mark state history checkpoint complete")?;
-        Ok(())
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "checkpoint manifest {checkpoint_id} not found"
+        );
+        for timestamp in block_timestamps {
+            insert_block_timestamp(&mut tx, timestamp).await?;
+        }
+        tx.commit()
+            .await
+            .context("failed to commit state history checkpoint completion transaction")
     }
 
     pub async fn mark_checkpoint_failed(&self, checkpoint_id: i64, error: &str) -> Result<()> {
@@ -2020,6 +2529,26 @@ impl StateHistoryPgStore {
             handoffs.push(handoff);
         }
         Ok(StoredGenerationHandoffs::new(handoffs))
+    }
+
+    pub async fn resolve_backtest_range(
+        &self,
+        request: BacktestRangeRequest,
+    ) -> Result<BacktestRangePlan> {
+        request.validate()?;
+        let boundary = if request.includes_rfq() {
+            Some(self.backtest_boundary_timestamps(&request).await?)
+        } else {
+            None
+        };
+        let history_request = request.to_history_range_request(boundary.as_ref())?;
+        let history = self.resolve_history_range(history_request).await?;
+        Ok(BacktestRangePlan {
+            request,
+            start_block_timestamp_ms: boundary.map(|boundary| boundary.start_block_timestamp_ms),
+            end_block_timestamp_ms: boundary.map(|boundary| boundary.end_block_timestamp_ms),
+            history,
+        })
     }
 
     async fn deltas_for_range(
@@ -2618,6 +3147,13 @@ impl StateHistoryReader {
         self.pg_store.resolve_history_range(request).await
     }
 
+    pub async fn resolve_backtest_range(
+        &self,
+        request: BacktestRangeRequest,
+    ) -> Result<BacktestRangePlan> {
+        self.pg_store.resolve_backtest_range(request).await
+    }
+
     pub async fn fetch_checkpoint(
         &self,
         manifest: &CheckpointManifest,
@@ -2668,6 +3204,18 @@ impl StateHistoryCheckpointWriter {
                 || archive.metadata.rfq_update_timestamp_ms.is_some(),
             "state history RFQ checkpoints require an RFQ update timestamp"
         );
+        let boundary_block = archive.metadata.block_number;
+        {
+            let mut status = self.status.write().await;
+            status.attempted_checkpoints = status.attempted_checkpoints.saturating_add(1);
+        }
+        // Collect while the payloads are still the in-memory typed vec, and fail the
+        // boundary guard before the manifest exists so nothing is orphaned in PG or
+        // S3. The checkpoint task retries on the next poll.
+        let collected = match block_timestamps_from_checkpoint_archive(&archive) {
+            Ok(collected) => collected,
+            Err(error) => return Err(self.fail_checkpoint(None, boundary_block, error).await),
+        };
         let s3_key = checkpoint_s3_key(
             &self.s3_prefix,
             archive.metadata.chain_id,
@@ -2680,20 +3228,9 @@ impl StateHistoryCheckpointWriter {
             s3_bucket: self.checkpoint_store.bucket().to_string(),
             s3_key: s3_key.clone(),
         };
-        {
-            let mut status = self.status.write().await;
-            status.attempted_checkpoints = status.attempted_checkpoints.saturating_add(1);
-        }
         let manifest_id = match self.pg_store.create_checkpoint_manifest(&input).await {
             Ok(manifest_id) => manifest_id,
-            Err(error) => {
-                self.record_checkpoint_failure(
-                    Some(archive.metadata.block_number),
-                    error.to_string(),
-                )
-                .await;
-                return Err(error);
-            }
+            Err(error) => return Err(self.fail_checkpoint(None, boundary_block, error).await),
         };
 
         let encoded = match self
@@ -2703,14 +3240,9 @@ impl StateHistoryCheckpointWriter {
         {
             Ok(encoded) => encoded,
             Err(error) => {
-                let message = format!("{error:#}");
-                let _ = self
-                    .pg_store
-                    .mark_checkpoint_failed(manifest_id, &message)
-                    .await;
-                self.record_checkpoint_failure(Some(archive.metadata.block_number), message)
-                    .await;
-                return Err(error);
+                return Err(self
+                    .fail_checkpoint(Some(manifest_id), boundary_block, error)
+                    .await)
             }
         };
         let completion = CheckpointCompletion {
@@ -2720,23 +3252,25 @@ impl StateHistoryCheckpointWriter {
         };
         if let Err(error) = self
             .pg_store
-            .mark_checkpoint_complete(manifest_id, &completion)
+            .mark_checkpoint_complete_with_block_timestamps(
+                manifest_id,
+                &completion,
+                &collected.rows,
+            )
             .await
         {
-            let message = format!("{error:#}");
-            let _ = self
-                .pg_store
-                .mark_checkpoint_failed(manifest_id, &message)
-                .await;
-            self.record_checkpoint_failure(Some(archive.metadata.block_number), message)
-                .await;
-            return Err(error);
+            return Err(self
+                .fail_checkpoint(Some(manifest_id), boundary_block, error)
+                .await);
         }
 
         let mut status = self.status.write().await;
         status.healthy = true;
         status.completed_checkpoints = status.completed_checkpoints.saturating_add(1);
-        status.last_checkpoint_block_number = Some(archive.metadata.block_number);
+        status.skipped_block_timestamp_records = status
+            .skipped_block_timestamp_records
+            .saturating_add(collected.skipped_records);
+        status.last_checkpoint_block_number = Some(boundary_block);
         status.last_checkpoint_s3_key = Some(s3_key.clone());
         status.last_error = None;
 
@@ -2749,6 +3283,26 @@ impl StateHistoryCheckpointWriter {
 
     pub async fn snapshot(&self) -> StateHistoryCheckpointWriterSnapshot {
         self.status.read().await.clone()
+    }
+
+    // Shared failure arm for write_checkpoint. Marks the manifest failed when one
+    // exists, records the status failure, and hands the error back for propagation.
+    async fn fail_checkpoint(
+        &self,
+        manifest_id: Option<i64>,
+        block_number: u64,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let message = format!("{error:#}");
+        if let Some(manifest_id) = manifest_id {
+            let _ = self
+                .pg_store
+                .mark_checkpoint_failed(manifest_id, &message)
+                .await;
+        }
+        self.record_checkpoint_failure(Some(block_number), message)
+            .await;
+        error
     }
 
     async fn record_checkpoint_failure(&self, block_number: Option<u64>, message: String) {
@@ -3045,10 +3599,13 @@ async fn persist_delta_with_retry(
             )
             .await
         {
-            Ok(_) => {
+            Ok(persisted) => {
                 let mut status = status.write().await;
                 status.healthy = true;
                 status.persisted_deltas = status.persisted_deltas.saturating_add(1);
+                status.skipped_block_timestamp_records = status
+                    .skipped_block_timestamp_records
+                    .saturating_add(persisted.skipped_block_timestamp_records);
                 status.last_persisted_stream_id = Some(entry.stream_id.clone());
                 status.last_persisted_redis_entry_id = Some(redis_entry_id.clone());
                 status.last_persisted_message_seq = Some(entry.message_seq);
@@ -3167,6 +3724,235 @@ async fn record_gap_for_entry(
     pg_store.record_gap(&gap).await
 }
 
+// Pre-image of the stored row as of the statement-start snapshot, used only to
+// classify and log the write outcome.
+#[derive(Debug, Clone)]
+struct StoredBlockTimestamp {
+    timestamp_ms: u64,
+    block_hash: Vec<u8>,
+    parent_hash: Vec<u8>,
+    source_stream_id: String,
+    source_message_seq: u64,
+}
+
+// Diagnostic classification of one block timestamp upsert. The SQL predicate already
+// enforced source order, so outcomes never change what was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockTimestampWriteOutcome {
+    // Applied with no pre-image. Under READ COMMITTED a row committed after the
+    // statement snapshot can still reach the conflict arm and pass the source check,
+    // so this can also be a concurrent overwrite. Diagnostics only, never acted on.
+    Inserted,
+    // Verbatim redelivery from a stale or equal source, no row version written.
+    IdenticalNoop,
+    // Stale source carried different content, the stored row wins.
+    StaleSourceKept,
+    // Newer or different source with identical content, provenance advanced with
+    // updated_at preserved.
+    SourceAdvanced,
+    // Newer or different source with different content, full overwrite. This is the
+    // reorg audit trail.
+    Superseded,
+    // Not applied with no pre-image. The insert race was lost to a concurrent writer
+    // whose row then won the source-order check.
+    ConcurrentSkip,
+}
+
+fn classify_block_timestamp_write(
+    incoming: &BlockTimestampMetadata,
+    applied: bool,
+    stored: Option<&StoredBlockTimestamp>,
+) -> BlockTimestampWriteOutcome {
+    let Some(stored) = stored else {
+        return if applied {
+            BlockTimestampWriteOutcome::Inserted
+        } else {
+            BlockTimestampWriteOutcome::ConcurrentSkip
+        };
+    };
+    let content_identical = stored.timestamp_ms == incoming.timestamp_ms
+        && stored.block_hash == incoming.block_hash
+        && stored.parent_hash == incoming.parent_hash;
+    match (applied, content_identical) {
+        (true, true) => BlockTimestampWriteOutcome::SourceAdvanced,
+        (true, false) => BlockTimestampWriteOutcome::Superseded,
+        (false, true) => BlockTimestampWriteOutcome::IdenticalNoop,
+        (false, false) => BlockTimestampWriteOutcome::StaleSourceKept,
+    }
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+async fn insert_block_timestamp(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    timestamp: &BlockTimestampMetadata,
+) -> Result<()> {
+    // Single statement so the pre-image read, the source-order check, and the write
+    // are atomic under the two in-process writers plus handoff-era peers. The existing
+    // CTE reads the statement-start snapshot and executes because the final SELECT
+    // references it, which gives the classifier a pre-image for free. updated_at only
+    // moves when content changes, so provenance-only advances stay HOT-eligible.
+    let row = sqlx::query(
+        r#"
+        WITH incoming AS (
+            SELECT $1::BIGINT AS chain_id, $2::BIGINT AS block_number, $3::BIGINT AS timestamp_ms,
+                   $4::BYTEA AS block_hash, $5::BYTEA AS parent_hash,
+                   $6::TEXT AS source_stream_id, $7::BIGINT AS source_message_seq,
+                   $8::TEXT AS source_backend, $9::TEXT AS source_protocol
+        ),
+        existing AS (
+            SELECT stored.timestamp_ms, stored.block_hash, stored.parent_hash,
+                   stored.source_stream_id, stored.source_message_seq
+            FROM state_history.block_timestamps stored
+            JOIN incoming USING (chain_id, block_number)
+        ),
+        upsert AS (
+            INSERT INTO state_history.block_timestamps AS stored (
+                chain_id, block_number, timestamp_ms, block_hash, parent_hash,
+                source_stream_id, source_message_seq, source_backend, source_protocol
+            )
+            SELECT chain_id, block_number, timestamp_ms, block_hash, parent_hash,
+                   source_stream_id, source_message_seq, source_backend, source_protocol
+            FROM incoming
+            ON CONFLICT (chain_id, block_number) DO UPDATE SET
+                timestamp_ms = EXCLUDED.timestamp_ms,
+                block_hash = EXCLUDED.block_hash,
+                parent_hash = EXCLUDED.parent_hash,
+                source_stream_id = EXCLUDED.source_stream_id,
+                source_message_seq = EXCLUDED.source_message_seq,
+                source_backend = EXCLUDED.source_backend,
+                source_protocol = EXCLUDED.source_protocol,
+                updated_at = CASE
+                    WHEN (stored.timestamp_ms, stored.block_hash, stored.parent_hash)
+                         IS DISTINCT FROM (EXCLUDED.timestamp_ms, EXCLUDED.block_hash, EXCLUDED.parent_hash)
+                    THEN now()
+                    ELSE stored.updated_at
+                END
+            WHERE stored.source_stream_id <> EXCLUDED.source_stream_id
+               OR stored.source_message_seq < EXCLUDED.source_message_seq
+            RETURNING 1 AS applied
+        )
+        SELECT EXISTS (SELECT 1 FROM upsert) AS applied,
+               existing.timestamp_ms        AS stored_timestamp_ms,
+               existing.block_hash          AS stored_block_hash,
+               existing.parent_hash         AS stored_parent_hash,
+               existing.source_stream_id    AS stored_source_stream_id,
+               existing.source_message_seq  AS stored_source_message_seq
+        FROM (SELECT 1) AS one
+        LEFT JOIN existing ON TRUE
+        "#,
+    )
+    .bind(u64_to_i64("chain_id", timestamp.chain_id)?)
+    .bind(u64_to_i64("block_number", timestamp.block_number)?)
+    .bind(u64_to_i64("timestamp_ms", timestamp.timestamp_ms)?)
+    .bind(&timestamp.block_hash)
+    .bind(&timestamp.parent_hash)
+    .bind(&timestamp.source_stream_id)
+    .bind(u64_to_i64(
+        "source_message_seq",
+        timestamp.source_message_seq,
+    )?)
+    .bind(timestamp.source_backend.as_str())
+    .bind(&timestamp.source_protocol)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to upsert state history block timestamp")?;
+    let applied: bool = row.get("applied");
+    let stored = stored_block_timestamp_from_row(&row)?;
+    let outcome = classify_block_timestamp_write(timestamp, applied, stored.as_ref());
+    log_block_timestamp_write_outcome(timestamp, stored.as_ref(), outcome);
+    Ok(())
+}
+
+fn stored_block_timestamp_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<StoredBlockTimestamp>> {
+    row.get::<Option<i64>, _>("stored_timestamp_ms")
+        .map(|stored_timestamp_ms| -> Result<StoredBlockTimestamp> {
+            Ok(StoredBlockTimestamp {
+                timestamp_ms: i64_to_u64("stored_timestamp_ms", stored_timestamp_ms)?,
+                block_hash: row.get("stored_block_hash"),
+                parent_hash: row.get("stored_parent_hash"),
+                source_stream_id: row.get("stored_source_stream_id"),
+                source_message_seq: i64_to_u64(
+                    "stored_source_message_seq",
+                    row.get("stored_source_message_seq"),
+                )?,
+            })
+        })
+        .transpose()
+}
+
+fn log_block_timestamp_write_outcome(
+    timestamp: &BlockTimestampMetadata,
+    stored: Option<&StoredBlockTimestamp>,
+    outcome: BlockTimestampWriteOutcome,
+) {
+    match outcome {
+        BlockTimestampWriteOutcome::Inserted | BlockTimestampWriteOutcome::IdenticalNoop => {}
+        BlockTimestampWriteOutcome::SourceAdvanced => {
+            debug!(
+                event = "state_history_block_timestamp_source_advanced",
+                chain_id = timestamp.chain_id,
+                block_number = timestamp.block_number,
+                source_stream_id = %timestamp.source_stream_id,
+                source_message_seq = timestamp.source_message_seq,
+                "Advancing block timestamp provenance for identical content"
+            );
+        }
+        BlockTimestampWriteOutcome::StaleSourceKept => {
+            if let Some(stored) = stored {
+                warn!(
+                    event = "state_history_block_timestamp_stale_source_kept",
+                    chain_id = timestamp.chain_id,
+                    block_number = timestamp.block_number,
+                    stored_source_stream_id = %stored.source_stream_id,
+                    stored_source_message_seq = stored.source_message_seq,
+                    incoming_source_stream_id = %timestamp.source_stream_id,
+                    incoming_source_message_seq = timestamp.source_message_seq,
+                    "Keeping stored block timestamp over conflicting content from a stale source"
+                );
+            }
+        }
+        BlockTimestampWriteOutcome::Superseded => {
+            if let Some(stored) = stored {
+                warn!(
+                    event = "state_history_block_timestamp_superseded",
+                    chain_id = timestamp.chain_id,
+                    block_number = timestamp.block_number,
+                    old_timestamp_ms = stored.timestamp_ms,
+                    old_block_hash = %hex_string(&stored.block_hash),
+                    old_source_stream_id = %stored.source_stream_id,
+                    old_source_message_seq = stored.source_message_seq,
+                    new_timestamp_ms = timestamp.timestamp_ms,
+                    new_block_hash = %hex_string(&timestamp.block_hash),
+                    new_source_stream_id = %timestamp.source_stream_id,
+                    new_source_message_seq = timestamp.source_message_seq,
+                    "Superseding stored block timestamp with newer source content"
+                );
+            }
+        }
+        BlockTimestampWriteOutcome::ConcurrentSkip => {
+            warn!(
+                event = "state_history_block_timestamp_concurrent_skip",
+                chain_id = timestamp.chain_id,
+                block_number = timestamp.block_number,
+                source_stream_id = %timestamp.source_stream_id,
+                source_message_seq = timestamp.source_message_seq,
+                "Skipping block timestamp write that lost an insert race to a newer source"
+            );
+        }
+    }
+}
+
 fn ingestion_gap_for_entry(
     entry: &BroadcasterRedisStreamEntry,
     reason: &str,
@@ -3248,6 +4034,32 @@ fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
+}
+
+fn block_timestamp_record_from_row(row: sqlx::postgres::PgRow) -> Result<BlockTimestampRecord> {
+    let source_backend: String = row.get("source_backend");
+    let source_backend = match source_backend.as_str() {
+        "native" => BroadcasterBackend::Native,
+        "vm" => BroadcasterBackend::Vm,
+        other => {
+            return Err(anyhow!(
+                "unsupported block timestamp source backend {other}"
+            ))
+        }
+    };
+    Ok(BlockTimestampRecord {
+        chain_id: i64_to_u64("chain_id", row.get("chain_id"))?,
+        block_number: i64_to_u64("block_number", row.get("block_number"))?,
+        timestamp_ms: i64_to_u64("timestamp_ms", row.get("timestamp_ms"))?,
+        block_hash: row.get("block_hash"),
+        parent_hash: row.get("parent_hash"),
+        source_stream_id: row.get("source_stream_id"),
+        source_message_seq: i64_to_u64("source_message_seq", row.get("source_message_seq"))?,
+        source_backend,
+        source_protocol: row.get("source_protocol"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 fn checkpoint_manifest_from_row(row: sqlx::postgres::PgRow) -> Result<CheckpointManifest> {
@@ -3350,27 +4162,40 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use anyhow::Result;
     use simulator_core::broadcaster::{
-        BroadcasterBackend, BroadcasterEnvelope, BroadcasterMessageKind,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind,
-        BroadcasterRedisStreamEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+        BroadcasterBackend, BroadcasterBlockRef, BroadcasterEnvelope, BroadcasterMessageKind,
+        BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
+        BroadcasterProtocolSyncStatusKind, BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk,
+        BroadcasterSnapshotPartition, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    };
+    use tycho_simulation::{
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, SynchronizerState,
+        },
+        tycho_common::Bytes,
     };
 
     use super::{
-        build_validated_history_segments, build_validated_replay_segments,
-        decode_checkpoint_archive_bytes, encode_checkpoint_archive, indexed_backends_for_entry,
-        ingestion_gap_for_entry, ingestion_gap_within_segments, optional_u64_to_i64,
-        prepare_delta_message, run_state_history_writer, u64_to_i64,
-        verify_ingestion_coverage_from_cursors, writer_retry_backoff, CheckpointArchive,
-        CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload, CheckpointStatus,
-        DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource, HistoryRangePlan,
-        HistoryRangeRequest, HistoryReplaySegment, HistoryStreamCursor, StateHistoryPgStore,
-        StateHistoryWriteCommand, StateHistoryWriter, StateHistoryWriterSnapshot,
-        StoredGenerationHandoff, StoredGenerationHandoffs, WriterShutdown,
-        DEFAULT_GAP_RECORD_TASK_LIMIT, WRITER_RETRY_BACKOFF_CAP,
+        backtest_boundary_from_rows, block_timestamp_ms_from_seconds, block_timestamps_for_entry,
+        block_timestamps_from_checkpoint_archive, build_validated_history_segments,
+        build_validated_replay_segments, classify_block_timestamp_write,
+        collect_block_timestamps_from_payload, decode_checkpoint_archive_bytes,
+        encode_checkpoint_archive, indexed_backends_for_entry, ingestion_gap_for_entry,
+        ingestion_gap_within_segments, optional_u64_to_i64, prepare_delta_message,
+        run_state_history_writer, u64_to_i64, verify_ingestion_coverage_from_cursors,
+        writer_retry_backoff, BacktestBoundaryTimestamps, BacktestRangeRequest,
+        BlockTimestampCollector, BlockTimestampMetadata, BlockTimestampWriteOutcome,
+        CheckpointArchive, CheckpointArchiveMetadata, CheckpointManifest, CheckpointPayload,
+        CheckpointStatus, DecodedCheckpointArchive, HistoryRangeGap, HistoryRangeGapSource,
+        HistoryRangePlan, HistoryRangeRequest, HistoryReplaySegment, HistoryStreamCursor,
+        StateHistoryPgStore, StateHistoryWriteCommand, StateHistoryWriter,
+        StateHistoryWriterSnapshot, StoredBlockTimestamp, StoredGenerationHandoff,
+        StoredGenerationHandoffs, WriterShutdown, DEFAULT_GAP_RECORD_TASK_LIMIT,
+        WRITER_RETRY_BACKOFF_CAP,
     };
 
     #[test]
@@ -3504,6 +4329,525 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("scope mismatch should fail"))?;
 
         assert!(error.to_string().contains("partition backends"));
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamps_are_extracted_from_native_and_vm_update_blocks() -> Result<()> {
+        let native_block = block_ref(124, 1, 1_720_000_001);
+        let vm_block = block_ref(125, 2, 1_720_000_002);
+        let update = BroadcasterUpdateMessage::new(vec![
+            BroadcasterUpdatePartition::new(
+                BroadcasterBackend::Native,
+                native_block.number,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sync_statuses_with_block("uniswap_v2", native_block.clone()),
+            ),
+            BroadcasterUpdatePartition::new(
+                BroadcasterBackend::Vm,
+                vm_block.number,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sync_statuses_with_block("vm:curve", vm_block.clone()),
+            ),
+        ])?;
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            12,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        let collected = block_timestamps_for_entry(
+            &entry,
+            &[BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        );
+        let timestamps = collected.rows;
+
+        assert_eq!(collected.skipped_records, 0);
+        assert_eq!(timestamps.len(), 2);
+        assert_eq!(timestamps[0].chain_id, 8453);
+        assert_eq!(timestamps[0].block_number, 124);
+        assert_eq!(timestamps[0].timestamp_ms, 1_720_000_001_000);
+        assert_eq!(timestamps[0].block_hash, vec![1u8; 32]);
+        assert_eq!(timestamps[0].parent_hash, vec![2u8; 32]);
+        assert_eq!(timestamps[0].source_stream_id, "stream-1");
+        assert_eq!(timestamps[0].source_message_seq, 12);
+        assert_eq!(timestamps[0].source_backend, BroadcasterBackend::Native);
+        assert_eq!(timestamps[0].source_protocol, "uniswap_v2");
+        assert_eq!(timestamps[1].block_number, 125);
+        assert_eq!(timestamps[1].timestamp_ms, 1_720_000_002_000);
+        assert_eq!(timestamps[1].source_backend, BroadcasterBackend::Vm);
+        assert_eq!(timestamps[1].source_protocol, "vm:curve");
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamps_are_extracted_from_raw_protocol_message_headers() -> Result<()> {
+        let update =
+            BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                126,
+                vec![raw_protocol_message("uniswap_v2", 126, 3, 1_720_000_003)],
+                BTreeMap::new(),
+            )])?;
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            13,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        let timestamps = block_timestamps_for_entry(&entry, &[BroadcasterBackend::Native]).rows;
+
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[0].block_number, 126);
+        assert_eq!(timestamps[0].timestamp_ms, 1_720_000_003_000);
+        assert_eq!(timestamps[0].block_hash, vec![3u8; 32]);
+        assert_eq!(timestamps[0].parent_hash, vec![4u8; 32]);
+        assert_eq!(timestamps[0].source_backend, BroadcasterBackend::Native);
+        assert_eq!(timestamps[0].source_protocol, "uniswap_v2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamps_are_extracted_from_snapshot_chunk_partitions() -> Result<()> {
+        let native_partition = BroadcasterSnapshotPartition::with_messages(
+            BroadcasterBackend::Native,
+            130,
+            vec![raw_protocol_message("uniswap_v2", 130, 5, 1_720_000_005)],
+            sync_statuses_with_block("uniswap_v3", block_ref(131, 7, 1_720_000_006)),
+        );
+        let rfq_partition = BroadcasterSnapshotPartition::new(
+            BroadcasterBackend::Rfq,
+            132,
+            Vec::new(),
+            sync_statuses_with_block("rfq:bebop", block_ref(132, 9, 1_720_000_007)),
+        );
+        let chunk =
+            BroadcasterSnapshotChunk::new("snapshot-1", 0, vec![native_partition, rfq_partition])?;
+
+        let mut collector = BlockTimestampCollector::default();
+        collect_block_timestamps_from_payload(
+            &mut collector,
+            8453,
+            "checkpoint-stream",
+            42,
+            &BroadcasterPayload::SnapshotChunk(chunk),
+        );
+        let collected = collector.finish();
+
+        assert_eq!(collected.skipped_records, 0);
+        assert_eq!(collected.rows.len(), 2);
+        assert_eq!(collected.rows[0].block_number, 130);
+        assert_eq!(collected.rows[0].timestamp_ms, 1_720_000_005_000);
+        assert_eq!(collected.rows[0].source_stream_id, "checkpoint-stream");
+        assert_eq!(collected.rows[0].source_message_seq, 42);
+        assert_eq!(collected.rows[0].source_backend, BroadcasterBackend::Native);
+        assert_eq!(collected.rows[0].source_protocol, "uniswap_v2");
+        assert_eq!(collected.rows[1].block_number, 131);
+        assert_eq!(collected.rows[1].source_protocol, "uniswap_v3");
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamps_dedup_identical_records_per_height() -> Result<()> {
+        // Message header and sync-status ref carry identical content for block 124.
+        let update =
+            BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                124,
+                vec![raw_protocol_message("uniswap_v2", 124, 1, 1_720_000_001)],
+                sync_statuses_with_block("uniswap_v3", block_ref(124, 1, 1_720_000_001)),
+            )])?;
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            12,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        let collected = block_timestamps_for_entry(&entry, &[BroadcasterBackend::Native]);
+
+        assert_eq!(collected.skipped_records, 0);
+        assert_eq!(collected.rows.len(), 1);
+        assert_eq!(collected.rows[0].block_number, 124);
+        assert_eq!(collected.rows[0].timestamp_ms, 1_720_000_001_000);
+        // First-seen candidate keeps provenance, message headers stage before sync statuses.
+        assert_eq!(collected.rows[0].source_protocol, "uniswap_v2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamps_conflicting_same_height_records_skip_height() -> Result<()> {
+        let update = BroadcasterUpdateMessage::new(vec![
+            BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                124,
+                vec![raw_protocol_message("uniswap_v2", 124, 1, 1_720_000_001)],
+                sync_statuses_with_block("uniswap_v3", block_ref(124, 9, 1_720_000_001)),
+            ),
+            BroadcasterUpdatePartition::new(
+                BroadcasterBackend::Vm,
+                125,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                sync_statuses_with_block("vm:curve", block_ref(125, 2, 1_720_000_002)),
+            ),
+        ])?;
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            12,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        let collected = block_timestamps_for_entry(
+            &entry,
+            &[BroadcasterBackend::Native, BroadcasterBackend::Vm],
+        );
+
+        assert_eq!(collected.skipped_records, 1);
+        assert_eq!(collected.rows.len(), 1);
+        assert_eq!(collected.rows[0].block_number, 125);
+        assert_eq!(collected.rows[0].source_backend, BroadcasterBackend::Vm);
+
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_archive_conflict_skip_spans_chunks_and_fails_missing_boundary() -> Result<()> {
+        let metadata = CheckpointArchiveMetadata {
+            chain_id: 8453,
+            block_number: 130,
+            captured_at_timestamp_ms: 1_720_000_000_000,
+            rfq_update_timestamp_ms: None,
+            stream_id: "stream-live".to_string(),
+            source_message_seq: 42,
+            backends: vec![BroadcasterBackend::Native],
+        };
+
+        // The chunks disagree about the boundary height, so the archive-wide skip
+        // rule leaves no boundary row and the guard hard-errors.
+        let conflicted_boundary = CheckpointArchive {
+            metadata: metadata.clone(),
+            payloads: vec![
+                snapshot_chunk_envelope(1, 0, vec![block_ref(130, 1, 1_720_000_005)])?,
+                snapshot_chunk_envelope(2, 1, vec![block_ref(130, 2, 1_720_000_005)])?,
+            ],
+        };
+        let error = block_timestamps_from_checkpoint_archive(&conflicted_boundary)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("conflicted boundary height should fail"))?;
+        assert!(error
+            .to_string()
+            .contains("no usable block timestamp for boundary block 130"));
+
+        // A cross-chunk conflict away from the boundary only poisons that height.
+        let conflicted_sibling = CheckpointArchive {
+            metadata,
+            payloads: vec![
+                snapshot_chunk_envelope(
+                    1,
+                    0,
+                    vec![
+                        block_ref(130, 1, 1_720_000_005),
+                        block_ref(131, 3, 1_720_000_006),
+                    ],
+                )?,
+                snapshot_chunk_envelope(2, 1, vec![block_ref(131, 4, 1_720_000_006)])?,
+            ],
+        };
+        let collected = block_timestamps_from_checkpoint_archive(&conflicted_sibling)?;
+
+        assert_eq!(collected.skipped_records, 1);
+        assert_eq!(collected.rows.len(), 1);
+        assert_eq!(collected.rows[0].block_number, 130);
+        assert_eq!(collected.rows[0].timestamp_ms, 1_720_000_005_000);
+        // Provenance comes from the metadata replay-boundary cursor, not the
+        // synthetic per-archive envelope stream or seqs.
+        assert_eq!(collected.rows[0].source_stream_id, "stream-live");
+        assert_eq!(collected.rows[0].source_message_seq, 42);
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamps_skip_headers_with_overflowing_timestamps() -> Result<()> {
+        let mut sync_statuses =
+            sync_statuses_with_block("uniswap_v2", block_ref(124, 1, 1_720_000_001));
+        sync_statuses.extend(sync_statuses_with_block(
+            "uniswap_v3",
+            block_ref(125, 2, u64::MAX),
+        ));
+        let update = BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::new(
+            BroadcasterBackend::Native,
+            125,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sync_statuses,
+        )])?;
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            12,
+            simulator_core::broadcaster::BroadcasterPayload::Update(update),
+        );
+        let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+
+        let collected = block_timestamps_for_entry(&entry, &[BroadcasterBackend::Native]);
+
+        assert_eq!(collected.skipped_records, 1);
+        assert_eq!(collected.rows.len(), 1);
+        assert_eq!(collected.rows[0].block_number, 124);
+        assert_eq!(collected.rows[0].timestamp_ms, 1_720_000_001_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamp_extraction_skips_payload_for_rfq_only_scope() -> Result<()> {
+        let envelope = update_envelope("stream-1", 14, BroadcasterBackend::Rfq, 789)?;
+        let mut entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+        // An undecodable payload proves the RFQ-only path never touches payload_json.
+        entry.payload_json = "not json".to_string();
+
+        let collected = block_timestamps_for_entry(&entry, &[BroadcasterBackend::Rfq]);
+
+        assert!(collected.rows.is_empty());
+        assert_eq!(collected.skipped_records, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamp_extraction_survives_undecodable_payload() -> Result<()> {
+        let envelope = update_envelope("stream-1", 15, BroadcasterBackend::Native, 124)?;
+        let mut entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+        entry.payload_json = "not json".to_string();
+
+        let collected = block_timestamps_for_entry(&entry, &[BroadcasterBackend::Native]);
+
+        assert!(collected.rows.is_empty());
+        assert_eq!(collected.skipped_records, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_timestamp_seconds_normalize_to_milliseconds_with_overflow_check() {
+        assert_eq!(
+            block_timestamp_ms_from_seconds(1_720_000_001),
+            Some(1_720_000_001_000)
+        );
+        // Multiplication overflows u64.
+        assert_eq!(block_timestamp_ms_from_seconds(u64::MAX), None);
+        // Fits u64 after the multiply but not the BIGINT column.
+        assert_eq!(block_timestamp_ms_from_seconds(u64::MAX / 1_000), None);
+    }
+
+    #[test]
+    fn block_timestamp_write_classification_covers_supersession_matrix() {
+        let incoming = BlockTimestampMetadata {
+            chain_id: 8453,
+            block_number: 111,
+            timestamp_ms: 1_720_000_010_000,
+            block_hash: vec![0xaa; 32],
+            parent_hash: vec![0xbb; 32],
+            source_stream_id: "stream-live".to_string(),
+            source_message_seq: 8,
+            source_backend: BroadcasterBackend::Native,
+            source_protocol: "uniswap_v2".to_string(),
+        };
+        // Same stream at a newer seq, the source-order predicate skips these writes.
+        let same_stream_newer_identical = StoredBlockTimestamp {
+            timestamp_ms: incoming.timestamp_ms,
+            block_hash: incoming.block_hash.clone(),
+            parent_hash: incoming.parent_hash.clone(),
+            source_stream_id: incoming.source_stream_id.clone(),
+            source_message_seq: 10,
+        };
+        let same_stream_newer_conflicting = StoredBlockTimestamp {
+            block_hash: vec![0xcc; 32],
+            ..same_stream_newer_identical.clone()
+        };
+        // Different stream at a higher seq, the predicate still applies these writes.
+        let cross_stream_identical = StoredBlockTimestamp {
+            source_stream_id: "stream-checkpoint".to_string(),
+            source_message_seq: 42,
+            ..same_stream_newer_identical.clone()
+        };
+        let cross_stream_conflicting = StoredBlockTimestamp {
+            timestamp_ms: incoming.timestamp_ms + 1_000,
+            block_hash: vec![0xdd; 32],
+            ..cross_stream_identical.clone()
+        };
+
+        // Applied without a pre-image is a fresh insert. Under READ COMMITTED it can
+        // also be a concurrent overwrite, the documented Inserted caveat.
+        assert_eq!(
+            classify_block_timestamp_write(&incoming, true, None),
+            BlockTimestampWriteOutcome::Inserted
+        );
+        // Not applied without a pre-image means the insert race was lost.
+        assert_eq!(
+            classify_block_timestamp_write(&incoming, false, None),
+            BlockTimestampWriteOutcome::ConcurrentSkip
+        );
+        // Verbatim redelivery leaves the row and updated_at untouched.
+        assert_eq!(
+            classify_block_timestamp_write(&incoming, false, Some(&same_stream_newer_identical)),
+            BlockTimestampWriteOutcome::IdenticalNoop
+        );
+        // A stale source with different content never displaces the stored row.
+        assert_eq!(
+            classify_block_timestamp_write(&incoming, false, Some(&same_stream_newer_conflicting)),
+            BlockTimestampWriteOutcome::StaleSourceKept
+        );
+        // Identical content accepted from another source only advances provenance.
+        assert_eq!(
+            classify_block_timestamp_write(&incoming, true, Some(&cross_stream_identical)),
+            BlockTimestampWriteOutcome::SourceAdvanced
+        );
+        // Cross-stream writes apply regardless of the stored seq, so an unfenced late
+        // writer on another stream overwrites. This pins the accepted residual.
+        assert_eq!(
+            classify_block_timestamp_write(&incoming, true, Some(&cross_stream_conflicting)),
+            BlockTimestampWriteOutcome::Superseded
+        );
+    }
+
+    #[test]
+    fn backtest_range_request_builds_history_request_with_rfq_block_timestamp_bounds() -> Result<()>
+    {
+        let request = BacktestRangeRequest::new(
+            8453,
+            100,
+            200,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        )?;
+        let boundary = BacktestBoundaryTimestamps {
+            start_block_timestamp_ms: 1_720_000_000_000,
+            end_block_timestamp_ms: 1_720_000_060_000,
+            next_block_timestamp_ms: 1_720_000_062_000,
+        };
+
+        let history_request = request.to_history_range_request(Some(&boundary))?;
+
+        assert_eq!(history_request.chain_id, 8453);
+        assert_eq!(history_request.start_block_number, 100);
+        assert_eq!(history_request.end_block_number, 200);
+        assert_eq!(
+            history_request.rfq_start_timestamp_ms,
+            Some(1_720_000_000_000)
+        );
+        // The RFQ end bound is the next block timestamp minus 1ms, not the end
+        // block's own timestamp, so end-block head-tenure RFQ updates are kept.
+        assert_eq!(
+            history_request.rfq_end_timestamp_ms,
+            Some(1_720_000_061_999)
+        );
+        assert_eq!(
+            history_request.backends,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn backtest_range_request_requires_boundary_timestamps_for_rfq() -> Result<()> {
+        let request = BacktestRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Rfq])?;
+
+        let error = request
+            .to_history_range_request(None)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("missing boundary timestamps should fail"))?;
+
+        assert!(error
+            .to_string()
+            .contains("RFQ backtest ranges require resolved boundary block timestamps"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn backtest_range_request_rejects_end_block_u64_max() -> Result<()> {
+        let error =
+            BacktestRangeRequest::new(8453, 100, u64::MAX, vec![BroadcasterBackend::Native])
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("u64::MAX end block should fail"))?;
+        assert!(error.to_string().contains("below u64::MAX"));
+
+        // Fields are pub, so a literally built request must be caught by validate too.
+        let literal = BacktestRangeRequest {
+            chain_id: 8453,
+            start_block_number: 100,
+            end_block_number: u64::MAX,
+            backends: vec![BroadcasterBackend::Native],
+        };
+        let error = literal
+            .validate()
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("literal u64::MAX end block should fail validation"))?;
+        assert!(error.to_string().contains("below u64::MAX"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn backtest_boundary_assembly_reports_missing_and_non_increasing_rows() -> Result<()> {
+        let request = BacktestRangeRequest::new(8453, 100, 200, vec![BroadcasterBackend::Rfq])?;
+        let start_row = (100u64, 1_720_000_000_000u64);
+        let end_row = (200u64, 1_720_000_060_000u64);
+        let next_row = (201u64, 1_720_000_062_000u64);
+
+        let error = backtest_boundary_from_rows(&request, &[end_row, next_row])
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("missing start row should fail"))?;
+        assert!(error
+            .to_string()
+            .contains("missing state history block timestamp for start block 100"));
+
+        let error = backtest_boundary_from_rows(&request, &[start_row, next_row])
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("missing end row should fail"))?;
+        assert!(error
+            .to_string()
+            .contains("missing state history block timestamp for end block 200"));
+
+        let error = backtest_boundary_from_rows(&request, &[start_row, end_row])
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("missing end+1 row should fail"))?;
+        assert!(error
+            .to_string()
+            .contains("missing state history block timestamp for block 201"));
+        assert!(error
+            .to_string()
+            .contains("ranges ending at the recorded head are unresolvable"));
+
+        let error = backtest_boundary_from_rows(&request, &[start_row, end_row, (201, end_row.1)])
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("non-increasing next timestamp should fail"))?;
+        assert!(error.to_string().contains("must be greater than"));
+
+        // start == end shares one row across both bounds.
+        let single_block =
+            BacktestRangeRequest::new(8453, 200, 200, vec![BroadcasterBackend::Rfq])?;
+        let boundary = backtest_boundary_from_rows(&single_block, &[end_row, next_row])?;
+        assert_eq!(boundary.start_block_timestamp_ms, 1_720_000_060_000);
+        assert_eq!(boundary.end_block_timestamp_ms, 1_720_000_060_000);
+        assert_eq!(boundary.next_block_timestamp_ms, 1_720_000_062_000);
+        assert_eq!(boundary.rfq_end_timestamp_ms(), 1_720_000_061_999);
+
         Ok(())
     }
 
@@ -4361,6 +5705,90 @@ mod tests {
             shutdown: std::sync::Arc::new(WriterShutdown::default()),
             task: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    fn sync_statuses_with_block(
+        protocol: &str,
+        block: BroadcasterBlockRef,
+    ) -> BTreeMap<String, BroadcasterProtocolSyncStatus> {
+        BTreeMap::from([(
+            protocol.to_string(),
+            BroadcasterProtocolSyncStatus {
+                kind: BroadcasterProtocolSyncStatusKind::Ready,
+                block: Some(block),
+                reason: None,
+            },
+        )])
+    }
+
+    fn snapshot_chunk_envelope(
+        message_seq: u64,
+        chunk_index: u32,
+        blocks: Vec<BroadcasterBlockRef>,
+    ) -> Result<BroadcasterEnvelope> {
+        // Protocol keys are contract-validated against known native protocols.
+        let protocols = ["uniswap_v2", "uniswap_v3"];
+        let mut sync_statuses = BTreeMap::new();
+        for (protocol, block) in protocols.into_iter().zip(blocks) {
+            sync_statuses.extend(sync_statuses_with_block(protocol, block));
+        }
+        let partition = BroadcasterSnapshotPartition::new(
+            BroadcasterBackend::Native,
+            130,
+            Vec::new(),
+            sync_statuses,
+        );
+        let chunk = BroadcasterSnapshotChunk::new("snapshot-1", chunk_index, vec![partition])?;
+        // A stream and seq distinct from the archive metadata prove that collected
+        // provenance is fixed from the metadata cursor.
+        Ok(BroadcasterEnvelope::new(
+            "archive-internal",
+            message_seq,
+            BroadcasterPayload::SnapshotChunk(chunk),
+        ))
+    }
+
+    fn block_ref(number: u64, seed: u8, timestamp: u64) -> BroadcasterBlockRef {
+        BroadcasterBlockRef {
+            hash: vec![seed; 32].into(),
+            number,
+            parent_hash: vec![seed.saturating_add(1); 32].into(),
+            revert: false,
+            timestamp,
+            partial_block_index: None,
+        }
+    }
+
+    fn raw_protocol_message(
+        protocol: &str,
+        number: u64,
+        seed: u8,
+        timestamp: u64,
+    ) -> BroadcasterProtocolMessage {
+        BroadcasterProtocolMessage::new(
+            protocol,
+            SynchronizerState::Ready(raw_block_header(number, seed, timestamp)),
+            StateSyncMessage {
+                header: raw_block_header(number, seed, timestamp),
+                snapshots: Snapshot {
+                    states: HashMap::new(),
+                    vm_storage: HashMap::new(),
+                },
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )
+    }
+
+    fn raw_block_header(number: u64, seed: u8, timestamp: u64) -> BlockHeader {
+        BlockHeader {
+            hash: Bytes::from(vec![seed; 32]),
+            number,
+            parent_hash: Bytes::from(vec![seed.saturating_add(1); 32]),
+            revert: false,
+            timestamp,
+            partial_block_index: None,
+        }
     }
 
     #[test]

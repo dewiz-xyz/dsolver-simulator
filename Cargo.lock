@@ -929,6 +929,7 @@ dependencies = [
  "state-history",
  "tokio",
  "tower",
+ "tracing-subscriber 0.3.23",
  "tycho-simulation",
  "typetag",
 ]
@@ -6647,6 +6648,7 @@ checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
  "base64",
  "bytes",
+ "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -6705,7 +6707,9 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-postgres",
+ "sqlx-sqlite",
  "syn 2.0.117",
  "tokio",
  "url",
@@ -6722,6 +6726,7 @@ dependencies = [
  "bitflags 2.11.1",
  "byteorder",
  "bytes",
+ "chrono",
  "crc",
  "digest 0.10.7",
  "dotenvy",
@@ -6742,6 +6747,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.6",
  "rsa",
+ "serde",
  "sha1 0.10.6",
  "sha2 0.10.9",
  "smallvec",
@@ -6762,6 +6768,7 @@ dependencies = [
  "base64",
  "bitflags 2.11.1",
  "byteorder",
+ "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -6796,6 +6803,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
+ "chrono",
  "flume",
  "futures-channel",
  "futures-core",
@@ -6805,6 +6813,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "percent-encoding",
+ "serde",
  "serde_urlencoded",
  "sqlx-core",
  "thiserror 2.0.18",
@@ -6842,6 +6851,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "chrono",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6849,6 +6859,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "tycho-simulation",
  "zstd",
 ]
 

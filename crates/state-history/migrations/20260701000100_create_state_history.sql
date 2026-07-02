@@ -73,6 +73,24 @@ CREATE TABLE state_history.generation_handoffs (
     UNIQUE (chain_id, next_stream_id)
 );
 
+CREATE TABLE state_history.block_timestamps (
+    chain_id BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    timestamp_ms BIGINT NOT NULL,
+    block_hash BYTEA NOT NULL,
+    parent_hash BYTEA NOT NULL,
+    source_stream_id TEXT NOT NULL,
+    source_message_seq BIGINT NOT NULL,
+    source_backend TEXT NOT NULL CHECK (source_backend IN ('native', 'vm')),
+    source_protocol TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chain_id, block_number)
+);
+
+CREATE INDEX state_history_block_timestamps_lookup_idx
+    ON state_history.block_timestamps (chain_id, timestamp_ms, block_number);
+
 CREATE TABLE state_history.checkpoints (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,

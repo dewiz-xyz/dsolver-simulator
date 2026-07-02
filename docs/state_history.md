@@ -4,10 +4,14 @@ State history is an opt-in long-term store for accepted broadcaster state change
 
 ## What Is Stored
 
-- PostgreSQL stores accepted state-changing broadcaster Redis entries, per-backend indexes, stream cursors, checkpoint manifests, and explicit ingestion gaps.
+- PostgreSQL stores accepted state-changing broadcaster Redis entries, per-backend indexes, stream cursors, native/VM block timestamp metadata, checkpoint manifests, and explicit ingestion gaps.
 - S3 stores compressed combined checkpoints built from the broadcaster snapshot payload model.
+- Block timestamp metadata stays in PostgreSQL; S3 checkpoint metadata and `checkpoint.zst` payloads keep their existing shape.
+- Block timestamp rows are recorded from accepted update deltas and from completed checkpoint snapshots. Checkpoint rows land in the same transaction that marks the checkpoint complete, so every complete checkpoint has a row at its boundary block.
+- Reorgs are handled by newest-source supersession. A newer sequence on the same stream or a write from another stream overwrites the stored row, while stale same-stream writes are kept out. `updated_at` moves only when the stored content changes.
 - Native and VM history use block-number cursors.
 - RFQ history uses the RFQ update timestamp cursor. This stores RFQ state for historical indicative `/simulate` reconstruction. It does not store signed quote replay material for `/encode`.
+- Block-range backtests can request native, VM, and RFQ together by block number. The reader resolves the start, end, and end+1 blocks through PostgreSQL block timestamp metadata. The RFQ range runs from the start block timestamp to the end+1 block timestamp minus 1 ms, so it captures RFQ updates observed while the end block was head. Ranges ending at the recorded head are unresolvable until the next block is stored.
 
 ## Runtime Contract
 
@@ -55,18 +59,23 @@ The harness:
 
 - applies the repo-owned migrations;
 - creates the local S3 bucket if it is missing;
-- writes synthetic native, VM, and RFQ deltas;
-- writes and fetches a combined checkpoint;
+- writes synthetic native, VM, and RFQ deltas, then replays duplicate, reorg, stale-writer, and cross-stream block timestamp writes and reads the stored rows back to verify supersession, kept stale writes, and untouched `updated_at` on verbatim redelivery;
+- writes and fetches a combined checkpoint whose snapshot chunk seeds the start boundary timestamp row with the checkpoint's replay-boundary provenance;
+- rejects a checkpoint archive with a conflicted boundary height before any manifest or S3 object is created;
 - resolves a history range through the reader API;
 - verifies the gap-free helper;
 - records one synthetic gap and verifies that the reader reports it;
 - verifies that the reader reports unproven ingestion when synthetic cursors do not prove the open stream through the requested head.
+- resolves the same replay plan through the block-range backtest API and verifies the RFQ end bound equals the end+1 block timestamp minus 1 ms;
+- verifies that a backtest range ending at the recorded head is a hard error;
+- records one synthetic gap and one stale-stream delta, then verifies that the reader reports the visible recorded gap and the generation-switch gap.
 
 ## Reader Contract
 
 The `state-history` crate exposes the reader API for external harnesses:
 
 - `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. When a checkpoint is selected, replay is scoped to the validated Redis stream handoff chain and starts at the first message after the checkpoint's recorded source sequence. RFQ ranges use the checkpoint's RFQ update timestamp, not its wall-clock capture time, as the RFQ replay cursor.
+- `StateHistoryReader::resolve_backtest_range` accepts only block bounds and rejects an end block of `u64::MAX`. If RFQ is in scope, the start, end, and end+1 blocks must already exist in `state_history.block_timestamps`, and the end+1 timestamp must be strictly greater than the end timestamp. Missing metadata or a non-increasing next timestamp is a hard error before the reader builds the lower-level history request. Native/VM-only requests skip the timestamp lookup and delegate directly to `resolve_range`.
 - `StateHistoryReader::fetch_checkpoint` fetches and verifies the S3 object for a complete manifest.
 - `HistoryRangePlan::ensure_gap_free` turns recorded gaps, missing checkpoints, generation switches, or unproven ingestion into a hard error for callers that require complete ranges.
 
