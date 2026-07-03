@@ -1,10 +1,12 @@
 # Protocol feeds (what this server subscribes to)
 
-The service subscribes to chain-specific Tycho exchanges at startup (see `src/config/mod.rs` and `src/services/stream_builder.rs`).
+The service subscribes to chain-specific Tycho exchanges at startup (see
+`crates/runtime/src/config/mod.rs` and `crates/runtime/src/services/stream_builder.rs`).
 
 ## Native feeds by chain
 
 ### Ethereum (`CHAIN_ID=1`)
+
 - `uniswap_v2`
 - `sushiswap_v2`
 - `pancakeswap_v2`
@@ -18,6 +20,7 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 - `ekubo_v3`
 
 ### Base (`CHAIN_ID=8453`)
+
 - `uniswap_v2`
 - `uniswap_v3`
 - `uniswap_v4`
@@ -27,34 +30,44 @@ The service subscribes to chain-specific Tycho exchanges at startup (see `src/co
 ## VM feeds by chain
 
 ### Ethereum (`CHAIN_ID=1`)
+
 - `vm:curve`
 - `vm:balancer_v2`
 - `vm:maverick_v2`
 
 ### Base (`CHAIN_ID=8453`)
+
 - No VM protocols configured in this iteration.
 
 ## RFQ feeds by chain
 
 ### Ethereum (`CHAIN_ID=1`)
+
 - `rfq:bebop`
 - `rfq:hashflow`
 
+> **NOTE:** `rfq:liquorice` simulation is wired in the quote, but encoding and full support will be
+> introduced in the future. For now it's unsupported.
+
 ### Base (`CHAIN_ID=8453`)
+
 - `rfq:bebop`
 - `rfq:hashflow`
 
 ## Effective VM enablement
 
 - Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
-- This means Base reports `vm_enabled=false` even if `ENABLE_VM_POOLS=true`.
+- This means Base omits `backends.vm` even if `ENABLE_VM_POOLS=true`.
 - The local analyzer waits for VM readiness automatically on Ethereum when VM pools are enabled.
 
 ## Effective RFQ enablement
 
 - Runtime RFQ state is `effective_rfq_enabled = ENABLE_RFQ_POOLS && rfq_protocols_not_empty`.
-- Enabling RFQ analysis on Ethereum or Base also requires `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, and `HASHFLOW_KEY`.
+- Enabling RFQ analysis requires credentials for the providers on that chain. Ethereum and Base use
+  the Bebop and Hashflow pairs. Liquorice credentials are only needed after `rfq:liquorice` is added
+  to the active chain list.
 - The local analyzer waits for RFQ readiness automatically when RFQ pools are enabled on either chain.
+- On Base, RFQ-enabled analyzer runs include a Bebop partial-fill encode diagnostic. It is required only when RFQ is enabled and ready, and it reports degraded evidence if `rfq:bebop` or the non-RFQ comparison leg is not visible.
 
 ## Notes that affect local analysis
 

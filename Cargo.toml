@@ -1,49 +1,53 @@
-[package]
-name = "dsolver-simulator"
+[workspace]
+members = [
+    "crates/simulator-core",
+    "crates/broadcaster-replay-client",
+    "crates/runtime",
+    "crates/rpc",
+    "crates/apps",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91.0"
-default-run = "dsolver-simulator-service"
-description = "DSolver Simulator: fast DeFi swap simulation and route encoding on live Tycho state."
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 
-[[bin]]
-name = "dsolver-simulator-service"
-path = "src/main.rs"
-
-[dependencies]
-tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation", tag = "0.248.1" }
-tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
-anyhow = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-futures = "0.3"
-num-traits = "0.2"
-num-bigint = "0.4"
-reqwest = { version = "0.12", features = ["json"] }
-axum = "0.7"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dotenv = "0.15.0"
+[workspace.dependencies]
 alloy-primitives = "1.5.4"
 alloy-sol-types = "1.5.2"
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-tokio-util = "0.7"
-tower = { version = "0.5", features = ["timeout", "util"] }
-rand = "0.8"
+anyhow = "1.0"
+axum = "0.7"
+chrono = "0.4"
+csv = "1.4.0"
+dotenv = "0.15.0"
+futures = "0.3"
 jemalloc-ctl = "0.5"
 jemallocator = "0.5"
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"
+rayon = "1.12"
+redis = { version = "1.2.3", default-features = false, features = ["connection-manager", "streams", "tokio-comp", "tokio-rustls-comp"] }
+reqwest = { version = "0.12", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1.18"
-csv = "1.4.0"
-tycho-common = "0.152.4"
-
-[dev-dependencies]
-chrono = "0.4"
+tokio-util = "0.7"
+toml = "0.8"
+tower = { version = "0.5", features = ["timeout", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+tycho-common = "0.158.0"
+tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
+tycho-simulation = "0.258.0"
 typetag = "0.2"
 
-[lints.clippy]
+[workspace.lints.clippy]
 dbg_macro = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"

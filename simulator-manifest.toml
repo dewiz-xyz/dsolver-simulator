@@ -1,0 +1,149 @@
+# Declare protocols once up top, then let each chain opt into the ones it actually wants.
+[[protocols]]
+id = "uniswap_v2"
+backend = "native"
+
+[[protocols]]
+id = "sushiswap_v2"
+backend = "native"
+
+[[protocols]]
+id = "pancakeswap_v2"
+backend = "native"
+
+[[protocols]]
+id = "uniswap_v3"
+backend = "native"
+
+[[protocols]]
+id = "pancakeswap_v3"
+backend = "native"
+
+[[protocols]]
+id = "uniswap_v4"
+backend = "native"
+
+[[protocols]]
+id = "ekubo_v2"
+backend = "native"
+
+[[protocols]]
+id = "fluid_v1"
+backend = "native"
+
+[[protocols]]
+id = "rocketpool"
+backend = "native"
+
+[[protocols]]
+id = "ekubo_v3"
+backend = "native"
+
+[[protocols]]
+id = "erc4626"
+backend = "native"
+
+[[protocols]]
+id = "aerodrome_slipstreams"
+backend = "native"
+
+[[protocols]]
+id = "vm:curve"
+backend = "vm"
+
+[[protocols]]
+id = "vm:balancer_v2"
+backend = "vm"
+
+[[protocols]]
+id = "vm:maverick_v2"
+backend = "vm"
+
+[[protocols]]
+id = "rfq:bebop"
+backend = "rfq"
+
+[[protocols]]
+id = "rfq:hashflow"
+backend = "rfq"
+
+[[protocols]]
+id = "rfq:liquorice"
+backend = "rfq"
+
+# Route policies hold the routing nuances that do not belong in the plain chain protocol lists.
+[[route_policies]]
+id = "ethereum"
+native_token_protocol_allowlist = ["rocketpool"]
+reset_allowance_tokens = ["0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+
+# ERC4626 is the one case where direction really matters, so it stays explicit here.
+[[route_policies.erc4626_pairs]]
+asset_symbol = "USDS"
+share_symbol = "sUSDS"
+asset = "0xdC035D45d973E3EC169d2276DDab16f1e407384F"
+share = "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"
+allow_asset_to_share = true
+allow_share_to_asset = true
+
+[[route_policies.erc4626_pairs]]
+asset_symbol = "USDC"
+share_symbol = "sUSDC"
+asset = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+share = "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE"
+allow_asset_to_share = true
+allow_share_to_asset = true
+
+[[route_policies.erc4626_pairs]]
+asset_symbol = "PYUSD"
+share_symbol = "spPYUSD"
+asset = "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"
+share = "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354"
+allow_asset_to_share = true
+allow_share_to_asset = true
+
+[[route_policies]]
+id = "base"
+native_token_protocol_allowlist = []
+reset_allowance_tokens = []
+
+# Chain entries stay intentionally small: endpoints, enabled protocol sets, and the route policy to use.
+[[chains]]
+chain_id = 1
+tycho_url = "tycho-beta.propellerheads.xyz"
+bebop_url = "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
+hashflow_filename = "./hashflow_supported_tokens.csv"
+liquorice_url = "https://api.liquorice.tech/v1/solver/supported-tokens"
+native_protocols = [
+    "uniswap_v2",
+    "sushiswap_v2",
+    "pancakeswap_v2",
+    "uniswap_v3",
+    "pancakeswap_v3",
+    "uniswap_v4",
+    "ekubo_v2",
+    "fluid_v1",
+    "rocketpool",
+    "ekubo_v3",
+    "erc4626",
+]
+vm_protocols = ["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
+# TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
+rfq_protocols = ["rfq:bebop", "rfq:hashflow"]
+route_policy = "ethereum"
+
+[[chains]]
+chain_id = 8453
+tycho_url = "tycho-base-beta.propellerheads.xyz"
+bebop_url = "https://api.bebop.xyz/pmm/base/v3/tokens"
+hashflow_filename = "./hashflow_supported_tokens.csv"
+native_protocols = [
+    "uniswap_v2",
+    "uniswap_v3",
+    "uniswap_v4",
+    "pancakeswap_v3",
+    "aerodrome_slipstreams",
+]
+vm_protocols = []
+rfq_protocols = ["rfq:bebop", "rfq:hashflow"]
+route_policy = "base"
