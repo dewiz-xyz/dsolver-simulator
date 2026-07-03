@@ -26,6 +26,7 @@ logs/
 .tycho-broadcaster-service.pid
 .tycho-broadcaster-service.meta
 .tycho-redis-service.meta
+.agents
 .cursorrules
 AGENTS.md
 CLAUDE.md
