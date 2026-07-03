@@ -5508,6 +5508,7 @@ dependencies = [
  "rayon",
  "redis",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "simulator-core",

@@ -32,6 +32,7 @@ rand = "0.8"
 rayon = "1.12"
 redis = { version = "1.2.3", default-features = false, features = ["connection-manager", "streams", "tokio-comp", "tokio-rustls-comp"] }
 reqwest = { version = "0.12", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }

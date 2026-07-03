@@ -7,6 +7,10 @@ use tracing_subscriber::{
 
 /// Initialize the logging system with tracing
 pub fn init_logging() {
+    // Cargo can enable both rustls providers, so choose aws-lc-rs before any rediss:// handshake.
+    // An already-installed default is fine and keeps repeated startup calls harmless.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Get log level from environment or default to INFO
     let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
