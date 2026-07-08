@@ -561,16 +561,20 @@ impl EncodedCheckpointArchive {
     }
 }
 
-pub fn encode_checkpoint_archive(archive: &CheckpointArchive) -> Result<EncodedCheckpointArchive> {
+pub fn encode_checkpoint_archive(archive: CheckpointArchive) -> Result<EncodedCheckpointArchive> {
+    // Checkpoint archives are the full typed payload set, so keep at most two of
+    // the three representations (typed, JSON, compressed) alive at any point.
     let wire = CheckpointArchiveWire {
         schema_version: CHECKPOINT_ARCHIVE_SCHEMA_VERSION,
-        metadata: archive.metadata.clone(),
-        payloads: archive.payloads.clone(),
+        metadata: archive.metadata,
+        payloads: archive.payloads,
     };
     let json =
         serde_json::to_vec(&wire).context("failed to serialize checkpoint archive as JSON")?;
+    drop(wire);
     let hash = sha256_hex(&json);
-    let compressed = zstd::stream::encode_all(Cursor::new(&json), ZSTD_LEVEL)
+    let uncompressed_bytes = json.len();
+    let compressed = zstd::stream::encode_all(Cursor::new(json), ZSTD_LEVEL)
         .context("failed to compress checkpoint archive")?;
     let compressed_bytes = compressed.len();
     Ok(EncodedCheckpointArchive {
@@ -578,7 +582,7 @@ pub fn encode_checkpoint_archive(archive: &CheckpointArchive) -> Result<EncodedC
         payload: EncodedPayload {
             encoding: PayloadEncoding::JsonZstd,
             hash,
-            uncompressed_bytes: json.len(),
+            uncompressed_bytes,
             compressed_bytes,
         },
     })
@@ -3097,18 +3101,23 @@ impl S3CheckpointStore {
     pub async fn put_checkpoint_archive(
         &self,
         key: &str,
-        archive: &CheckpointArchive,
-    ) -> Result<EncodedCheckpointArchive> {
-        let encoded = encode_checkpoint_archive(archive)?;
+        archive: CheckpointArchive,
+    ) -> Result<EncodedPayload> {
+        // The archive encode (JSON + SHA-256 + zstd) is CPU-bound over the full
+        // checkpoint, so run it off the async runtime.
+        let EncodedCheckpointArchive { bytes, payload } =
+            tokio::task::spawn_blocking(move || encode_checkpoint_archive(archive))
+                .await
+                .context("checkpoint archive encode task failed")??;
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(encoded.bytes.clone()))
+            .body(ByteStream::from(bytes))
             .send()
             .await
             .with_context(|| format!("failed to upload state history checkpoint {key}"))?;
-        Ok(encoded)
+        Ok(payload)
     }
 
     pub async fn get_checkpoint_archive(
@@ -3233,12 +3242,12 @@ impl StateHistoryCheckpointWriter {
             Err(error) => return Err(self.fail_checkpoint(None, boundary_block, error).await),
         };
 
-        let encoded = match self
+        let payload = match self
             .checkpoint_store
-            .put_checkpoint_archive(&s3_key, &archive)
+            .put_checkpoint_archive(&s3_key, archive)
             .await
         {
-            Ok(encoded) => encoded,
+            Ok(payload) => payload,
             Err(error) => {
                 return Err(self
                     .fail_checkpoint(Some(manifest_id), boundary_block, error)
@@ -3246,9 +3255,9 @@ impl StateHistoryCheckpointWriter {
             }
         };
         let completion = CheckpointCompletion {
-            payload_hash: encoded.payload.hash.clone(),
-            payload_bytes: encoded.payload.uncompressed_bytes,
-            compressed_bytes: encoded.payload.compressed_bytes,
+            payload_hash: payload.hash.clone(),
+            payload_bytes: payload.uncompressed_bytes,
+            compressed_bytes: payload.compressed_bytes,
         };
         if let Err(error) = self
             .pg_store
@@ -3277,7 +3286,7 @@ impl StateHistoryCheckpointWriter {
         Ok(CheckpointWriteOutcome {
             manifest_id,
             s3_key,
-            payload: encoded.payload,
+            payload,
         })
     }
 
@@ -4307,7 +4316,7 @@ mod tests {
             payloads: vec![first.clone(), second.clone()],
         };
 
-        let encoded = encode_checkpoint_archive(&archive)?;
+        let encoded = encode_checkpoint_archive(archive.clone())?;
         let decoded: DecodedCheckpointArchive = encoded.decode()?;
 
         assert_eq!(decoded.archive.metadata, archive.metadata);
@@ -4336,7 +4345,7 @@ mod tests {
             },
             payloads: vec![envelope],
         };
-        let encoded = encode_checkpoint_archive(&archive)?;
+        let encoded = encode_checkpoint_archive(archive)?;
 
         let error = decode_checkpoint_archive_bytes(encoded.bytes, Some("wrong-hash"))
             .err()
