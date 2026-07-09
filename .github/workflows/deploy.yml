@@ -3,7 +3,6 @@ name: Build & Push Simulator Image
 on:
   push:
     branches:
-      - master
       - staging
       - shadow
   workflow_dispatch:
@@ -51,9 +50,6 @@ jobs:
           elif [ "$REF_NAME" = "staging" ]; then
             TARGETS='["staging-solve-base"]'
             ENV="staging"
-          else
-            TARGETS='["quoter-base","solve-base"]'
-            ENV="production"
           fi
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
