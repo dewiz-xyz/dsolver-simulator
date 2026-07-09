@@ -219,6 +219,10 @@ For ops, `/encode` timeout and failure logs include stable `encode_error_kind` a
 
 If you are integrating against `/simulate`, inspect `meta` on every successful HTTP response. If you are integrating against `/encode`, normal HTTP success and error handling is still the right control flow.
 
+## Deployments
+
+Production simulator and broadcaster images are built and pushed to ECR only through manual dispatch of `deploy.yml` or `deploy-broadcaster.yml` for the target environment. Pushing an image does not change what runs in production on its own. Activation is a separate step in the infrastructure repository, while pushes to the `staging` branch continue to build and deploy staging automatically.
+
 ## Verification
 
 CI-equivalent commands:
