@@ -18,7 +18,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
 - For server-side reporting, rely on the structured summary log emitted for each `/encode` request. Detailed resimulation traces are available at `debug`.
 
-The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for the default 2-hop route on each supported chain, requires both simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on either hop.
+The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for default routes on each supported chain, requires simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on a required hop.
 
 ## Request body (shape)
 
@@ -212,4 +212,4 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 
 ### Local analysis note
 
-The repo-local analyzer uses a narrow 2-hop route probe built from `/simulate` results and records how `/encode` behaves for that route. It is meant to surface behavior, latency, and oddities in a standardized report, not to act like a strict pass/fail encode contract test.
+The repo-local analyzer uses a SimpleSwap, MultiSwap, and MegaSwap route matrix built from `/simulate` results and records how `/encode` behaves for those routes. It is meant to surface behavior, latency, and oddities in a standardized report, not to act like a strict pass/fail encode contract test.

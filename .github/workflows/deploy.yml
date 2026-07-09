@@ -1,9 +1,8 @@
-name: Build & Push Docker Image
+name: Build & Push Simulator Image
 
 on:
   push:
     branches:
-      - master
       - staging
       - shadow
   workflow_dispatch:
@@ -51,9 +50,6 @@ jobs:
           elif [ "$REF_NAME" = "staging" ]; then
             TARGETS='["staging-solve-base"]'
             ENV="staging"
-          else
-            TARGETS='["quoter-base","solve-base"]'
-            ENV="production"
           fi
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
@@ -83,6 +79,7 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile.simulator-service
           platforms: linux/amd64
           push: true
           tags: |
@@ -90,9 +87,40 @@ jobs:
             ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          secrets: |
+            github_token=${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+
+      - name: Build & push broadcaster image
+        if: matrix.target == 'quoter-base' || matrix.target == 'staging-solve-base'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.broadcaster-service
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/tycho-broadcaster-${{ matrix.target }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-broadcaster-${{ matrix.target }}:latest
+          cache-from: type=gha,scope=broadcaster-service-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=broadcaster-service-${{ matrix.target }}
+          secrets: |
+            github_token=${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
 
       - name: Force deploy ECS service
         env:
           CLUSTER: ${{ matrix.target }}
         run: |
           aws ecs update-service --cluster "$CLUSTER" --service tycho-simulator --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text
+
+      - name: Force deploy broadcaster ECS service
+        if: matrix.target == 'quoter-base' || matrix.target == 'staging-solve-base'
+        env:
+          CLUSTER: ${{ matrix.target }}
+        run: |
+          # The broadcaster service may not exist yet because its infra lands separately, so skip instead of failing.
+          STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services broadcaster --region ${{ env.AWS_REGION }} --query 'services[0].status' --output text 2>/dev/null || echo "MISSING")
+          if [ "$STATUS" = "ACTIVE" ]; then
+            aws ecs update-service --cluster "$CLUSTER" --service broadcaster --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text
+          else
+            echo "broadcaster service not ACTIVE in $CLUSTER (status: $STATUS), skipping force deploy"
+          fi

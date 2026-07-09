@@ -12,10 +12,10 @@ Options:
   --timeout              Timeout in seconds (default: 180)
   --interval             Poll interval in seconds (default: 2)
   --expect-chain-id      Require /status.chain_id to match this chain id
-  --require-vm-ready     Require vm_status=ready before succeeding
-  --require-vm-pools-min Minimum vm_pools required when --require-vm-ready is set (default: 1)
-  --require-rfq-ready    Require rfq_status=ready before succeeding
-  --require-rfq-pools-min Minimum rfq_pools required when --require-rfq-ready is set (default: 1)
+  --require-vm-ready     Require backends.vm.status=ready before succeeding
+  --require-vm-pools-min Minimum backends.vm.pool_count required when --require-vm-ready is set (default: 1)
+  --require-rfq-ready    Require backends.rfq.status=ready before succeeding
+  --require-rfq-pools-min Minimum backends.rfq.pool_count required when --require-rfq-ready is set (default: 1)
   -h, --help             Show this help
 USAGE
 }
@@ -108,24 +108,26 @@ if expected_chain is not None:
 if status_code != "200":
     raise SystemExit(2)
 
-if payload.get("native_status") != "ready":
+backends = payload.get("backends") or {}
+native = backends.get("native") or {}
+
+if native.get("status") != "ready":
     raise SystemExit(2)
 
-if require_vm:
-    if not payload.get("vm_enabled"):
+def require_backend(kind, pools_min):
+    backend = backends.get(kind) or {}
+    if not backend.get("enabled"):
         raise SystemExit(2)
-    if payload.get("vm_status") != "ready":
+    if backend.get("status") != "ready":
         raise SystemExit(2)
-    if int(payload.get("vm_pools") or 0) < vm_pools_min:
+    if int(backend.get("pool_count") or 0) < pools_min:
         raise SystemExit(2)
 
+if require_vm:
+    require_backend("vm", vm_pools_min)
+
 if require_rfq:
-    if not payload.get("rfq_enabled"):
-        raise SystemExit(2)
-    if payload.get("rfq_status") != "ready":
-        raise SystemExit(2)
-    if int(payload.get("rfq_pools") or 0) < rfq_pools_min:
-        raise SystemExit(2)
+    require_backend("rfq", rfq_pools_min)
 ' "$status_code" "$require_vm_ready" "$require_vm_pools_min" "$require_rfq_ready" "$require_rfq_pools_min" "$expect_chain_id" <<<"$body" 2>&1)"
   then
     echo "ready"

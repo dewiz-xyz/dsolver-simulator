@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+FROM public.ecr.aws/docker/library/rust:1.91.0-bookworm AS builder
+WORKDIR /app
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev clang cmake git && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY . .
+
+RUN --mount=type=secret,id=github_token \
+    GITHUB_TOKEN="$(cat /run/secrets/github_token)" && \
+    test -n "$GITHUB_TOKEN" && \
+    GIT_CONFIG_COUNT=2 \
+    GIT_CONFIG_KEY_0="url.https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/.insteadOf" \
+    GIT_CONFIG_VALUE_0="ssh://git@github.com/pedrobergamini/" \
+    GIT_CONFIG_KEY_1="url.https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/.insteadOf" \
+    GIT_CONFIG_VALUE_1="git@github.com:pedrobergamini/" \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+
+
+FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    ca-certificates openssl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/target/release/dsolver-tycho-broadcaster-service /usr/local/bin/dsolver-tycho-broadcaster-service
+COPY --from=builder /app/simulator-manifest.toml /app/simulator-manifest.toml
+COPY --from=builder /app/hashflow_supported_tokens.csv /app/hashflow_supported_tokens.csv
+ENV HASHFLOW_FILENAME_CSV=/app/hashflow_supported_tokens.csv
+
+RUN useradd -m appuser
+USER appuser
+
+ENTRYPOINT ["dsolver-tycho-broadcaster-service"]

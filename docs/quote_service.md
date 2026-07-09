@@ -30,6 +30,7 @@ The request-level metadata shape is `QuoteMeta`:
 - optional `partial_kind`
 - `block_number`
 - optional `vm_block_number`
+- optional `rfq_update_timestamp`
 - `matching_pools`
 - `candidate_pools`
 - optional `total_pools`
@@ -43,7 +44,7 @@ Live enum values:
 - `QuoteStatus`: `ready`, `warming_up`, `token_missing`, `no_liquidity`, `invalid_request`, `internal_error`
 - `QuoteResultQuality`: `complete`, `partial`, `no_results`, `request_level_failure`
 - `QuotePartialKind`: `amount_ladders`, `pool_coverage`, `mixed`
-- `PoolOutcomeKind`: `partial_output`, `zero_output`, `skipped_concurrency`, `skipped_deadline`, `timed_out`, `simulator_error`, `internal_error`
+- `PoolOutcomeKind`: `partial_output`, `zero_output`, `timed_out`, `simulator_error`, `internal_error`
 
 Contract invariants:
 
@@ -53,6 +54,7 @@ Contract invariants:
 - `partial_kind` appears only when `result_quality=partial`
 - `no_liquidity` never appears alongside usable quote data
 - request-relevant fatal failures remain visible in `meta.failures` even when some usable amount outputs survive
+- `block_number` is the native stream block; `vm_block_number` is the VM stream block when VM state is ready; `rfq_update_timestamp` is the current RFQ update timestamp/cursor when RFQ state is ready
 - requested-amount order inside each pool row is part of the quote contract; `amounts_out[i]` matches the requested `amounts[i]`
 - emitted pool rows preserve request order and request length for usable partial results; failed or timed-out requested amounts are serialized in place as `"0"` with matching `gas_used=0`
 - `"0"` in `amounts_out` means that requested amount did not produce a usable quote for that pool; only positive outputs are usable quotes
@@ -69,7 +71,7 @@ Contract invariants:
 4. Token metadata is loaded for both sides. Missing or timed-out token coverage exits as `token_missing + request_level_failure`.
 5. Candidate pools are loaded from native state and, when available, VM state.
 6. Unsupported ERC4626 candidates are filtered before execution.
-7. Pool tasks are scheduled under quote deadlines and global concurrency limits.
+7. Pool tasks run until they complete or the request-level timeout guard ends the computation.
 8. Per-pool execution results are aggregated into `data`, `meta.failures`, and `meta.pool_results`.
 9. The runner classifies the final exit as `complete`, `partial`, `no_results`, or `request_level_failure`.
 
@@ -87,7 +89,7 @@ The current classification logic is:
 | --- | --- | --- | --- | --- |
 | Complete quote, all relevant requested amounts returned | `ready` | `complete` | omitted | `meta.failures` and `meta.pool_results` stay empty or omitted |
 | Usable quotes returned, but at least one returned pool has partial requested-amount coverage | `ready` | `partial` | `amount_ladders` | emitted pool rows stay full-length and zero-fill failed amount positions; only positive outputs are usable quotes; `meta.pool_results` includes `partial_output` |
-| Usable quotes returned, but some matching pools failed, timed out, or were skipped | `ready` | `partial` | `pool_coverage` | scheduling and simulator anomalies remain visible |
+| Usable quotes returned, but some matching pools failed or timed out | `ready` | `partial` | `pool_coverage` | simulator anomalies remain visible |
 | Both partial requested-amount coverage and incomplete pool coverage occurred | `ready` | `partial` | `mixed` | both partiality sources are present |
 | Matching pools exist, but none produce a usable quote because liquidity is absent or exhausted | `no_liquidity` | `no_results` | omitted | includes cases where candidate rows would otherwise be fully zero; `meta.failures` explains the no-liquidity reason |
 | No matching pools exist | `no_liquidity` | `no_results` | omitted | `meta.failures` includes `no_pools` |
@@ -101,22 +103,35 @@ The current classification logic is:
 Service health and native readiness:
 
 - `status="ready"` with HTTP `200` means the service is healthy
-- `status="warming_up"` with HTTP `503` means no backend is ready yet
-- `native_status="ready"` means native state is ready and recent enough
-- `native_status="warming_up"` means initial native state is still loading or native updates are stale
+- `status="warming_up"` with HTTP `503` means native state is still loading
+- `status="stale"` with HTTP `503` means native state was ready before but is now stale
+- `backends.native.status="ready"` means native state is ready and recent enough
+- `backends.native.status="warming_up"` means the native subscriber, snapshot bootstrap, or state store is still loading
+- `backends.native.status="stale"` means native updates are past the readiness freshness window
 
 VM readiness:
 
-- `vm_status="disabled"` when VM pools are turned off
-- `vm_status="warming_up"` while VM state is still loading
-- `vm_status="rebuilding"` during VM rebuilds
-- `vm_status="ready"` when VM state is usable
+- `backends.vm.status="disabled"` when VM pools are configured but turned off
+- `backends.vm.status="warming_up"` while VM subscriber bootstrap or VM state is still loading
+- `backends.vm.status="rebuilding"` during VM rebuilds
+- `backends.vm.status="stale"` when VM updates are past the readiness freshness window
+- `backends.vm.status="ready"` when VM state is usable
+
+RFQ readiness:
+
+- `backends.rfq.status="disabled"` when RFQ pools are configured but turned off
+- `backends.rfq.status="warming_up"` while RFQ subscriber bootstrap or RFQ state is still loading
+- `backends.rfq.status="stale"` when RFQ updates are past the readiness freshness window
+- `backends.rfq.status="ready"` when RFQ state is usable
+- `backends.rfq.update_timestamp` is the current Tycho RFQ update timestamp/cursor when RFQ state is ready; RFQ backend status does not expose `block_number`
 
 Quote-path implications:
 
 - native readiness still gates the whole request
 - VM readiness does not gate the whole request when native pools are still available
 - when VM pools are enabled but not ready, the runner skips VM candidates and sets `meta.vm_unavailable=true`
+- RFQ readiness does not gate the whole request when native pools are still available
+- when RFQ pools are enabled but not ready, the runner skips RFQ candidates and sets `meta.rfq_unavailable=true`
 
 ## Candidate selection and execution
 
@@ -124,18 +139,17 @@ Candidate discovery:
 
 - native candidates come from the native state store
 - VM candidates come from the VM state store only when VM state is ready
+- RFQ candidates come from the RFQ state store only when RFQ state is ready
 
 Execution rules:
 
-- native and VM tasks share separate global concurrency caps
-- per-request quote execution uses a request deadline and per-pool deadlines
-- pools that cannot be scheduled before the deadline or under concurrency limits are skipped instead of queued indefinitely
+- per-request quote execution uses the request deadline
 - usable outputs are preserved even when some pools degrade
 
 Partiality sources:
 
 - `amount_ladders`: a returned pool produced at least one usable quote, but one or more requested amounts failed or timed out
-- `pool_coverage`: one or more matching pools were skipped, timed out, or failed before returning a usable quote
+- `pool_coverage`: one or more matching pools timed out or failed before returning a usable quote
 - `mixed`: both conditions happened in one response
 
 Advisory `get_limits` signals do not define success on their own. `get_amount_out` remains the source of truth for quote success or failure.
@@ -157,7 +171,6 @@ Important failure kinds include:
 - `token_validation`
 - `token_coverage`
 - `timeout`
-- `concurrency_limit`
 - `overflow`
 - `simulator`
 - `no_pools`
@@ -171,7 +184,6 @@ Use it to understand:
 
 - which pools returned partial requested-amount coverage while still yielding at least one usable quote
 - which pools returned zero output across all requested amounts and were therefore filtered out of `data[]`
-- which pools were skipped because of concurrency or deadlines
 - which pools timed out or failed inside the simulator
 
 The two layers are intentionally redundant in some degraded cases. Material request-visible failures should not be visible only through per-pool anomaly rows.
@@ -242,7 +254,7 @@ Operational guidance:
 
 Repo analysis workflow:
 
-- `cargo run --bin sim-analysis -- ...` is intentionally reporting-first and summarizes healthy, degraded, and errored outcomes instead of acting like a strict branch gate
+- `cargo run -p apps --bin sim-analysis -- ...` is intentionally reporting-first and summarizes healthy, degraded, and errored outcomes instead of acting like a strict branch gate
 - the analyzer still evaluates `result_quality`, `partial_kind`, `meta.failures`, and protocol visibility rather than looking only at HTTP status or `meta.status`
 - saved artifacts under `logs/simulation-reports/` make it easier to compare local runs and investigate odd protocol-specific behavior without hard-coding business assertions
 
