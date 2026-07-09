@@ -10,6 +10,7 @@ on:
         options:
           - staging-solve-base
           - quoter-base
+          - base-production
 
 permissions:
   id-token: write
@@ -22,7 +23,7 @@ jobs:
   build-and-deploy:
     name: Build & Deploy Broadcaster (${{ inputs.target }})
     runs-on: ubuntu-latest
-    environment: ${{ inputs.target == 'quoter-base' && 'production' || 'staging' }}
+    environment: ${{ (inputs.target == 'quoter-base' || inputs.target == 'base-production') && 'production' || 'staging' }}
     steps:
       - uses: actions/checkout@v4
 
