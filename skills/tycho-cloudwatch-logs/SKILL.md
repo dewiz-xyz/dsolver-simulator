@@ -1,12 +1,12 @@
 ---
 name: tycho-cloudwatch-logs
-description: Search, tail, and query Tycho simulation production logs in AWS CloudWatch using AWS CLI and bundled scripts. Use for /ecs/tycho-simulator investigations such as block updates, resyncs, readiness, timeouts, or general app errors.
+description: Search, tail, and query Tycho production logs in AWS CloudWatch using AWS CLI and bundled scripts. Use for simulator or shared broadcaster investigations such as block updates, resyncs, readiness, timeouts, or general app errors.
 ---
 
 # Tycho Cloudwatch Logs
 
 ## Overview
-Use AWS CLI to inspect Tycho simulation logs in CloudWatch. Default log group is `/ecs/tycho-simulator` in `eu-central-1`. Logs are JSON from `tracing_subscriber`, so queries parse `@message` to extract `msg`, `level`, and structured fields.
+Use AWS CLI to inspect Tycho simulation logs in CloudWatch. Simulator groups use `/ecs/{env}/tycho-simulator` for `quoter-base` and `solve-base`, while `staging-solve-base` is dark. The bundled scripts default to `/ecs/quoter-base/tycho-simulator` in `eu-central-1`. The shared producer logs to `/ecs/broadcaster-production/broadcaster`. RFQ provider stream errors, including chronic Hashflow HTTP 400 responses, appear only in the broadcaster group. Logs are JSON from `tracing_subscriber`, so queries parse `@message` to extract `msg`, `level`, and structured fields.
 
 If you hit `ExpiredTokenException`, refresh the `AWS_SESSION_TOKEN` in `.env` and retry.
 

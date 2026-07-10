@@ -221,7 +221,7 @@ If you are integrating against `/simulate`, inspect `meta` on every successful H
 
 ## Deployments
 
-Production simulator and broadcaster images are built and pushed to ECR only through manual dispatch of `deploy.yml` or `deploy-broadcaster.yml` for the target environment. Pushing an image does not change what runs in production on its own. Activation is a separate step in the infrastructure repository, while pushes to the `staging` branch continue to build and deploy staging automatically.
+Production task definitions pin immutable git SHA image tags, so pushing an image is inert. The force redeploy steps only cycle tasks on the SHA already pinned. Go live by bumping `imageTag` in the solver-iac stack YAML and manually dispatching that stack there. The staging push flow still exists, but it deploys into a fully dark environment.
 
 ## Verification
 

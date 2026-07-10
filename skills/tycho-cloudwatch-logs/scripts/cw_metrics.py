@@ -259,7 +259,7 @@ def main():
     parser.add_argument("--since", default="12h")
     parser.add_argument("--until", default="now")
     parser.add_argument("--metrics", default="memory,cpu")
-    parser.add_argument("--cluster", default=os.getenv("TYCHO_ECS_CLUSTER", "tycho-simulator-cluster"))
+    parser.add_argument("--cluster", default=os.getenv("TYCHO_ECS_CLUSTER", "quoter-base"))
     parser.add_argument("--service", default=os.getenv("TYCHO_ECS_SERVICE", "tycho-simulator"))
     parser.add_argument("--task-ids", default="")
     parser.add_argument("--period", type=int, default=60)

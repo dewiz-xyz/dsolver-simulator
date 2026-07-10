@@ -1,9 +1,11 @@
 # Tycho CloudWatch log queries
 
 ## Defaults
-- Region: eu-central-1
-- Log group: /ecs/tycho-simulator
-- Log stream prefix (ECS): tycho-simulator/web/
+- The default region is eu-central-1.
+- Simulator log groups use /ecs/{env}/tycho-simulator for quoter-base and solve-base. staging-solve-base is dark.
+- The default log group is /ecs/quoter-base/tycho-simulator.
+- The shared broadcaster log group is /ecs/broadcaster-production/broadcaster. RFQ provider stream errors, including chronic Hashflow HTTP 400 responses, appear only here.
+- The ECS log stream prefix is tycho-simulator/web/.
 
 ## JSON note
 Logs are JSON from `tracing_subscriber`. CloudWatch does not always flatten nested `fields`,

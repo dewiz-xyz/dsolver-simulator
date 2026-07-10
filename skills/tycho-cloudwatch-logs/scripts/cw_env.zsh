@@ -10,7 +10,8 @@ if [[ -z "${AWS_ACCESS_KEY_ID:-}" && -f "$env_file" ]]; then
   set +a
 fi
 
-: "${TYCHO_LOG_GROUP:=/ecs/tycho-simulator}"
+# Valid log groups include /ecs/quoter-base/tycho-simulator, /ecs/solve-base/tycho-simulator, and /ecs/broadcaster-production/broadcaster.
+: "${TYCHO_LOG_GROUP:=/ecs/quoter-base/tycho-simulator}"
 
 if [[ -z "${AWS_REGION:-}" && -z "${AWS_DEFAULT_REGION:-}" ]]; then
   export AWS_REGION="eu-central-1"
