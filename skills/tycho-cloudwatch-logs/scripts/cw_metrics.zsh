@@ -8,13 +8,16 @@ usage() {
   cat <<'USAGE'
 Usage: cw_metrics.zsh [--since 12h] [--until now]
                      [--metrics memory,cpu]
-                     [--cluster tycho-simulator-cluster]
+                     [--cluster quoter-base]
                      [--service tycho-simulator]
                      [--task-ids id1,id2]
                      [--period 60] [--stat Average|Maximum|Minimum]
                      [--output table|json|tsv]
                      [--mode summary|series|both]
                      [--pivot 2026-02-04T11:38:00Z] [--window 10m]
+
+Simulator defaults use cluster quoter-base and service tycho-simulator.
+The shared producer uses cluster broadcaster-production and service broadcaster.
 USAGE
 }
 

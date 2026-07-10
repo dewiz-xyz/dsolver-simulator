@@ -91,7 +91,7 @@ jobs:
             github_token=${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
 
       - name: Build & push broadcaster image
-        if: matrix.target == 'quoter-base' || matrix.target == 'staging-solve-base'
+        if: matrix.target == 'staging-solve-base'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -114,7 +114,7 @@ jobs:
           aws ecs update-service --cluster "$CLUSTER" --service tycho-simulator --force-new-deployment --region ${{ env.AWS_REGION }} --query 'service.serviceName' --output text
 
       - name: Force deploy broadcaster ECS service
-        if: matrix.target == 'quoter-base' || matrix.target == 'staging-solve-base'
+        if: matrix.target == 'staging-solve-base'
         env:
           CLUSTER: ${{ matrix.target }}
         run: |
