@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -282,6 +283,7 @@ impl<'a> RouteResimulator<'a> {
                 pool_state.as_ref(),
                 self.chain,
                 &self.state.rfq_client_config,
+                encode_rfq_quote_timeout(self.state.request_timeout()),
             )?
         } else {
             pool_state
@@ -303,11 +305,22 @@ impl<'a> RouteResimulator<'a> {
     }
 }
 
+// Kept below the firm-quote timeout so a clamped client still gets most of the request budget.
+const ENCODE_QUOTE_TIMEOUT_HEADROOM: Duration = Duration::from_millis(200);
+
+// The firm quote blocks the encode task through block_in_place, so the outer request guard cannot
+// interrupt it. Clamp the quote timeout below the configured guard so the guard stays authoritative
+// even if REQUEST_TIMEOUT_MS is lowered below the static cap.
+fn encode_rfq_quote_timeout(request_timeout: Duration) -> Duration {
+    ENCODE_RFQ_QUOTE_TIMEOUT.min(request_timeout.saturating_sub(ENCODE_QUOTE_TIMEOUT_HEADROOM))
+}
+
 fn hydrate_rfq_pool_state(
     pool_id: &str,
     pool_state: &dyn ProtocolSim,
     chain: Chain,
     config: &RfqClientConfig,
+    quote_timeout: Duration,
 ) -> Result<Arc<dyn ProtocolSim>, EncodeError> {
     // Broadcaster serialization strips credentials, so rebuild only the request-scoped client.
     // Firm quotes do not use the stream token filters carried by these clients.
@@ -320,7 +333,7 @@ fn hydrate_rfq_pool_state(
             config.bebop_user.clone(),
             config.bebop_key.clone(),
             HashSet::new(),
-            ENCODE_RFQ_QUOTE_TIMEOUT,
+            quote_timeout,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Bebop", err))?;
         return Ok(Arc::new(hydrated));
@@ -336,7 +349,7 @@ fn hydrate_rfq_pool_state(
             config.hashflow_user.clone(),
             config.hashflow_key.clone(),
             RFQ_POLL_TIME,
-            ENCODE_RFQ_QUOTE_TIMEOUT,
+            quote_timeout,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Hashflow", err))?;
         return Ok(Arc::new(hydrated));
@@ -352,7 +365,7 @@ fn hydrate_rfq_pool_state(
             config.liquorice_user.clone(),
             config.liquorice_key.clone(),
             RFQ_POLL_TIME,
-            ENCODE_RFQ_QUOTE_TIMEOUT,
+            quote_timeout,
             LIQUORICE_QUOTE_EXPIRY_SECS,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Liquorice", err))?;
@@ -737,9 +750,14 @@ mod tests {
             dummy_token("0x0000000000000000000000000000000000000002"),
         );
 
-        let hydrated =
-            hydrate_rfq_pool_state("pool-bebop", &state, Chain::Ethereum, &rfq_client_config())
-                .unwrap();
+        let hydrated = hydrate_rfq_pool_state(
+            "pool-bebop",
+            &state,
+            Chain::Ethereum,
+            &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
+        )
+        .unwrap();
         let hydrated = hydrated.as_any().downcast_ref::<BebopState>().unwrap();
         let client = format!("{:?}", hydrated.client);
 
@@ -787,6 +805,7 @@ mod tests {
             &state,
             Chain::Ethereum,
             &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
         )
         .unwrap();
         let hydrated = hydrated.as_any().downcast_ref::<HashflowState>().unwrap();
@@ -832,6 +851,7 @@ mod tests {
             &state,
             Chain::Ethereum,
             &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
         )
         .unwrap();
         let hydrated = hydrated.as_any().downcast_ref::<LiquoriceState>().unwrap();
@@ -855,6 +875,7 @@ mod tests {
             &StepProtocolSim { multiplier: 1 },
             Chain::Ethereum,
             &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
         ) {
             Ok(_) => panic!("unknown RFQ state type should fail hydration"),
             Err(err) => err,
@@ -867,6 +888,25 @@ mod tests {
         assert_eq!(
             err.message(),
             "RFQ pool pool-unknown has unsupported state type"
+        );
+    }
+
+    #[test]
+    fn encode_rfq_quote_timeout_clamps_to_request_guard() {
+        // Prod guard (4.5s) leaves room for the full cap.
+        assert_eq!(
+            encode_rfq_quote_timeout(Duration::from_millis(4500)),
+            ENCODE_RFQ_QUOTE_TIMEOUT
+        );
+        // A guard below the cap wins, minus the headroom.
+        assert_eq!(
+            encode_rfq_quote_timeout(Duration::from_millis(2000)),
+            Duration::from_millis(1800)
+        );
+        // A guard at or under the headroom leaves no quote budget.
+        assert_eq!(
+            encode_rfq_quote_timeout(Duration::from_millis(150)),
+            Duration::ZERO
         );
     }
 

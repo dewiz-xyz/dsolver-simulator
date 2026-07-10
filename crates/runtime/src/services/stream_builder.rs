@@ -55,9 +55,10 @@ use tycho_simulation::{
 
 pub(crate) const RFQ_POLL_TIME: Duration = Duration::from_secs(5);
 pub(crate) const RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(5);
-// Firm quotes block the encode task through block_in_place/block_on, so this must stay below the
-// roughly 4.5-second /encode guard. Streaming clients keep RFQ_QUOTE_TIMEOUT because they do not
-// request firm quotes.
+// Upper cap for the firm-quote timeout on hydrated encode clients. Firm quotes block the encode
+// task through block_in_place/block_on, so the request guard cannot interrupt them; the encode path
+// additionally clamps this below the configured guard. Streaming clients keep RFQ_QUOTE_TIMEOUT
+// because they do not request firm quotes.
 pub(crate) const ENCODE_RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const LIQUORICE_QUOTE_EXPIRY_SECS: u64 = 300;
 
