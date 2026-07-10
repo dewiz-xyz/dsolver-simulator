@@ -33,6 +33,7 @@ fn native_token_address() -> Bytes {
 #[derive(Clone)]
 pub struct AppState {
     pub chain: Chain,
+    pub rfq_client_config: Arc<RfqClientConfig>,
     pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
     pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
@@ -56,6 +57,17 @@ pub struct AppState {
     pub erc4626_deposits_enabled: bool,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
     pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
+}
+
+#[derive(Clone, Default)]
+pub struct RfqClientConfig {
+    pub tvl_threshold: f64,
+    pub bebop_user: String,
+    pub bebop_key: String,
+    pub hashflow_user: String,
+    pub hashflow_key: String,
+    pub liquorice_user: String,
+    pub liquorice_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1776,6 +1788,7 @@ mod tests {
     fn build_test_app_state(stores: TestAppStateStores, flags: PoolFlags) -> AppState {
         AppState {
             chain: Chain::Ethereum,
+            rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: stores.token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

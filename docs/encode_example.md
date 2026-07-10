@@ -16,6 +16,7 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - Build a `RouteEncodeRequest` with `segments[] -> hops[] -> swaps[]`, using segment `shareBps` and swap `splitBps` to define splits.
 - Provide only the top-level `amountIn` and `minAmountOut` as the route-level guard.
 - POST to `/encode`, which re-simulates swaps internally, derives per-hop and per-swap amounts, and returns settlement `interactions[]`.
+- RFQ routes are supported when RFQ state is ready. The simulator adds its provider credentials to the request-scoped RFQ state and requests the firm signed quote while building calldata.
 - For server-side reporting, rely on the structured summary log emitted for each `/encode` request. Detailed resimulation traces are available at `debug`.
 
 The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for default routes on each supported chain, requires simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on a required hop.
@@ -204,6 +205,7 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 - The encoder emits `singleSwap`, `sequentialSwap`, or `splitSwap` based on route shape and splits.
 - `poolAddress` is optional and may be omitted when unavailable.
 - `estimatedAmountIn` is optional and may be omitted.
+- RFQ credentials come from the simulator environment, not broadcaster snapshots. Startup fails when an enabled RFQ provider is missing its credentials.
 - `interactions[]` are emitted in order: approve(amountIn) -> router call. For reset-allowance tokens an approve(0) is prepended.
 - Native `tokenIn`/`tokenOut` is supported only for allowlisted protocols (currently `rocketpool`).
   - Native `tokenIn` routes emit a `CALL`-only interaction with `value=amountIn` (no ERC20 approvals).

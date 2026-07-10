@@ -14,7 +14,8 @@ use crate::config::SlippageConfig;
 use crate::models::erc4626::Erc4626PairPolicy;
 use crate::models::messages::PoolRef;
 use crate::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
+    VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
@@ -153,6 +154,7 @@ pub(super) fn test_app_state(
 ) -> AppState {
     AppState {
         chain: Chain::Ethereum,
+        rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

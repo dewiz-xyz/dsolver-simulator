@@ -11,7 +11,8 @@ use jemallocator::Jemalloc;
 use num_bigint::BigUint;
 use runtime::config::{MemoryConfig, SlippageConfig};
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
+    VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -608,6 +609,7 @@ async fn vm_rebuild_resets_store_and_blocks_quotes() {
 
     let app_state = AppState {
         chain: Chain::Ethereum,
+        rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&token_store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

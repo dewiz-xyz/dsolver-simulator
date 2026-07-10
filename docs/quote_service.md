@@ -124,6 +124,7 @@ RFQ readiness:
 - `backends.rfq.status="stale"` when RFQ updates are past the readiness freshness window
 - `backends.rfq.status="ready"` when RFQ state is usable
 - `backends.rfq.update_timestamp` is the current Tycho RFQ update timestamp/cursor when RFQ state is ready; RFQ backend status does not expose `block_number`
+- when RFQ is enabled, the simulator requires credentials for every configured RFQ provider at startup so `/encode` can request firm signed quotes
 
 Quote-path implications:
 
@@ -248,6 +249,7 @@ Operational guidance:
 
 - `/encode` does not expose `QuoteMeta`
 - `/encode` clients and smoke helpers depend on `/simulate` to find candidate pools
+- `/encode` supports RFQ pools when RFQ state is ready; it rebuilds the selected request-scoped RFQ client with simulator credentials because broadcaster serialization omits them
 - pool selection should stay strict: `ready + complete|partial` is usable, `request_level_failure` and `no_results` are not
 - clients should filter returned rows explicitly for the amount position they need instead of relying on `data[0]`
 - repo encode smoke uses dedicated realistic amount presets per default route and requires every tested amount to stay usable across both simulated hops

@@ -2566,7 +2566,8 @@ mod tests {
     use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
 
     use crate::models::state::{
-        BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
+        BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
+        VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -3097,6 +3098,7 @@ mod tests {
     ) -> AppState {
         AppState {
             chain: Chain::Ethereum,
+            rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

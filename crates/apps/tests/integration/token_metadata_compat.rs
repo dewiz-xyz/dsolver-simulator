@@ -13,7 +13,8 @@ use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
+    VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -263,6 +264,7 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
 
     Ok(AppState {
         chain: Chain::Ethereum,
+        rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

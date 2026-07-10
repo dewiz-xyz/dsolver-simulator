@@ -53,6 +53,10 @@ use tycho_simulation::{
     },
 };
 
+pub(crate) const RFQ_POLL_TIME: Duration = Duration::from_secs(5);
+pub(crate) const RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const LIQUORICE_QUOTE_EXPIRY_SECS: u64 = 300;
+
 #[derive(Clone, Copy)]
 enum StreamDecodePolicy {
     Native,
@@ -332,6 +336,7 @@ pub async fn build_rfq_stream(
         let bebop_client = BebopClientBuilder::new(chain, user, key)
             .tokens(rfq_tokens_bebop)
             .tvl_threshold(tvl_add_threshold)
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
             .build()
             .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
         rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
@@ -350,7 +355,8 @@ pub async fn build_rfq_stream(
         let hashflow_client = HashflowClientBuilder::new(chain, user, key)
             .tokens(rfq_tokens_hashflow)
             .tvl_threshold(tvl_add_threshold)
-            .poll_time(Duration::from_secs(5))
+            .poll_time(RFQ_POLL_TIME)
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
             .build()
             .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
         rfq_builder =
@@ -370,7 +376,9 @@ pub async fn build_rfq_stream(
         let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
             .tokens(rfq_tokens_liquorice)
             .tvl_threshold(tvl_add_threshold)
-            .poll_time(Duration::from_secs(5))
+            .poll_time(RFQ_POLL_TIME)
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
+            .quote_expiry_secs(LIQUORICE_QUOTE_EXPIRY_SECS)
             .build()
             .map_err(|err| anyhow::anyhow!("failed to create Liquorice RFQ client: {err}"))?;
         rfq_builder =

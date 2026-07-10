@@ -27,6 +27,7 @@ futures.workspace = true
 jemalloc-ctl.workspace = true
 num-traits.workspace = true
 tower.workspace = true
+tycho-execution.workspace = true
 tycho-simulation.workspace = true
 typetag.workspace = true
 
