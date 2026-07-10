@@ -926,6 +926,7 @@ dependencies = [
  "simulator-core",
  "tokio",
  "tower",
+ "tycho-execution",
  "tycho-simulation",
  "typetag",
 ]

@@ -15,7 +15,8 @@ use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
+    VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
@@ -25,7 +26,11 @@ use simulator_core::models::messages::{
     RouteEncodeResponse, SegmentDraft, SwapKind,
 };
 use tower::ServiceExt;
+use tycho_execution::encoding::errors::EncodingError;
+use tycho_execution::encoding::models::{EncodedSolution, Solution, Transaction};
+use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
+use tycho_simulation::rfq::protocols::bebop::{client::BebopClient, state::BebopState};
 use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
 use tycho_simulation::tycho_common::models::{token::Token, Chain};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -45,6 +50,38 @@ struct SlowAmountSim {
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct SleepAmountSim {
     sleep_for: Duration,
+}
+
+struct MockTychoEncoder {
+    router: Bytes,
+}
+
+impl TychoEncoder for MockTychoEncoder {
+    fn encode_solutions(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<EncodedSolution>, EncodingError> {
+        Ok(vec![EncodedSolution {
+            swaps: vec![0x01, 0x02],
+            interacting_with: self.router.clone(),
+            function_signature: "singleSwap()".to_string(),
+            n_tokens: 0,
+            permit: None,
+        }])
+    }
+
+    fn encode_full_calldata(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<Transaction>, EncodingError> {
+        Err(EncodingError::FatalError(
+            "encode_full_calldata not supported in tests".to_string(),
+        ))
+    }
+
+    fn validate_solution(&self, _solution: &Solution) -> Result<(), EncodingError> {
+        Ok(())
+    }
 }
 
 #[typetag::serde]
@@ -440,10 +477,16 @@ async fn build_fixture_stores(
         NaiveDateTime::default(),
     );
 
-    let states = HashMap::from([(
-        pool_id.to_string(),
-        Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
-    )]);
+    let state: Box<dyn ProtocolSim> = if config.rfq_pool {
+        Box::new(build_bebop_state(
+            &fixture_tokens.token_in_meta,
+            &fixture_tokens.token_out_meta,
+            config.chain,
+        )?)
+    } else {
+        Box::new(EchoAmountSim)
+    };
+    let states = HashMap::from([(pool_id.to_string(), state)]);
     let new_pairs = HashMap::from([(pool_id.to_string(), component)]);
     let update = Update::new(42, states, new_pairs);
     if config.vm_pool {
@@ -454,6 +497,42 @@ async fn build_fixture_stores(
         native_state_store.apply_update(update).await;
     }
     Ok((native_state_store, vm_state_store, rfq_state_store))
+}
+
+fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Result<BebopState> {
+    let client = BebopClient::new(
+        chain,
+        HashSet::new(),
+        100.0,
+        "snapshot-user".to_string(),
+        "snapshot-key".to_string(),
+        HashSet::new(),
+        Duration::from_secs(5),
+    )?;
+    Ok(serde_json::from_value(serde_json::json!({
+        "base_token": token_in,
+        "quote_token": token_out,
+        "price_data": {
+            "base": token_in.address.to_vec(),
+            "quote": token_out.address.to_vec(),
+            "last_update_ts": 1,
+            "bids": [2.0, 100.0],
+            "asks": [2.0, 100.0],
+        },
+        "client": client,
+    }))?)
+}
+
+fn test_rfq_client_config() -> RfqClientConfig {
+    RfqClientConfig {
+        tvl_threshold: 100.0,
+        bebop_user: "test-bebop-user".to_string(),
+        bebop_key: "test-bebop-key".to_string(),
+        hashflow_user: "test-hashflow-user".to_string(),
+        hashflow_key: "test-hashflow-key".to_string(),
+        liquorice_user: "test-liquorice-user".to_string(),
+        liquorice_key: "test-liquorice-key".to_string(),
+    }
 }
 
 async fn ensure_native_store_ready(
@@ -579,6 +658,7 @@ async fn build_app_state_and_request(
 
     let state = AppState {
         chain: config.chain,
+        rfq_client_config: Arc::new(test_rfq_client_config()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -616,8 +696,19 @@ async fn build_app_state_and_request(
 async fn setup_app_state_and_request(
     config: EncodeFixtureConfig<'_>,
 ) -> Result<(axum::Router, RouteEncodeRequest)> {
+    let uses_rfq_fixture = config.rfq_pool;
     let (state, request) = build_app_state_and_request(config).await?;
-    Ok((create_router(SimulatorRuntime::new(state)), request))
+    let runtime = if uses_rfq_fixture {
+        SimulatorRuntime::new_with_encoder(
+            state,
+            Arc::new(MockTychoEncoder {
+                router: parse_bytes(&request.tycho_router_address)?,
+            }),
+        )
+    } else {
+        SimulatorRuntime::new(state)
+    };
+    Ok((create_router(runtime), request))
 }
 
 async fn post_encode(
@@ -677,6 +768,7 @@ async fn setup_timeout_app(
 
     let state = AppState {
         chain: config.chain,
+        rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -1018,11 +1110,11 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
 }
 
 #[tokio::test]
-async fn encode_route_rejects_rfq_route_under_broadcaster_snapshot_model() -> Result<()> {
+async fn encode_route_succeeds_for_rfq_route_from_broadcaster_snapshot() -> Result<()> {
     let config = EncodeFixtureConfig {
-        request_pool_protocol: "rfq:hashflow",
-        component_protocol_system: "rfq:hashflow",
-        component_protocol_type_name: "hashflow_pool",
+        request_pool_protocol: "rfq:bebop",
+        component_protocol_system: "rfq:bebop",
+        component_protocol_type_name: "bebop_pool",
         rfq_pool: true,
         enable_rfq_pools: true,
         request_id: "req-rfq-indicative-only",
@@ -1032,21 +1124,24 @@ async fn encode_route_rejects_rfq_route_under_broadcaster_snapshot_model() -> Re
 
     let (status, body) = post_encode(app, &request).await?;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
     assert_eq!(
-        response.error,
-        "Encode unavailable: RFQ signed quote generation is not supported from broadcaster RFQ snapshots"
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
     );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body)?;
+    assert!(!response.interactions.is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn encode_route_rejects_rfq_pool_even_when_request_hint_is_native() -> Result<()> {
+async fn encode_route_succeeds_for_rfq_pool_when_request_hint_is_native() -> Result<()> {
     let config = EncodeFixtureConfig {
         request_pool_protocol: "uniswap_v2",
-        component_protocol_system: "",
-        component_protocol_type_name: "hashflow_pool",
+        component_protocol_system: "rfq:bebop",
+        component_protocol_type_name: "bebop_pool",
         rfq_pool: true,
         enable_rfq_pools: true,
         request_id: "req-rfq-actual-backend",
@@ -1056,12 +1151,15 @@ async fn encode_route_rejects_rfq_pool_even_when_request_hint_is_native() -> Res
 
     let (status, body) = post_encode(app, &request).await?;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
     assert_eq!(
-        response.error,
-        "Encode unavailable: RFQ signed quote generation is not supported from broadcaster RFQ snapshots"
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
     );
+    let response: RouteEncodeResponse = serde_json::from_slice(&body)?;
+    assert!(!response.interactions.is_empty());
     Ok(())
 }
 
@@ -1483,6 +1581,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
         chain: Chain::Ethereum,
+        rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

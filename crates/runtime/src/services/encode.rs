@@ -18,15 +18,22 @@ mod mocks;
 pub use error::{EncodeError, EncodeErrorKind};
 pub use response::{log_failure, log_handler_timeout, log_received, log_success};
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
 use crate::models::state::AppState;
+use tycho_execution::encoding::tycho_encoder::TychoEncoder;
+use tycho_simulation::tycho_common::{models::Chain, Bytes};
+
+type EncoderFactory =
+    Arc<dyn Fn(Chain, Bytes) -> Result<Arc<dyn TychoEncoder>, EncodeError> + Send + Sync>;
 
 /// Transport-free runtime wrapper for `/encode` route encoding.
 #[derive(Clone)]
 pub struct EncodeService {
     state: AppState,
+    encoder_factory: EncoderFactory,
 }
 
 pub struct EncodeServiceSuccess {
@@ -42,7 +49,17 @@ pub enum EncodeServiceError {
 
 impl EncodeService {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            encoder_factory: Arc::new(calldata::build_encoder),
+        }
+    }
+
+    pub fn with_encoder(state: AppState, encoder: Arc<dyn TychoEncoder>) -> Self {
+        Self {
+            state,
+            encoder_factory: Arc::new(move |_, _| Ok(Arc::clone(&encoder))),
+        }
     }
 
     pub async fn encode(
@@ -53,7 +70,11 @@ impl EncodeService {
         response::log_received(&request);
 
         let request_timeout = self.state.request_timeout();
-        let computation_future = encode_route(self.state.clone(), request);
+        let computation_future = encode_route(
+            self.state.clone(),
+            request,
+            Arc::clone(&self.encoder_factory),
+        );
 
         let Ok(computation) = tokio::time::timeout(request_timeout, computation_future).await
         else {
@@ -80,12 +101,10 @@ pub struct EncodeComputation {
     pub reset_approval: bool,
 }
 
-const RFQ_ENCODE_UNAVAILABLE_MESSAGE: &str =
-    "Encode unavailable: RFQ signed quote generation is not supported from broadcaster RFQ snapshots";
-
 async fn encode_route(
     state: AppState,
     request: RouteEncodeRequest,
+    encoder_factory: EncoderFactory,
 ) -> Result<EncodeComputation, EncodeError> {
     let chain = request::validate_chain(request.chain_id, state.chain)?;
     request::validate_swap_kinds(&request)?;
@@ -128,9 +147,6 @@ async fn encode_route(
     if let Some(message) = availability.availability_message() {
         return Err(EncodeError::unavailable(message));
     }
-    if uses_rfq {
-        return Err(EncodeError::unavailable(RFQ_ENCODE_UNAVAILABLE_MESSAGE));
-    }
     let resimulated = resimulate::resimulate_route(
         &state,
         &normalized,
@@ -149,7 +165,7 @@ async fn encode_route(
         ));
     }
     let amount_out_delta = (&expected_total - &min_amount_out).to_string();
-    let encoder = calldata::build_encoder(chain, router_address.clone())?;
+    let encoder = encoder_factory(chain, router_address.clone())?;
     let route_context = calldata::RouteContext {
         request: &request,
         token_in: &token_in,

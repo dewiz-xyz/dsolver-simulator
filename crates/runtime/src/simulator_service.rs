@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use simulator_core::broadcaster::BroadcasterTokenSnapshotResponse;
 use tracing::{debug, info, warn};
+use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
     Bytes,
@@ -20,7 +21,9 @@ use crate::config::{
     MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
-use crate::models::state::{AppState, BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
+use crate::models::state::{
+    AppState, BroadcasterSubscriptionStatus, RfqClientConfig, StateStore, VmStreamStatus,
+};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{
     derive_broadcaster_token_lookup_url, derive_broadcaster_token_snapshot_url, TokenStore,
@@ -49,6 +52,14 @@ impl SimulatorRuntime {
         Self {
             quote_service: QuoteService::new(app_state.clone()),
             encode_service: EncodeService::new(app_state.clone()),
+            app_state,
+        }
+    }
+
+    pub fn new_with_encoder(app_state: AppState, encoder: Arc<dyn TychoEncoder>) -> Self {
+        Self {
+            quote_service: QuoteService::new(app_state.clone()),
+            encode_service: EncodeService::with_encoder(app_state.clone(), encoder),
             app_state,
         }
     }
@@ -350,6 +361,15 @@ fn build_app_state(
 
     AppState {
         chain,
+        rfq_client_config: Arc::new(RfqClientConfig {
+            tvl_threshold: config.tvl_threshold,
+            bebop_user: config.bebop_user.clone(),
+            bebop_key: config.bebop_key.clone(),
+            hashflow_user: config.hashflow_user.clone(),
+            hashflow_key: config.hashflow_key.clone(),
+            liquorice_user: config.liquorice_user.clone(),
+            liquorice_key: config.liquorice_key.clone(),
+        }),
         native_token_protocol_allowlist: Arc::new(
             config.chain_profile.native_token_protocol_allowlist.clone(),
         ),
@@ -1079,6 +1099,13 @@ mod tests {
         assert_eq!(app_state.chain, Chain::Base);
         assert!(!app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
+        assert_eq!(app_state.rfq_client_config.tvl_threshold, 100.0);
+        assert_eq!(app_state.rfq_client_config.bebop_user, "bebop-user");
+        assert_eq!(app_state.rfq_client_config.bebop_key, "bebop-key");
+        assert_eq!(app_state.rfq_client_config.hashflow_user, "hashflow-user");
+        assert_eq!(app_state.rfq_client_config.hashflow_key, "hashflow-key");
+        assert_eq!(app_state.rfq_client_config.liquorice_user, "liquorice-user");
+        assert_eq!(app_state.rfq_client_config.liquorice_key, "liquorice-key");
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);

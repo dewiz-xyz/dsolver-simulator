@@ -84,8 +84,9 @@ pub fn load_config() -> AppConfig {
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
+    let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
     let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
-        empty_rfq_credentials();
+        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     AppConfig {
         chain_profile,
@@ -1370,23 +1371,17 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_config_allows_rfq_without_provider_credentials() {
-        let config = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
+    fn load_config_requires_rfq_provider_credentials_when_effective() {
+        let message = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
-            load_config()
+            match std::panic::catch_unwind(load_config) {
+                Ok(_) => unreachable!("simulator config should require RFQ credentials"),
+                Err(panic) => panic_message(panic),
+            }
         });
 
-        assert!(rfq_effectively_enabled(
-            config.enable_rfq_pools,
-            &config.chain_profile
-        ));
-        assert!(config.bebop_user.is_empty());
-        assert!(config.bebop_key.is_empty());
-        assert!(config.hashflow_user.is_empty());
-        assert!(config.hashflow_key.is_empty());
-        assert!(config.liquorice_user.is_empty());
-        assert!(config.liquorice_key.is_empty());
+        assert!(message.contains("BEBOP_USER"));
     }
 
     #[test]

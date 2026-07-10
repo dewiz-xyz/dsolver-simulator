@@ -1,11 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
 use tracing::debug;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
+    rfq::protocols::{
+        bebop::{client::BebopClient, state::BebopState},
+        hashflow::{client::HashflowClient, state::HashflowState},
+        liquorice::{client::LiquoriceClient, state::LiquoriceState},
+    },
     tycho_common::{
         models::{token::Token, Chain},
         simulation::protocol_sim::ProtocolSim,
@@ -16,8 +22,11 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
-use crate::models::state::{AppState, SimulationRebuildGuard};
+use crate::models::state::{AppState, RfqClientConfig, SimulationRebuildGuard};
 use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
+use crate::services::stream_builder::{
+    ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
+};
 
 use super::allocation::allocate_swaps_by_bps;
 use super::backend::PoolBackend;
@@ -268,11 +277,17 @@ impl<'a> RouteResimulator<'a> {
             .map_err(availability_error)?
             .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
         let backend = PoolBackend::from_component(component.as_ref());
-        if backend.is_rfq() {
-            return Err(EncodeError::unavailable(
-                super::RFQ_ENCODE_UNAVAILABLE_MESSAGE,
-            ));
-        }
+        let pool_state = if backend.is_rfq() {
+            hydrate_rfq_pool_state(
+                pool_id,
+                pool_state.as_ref(),
+                self.chain,
+                &self.state.rfq_client_config,
+                encode_rfq_quote_timeout(self.state.request_timeout()),
+            )?
+        } else {
+            pool_state
+        };
 
         let entry = CachedPoolEntry {
             backend,
@@ -288,6 +303,88 @@ impl<'a> RouteResimulator<'a> {
     ) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
         build_resimulated_segments(self.normalized, &mut self.segment_states)
     }
+}
+
+// Kept below the firm-quote timeout so a clamped client still gets most of the request budget.
+const ENCODE_QUOTE_TIMEOUT_HEADROOM: Duration = Duration::from_millis(200);
+
+// The firm quote blocks the encode task through block_in_place, so the outer request guard cannot
+// interrupt it. Clamp the quote timeout below the configured guard so the guard stays authoritative
+// even if REQUEST_TIMEOUT_MS is lowered below the static cap.
+fn encode_rfq_quote_timeout(request_timeout: Duration) -> Duration {
+    ENCODE_RFQ_QUOTE_TIMEOUT.min(request_timeout.saturating_sub(ENCODE_QUOTE_TIMEOUT_HEADROOM))
+}
+
+fn hydrate_rfq_pool_state(
+    pool_id: &str,
+    pool_state: &dyn ProtocolSim,
+    chain: Chain,
+    config: &RfqClientConfig,
+    quote_timeout: Duration,
+) -> Result<Arc<dyn ProtocolSim>, EncodeError> {
+    // Broadcaster serialization strips credentials, so rebuild only the request-scoped client.
+    // Firm quotes do not use the stream token filters carried by these clients.
+    if let Some(state) = pool_state.as_any().downcast_ref::<BebopState>() {
+        let mut hydrated = state.clone();
+        hydrated.client = BebopClient::new(
+            chain,
+            HashSet::new(),
+            config.tvl_threshold,
+            config.bebop_user.clone(),
+            config.bebop_key.clone(),
+            HashSet::new(),
+            quote_timeout,
+        )
+        .map_err(|err| rfq_hydration_error(pool_id, "Bebop", err))?;
+        return Ok(Arc::new(hydrated));
+    }
+
+    if let Some(state) = pool_state.as_any().downcast_ref::<HashflowState>() {
+        let mut hydrated = state.clone();
+        hydrated.client = HashflowClient::new(
+            chain,
+            HashSet::new(),
+            config.tvl_threshold,
+            HashSet::new(),
+            config.hashflow_user.clone(),
+            config.hashflow_key.clone(),
+            RFQ_POLL_TIME,
+            quote_timeout,
+        )
+        .map_err(|err| rfq_hydration_error(pool_id, "Hashflow", err))?;
+        return Ok(Arc::new(hydrated));
+    }
+
+    if let Some(state) = pool_state.as_any().downcast_ref::<LiquoriceState>() {
+        let mut hydrated = state.clone();
+        hydrated.client = LiquoriceClient::new(
+            chain,
+            HashSet::new(),
+            config.tvl_threshold,
+            HashSet::new(),
+            config.liquorice_user.clone(),
+            config.liquorice_key.clone(),
+            RFQ_POLL_TIME,
+            quote_timeout,
+            LIQUORICE_QUOTE_EXPIRY_SECS,
+        )
+        .map_err(|err| rfq_hydration_error(pool_id, "Liquorice", err))?;
+        return Ok(Arc::new(hydrated));
+    }
+
+    Err(EncodeError::internal(format!(
+        "RFQ pool {pool_id} has unsupported state type"
+    )))
+}
+
+fn rfq_hydration_error(
+    pool_id: &str,
+    provider: &str,
+    error: impl std::fmt::Display,
+) -> EncodeError {
+    EncodeError::internal(format!(
+        "Failed to hydrate {provider} client for RFQ pool {pool_id}: {error}"
+    ))
 }
 
 fn availability_error(availability: crate::models::state::EncodeAvailability) -> EncodeError {
@@ -581,12 +678,18 @@ impl<'a> TokenCache<'a> {
     reason = "negative test assertions read more clearly in match form here"
 )]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
     use tycho_simulation::protocol::models::Update;
+    use tycho_simulation::rfq::protocols::{
+        bebop::{client::BebopClient, state::BebopState},
+        hashflow::{client::HashflowClient, state::HashflowState},
+        liquorice::{client::LiquoriceClient, state::LiquoriceState},
+    };
 
     use super::*;
+    use crate::models::state::RfqClientConfig;
     use crate::services::encode::fixtures::{
         component_with_protocol, component_with_tokens, dummy_token, pool_ref, test_app_state,
         test_state_stores, token_store_with_tokens, TestAppStateConfig,
@@ -600,6 +703,211 @@ mod tests {
         app_state
             .acquire_simulation_rebuild_guard(false, false)
             .await
+    }
+
+    fn rfq_client_config() -> RfqClientConfig {
+        RfqClientConfig {
+            tvl_threshold: 321.0,
+            bebop_user: "runtime-bebop-user".to_string(),
+            bebop_key: "runtime-bebop-key".to_string(),
+            hashflow_user: "runtime-hashflow-user".to_string(),
+            hashflow_key: "runtime-hashflow-key".to_string(),
+            liquorice_user: "runtime-liquorice-user".to_string(),
+            liquorice_key: "runtime-liquorice-key".to_string(),
+        }
+    }
+
+    fn source_bebop_state(base_token: Token, quote_token: Token) -> BebopState {
+        let client = BebopClient::new(
+            Chain::Ethereum,
+            HashSet::new(),
+            1.0,
+            "snapshot-user".to_string(),
+            "snapshot-key".to_string(),
+            HashSet::new(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "base_token": base_token,
+            "quote_token": quote_token,
+            "price_data": {
+                "base": base_token.address.to_vec(),
+                "quote": quote_token.address.to_vec(),
+                "last_update_ts": 1,
+                "bids": [2.0, 100.0],
+                "asks": [2.0, 100.0],
+            },
+            "client": client,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn hydrate_rfq_pool_state_replaces_bebop_client() {
+        let state = source_bebop_state(
+            dummy_token("0x0000000000000000000000000000000000000001"),
+            dummy_token("0x0000000000000000000000000000000000000002"),
+        );
+
+        let hydrated = hydrate_rfq_pool_state(
+            "pool-bebop",
+            &state,
+            Chain::Ethereum,
+            &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
+        )
+        .unwrap();
+        let hydrated = hydrated.as_any().downcast_ref::<BebopState>().unwrap();
+        let client = format!("{:?}", hydrated.client);
+
+        assert_eq!(hydrated.base_token, state.base_token);
+        assert_eq!(hydrated.quote_token, state.quote_token);
+        assert!(client.contains("runtime-bebop-user"));
+        assert!(client.contains("runtime-bebop-key"));
+        assert!(client.contains("tvl: 321.0"));
+        assert!(client.contains("quote_timeout: 3s"));
+        assert!(!client.contains("snapshot-user"));
+    }
+
+    #[test]
+    fn hydrate_rfq_pool_state_replaces_hashflow_client() {
+        let base_token = dummy_token("0x0000000000000000000000000000000000000001");
+        let quote_token = dummy_token("0x0000000000000000000000000000000000000002");
+        let client = HashflowClient::new(
+            Chain::Ethereum,
+            HashSet::new(),
+            1.0,
+            HashSet::new(),
+            "snapshot-user".to_string(),
+            "snapshot-key".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let state: HashflowState = serde_json::from_value(serde_json::json!({
+            "base_token": base_token,
+            "quote_token": quote_token,
+            "levels": {
+                "pair": {
+                    "baseToken": base_token.address.to_string(),
+                    "quoteToken": quote_token.address.to_string(),
+                },
+                "levels": [],
+            },
+            "market_maker": "maker",
+            "client": client,
+        }))
+        .unwrap();
+
+        let hydrated = hydrate_rfq_pool_state(
+            "pool-hashflow",
+            &state,
+            Chain::Ethereum,
+            &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
+        )
+        .unwrap();
+        let hydrated = hydrated.as_any().downcast_ref::<HashflowState>().unwrap();
+        let client = format!("{:?}", hydrated.client);
+
+        assert_eq!(hydrated.base_token, state.base_token);
+        assert_eq!(hydrated.quote_token, state.quote_token);
+        assert_eq!(hydrated.market_maker, state.market_maker);
+        assert!(client.contains("runtime-hashflow-user"));
+        assert!(client.contains("runtime-hashflow-key"));
+        assert!(client.contains("tvl: 321.0"));
+        assert!(client.contains("poll_time: 5s"));
+        assert!(client.contains("quote_timeout: 3s"));
+        assert!(!client.contains("snapshot-user"));
+    }
+
+    #[test]
+    fn hydrate_rfq_pool_state_replaces_liquorice_client() {
+        let base_token = dummy_token("0x0000000000000000000000000000000000000001");
+        let quote_token = dummy_token("0x0000000000000000000000000000000000000002");
+        let client = LiquoriceClient::new(
+            Chain::Ethereum,
+            HashSet::new(),
+            1.0,
+            HashSet::new(),
+            "snapshot-user".to_string(),
+            "snapshot-key".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            1,
+        )
+        .unwrap();
+        let state: LiquoriceState = serde_json::from_value(serde_json::json!({
+            "base_token": base_token,
+            "quote_token": quote_token,
+            "prices_by_mm": {},
+            "client": client,
+        }))
+        .unwrap();
+
+        let hydrated = hydrate_rfq_pool_state(
+            "pool-liquorice",
+            &state,
+            Chain::Ethereum,
+            &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
+        )
+        .unwrap();
+        let hydrated = hydrated.as_any().downcast_ref::<LiquoriceState>().unwrap();
+        let client = format!("{:?}", hydrated.client);
+
+        assert_eq!(hydrated.base_token, state.base_token);
+        assert_eq!(hydrated.quote_token, state.quote_token);
+        assert!(client.contains("runtime-liquorice-user"));
+        assert!(client.contains("runtime-liquorice-key"));
+        assert!(client.contains("tvl: 321.0"));
+        assert!(client.contains("poll_time: 5s"));
+        assert!(client.contains("quote_timeout: 3s"));
+        assert!(client.contains("quote_expiry_secs: 300"));
+        assert!(!client.contains("snapshot-user"));
+    }
+
+    #[test]
+    fn hydrate_rfq_pool_state_rejects_unknown_state_type() {
+        let err = match hydrate_rfq_pool_state(
+            "pool-unknown",
+            &StepProtocolSim { multiplier: 1 },
+            Chain::Ethereum,
+            &rfq_client_config(),
+            ENCODE_RFQ_QUOTE_TIMEOUT,
+        ) {
+            Ok(_) => panic!("unknown RFQ state type should fail hydration"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.kind(),
+            crate::services::encode::EncodeErrorKind::Internal
+        );
+        assert_eq!(
+            err.message(),
+            "RFQ pool pool-unknown has unsupported state type"
+        );
+    }
+
+    #[test]
+    fn encode_rfq_quote_timeout_clamps_to_request_guard() {
+        // Prod guard (4.5s) leaves room for the full cap.
+        assert_eq!(
+            encode_rfq_quote_timeout(Duration::from_millis(4500)),
+            ENCODE_RFQ_QUOTE_TIMEOUT
+        );
+        // A guard below the cap wins, minus the headroom.
+        assert_eq!(
+            encode_rfq_quote_timeout(Duration::from_millis(2000)),
+            Duration::from_millis(1800)
+        );
+        // A guard at or under the headroom leaves no quote budget.
+        assert_eq!(
+            encode_rfq_quote_timeout(Duration::from_millis(150)),
+            Duration::ZERO
+        );
     }
 
     #[test]
