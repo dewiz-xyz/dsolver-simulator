@@ -24,7 +24,7 @@ use crate::models::erc4626::{
 use crate::models::state::{AppState, RfqClientConfig, SimulationRebuildGuard};
 use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::services::stream_builder::{
-    LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME, RFQ_QUOTE_TIMEOUT,
+    ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
 };
 
 use super::allocation::allocate_swaps_by_bps;
@@ -320,7 +320,7 @@ fn hydrate_rfq_pool_state(
             config.bebop_user.clone(),
             config.bebop_key.clone(),
             HashSet::new(),
-            RFQ_QUOTE_TIMEOUT,
+            ENCODE_RFQ_QUOTE_TIMEOUT,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Bebop", err))?;
         return Ok(Arc::new(hydrated));
@@ -336,7 +336,7 @@ fn hydrate_rfq_pool_state(
             config.hashflow_user.clone(),
             config.hashflow_key.clone(),
             RFQ_POLL_TIME,
-            RFQ_QUOTE_TIMEOUT,
+            ENCODE_RFQ_QUOTE_TIMEOUT,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Hashflow", err))?;
         return Ok(Arc::new(hydrated));
@@ -352,7 +352,7 @@ fn hydrate_rfq_pool_state(
             config.liquorice_user.clone(),
             config.liquorice_key.clone(),
             RFQ_POLL_TIME,
-            RFQ_QUOTE_TIMEOUT,
+            ENCODE_RFQ_QUOTE_TIMEOUT,
             LIQUORICE_QUOTE_EXPIRY_SECS,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Liquorice", err))?;
@@ -748,7 +748,7 @@ mod tests {
         assert!(client.contains("runtime-bebop-user"));
         assert!(client.contains("runtime-bebop-key"));
         assert!(client.contains("tvl: 321.0"));
-        assert!(client.contains("quote_timeout: 5s"));
+        assert!(client.contains("quote_timeout: 3s"));
         assert!(!client.contains("snapshot-user"));
     }
 
@@ -799,7 +799,7 @@ mod tests {
         assert!(client.contains("runtime-hashflow-key"));
         assert!(client.contains("tvl: 321.0"));
         assert!(client.contains("poll_time: 5s"));
-        assert!(client.contains("quote_timeout: 5s"));
+        assert!(client.contains("quote_timeout: 3s"));
         assert!(!client.contains("snapshot-user"));
     }
 
@@ -843,7 +843,7 @@ mod tests {
         assert!(client.contains("runtime-liquorice-key"));
         assert!(client.contains("tvl: 321.0"));
         assert!(client.contains("poll_time: 5s"));
-        assert!(client.contains("quote_timeout: 5s"));
+        assert!(client.contains("quote_timeout: 3s"));
         assert!(client.contains("quote_expiry_secs: 300"));
         assert!(!client.contains("snapshot-user"));
     }
