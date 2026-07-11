@@ -30,7 +30,7 @@ use simulator_core::broadcaster::{
 
 use super::redis_publisher::BroadcasterRedisPublisherStatus;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcasterReadiness {
     Ready,
     RedisPublisherPassive,

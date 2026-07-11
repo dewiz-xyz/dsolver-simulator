@@ -290,7 +290,24 @@ fn combine_readiness(
     left: BroadcasterReadiness,
     right: BroadcasterReadiness,
 ) -> BroadcasterReadiness {
-    left.max(right)
+    if readiness_priority(left) >= readiness_priority(right) {
+        left
+    } else {
+        right
+    }
+}
+
+const fn readiness_priority(readiness: BroadcasterReadiness) -> u8 {
+    match readiness {
+        BroadcasterReadiness::Ready => 0,
+        BroadcasterReadiness::UpstreamRecovering => 1,
+        BroadcasterReadiness::SnapshotUnexportable => 2,
+        BroadcasterReadiness::RedisPublisherPassive => 3,
+        BroadcasterReadiness::RedisPublisherRetired => 4,
+        BroadcasterReadiness::RedisPublisherUnhealthy => 5,
+        BroadcasterReadiness::SnapshotWarmingUp => 6,
+        BroadcasterReadiness::UpstreamDisconnected => 7,
+    }
 }
 
 fn redis_readiness(mode: &str) -> BroadcasterReadiness {
@@ -557,7 +574,8 @@ mod tests {
     use simulator_core::broadcaster::BroadcasterBackend;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
-    use super::{raw_configured_backends, rfq_configured_backends};
+    use super::{combine_readiness, raw_configured_backends, rfq_configured_backends};
+    use crate::broadcaster::state::BroadcasterReadiness;
     use crate::config::{BroadcasterConfig, BroadcasterTuning, ChainProfile, MemoryConfig};
 
     fn test_config() -> BroadcasterConfig {
@@ -640,5 +658,51 @@ mod tests {
         config.enable_rfq_pools = false;
 
         assert_eq!(rfq_configured_backends(&config), None);
+    }
+
+    #[test]
+    fn readiness_combination_uses_operational_priority() {
+        let cases = [
+            (
+                BroadcasterReadiness::SnapshotWarmingUp,
+                BroadcasterReadiness::UpstreamRecovering,
+                BroadcasterReadiness::SnapshotWarmingUp,
+            ),
+            (
+                BroadcasterReadiness::SnapshotWarmingUp,
+                BroadcasterReadiness::SnapshotUnexportable,
+                BroadcasterReadiness::SnapshotWarmingUp,
+            ),
+            (
+                BroadcasterReadiness::RedisPublisherPassive,
+                BroadcasterReadiness::SnapshotUnexportable,
+                BroadcasterReadiness::RedisPublisherPassive,
+            ),
+            (
+                BroadcasterReadiness::RedisPublisherUnhealthy,
+                BroadcasterReadiness::UpstreamRecovering,
+                BroadcasterReadiness::RedisPublisherUnhealthy,
+            ),
+            (
+                BroadcasterReadiness::UpstreamRecovering,
+                BroadcasterReadiness::Ready,
+                BroadcasterReadiness::UpstreamRecovering,
+            ),
+            (
+                BroadcasterReadiness::SnapshotUnexportable,
+                BroadcasterReadiness::UpstreamRecovering,
+                BroadcasterReadiness::SnapshotUnexportable,
+            ),
+            (
+                BroadcasterReadiness::UpstreamDisconnected,
+                BroadcasterReadiness::SnapshotWarmingUp,
+                BroadcasterReadiness::UpstreamDisconnected,
+            ),
+        ];
+
+        for (left, right, expected) in cases {
+            assert_eq!(combine_readiness(left, right), expected);
+            assert_eq!(combine_readiness(right, left), expected);
+        }
     }
 }
