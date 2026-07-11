@@ -271,6 +271,17 @@ for kind, backend in sorted(backends.items()):
     gap = subscription.get("redis_gap_reason")
     if gap is not None:
         raise SystemExit(f"simulator /status backend {kind} has redis_gap_reason={gap}")
+    if subscription.get("redis_transport_status") != "connected":
+        transport_error = subscription.get("redis_transport_last_error")
+        raise SystemExit(
+            f"simulator /status backend {kind} Redis transport is not connected"
+            f" last_error={transport_error}"
+        )
+    retry_count = subscription.get("redis_transport_retry_count")
+    if not isinstance(retry_count, int) or retry_count < 0:
+        raise SystemExit(
+            f"simulator /status backend {kind} has invalid redis_transport_retry_count={retry_count}"
+        )
     for field in ["streamKey", "generation", "streamId", "snapshotId"]:
         expected = broadcaster_boundary[field]
         actual = boundary[field]

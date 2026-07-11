@@ -94,6 +94,26 @@ pub struct BroadcasterSubscriptionStatus {
     inner: Arc<RwLock<BroadcasterSubscriptionStatusData>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RedisTransportStatus {
+    #[default]
+    Connecting,
+    Connected,
+    Retrying,
+    Failed,
+}
+
+impl RedisTransportStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Retrying => "retrying",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct BroadcasterSubscriptionStatusData {
     connected: bool,
@@ -104,6 +124,9 @@ struct BroadcasterSubscriptionStatusData {
     redis_replay_checkpoint: Option<String>,
     redis_replay_caught_up: bool,
     redis_gap_reason: Option<String>,
+    redis_transport_status: RedisTransportStatus,
+    redis_transport_retry_count: u64,
+    redis_transport_last_error: Option<String>,
     restart_count: u64,
     last_error: Option<String>,
 }
@@ -118,6 +141,9 @@ pub struct BroadcasterSubscriptionSnapshot {
     pub redis_replay_checkpoint: Option<String>,
     pub redis_replay_caught_up: bool,
     pub redis_gap_reason: Option<String>,
+    pub redis_transport_status: RedisTransportStatus,
+    pub redis_transport_retry_count: u64,
+    pub redis_transport_last_error: Option<String>,
     pub restart_count: u64,
     pub last_error: Option<String>,
 }
@@ -133,6 +159,9 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_replay_checkpoint = None;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
+        guard.redis_transport_status = RedisTransportStatus::Connecting;
+        guard.redis_transport_retry_count = 0;
+        guard.redis_transport_last_error = None;
         guard.last_error = None;
     }
 
@@ -150,6 +179,9 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_replay_checkpoint = None;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
+        guard.redis_transport_status = RedisTransportStatus::Connecting;
+        guard.redis_transport_retry_count = 0;
+        guard.redis_transport_last_error = None;
         guard.last_error = None;
     }
 
@@ -164,6 +196,9 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_replay_boundary = Some(boundary);
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
+        guard.redis_transport_status = RedisTransportStatus::Connected;
+        guard.redis_transport_retry_count = 0;
+        guard.redis_transport_last_error = None;
         guard.last_error = None;
     }
 
@@ -177,6 +212,8 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_replay_boundary = Some(boundary);
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
+        guard.redis_transport_status = RedisTransportStatus::Connected;
+        guard.redis_transport_last_error = None;
         guard.last_error = None;
     }
 
@@ -199,6 +236,25 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_gap_reason = Some(reason.into());
     }
 
+    pub async fn mark_redis_transport_error(&self, error: impl Into<String>) {
+        let mut guard = self.inner.write().await;
+        guard.redis_transport_status = RedisTransportStatus::Retrying;
+        guard.redis_transport_retry_count = guard.redis_transport_retry_count.saturating_add(1);
+        guard.redis_transport_last_error = Some(error.into());
+    }
+
+    pub async fn mark_redis_transport_recovered(&self) {
+        let mut guard = self.inner.write().await;
+        guard.redis_transport_status = RedisTransportStatus::Connected;
+        guard.redis_transport_last_error = None;
+    }
+
+    pub async fn mark_redis_transport_failed(&self, error: impl Into<String>) {
+        let mut guard = self.inner.write().await;
+        guard.redis_transport_status = RedisTransportStatus::Failed;
+        guard.redis_transport_last_error = Some(error.into());
+    }
+
     pub async fn mark_disconnected(&self, last_error: Option<String>) {
         let mut guard = self.inner.write().await;
         guard.connected = false;
@@ -209,6 +265,9 @@ impl BroadcasterSubscriptionStatus {
         guard.redis_replay_checkpoint = None;
         guard.redis_replay_caught_up = false;
         guard.redis_gap_reason = None;
+        guard.redis_transport_status = RedisTransportStatus::Connecting;
+        guard.redis_transport_retry_count = 0;
+        guard.redis_transport_last_error = None;
         guard.restart_count = guard.restart_count.saturating_add(1);
         guard.last_error = last_error;
     }
@@ -224,6 +283,9 @@ impl BroadcasterSubscriptionStatus {
             redis_replay_checkpoint: guard.redis_replay_checkpoint.clone(),
             redis_replay_caught_up: guard.redis_replay_caught_up,
             redis_gap_reason: guard.redis_gap_reason.clone(),
+            redis_transport_status: guard.redis_transport_status,
+            redis_transport_retry_count: guard.redis_transport_retry_count,
+            redis_transport_last_error: guard.redis_transport_last_error.clone(),
             restart_count: guard.restart_count,
             last_error: guard.last_error.clone(),
         }
@@ -240,6 +302,9 @@ impl BroadcasterSubscriptionStatus {
                 redis_replay_checkpoint: None,
                 redis_replay_caught_up: true,
                 redis_gap_reason: None,
+                redis_transport_status: RedisTransportStatus::Connected,
+                redis_transport_retry_count: 0,
+                redis_transport_last_error: None,
                 restart_count: 0,
                 last_error: None,
             })),
@@ -421,6 +486,9 @@ pub struct SimulatorBackendSubscriptionSnapshot {
     pub redis_replay_checkpoint: Option<String>,
     pub redis_replay_caught_up: bool,
     pub redis_gap_reason: Option<String>,
+    pub redis_transport_status: RedisTransportStatus,
+    pub redis_transport_retry_count: u64,
+    pub redis_transport_last_error: Option<String>,
     pub restart_count: u64,
     pub last_error: Option<String>,
 }
@@ -1006,6 +1074,9 @@ impl From<BroadcasterSubscriptionSnapshot> for SimulatorBackendSubscriptionSnaps
             redis_replay_checkpoint: snapshot.redis_replay_checkpoint,
             redis_replay_caught_up: snapshot.redis_replay_caught_up,
             redis_gap_reason: snapshot.redis_gap_reason,
+            redis_transport_status: snapshot.redis_transport_status,
+            redis_transport_retry_count: snapshot.redis_transport_retry_count,
+            redis_transport_last_error: snapshot.redis_transport_last_error,
             restart_count: snapshot.restart_count,
             last_error: snapshot.last_error,
         }
@@ -1641,6 +1712,43 @@ mod tests {
             Bytes,
         },
     };
+
+    #[tokio::test]
+    async fn redis_transport_failure_preserves_replay_state() {
+        let status = BroadcasterSubscriptionStatus::default();
+        let boundary = replay_boundary(7);
+        status
+            .mark_bootstrap_complete_with_redis_boundary(boundary.clone())
+            .await;
+        status.mark_redis_catch_up_checkpoint("1-7").await;
+
+        status
+            .mark_redis_transport_error("Redis XINFO STREAM failed: timeout")
+            .await;
+
+        let failed = status.snapshot().await;
+        assert!(failed.connected);
+        assert!(failed.bootstrap_complete);
+        assert_eq!(failed.redis_replay_boundary, Some(boundary));
+        assert_eq!(failed.redis_replay_checkpoint.as_deref(), Some("1-7"));
+        assert!(failed.redis_replay_caught_up);
+        assert_eq!(
+            failed.redis_transport_status,
+            RedisTransportStatus::Retrying
+        );
+        assert_eq!(failed.redis_transport_retry_count, 1);
+        assert!(failed.redis_transport_last_error.is_some());
+
+        status.mark_redis_transport_recovered().await;
+
+        let recovered = status.snapshot().await;
+        assert_eq!(
+            recovered.redis_transport_status,
+            RedisTransportStatus::Connected
+        );
+        assert_eq!(recovered.redis_transport_retry_count, 1);
+        assert!(recovered.redis_transport_last_error.is_none());
+    }
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim;

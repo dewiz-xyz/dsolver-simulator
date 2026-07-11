@@ -65,9 +65,11 @@ simulator_status_body() {
   local stream_id="${5:-chain-8453-stream-$generation}"
   local snapshot_id="${6:-chain-8453-snapshot-$generation}"
   local exclusive_message_seq="${7:-14}"
+  local transport_status="${8:-\"connected\"}"
+  local transport_error="${9:-null}"
 
   cat <<JSON
-{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq},"redis_replay_checkpoint":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason}}}}
+{"status":"ready","backends":{"native":{"enabled":true,"subscription":{"redis_replay_boundary":{"streamKey":"$stream_key","streamId":"$stream_id","snapshotId":"$snapshot_id","generation":$generation,"exclusiveMessageSeq":$exclusive_message_seq},"redis_replay_checkpoint":"$generation-$exclusive_message_seq","redis_replay_caught_up":$caught_up,"redis_gap_reason":$gap_reason,"redis_transport_status":$transport_status,"redis_transport_retry_count":0,"redis_transport_last_error":$transport_error}}}}
 JSON
 }
 
@@ -226,6 +228,16 @@ if run_verifier_fixture "$(simulator_status_body false null)" "2-15" "2-14" "$ou
 fi
 if ! grep -q "simulator /status backend native has not caught up from Redis replay" "$output_file"; then
   echo "expected simulator not-caught-up failure context" >&2
+  cat "$output_file" >&2
+  exit 1
+fi
+
+if run_verifier_fixture "$(simulator_status_body true null 2 dsolver:broadcaster:local:8453:events chain-8453-stream-2 chain-8453-snapshot-2 14 '"retrying"' '"timeout"')" "2-15" "2-15" "$output_file"; then
+  echo "expected disconnected Redis transport to fail" >&2
+  exit 1
+fi
+if ! grep -q "Redis transport is not connected last_error=timeout" "$output_file"; then
+  echo "expected Redis transport failure context" >&2
   cat "$output_file" >&2
   exit 1
 fi

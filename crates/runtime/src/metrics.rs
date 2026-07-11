@@ -12,6 +12,8 @@ const METRIC_SIMULATE_TIMEOUT: &str = "SimulateRequestTimeout";
 const METRIC_BROADCASTER_REDIS_APPEND_FAILURE: &str = "BroadcasterRedisAppendFailure";
 const METRIC_BROADCASTER_REDIS_GENERATION_RESET: &str = "BroadcasterRedisGenerationReset";
 const METRIC_BROADCASTER_SNAPSHOT_EXPORT_FAILURE: &str = "BroadcasterSnapshotExportFailure";
+const METRIC_BROADCASTER_REDIS_TRANSPORT_FAILURE: &str = "BroadcasterRedisTransportFailure";
+const METRIC_BROADCASTER_REDIS_REBOOTSTRAP: &str = "BroadcasterRedisRebootstrap";
 const METRIC_JEMALLOC_ALLOCATED_BYTES: &str = "JemallocAllocatedBytes";
 const METRIC_JEMALLOC_RESIDENT_BYTES: &str = "JemallocResidentBytes";
 const DIM_STATUS: &str = "Status";
@@ -19,6 +21,8 @@ const DIM_TIMED_OUT: &str = "TimedOut";
 const DIM_TIMEOUT_KIND: &str = "TimeoutKind";
 const DIM_RESULT_QUALITY: &str = "ResultQuality";
 const DIM_LABEL: &str = "Label";
+const DIM_OPERATION: &str = "Operation";
+const DIM_REASON: &str = "Reason";
 
 #[derive(Debug, Clone, Copy)]
 pub enum TimeoutKind {
@@ -72,6 +76,20 @@ pub fn emit_broadcaster_redis_generation_reset() {
 
 pub fn emit_broadcaster_snapshot_export_failure() {
     emit_count_metric(METRIC_BROADCASTER_SNAPSHOT_EXPORT_FAILURE, &[]);
+}
+
+pub fn emit_broadcaster_redis_transport_failure(operation: &'static str) {
+    emit_count_metric(
+        METRIC_BROADCASTER_REDIS_TRANSPORT_FAILURE,
+        &[(DIM_OPERATION, json!(operation))],
+    );
+}
+
+pub fn emit_broadcaster_redis_rebootstrap(reason: &'static str) {
+    emit_count_metric(
+        METRIC_BROADCASTER_REDIS_REBOOTSTRAP,
+        &[(DIM_REASON, json!(reason))],
+    );
 }
 
 pub fn emit_jemalloc_snapshot(label: &str, allocated_bytes: usize, resident_bytes: usize) {
