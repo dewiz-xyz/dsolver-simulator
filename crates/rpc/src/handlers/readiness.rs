@@ -97,6 +97,10 @@ pub struct BackendSubscriptionPayload {
     redis_replay_caught_up: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     redis_gap_reason: Option<String>,
+    redis_transport_status: &'static str,
+    redis_transport_retry_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redis_transport_last_error: Option<String>,
     restart_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
@@ -113,6 +117,9 @@ impl From<SimulatorBackendSubscriptionSnapshot> for BackendSubscriptionPayload {
             redis_replay_checkpoint: snapshot.redis_replay_checkpoint,
             redis_replay_caught_up: snapshot.redis_replay_caught_up,
             redis_gap_reason: snapshot.redis_gap_reason,
+            redis_transport_status: snapshot.redis_transport_status.label(),
+            redis_transport_retry_count: snapshot.redis_transport_retry_count,
+            redis_transport_last_error: snapshot.redis_transport_last_error,
             restart_count: snapshot.restart_count,
             last_error: snapshot.last_error,
         }
@@ -481,6 +488,9 @@ mod tests {
         );
         assert!(subscription.redis_replay_caught_up);
         assert!(subscription.redis_gap_reason.is_none());
+        assert_eq!(subscription.redis_transport_status, "connected");
+        assert_eq!(subscription.redis_transport_retry_count, 0);
+        assert!(subscription.redis_transport_last_error.is_none());
     }
 
     #[tokio::test]

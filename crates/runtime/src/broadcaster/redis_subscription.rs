@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use broadcaster_replay_client::{
@@ -11,7 +12,7 @@ use broadcaster_replay_client::{
 use futures::StreamExt;
 use rand::Rng;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
@@ -20,6 +21,9 @@ use simulator_core::broadcaster::{
 
 use crate::config::BroadcasterRedisConfig;
 use crate::memory::maybe_purge_allocator;
+use crate::metrics::{
+    emit_broadcaster_redis_rebootstrap, emit_broadcaster_redis_transport_failure,
+};
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
@@ -205,15 +209,31 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
             "Connected to broadcaster Redis subscription"
         );
 
-        let (exit, next_rebuilds) =
-            process_broadcaster_redis_subscription(&replay_client, prepared).await;
+        let (exit, next_rebuilds, caught_up_once) = process_broadcaster_redis_subscription(
+            &replay_client,
+            prepared,
+            &cfg,
+            &TokioRedisRetrySleeper,
+        )
+        .await;
+        if !subscription_exit_requires_rebuild(exit.reason) {
+            mark_redis_transport_failed(&controls, exit.message.clone()).await;
+            error!(
+                event = "broadcaster_redis_command_failed",
+                error = %exit.message,
+                "Broadcaster Redis subscription stopped after a permanent command failure"
+            );
+            return;
+        }
+        backoff = reset_outer_backoff_after_catch_up(backoff, &cfg, caught_up_once);
+        emit_broadcaster_redis_rebootstrap(exit.reason.as_str());
         (rebuilds, backoff) = reset_redis_subscription_after_error(
             &controls,
             &cfg,
             backoff,
             next_rebuilds,
             exit.message,
-            exit.redis_gap,
+            exit.reason == SubscriptionExitReason::RedisGap,
             (
                 "broadcaster_redis_subscription_restart",
                 "Restarting broadcaster Redis subscription",
@@ -493,19 +513,65 @@ fn pending_processor_bootstrap_error(
 }
 
 async fn process_broadcaster_redis_subscription(
-    replay_client: &BroadcasterReplayClient,
+    replay_client: &impl ReplayPollSource,
     mut prepared: PreparedBroadcasterRedisSubscription,
-) -> (SubscriptionExit, Vec<Option<SubscriptionRebuildState>>) {
+    cfg: &StreamSupervisorConfig,
+    retry_sleeper: &impl RedisRetrySleeper,
+) -> (
+    SubscriptionExit,
+    Vec<Option<SubscriptionRebuildState>>,
+    bool,
+) {
     let mut checkpoint =
         ReplayCheckpoint::new(prepared.replay_boundary.clone(), prepared.expected_chain_id);
+    let mut transport_retry: Option<RedisTransportRetry> = None;
+    let mut caught_up_once = false;
 
     loop {
         let poll = match replay_client.read_next(&checkpoint).await {
-            Ok(poll) => poll,
+            Ok(poll) => {
+                if let Some(retry) = transport_retry.take() {
+                    mark_redis_transport_recovered(&prepared.processors).await;
+                    info!(
+                        event = "broadcaster_redis_transport_recovered",
+                        attempts = retry.attempts,
+                        recovery_ms = retry.started_at.elapsed().as_millis() as u64,
+                        checkpoint = checkpoint.entry_id(),
+                        "Broadcaster Redis transport recovered"
+                    );
+                }
+                poll
+            }
+            Err(error) if redis_transport_error(&error) => {
+                let retry = transport_retry.get_or_insert_with(|| RedisTransportRetry {
+                    attempts: 0,
+                    backoff: cfg.restart_backoff_min,
+                    started_at: Instant::now(),
+                });
+                retry.attempts = retry.attempts.saturating_add(1);
+                let message = error.to_string();
+                let operation = redis_transport_operation(&error);
+                emit_broadcaster_redis_transport_failure(operation);
+                mark_redis_transport_error(&prepared.processors, message.clone()).await;
+                let backoff_ms = jittered_backoff_ms(retry.backoff, cfg.restart_backoff_jitter_pct);
+                warn!(
+                    event = "broadcaster_redis_transport_retry",
+                    operation,
+                    attempt = retry.attempts,
+                    backoff_ms,
+                    checkpoint = checkpoint.entry_id(),
+                    error = %message,
+                    "Retrying broadcaster Redis transport"
+                );
+                retry_sleeper.sleep(Duration::from_millis(backoff_ms)).await;
+                retry.backoff = next_backoff(retry.backoff, cfg.restart_backoff_max);
+                continue;
+            }
             Err(error) => {
                 return (
                     replay_error_exit(error),
                     redis_processor_rebuilds(prepared.processors),
+                    caught_up_once,
                 );
             }
         };
@@ -515,6 +581,7 @@ async fn process_broadcaster_redis_subscription(
             ReplayPoll::CaughtUp {
                 checkpoint: caught_up_checkpoint,
             } => {
+                caught_up_once = true;
                 mark_redis_catch_up_checkpoints(
                     &prepared.processors,
                     caught_up_checkpoint.entry_id(),
@@ -527,9 +594,14 @@ async fn process_broadcaster_redis_subscription(
                 if let Err(exit) =
                     apply_replay_batch(&mut prepared, &mut checkpoint, batch.items).await
                 {
-                    return (exit, redis_processor_rebuilds(prepared.processors));
+                    return (
+                        exit,
+                        redis_processor_rebuilds(prepared.processors),
+                        caught_up_once,
+                    );
                 }
                 if caught_up_after_batch {
+                    caught_up_once = true;
                     mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id())
                         .await;
                 }
@@ -538,11 +610,100 @@ async fn process_broadcaster_redis_subscription(
     }
 }
 
+trait ReplayPollSource {
+    fn read_next<'a>(
+        &'a self,
+        checkpoint: &'a ReplayCheckpoint,
+    ) -> impl Future<Output = std::result::Result<ReplayPoll, BroadcasterReplayClientError>> + Send + 'a;
+}
+
+impl ReplayPollSource for BroadcasterReplayClient {
+    async fn read_next<'a>(
+        &'a self,
+        checkpoint: &'a ReplayCheckpoint,
+    ) -> std::result::Result<ReplayPoll, BroadcasterReplayClientError> {
+        BroadcasterReplayClient::read_next(self, checkpoint).await
+    }
+}
+
+trait RedisRetrySleeper {
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+}
+
+struct TokioRedisRetrySleeper;
+
+impl RedisRetrySleeper for TokioRedisRetrySleeper {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+struct RedisTransportRetry {
+    attempts: u64,
+    backoff: Duration,
+    started_at: Instant,
+}
+
+fn redis_transport_error(error: &BroadcasterReplayClientError) -> bool {
+    matches!(
+        error,
+        BroadcasterReplayClientError::RedisReadTransport { .. }
+            | BroadcasterReplayClientError::RedisInspectTransport { .. }
+    )
+}
+
+fn redis_transport_operation(error: &BroadcasterReplayClientError) -> &'static str {
+    match error {
+        BroadcasterReplayClientError::RedisReadTransport { .. } => "xread",
+        BroadcasterReplayClientError::RedisInspectTransport { .. } => "xinfo",
+        _ => "unknown",
+    }
+}
+
+async fn mark_redis_transport_error(processors: &[PreparedRedisProcessor], error: String) {
+    for prepared in processors {
+        prepared
+            .processor
+            .controls
+            .broadcaster_subscription()
+            .mark_redis_transport_error(error.clone())
+            .await;
+    }
+}
+
+async fn mark_redis_transport_recovered(processors: &[PreparedRedisProcessor]) {
+    for prepared in processors {
+        prepared
+            .processor
+            .controls
+            .broadcaster_subscription()
+            .mark_redis_transport_recovered()
+            .await;
+    }
+}
+
+async fn mark_redis_transport_failed(controls: &[BroadcasterSubscriptionControls], error: String) {
+    for controls in controls {
+        controls
+            .broadcaster_subscription()
+            .mark_redis_transport_failed(error.clone())
+            .await;
+    }
+}
+
 fn replay_error_exit(error: BroadcasterReplayClientError) -> SubscriptionExit {
-    if matches!(error, BroadcasterReplayClientError::RedisGap { .. }) {
-        SubscriptionExit::redis_gap(error.to_string())
-    } else {
-        SubscriptionExit::error(error.to_string())
+    match error {
+        BroadcasterReplayClientError::RedisGap { .. } => {
+            SubscriptionExit::redis_gap(error.to_string())
+        }
+        BroadcasterReplayClientError::RedisDecode { .. } => {
+            SubscriptionExit::redis_decode(error.to_string())
+        }
+        BroadcasterReplayClientError::RedisRead { .. }
+        | BroadcasterReplayClientError::RedisInspect { .. } => {
+            SubscriptionExit::redis_command(error.to_string())
+        }
+        _ => SubscriptionExit::error(error.to_string()),
     }
 }
 
@@ -778,6 +939,18 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
 }
 
+fn reset_outer_backoff_after_catch_up(
+    current: Duration,
+    cfg: &StreamSupervisorConfig,
+    caught_up_once: bool,
+) -> Duration {
+    if caught_up_once {
+        cfg.restart_backoff_min
+    } else {
+        current
+    }
+}
+
 fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
     let base_ms = base.as_millis() as f64;
     let mut rng = rand::thread_rng();
@@ -788,21 +961,63 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 
 struct SubscriptionExit {
     message: String,
-    redis_gap: bool,
+    reason: SubscriptionExitReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionExitReason {
+    RedisCommand,
+    RedisGap,
+    RedisDecode,
+    StateApply,
+}
+
+impl SubscriptionExitReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RedisCommand => "redis_command",
+            Self::RedisGap => "redis_gap",
+            Self::RedisDecode => "redis_decode",
+            Self::StateApply => "state_apply",
+        }
+    }
+}
+
+fn subscription_exit_requires_rebuild(reason: SubscriptionExitReason) -> bool {
+    matches!(
+        reason,
+        SubscriptionExitReason::RedisGap
+            | SubscriptionExitReason::RedisDecode
+            | SubscriptionExitReason::StateApply
+    )
 }
 
 impl SubscriptionExit {
+    fn redis_command(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason: SubscriptionExitReason::RedisCommand,
+        }
+    }
+
     fn error(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            redis_gap: false,
+            reason: SubscriptionExitReason::StateApply,
+        }
+    }
+
+    fn redis_decode(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason: SubscriptionExitReason::RedisDecode,
         }
     }
 
     fn redis_gap(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            redis_gap: true,
+            reason: SubscriptionExitReason::RedisGap,
         }
     }
 }

@@ -36,7 +36,9 @@ mod tests {
 
     use super::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction};
     use super::client::{build_replay_batch, ReplayBatchItem};
-    use super::reader::{redis_xread_messages, RedisStreamInfo, RedisStreamMessage};
+    use super::reader::{
+        blocking_read_timeout, redis_xread_messages, RedisStreamInfo, RedisStreamMessage,
+    };
     use super::ReplayCheckpoint;
 
     #[test]
@@ -202,14 +204,23 @@ mod tests {
     }
 
     #[test]
-    fn redis_xread_timeout_returns_empty_poll() -> Result<()> {
+    fn redis_xread_timeout_is_a_transport_failure() -> Result<()> {
         let timeout: redis::RedisError = std::io::Error::from(std::io::ErrorKind::TimedOut).into();
 
-        let messages =
-            redis_xread_messages("stream", Err(timeout)).map_err(|error| anyhow!("{error:?}"))?;
+        let error = redis_xread_messages("stream", Err(timeout))
+            .err()
+            .ok_or_else(|| anyhow!("timeout should fail"))?;
 
-        assert!(messages.is_empty());
+        assert!(format!("{error:#}").contains("Redis XREAD transport failed"));
         Ok(())
+    }
+
+    #[test]
+    fn redis_xread_timeout_exceeds_block_window() {
+        assert_eq!(
+            blocking_read_timeout(5_000),
+            std::time::Duration::from_secs(7)
+        );
     }
 
     #[test]
@@ -221,7 +232,43 @@ mod tests {
             .err()
             .ok_or_else(|| anyhow!("broken pipe should fail"))?;
 
-        assert!(format!("{error:#}").contains("Redis XREAD failed"));
+        assert!(format!("{error:#}").contains("Redis XREAD transport failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_xread_permanent_error_is_not_transport_failure() -> Result<()> {
+        let auth = redis::RedisError::from((
+            redis::ErrorKind::AuthenticationFailed,
+            "invalid credentials",
+        ));
+
+        let error = redis_xread_messages("stream", Err(auth))
+            .err()
+            .ok_or_else(|| anyhow!("authentication error should fail"))?;
+
+        assert!(matches!(
+            error,
+            super::BroadcasterReplayClientError::RedisRead { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_xread_retryable_server_error_uses_transport_retry() -> Result<()> {
+        let try_again = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::TryAgain),
+            "retry the command",
+        ));
+
+        let error = redis_xread_messages("stream", Err(try_again))
+            .err()
+            .ok_or_else(|| anyhow!("TRYAGAIN should fail the current poll"))?;
+
+        assert!(matches!(
+            error,
+            super::BroadcasterReplayClientError::RedisReadTransport { .. }
+        ));
         Ok(())
     }
 

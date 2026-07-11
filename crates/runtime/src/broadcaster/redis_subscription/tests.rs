@@ -36,15 +36,21 @@ use super::processor::{
 use super::snapshot::RawSnapshotReassembly;
 use super::{
     apply_replay_batch, continue_redis_generation_handoff, mark_redis_replay_checkpoints,
+    mark_redis_transport_failed, process_broadcaster_redis_subscription, redis_transport_error,
+    replay_error_exit, reset_outer_backoff_after_catch_up, subscription_exit_requires_rebuild,
     BroadcasterSubscriptionControls, NativeBroadcasterSubscriptionControls,
-    PreparedBroadcasterRedisSubscription, VmBroadcasterSubscriptionControls,
+    PreparedBroadcasterRedisSubscription, RedisRetrySleeper, ReplayPollSource,
+    SubscriptionExitReason, VmBroadcasterSubscriptionControls,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
+use crate::config::MemoryConfig;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
+use crate::stream::StreamSupervisorConfig;
 use broadcaster_replay_client::{
-    GenerationHandoffCandidate, ReplayBatchItem, ReplayCheckpoint, ReplayMessage,
+    BroadcasterReplayClientError, GenerationHandoffCandidate, ReplayBatch, ReplayBatchItem,
+    ReplayCheckpoint, ReplayMessage, ReplayPoll,
 };
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterGenerationHandoff,
@@ -303,6 +309,266 @@ impl TestControls {
             protocols: vec!["rfq:hashflow".to_string()],
             simulation_rebuild_gate: Arc::clone(&self.rfq_simulation_rebuild_gate),
         })
+    }
+}
+
+#[test]
+fn redis_transport_errors_retry_without_rebootstrap() {
+    let read = BroadcasterReplayClientError::RedisReadTransport {
+        message: "timeout".to_string(),
+    };
+    let inspect = BroadcasterReplayClientError::RedisInspectTransport {
+        message: "connection reset".to_string(),
+    };
+
+    assert!(redis_transport_error(&read));
+    assert!(redis_transport_error(&inspect));
+}
+
+#[test]
+fn replay_data_errors_keep_state_invalidating_reason() {
+    let decode = replay_error_exit(BroadcasterReplayClientError::RedisDecode {
+        message: "bad payload".to_string(),
+    });
+    let gap = replay_error_exit(BroadcasterReplayClientError::RedisGap {
+        message: "missing entry".to_string(),
+    });
+
+    assert_eq!(decode.reason, SubscriptionExitReason::RedisDecode);
+    assert_eq!(gap.reason, SubscriptionExitReason::RedisGap);
+}
+
+#[tokio::test]
+async fn transient_redis_failures_preserve_checkpoint_and_reset_backoffs() -> Result<()> {
+    let (controls, prepared) = prepared_native_handoff_subscription().await?;
+    let source = FakeReplayPollSource::new([
+        FakeReplayPoll::RetryableServerError,
+        FakeReplayPoll::Batch,
+        FakeReplayPoll::CaughtUp,
+        FakeReplayPoll::TransportError,
+        FakeReplayPoll::CaughtUp,
+        FakeReplayPoll::DecodeError,
+    ]);
+    let sleeper = RecordingRetrySleeper::default();
+    let cfg = redis_test_supervisor_config();
+
+    let (exit, _rebuilds, caught_up_once) =
+        process_broadcaster_redis_subscription(&source, prepared, &cfg, &sleeper).await;
+
+    assert_eq!(exit.reason, SubscriptionExitReason::RedisDecode);
+    assert!(caught_up_once);
+    assert_eq!(
+        source.observed_checkpoints(),
+        vec!["7-103", "7-103", "7-104", "7-104", "7-104", "7-104"],
+        "transport retries must resume from the last accepted checkpoint"
+    );
+    assert_eq!(
+        sleeper.durations(),
+        vec![cfg.restart_backoff_min, cfg.restart_backoff_min],
+        "a successful Redis command must reset transport backoff"
+    );
+    assert_eq!(
+        reset_outer_backoff_after_catch_up(cfg.restart_backoff_max, &cfg, caught_up_once),
+        cfg.restart_backoff_min
+    );
+
+    let snapshot = controls.native_subscription.snapshot().await;
+    assert!(snapshot.connected);
+    assert!(snapshot.bootstrap_complete);
+    assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("7-104"));
+    assert_eq!(snapshot.restart_count, 0);
+    assert_eq!(snapshot.redis_transport_retry_count, 2);
+    assert_eq!(controls.native_state_store.current_block().await, 71);
+    assert_eq!(controls.native_state_store.total_states().await, 1);
+    let (state, _) = controls
+        .native_state_store
+        .pool_by_id("pool-native")
+        .await
+        .ok_or_else(|| anyhow!("native pool should remain available"))?;
+    assert_eq!(
+        state
+            .as_any()
+            .downcast_ref::<DummySim>()
+            .map(|state| state.0),
+        Some(3),
+        "the replay batch must apply its state transition exactly once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn permanent_redis_command_failure_stops_without_rebuilding_state() -> Result<()> {
+    let (controls, prepared) = prepared_native_handoff_subscription().await?;
+    let source = FakeReplayPollSource::new([FakeReplayPoll::PermanentCommandError]);
+    let sleeper = RecordingRetrySleeper::default();
+    let cfg = redis_test_supervisor_config();
+    let subscription_controls = vec![controls.native()];
+
+    let (exit, _rebuilds, caught_up_once) =
+        process_broadcaster_redis_subscription(&source, prepared, &cfg, &sleeper).await;
+
+    assert_eq!(exit.reason, SubscriptionExitReason::RedisCommand);
+    assert!(!subscription_exit_requires_rebuild(exit.reason));
+    assert!(!caught_up_once);
+    assert_eq!(source.observed_checkpoints(), vec!["7-103"]);
+    assert!(sleeper.durations().is_empty());
+
+    mark_redis_transport_failed(&subscription_controls, exit.message).await;
+
+    let snapshot = controls.native_subscription.snapshot().await;
+    assert!(snapshot.connected);
+    assert!(snapshot.bootstrap_complete);
+    assert_eq!(snapshot.redis_replay_checkpoint.as_deref(), Some("7-103"));
+    assert_eq!(snapshot.restart_count, 0);
+    assert_eq!(
+        snapshot.redis_transport_status,
+        crate::models::state::RedisTransportStatus::Failed
+    );
+    assert_eq!(controls.native_state_store.current_block().await, 70);
+    assert_eq!(controls.native_state_store.total_states().await, 1);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum FakeReplayPoll {
+    RetryableServerError,
+    TransportError,
+    PermanentCommandError,
+    Batch,
+    CaughtUp,
+    DecodeError,
+}
+
+struct FakeReplayPollSource {
+    polls: std::sync::Mutex<std::collections::VecDeque<FakeReplayPoll>>,
+    observed_checkpoints: std::sync::Mutex<Vec<String>>,
+}
+
+impl FakeReplayPollSource {
+    fn new(polls: impl IntoIterator<Item = FakeReplayPoll>) -> Self {
+        Self {
+            polls: std::sync::Mutex::new(polls.into_iter().collect()),
+            observed_checkpoints: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn observed_checkpoints(&self) -> Vec<String> {
+        self.observed_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ReplayPollSource for FakeReplayPollSource {
+    async fn read_next<'a>(
+        &'a self,
+        checkpoint: &'a ReplayCheckpoint,
+    ) -> std::result::Result<ReplayPoll, BroadcasterReplayClientError> {
+        self.observed_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(checkpoint.entry_id().to_string());
+        let poll = self
+            .polls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(FakeReplayPoll::DecodeError);
+        match poll {
+            FakeReplayPoll::RetryableServerError => {
+                Err(BroadcasterReplayClientError::RedisReadTransport {
+                    message: "TRYAGAIN retry the command".to_string(),
+                })
+            }
+            FakeReplayPoll::TransportError => {
+                Err(BroadcasterReplayClientError::RedisReadTransport {
+                    message: "timeout".to_string(),
+                })
+            }
+            FakeReplayPoll::PermanentCommandError => {
+                Err(BroadcasterReplayClientError::RedisInspect {
+                    message: "NOPERM this user has no permissions".to_string(),
+                })
+            }
+            FakeReplayPoll::Batch => {
+                let envelope =
+                    update_envelope_for_stream("stream-7", 104, 71).map_err(|error| {
+                        BroadcasterReplayClientError::RedisDecode {
+                            message: error.to_string(),
+                        }
+                    })?;
+                let entry = redis_entry_for_scope(&envelope, "native");
+                let checkpoint_after = ReplayCheckpoint::new(
+                    redis_boundary("stream-7", "snapshot-7", 7, 104).map_err(|error| {
+                        BroadcasterReplayClientError::RedisDecode {
+                            message: error.to_string(),
+                        }
+                    })?,
+                    Chain::Ethereum.id(),
+                );
+                Ok(ReplayPoll::Batch(ReplayBatch {
+                    items: vec![ReplayBatchItem::Message(ReplayMessage {
+                        entry_id: "7-104".to_string(),
+                        entry,
+                        envelope,
+                        checkpoint_after,
+                    })],
+                    caught_up_after_batch: false,
+                }))
+            }
+            FakeReplayPoll::CaughtUp => Ok(ReplayPoll::CaughtUp {
+                checkpoint: checkpoint.clone(),
+            }),
+            FakeReplayPoll::DecodeError => Err(BroadcasterReplayClientError::RedisDecode {
+                message: "bad payload".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingRetrySleeper {
+    durations: std::sync::Mutex<Vec<Duration>>,
+}
+
+impl RecordingRetrySleeper {
+    fn durations(&self) -> Vec<Duration> {
+        self.durations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl RedisRetrySleeper for RecordingRetrySleeper {
+    async fn sleep(&self, duration: Duration) {
+        self.durations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(duration);
+    }
+}
+
+fn redis_test_supervisor_config() -> StreamSupervisorConfig {
+    StreamSupervisorConfig {
+        readiness_stale: Duration::from_secs(120),
+        stream_stale: Duration::from_secs(120),
+        missing_block_burst: 3,
+        missing_block_window: Duration::from_secs(60),
+        error_burst: 3,
+        error_window: Duration::from_secs(60),
+        resync_grace: Duration::from_secs(60),
+        restart_backoff_min: Duration::from_millis(10),
+        restart_backoff_max: Duration::from_millis(80),
+        restart_backoff_jitter_pct: 0.0,
+        memory: MemoryConfig {
+            purge_enabled: false,
+            snapshots_enabled: false,
+            snapshots_min_interval_secs: 60,
+            snapshots_min_new_pairs: 1_000,
+            snapshots_emit_emf: false,
+        },
     }
 }
 

@@ -13,8 +13,12 @@ pub enum BroadcasterReplayClientError {
     RedisConnect { message: String },
     /// Blocking Redis stream read failed.
     RedisRead { message: String },
+    /// Blocking Redis stream read hit a transient transport failure.
+    RedisReadTransport { message: String },
     /// Redis stream inspection failed.
     RedisInspect { message: String },
+    /// Redis stream inspection hit a transient transport failure.
+    RedisInspectTransport { message: String },
     /// Redis returned a stream entry that could not be decoded.
     RedisDecode { message: String },
     /// Replay continuity checks failed and the caller should rebuild from a snapshot.
@@ -64,8 +68,20 @@ impl BroadcasterReplayClientError {
         }
     }
 
+    pub(crate) fn redis_read_transport(message: impl Into<String>) -> Self {
+        Self::RedisReadTransport {
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn redis_inspect(message: impl Into<String>) -> Self {
         Self::RedisInspect {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn redis_inspect_transport(message: impl Into<String>) -> Self {
+        Self::RedisInspectTransport {
             message: message.into(),
         }
     }
@@ -144,8 +160,14 @@ impl fmt::Display for BroadcasterReplayClientError {
                 )
             }
             Self::RedisRead { message } => write!(formatter, "Redis XREAD failed: {message}"),
+            Self::RedisReadTransport { message } => {
+                write!(formatter, "Redis XREAD transport failed: {message}")
+            }
             Self::RedisInspect { message } => {
                 write!(formatter, "Redis XINFO STREAM failed: {message}")
+            }
+            Self::RedisInspectTransport { message } => {
+                write!(formatter, "Redis XINFO STREAM transport failed: {message}")
             }
             Self::RedisDecode { message } => {
                 write!(formatter, "failed to decode Redis stream entry: {message}")

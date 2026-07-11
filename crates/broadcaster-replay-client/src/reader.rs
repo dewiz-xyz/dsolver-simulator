@@ -1,8 +1,14 @@
+use std::time::Duration;
+
 use redis::streams::{StreamId, StreamInfoStreamReply, StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
 use simulator_core::broadcaster::BroadcasterRedisStreamEntry;
 
 use crate::error::{BroadcasterReplayClientError, Result};
+
+const REDIS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+const REDIS_INSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
+const REDIS_BLOCKING_READ_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 
 pub(crate) struct TokioRedisStreamReader {
     blocking_read_connection: redis::aio::ConnectionManager,
@@ -10,17 +16,21 @@ pub(crate) struct TokioRedisStreamReader {
 }
 
 impl TokioRedisStreamReader {
-    pub(crate) async fn connect(redis_url: &str) -> Result<Self> {
+    pub(crate) async fn connect(redis_url: &str, block_ms: u64) -> Result<Self> {
         let client = redis::Client::open(redis_url)
             .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
-        let blocking_read_connection = client
-            .get_connection_manager()
-            .await
-            .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
-        let inspection_connection = client
-            .get_connection_manager()
-            .await
-            .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        let blocking_read_connection = redis::aio::ConnectionManager::new_with_config(
+            client.clone(),
+            connection_manager_config(blocking_read_timeout(block_ms)),
+        )
+        .await
+        .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        let inspection_connection = redis::aio::ConnectionManager::new_with_config(
+            client,
+            connection_manager_config(REDIS_INSPECTION_TIMEOUT),
+        )
+        .await
+        .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
         Ok(Self {
             blocking_read_connection,
             inspection_connection,
@@ -53,6 +63,16 @@ impl TokioRedisStreamReader {
             .await;
         redis_stream_info(reply)
     }
+}
+
+fn connection_manager_config(response_timeout: Duration) -> redis::aio::ConnectionManagerConfig {
+    redis::aio::ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(REDIS_CONNECTION_TIMEOUT))
+        .set_response_timeout(Some(response_timeout))
+}
+
+pub(crate) fn blocking_read_timeout(block_ms: u64) -> Duration {
+    Duration::from_millis(block_ms).saturating_add(REDIS_BLOCKING_READ_TIMEOUT_MARGIN)
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +114,9 @@ pub(crate) fn redis_xread_messages(
     match reply {
         Ok(Some(reply)) => redis_stream_messages(expected_stream_key, reply),
         Ok(None) => Ok(Vec::new()),
-        Err(error) if error.is_timeout() => Ok(Vec::new()),
+        Err(error) if redis_transport_failure(&error) => Err(
+            BroadcasterReplayClientError::redis_read_transport(error.to_string()),
+        ),
         Err(error) => Err(BroadcasterReplayClientError::redis_read(error.to_string())),
     }
 }
@@ -105,6 +127,9 @@ fn redis_stream_info(
     match reply {
         Ok(reply) => redis_stream_info_from_reply(reply).map(Some),
         Err(error) if redis_stream_missing_key(&error) => Ok(None),
+        Err(error) if redis_transport_failure(&error) => Err(
+            BroadcasterReplayClientError::redis_inspect_transport(error.to_string()),
+        ),
         Err(error) => Err(BroadcasterReplayClientError::redis_inspect(
             error.to_string(),
         )),
@@ -135,6 +160,14 @@ fn redis_stream_missing_key(error: &redis::RedisError) -> bool {
     error
         .detail()
         .is_some_and(|detail| detail.contains("no such key"))
+}
+
+fn redis_transport_failure(error: &redis::RedisError) -> bool {
+    if matches!(error.kind(), redis::ErrorKind::AuthenticationFailed) {
+        return false;
+    }
+
+    !matches!(error.retry_method(), redis::RetryMethod::NoRetry)
 }
 
 fn redis_stream_message(stream_id: StreamId) -> Result<RedisStreamMessage> {
