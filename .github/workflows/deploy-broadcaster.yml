@@ -63,6 +63,7 @@ jobs:
             github_token=${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
 
       - name: Force deploy broadcaster ECS service
+        if: inputs.target == 'staging-solve-base'
         env:
           CLUSTER: ${{ inputs.target }}
         run: |

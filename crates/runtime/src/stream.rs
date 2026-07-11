@@ -591,19 +591,26 @@ async fn handle_broadcaster_raw_update(
         .values()
         .map(|message| message.snapshots.states.len())
         .sum();
-    if let Err(error) = service.apply_feed_message(&update).await {
-        let error = error.to_string();
-        health.set_last_error(Some(error.clone())).await;
-        let reset_scope = if service.redis_publisher_needs_generation_reset().await {
-            BroadcasterResetScope::AllServices
-        } else {
-            BroadcasterResetScope::RestartedService
-        };
-        return Some(stream_exit_with_broadcaster_reset_scope(
-            StreamRestartReason::Error,
-            Some(error),
-            reset_scope,
-        ));
+    let published = match service.apply_feed_message(&update).await {
+        Ok(published) => published,
+        Err(error) => {
+            let error = error.to_string();
+            health.set_last_error(Some(error.clone())).await;
+            let reset_scope = if service.redis_publisher_needs_generation_reset().await {
+                BroadcasterResetScope::AllServices
+            } else {
+                BroadcasterResetScope::RestartedService
+            };
+            return Some(stream_exit_with_broadcaster_reset_scope(
+                StreamRestartReason::Error,
+                Some(error),
+                reset_scope,
+            ));
+        }
+    };
+
+    if !published {
+        return None;
     }
 
     health.record_update(block_number).await;
@@ -1165,8 +1172,9 @@ mod tests {
     use tycho_simulation::protocol::models::Update;
 
     use super::{
-        begin_vm_rebuild, classify_stream_error, handle_broadcaster_update, BroadcasterResetScope,
-        StreamRestartReason, StreamSupervisorConfig, VmStreamControls,
+        begin_vm_rebuild, classify_stream_error, handle_broadcaster_raw_update,
+        handle_broadcaster_update, BroadcasterResetScope, StreamRestartReason,
+        StreamSupervisorConfig, VmStreamControls,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -1179,7 +1187,13 @@ mod tests {
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
     use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
-    use tycho_simulation::tycho_common::{models::Chain, Bytes};
+    use tycho_simulation::{
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, FeedMessage, SynchronizerState,
+        },
+        tycho_common::{dto::ResponseAccount, models::Chain, Bytes},
+    };
 
     #[test]
     fn classifies_state_decoding_failure_messages() {
@@ -1280,6 +1294,91 @@ mod tests {
         assert_eq!(
             exit.broadcaster_reset_scope,
             BroadcasterResetScope::AllServices
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_raw_recovery_stays_degraded_without_supervisor_exit_or_health_advance(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            512,
+            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Vm]),
+            BroadcasterUpstreamState::default(),
+            test_redis_publisher(8453),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        let health = StreamHealth::new();
+        let mut ready_logged = false;
+        let address = Bytes::from([42u8; 20]);
+        let feed = |number: u64, hash: u8, parent: u8, value: u8| {
+            let header = BlockHeader {
+                hash: Bytes::from([hash; 32]),
+                number,
+                parent_hash: Bytes::from([parent; 32]),
+                revert: false,
+                timestamp: number * 10,
+                partial_block_index: None,
+            };
+            let account = ResponseAccount::new(
+                tycho_simulation::tycho_common::dto::Chain::Base,
+                address.clone(),
+                "large-account".to_string(),
+                HashMap::from([(Bytes::from([1u8; 32]), Bytes::from(vec![value; 4_096]))]),
+                Bytes::from([value; 32]),
+                HashMap::new(),
+                Bytes::from([7u8; 128]),
+                Bytes::from([8u8; 32]),
+                Bytes::from([9u8; 32]),
+                Bytes::from([10u8; 32]),
+                None,
+            );
+            FeedMessage {
+                state_msgs: HashMap::from([(
+                    "vm:curve".to_string(),
+                    StateSyncMessage {
+                        header: header.clone(),
+                        snapshots: Snapshot {
+                            states: HashMap::new(),
+                            vm_storage: HashMap::from([(address.clone(), account)]),
+                        },
+                        deltas: None,
+                        removed_components: HashMap::new(),
+                    },
+                )]),
+                sync_states: HashMap::from([(
+                    "vm:curve".to_string(),
+                    SynchronizerState::Ready(header),
+                )]),
+            }
+        };
+
+        assert!(handle_broadcaster_raw_update(
+            feed(10, 10, 9, 1),
+            &service,
+            &health,
+            &test_supervisor_config(),
+            &mut ready_logged,
+        )
+        .await
+        .is_none());
+        assert_eq!(health.last_block().await, 10);
+
+        assert!(handle_broadcaster_raw_update(
+            feed(12, 12, 11, 2),
+            &service,
+            &health,
+            &test_supervisor_config(),
+            &mut ready_logged,
+        )
+        .await
+        .is_none());
+        assert_eq!(health.last_block().await, 10);
+        assert_eq!(health.restart_count().await, 0);
+        assert_eq!(
+            service.status_snapshot().await.readiness,
+            crate::broadcaster::state::BroadcasterReadiness::UpstreamRecovering
         );
         Ok(())
     }

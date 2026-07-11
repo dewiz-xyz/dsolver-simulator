@@ -45,7 +45,7 @@ use tycho_simulation::{
     tycho_client::feed::component_tracker::ComponentFilter,
     tycho_client::{
         feed::{BlockHeader, FeedMessage},
-        stream::TychoStreamBuilder,
+        stream::{RetryConfiguration, TychoStreamBuilder},
     },
     tycho_common::{
         models::{token::Token, Chain},
@@ -534,6 +534,14 @@ fn raw_base_builder(
 
     let builder = TychoStreamBuilder::new(tycho_url, chain.into())
         .timeout(15)
+        .websockets_retry_config(&RetryConfiguration::constant(
+            u64::MAX,
+            Duration::from_secs(1),
+        ))
+        .state_synchronizer_retry_config(&RetryConfiguration::constant(
+            u64::MAX,
+            Duration::from_secs(2),
+        ))
         .auth_key(Some(api_key.to_string()));
 
     (builder, tvl_filter)

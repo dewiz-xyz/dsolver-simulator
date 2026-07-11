@@ -102,6 +102,11 @@ impl BroadcasterSubscriptionProcessor {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn next_message_seq(&self) -> Option<u64> {
+        self.tracker.next_message_seq()
+    }
+
     pub(super) fn align_redis_replay_boundary(
         &mut self,
         boundary: &BroadcasterRedisReplayBoundary,

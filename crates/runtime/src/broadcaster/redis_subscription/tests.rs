@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use tokio::sync::RwLock;
-use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
+use tycho_simulation::tycho_common::dto::{BlockChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
 use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
@@ -16,12 +16,13 @@ use tycho_simulation::{
     },
     tycho_client::feed::{
         synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
-        BlockHeader, SynchronizerState,
+        BlockHeader, FeedMessage, SynchronizerState,
     },
     tycho_common::{
         dto::{
-            Chain as DtoChain, ProtocolComponent as DtoProtocolComponent, ResponseAccount,
-            ResponseProtocolState,
+            Chain as DtoChain, ComponentBalance, EntryPoint,
+            ProtocolComponent as DtoProtocolComponent, RPCTracerParams, ResponseAccount,
+            ResponseProtocolState, ResponseToken, TokenBalances, TracingParams,
         },
         models::{token::Token, Chain},
         simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -38,6 +39,7 @@ use super::{
     BroadcasterSubscriptionControls, NativeBroadcasterSubscriptionControls,
     PreparedBroadcasterRedisSubscription, VmBroadcasterSubscriptionControls,
 };
+use crate::broadcaster::state::BroadcasterSnapshotCache;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
@@ -128,6 +130,102 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for DummySim {
         _decoder_context: &DecoderContext,
     ) -> std::result::Result<Self, Self::Error> {
         Ok(Self(0))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+struct StatefulSim {
+    attributes: HashMap<String, Bytes>,
+    balances: HashMap<Bytes, Bytes>,
+}
+
+#[typetag::serde]
+impl ProtocolSim for StatefulSim {
+    fn fee(&self) -> f64 {
+        0.0
+    }
+
+    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+        Ok(0.0)
+    }
+
+    fn get_amount_out(
+        &self,
+        amount_in: BigUint,
+        _token_in: &Token,
+        _token_out: &Token,
+    ) -> Result<GetAmountOutResult, SimulationError> {
+        Ok(GetAmountOutResult::new(
+            amount_in,
+            BigUint::from(0u8),
+            self.clone_box(),
+        ))
+    }
+
+    fn get_limits(
+        &self,
+        _sell_token: Bytes,
+        _buy_token: Bytes,
+    ) -> Result<(BigUint, BigUint), SimulationError> {
+        Ok((BigUint::from(0u8), BigUint::from(0u8)))
+    }
+
+    fn delta_transition(
+        &mut self,
+        delta: ProtocolStateDelta,
+        _tokens: &HashMap<Bytes, Token>,
+        balances: &Balances,
+    ) -> Result<(), TransitionError> {
+        for attribute in delta.deleted_attributes {
+            self.attributes.remove(&attribute);
+        }
+        self.attributes.extend(delta.updated_attributes);
+        if let Some(component_balances) = balances.component_balances.get(&delta.component_id) {
+            self.balances.clone_from(component_balances);
+        }
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn ProtocolSim> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn eq(&self, other: &dyn ProtocolSim) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+}
+
+impl TryFromWithBlock<ComponentWithState, BlockHeader> for StatefulSim {
+    type Error = InvalidSnapshotError;
+
+    async fn try_from_with_header(
+        snapshot: ComponentWithState,
+        block: BlockHeader,
+        _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
+        _all_tokens: &HashMap<Bytes, Token>,
+        _decoder_context: &DecoderContext,
+    ) -> std::result::Result<Self, Self::Error> {
+        let mut attributes = snapshot.state.attributes;
+        attributes.insert(
+            "block_number".to_string(),
+            Bytes::from(block.number.to_be_bytes().to_vec()),
+        );
+        attributes.insert(
+            "block_timestamp".to_string(),
+            Bytes::from(block.timestamp.to_be_bytes().to_vec()),
+        );
+        Ok(Self {
+            attributes,
+            balances: snapshot.state.balances,
+        })
     }
 }
 
@@ -922,6 +1020,12 @@ fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
     Arc::new(decoder)
 }
 
+fn stateful_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+    let mut decoder = TychoStreamDecoder::new();
+    decoder.register_decoder::<StatefulSim>("vm:curve");
+    Arc::new(decoder)
+}
+
 #[test]
 fn raw_snapshot_reassembly_merges_split_vm_storage_account() -> Result<()> {
     let account_address = Bytes::from([42u8; 20]);
@@ -1087,6 +1191,641 @@ fn raw_snapshot_reassembly_happy_path_preserves_header_and_sync_state() -> Resul
     assert_eq!(message.sync_state, sync_state);
     assert!(message.message.snapshots.states.contains_key("pool-a"));
     assert!(message.message.removed_components.contains_key("pool-b"));
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fragmented export and consumer reassembly contract stays in one regression"
+)]
+async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
+    let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+    let header = raw_block_header(10, 1);
+    let mut changes = BlockChanges::default();
+    for index in (0..24).rev() {
+        let component_id = format!("missing-{index:04}");
+        changes.state_updates.insert(
+            component_id.clone(),
+            ProtocolStateDelta {
+                component_id,
+                updated_attributes: HashMap::from([(
+                    "value".to_string(),
+                    Bytes::from(vec![index as u8; 384]),
+                )]),
+                deleted_attributes: Default::default(),
+            },
+        );
+    }
+    for index in 0..20u8 {
+        let token_address = Bytes::from([91u8.saturating_add(index); 20]);
+        changes.new_tokens.insert(
+            token_address.clone(),
+            ResponseToken {
+                chain: DtoChain::Ethereum,
+                address: token_address,
+                symbol: format!("TAIL{index}"),
+                decimals: 18,
+                tax: 0,
+                gas: Vec::new(),
+                quality: 100,
+            },
+        );
+        let entrypoint_id = format!("trace-{index}");
+        changes
+            .dci_update
+            .new_entrypoints
+            .entry("missing-dci".to_string())
+            .or_default()
+            .insert(EntryPoint {
+                external_id: entrypoint_id.clone(),
+                target: Bytes::from([index; 20]),
+                signature: format!("value{index}()"),
+            });
+        changes
+            .dci_update
+            .new_entrypoint_params
+            .entry(entrypoint_id.clone())
+            .or_default()
+            .insert((
+                TracingParams::RPCTracer(RPCTracerParams {
+                    caller: None,
+                    calldata: Bytes::from([index; 4]),
+                    state_overrides: None,
+                    prune_addresses: None,
+                }),
+                "missing-dci".to_string(),
+            ));
+        changes
+            .dci_update
+            .trace_results
+            .insert(entrypoint_id, Default::default());
+    }
+    cache
+        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
+            state_msgs: HashMap::from([(
+                "vm:curve".to_string(),
+                StateSyncMessage {
+                    header: header.clone(),
+                    snapshots: Snapshot {
+                        states: HashMap::from([(
+                            "pool-a".to_string(),
+                            raw_component_with_state("pool-a"),
+                        )]),
+                        vm_storage: HashMap::new(),
+                    },
+                    deltas: Some(changes),
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "vm:curve".to_string(),
+                SynchronizerState::Ready(header),
+            )]),
+        })
+        .await?;
+
+    let unsplit_export = cache.export_snapshot(usize::MAX).await?;
+    let unsplit_message = unsplit_export
+        .payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+        .flat_map(|chunk| &chunk.partitions)
+        .flat_map(|partition| &partition.messages)
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("expected unsplit raw message"))?;
+    let unsplit_size = serde_json::to_vec(&unsplit_export.payloads[1])?.len();
+    let split_export = cache.export_snapshot(unsplit_size / 2).await?;
+    let mut reassembly = RawSnapshotReassembly::default();
+    let mut fragment_count = 0usize;
+    for message in split_export
+        .payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+        .flat_map(|chunk| &chunk.partitions)
+        .flat_map(|partition| &partition.messages)
+    {
+        let json = serde_json::to_vec(message)?;
+        let decoded: BroadcasterProtocolMessage = serde_json::from_slice(&json)?;
+        reassembly.push(decoded)?;
+        fragment_count += 1;
+    }
+
+    assert!(fragment_count > 1);
+    assert_eq!(reassembly.take_messages(), vec![unsplit_message]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_component_removal_inverse_removes_consumer_state() -> Result<()> {
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.vm(), None);
+    bootstrap(&mut processor).await?;
+    let component_id = "0x1111111111111111111111111111111111111111";
+    controls
+        .vm_state_store
+        .apply_update(tycho_simulation::protocol::models::Update::new(
+            11,
+            HashMap::from([(
+                component_id.to_string(),
+                Box::new(DummySim(7)) as Box<dyn ProtocolSim>,
+            )]),
+            HashMap::from([(component_id.to_string(), vm_component())]),
+        ))
+        .await;
+    assert!(controls.vm_state_store.has_pool(component_id).await);
+
+    let mut removal = raw_protocol_message_with_ids(&[], &[component_id]);
+    let removal_header = raw_block_header(12, 2);
+    removal.message.header = removal_header.clone();
+    removal.sync_state = SynchronizerState::Ready(removal_header);
+    let update = BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::with_messages(
+        BroadcasterBackend::Vm,
+        12,
+        vec![removal],
+        BTreeMap::new(),
+    )])?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "stream-1",
+            4,
+            BroadcasterPayload::Update(update),
+        ))
+        .await?;
+
+    assert!(!controls.vm_state_store.has_pool(component_id).await);
+    assert_eq!(controls.vm_state_store.current_block().await, 12);
+    Ok(())
+}
+
+struct StatefulCompactionFixture {
+    component_id: &'static str,
+    token: Bytes,
+    snapshot_state: ComponentWithState,
+    changes: BlockChanges,
+    initial_header: BlockHeader,
+    final_header: BlockHeader,
+}
+
+fn stateful_compaction_fixture() -> StatefulCompactionFixture {
+    let component_id = "0x1111111111111111111111111111111111111111";
+    let token = Bytes::from([81u8; 20]);
+    let snapshot_state = ComponentWithState {
+        state: ResponseProtocolState {
+            component_id: component_id.to_string(),
+            attributes: HashMap::from([
+                ("value".to_string(), Bytes::from([1u8; 32])),
+                ("deleted".to_string(), Bytes::from([9u8; 32])),
+            ]),
+            balances: HashMap::from([(token.clone(), Bytes::from([10u8; 32]))]),
+        },
+        component: raw_dto_protocol_component(component_id),
+        component_tvl: Some(1.0),
+        entrypoints: Vec::new(),
+    };
+    let mut changes = BlockChanges::default();
+    changes.state_updates.insert(
+        component_id.to_string(),
+        ProtocolStateDelta {
+            component_id: component_id.to_string(),
+            updated_attributes: HashMap::from([("value".to_string(), Bytes::from([2u8; 32]))]),
+            deleted_attributes: ["deleted".to_string()].into_iter().collect(),
+        },
+    );
+    changes.component_balances.insert(
+        component_id.to_string(),
+        TokenBalances(HashMap::from([(
+            token.clone(),
+            ComponentBalance {
+                token: token.clone(),
+                balance: Bytes::from([20u8; 32]),
+                balance_float: 20.0,
+                modify_tx: Bytes::from([2u8; 32]),
+                component_id: component_id.to_string(),
+            },
+        )])),
+    );
+    changes.component_tvl.insert(component_id.to_string(), 2.0);
+    StatefulCompactionFixture {
+        component_id,
+        token,
+        snapshot_state,
+        changes,
+        initial_header: raw_block_header(10, 1),
+        final_header: raw_block_header(11, 2),
+    }
+}
+
+async fn bootstrap_uncompacted_stateful(
+    fixture: &StatefulCompactionFixture,
+) -> Result<TestControls> {
+    let uncompacted_message = BroadcasterProtocolMessage::new(
+        "vm:curve",
+        SynchronizerState::Ready(fixture.final_header.clone()),
+        StateSyncMessage {
+            header: fixture.final_header.clone(),
+            snapshots: Snapshot {
+                states: HashMap::from([(
+                    fixture.component_id.to_string(),
+                    fixture.snapshot_state.clone(),
+                )]),
+                vm_storage: HashMap::new(),
+            },
+            deltas: Some(fixture.changes.clone()),
+            removed_components: HashMap::new(),
+        },
+    );
+
+    let uncompacted_controls = TestControls::new();
+    let mut uncompacted_processor = BroadcasterSubscriptionProcessor::with_decoder(
+        Chain::Ethereum.id(),
+        uncompacted_controls.vm(),
+        stateful_decoder(),
+        None,
+    );
+    uncompacted_processor.set_bootstrap_redis_replay_boundary(
+        super::processor::default_test_redis_replay_boundary(),
+    );
+    uncompacted_processor
+        .observe(vm_only_snapshot_start_envelope(1)?)
+        .await?;
+    uncompacted_processor
+        .observe(raw_snapshot_chunk_envelope(
+            2,
+            0,
+            11,
+            vec![uncompacted_message],
+        )?)
+        .await?;
+    uncompacted_processor
+        .observe(snapshot_end_envelope_at(3))
+        .await?;
+    Ok(uncompacted_controls)
+}
+
+async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Result<TestControls> {
+    let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
+    cache
+        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
+            state_msgs: HashMap::from([(
+                "vm:curve".to_string(),
+                StateSyncMessage {
+                    header: fixture.initial_header.clone(),
+                    snapshots: Snapshot {
+                        states: HashMap::from([(
+                            fixture.component_id.to_string(),
+                            fixture.snapshot_state.clone(),
+                        )]),
+                        vm_storage: HashMap::new(),
+                    },
+                    deltas: None,
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "vm:curve".to_string(),
+                SynchronizerState::Ready(fixture.initial_header.clone()),
+            )]),
+        })
+        .await?;
+    cache
+        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
+            state_msgs: HashMap::from([(
+                "vm:curve".to_string(),
+                StateSyncMessage {
+                    header: fixture.final_header.clone(),
+                    snapshots: Snapshot::default(),
+                    deltas: Some(fixture.changes.clone()),
+                    removed_components: HashMap::new(),
+                },
+            )]),
+            sync_states: HashMap::from([(
+                "vm:curve".to_string(),
+                SynchronizerState::Ready(fixture.final_header.clone()),
+            )]),
+        })
+        .await?;
+    let compacted_export = cache.export_snapshot(8_388_608).await?;
+    let compacted_controls = TestControls::new();
+    let mut compacted_processor = BroadcasterSubscriptionProcessor::with_decoder(
+        Chain::Ethereum.id(),
+        compacted_controls.vm(),
+        stateful_decoder(),
+        None,
+    );
+    compacted_processor.set_bootstrap_redis_replay_boundary(BroadcasterRedisReplayBoundary::new(
+        "stream:test".to_string(),
+        compacted_export.stream_id.clone(),
+        compacted_export.snapshot_id.clone(),
+        1,
+        0,
+    )?);
+    for (index, payload) in compacted_export.payloads.into_iter().enumerate() {
+        compacted_processor
+            .observe(BroadcasterEnvelope::new(
+                compacted_export.stream_id.clone(),
+                index as u64 + 1,
+                payload,
+            ))
+            .await?;
+    }
+    Ok(compacted_controls)
+}
+
+#[tokio::test]
+async fn raw_cache_compaction_matches_consumer_state_transition() -> Result<()> {
+    let fixture = stateful_compaction_fixture();
+    let uncompacted_controls = bootstrap_uncompacted_stateful(&fixture).await?;
+    let compacted_controls = bootstrap_compacted_stateful(&fixture).await?;
+
+    let uncompacted_pool = uncompacted_controls
+        .vm_state_store
+        .pool_by_id(fixture.component_id)
+        .await
+        .ok_or_else(|| anyhow!("expected uncompacted pool"))?;
+    let compacted_pool = compacted_controls
+        .vm_state_store
+        .pool_by_id(fixture.component_id)
+        .await
+        .ok_or_else(|| anyhow!("expected compacted pool"))?;
+    assert!(uncompacted_pool.0.eq(compacted_pool.0.as_ref()));
+    assert_eq!(uncompacted_pool.1.as_ref(), compacted_pool.1.as_ref());
+    assert_eq!(
+        uncompacted_controls.vm_state_store.current_block().await,
+        11
+    );
+    assert_eq!(compacted_controls.vm_state_store.current_block().await, 11);
+    let state = compacted_pool
+        .0
+        .as_any()
+        .downcast_ref::<StatefulSim>()
+        .ok_or_else(|| anyhow!("expected stateful simulation"))?;
+    assert_eq!(state.attributes["value"], Bytes::from([2u8; 32]));
+    assert!(!state.attributes.contains_key("deleted"));
+    assert_eq!(state.balances[&fixture.token], Bytes::from([20u8; 32]));
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the full reconnect sequence stays in one cross-layer regression"
+)]
+async fn five_protocol_recovery_keeps_consumer_live_on_one_compact_redis_update() -> Result<()> {
+    const PROTOCOLS: [&str; 5] = [
+        "uniswap_v2",
+        "uniswap_v3",
+        "uniswap_v4",
+        "pancakeswap_v3",
+        "aerodrome_slipstreams",
+    ];
+    let cache = BroadcasterSnapshotCache::new_with_initial_generation(
+        8453,
+        vec![BroadcasterBackend::Native],
+        7,
+    );
+    let header = |number, hash, parent| BlockHeader {
+        hash: Bytes::from([hash; 32]),
+        number,
+        parent_hash: Bytes::from([parent; 32]),
+        revert: false,
+        timestamp: number * 10,
+        partial_block_index: None,
+    };
+    let protocol_message = |protocol: &str, block: BlockHeader, seed: u8| {
+        let protocol_index = PROTOCOLS
+            .iter()
+            .position(|candidate| *candidate == protocol)
+            .unwrap_or_default();
+        let component_id = format!("0x{:040x}", protocol_index + 1);
+        let mut component = raw_component_with_state(&component_id);
+        component.component.protocol_system = protocol.to_string();
+        component.component.protocol_type_name = protocol.to_string();
+        component
+            .state
+            .attributes
+            .insert("value".to_string(), Bytes::from([seed; 32]));
+        StateSyncMessage {
+            header: block,
+            snapshots: Snapshot {
+                states: HashMap::from([(component_id, component)]),
+                vm_storage: HashMap::new(),
+            },
+            deltas: None,
+            removed_components: HashMap::new(),
+        }
+    };
+    let feed = |entries: Vec<(&str, StateSyncMessage<BlockHeader>)>,
+                statuses: Vec<(&str, BlockHeader)>| FeedMessage {
+        state_msgs: entries
+            .into_iter()
+            .map(|(protocol, message)| (protocol.to_string(), message))
+            .collect(),
+        sync_states: statuses
+            .into_iter()
+            .map(|(protocol, block)| (protocol.to_string(), SynchronizerState::Ready(block)))
+            .collect(),
+    };
+    let block_10 = header(10, 10, 9);
+    let initial = feed(
+        PROTOCOLS
+            .iter()
+            .enumerate()
+            .map(|(index, protocol)| {
+                (
+                    *protocol,
+                    protocol_message(protocol, block_10.clone(), index as u8 + 1),
+                )
+            })
+            .collect(),
+        PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol, block_10.clone()))
+            .collect(),
+    );
+    cache.apply_feed_message(&initial).await?;
+    let export = cache.export_snapshot(8_388_608).await?;
+    let initial_stream_id = export.stream_id.clone();
+    let initial_snapshot_id = export.snapshot_id.clone();
+    let boundary = BroadcasterRedisReplayBoundary::new(
+        "broadcaster:test",
+        export.stream_id.clone(),
+        export.snapshot_id.clone(),
+        7,
+        103,
+    )?;
+
+    let controls = TestControls::new();
+    let mut decoder = TychoStreamDecoder::new();
+    for protocol in PROTOCOLS {
+        decoder.register_decoder::<StatefulSim>(protocol);
+    }
+    let mut processor = BroadcasterSubscriptionProcessor::with_decoder(
+        8453,
+        controls.native(),
+        Arc::new(decoder),
+        None,
+    );
+    processor.set_bootstrap_redis_replay_boundary(boundary.clone());
+    for (index, payload) in export.payloads.into_iter().enumerate() {
+        processor
+            .observe(BroadcasterEnvelope::new(
+                export.stream_id.clone(),
+                index as u64 + 1,
+                payload,
+            ))
+            .await?;
+    }
+    assert!(processor.bootstrap_complete());
+    processor.align_redis_replay_boundary(&boundary)?;
+    assert_eq!(processor.next_message_seq(), Some(104));
+
+    let block_12 = header(12, 12, 11);
+    let first = feed(
+        PROTOCOLS[..2]
+            .iter()
+            .enumerate()
+            .map(|(index, protocol)| {
+                (
+                    *protocol,
+                    protocol_message(protocol, block_12.clone(), if index == 0 { 9 } else { 2 }),
+                )
+            })
+            .collect(),
+        PROTOCOLS
+            .iter()
+            .enumerate()
+            .map(|(index, protocol)| {
+                (
+                    *protocol,
+                    if index < 2 {
+                        block_12.clone()
+                    } else {
+                        block_10.clone()
+                    },
+                )
+            })
+            .collect(),
+    );
+    assert!(cache.apply_feed_message(&first).await?.is_none());
+    assert_eq!(processor.next_message_seq(), Some(104));
+
+    let second = feed(
+        PROTOCOLS[2..]
+            .iter()
+            .enumerate()
+            .map(|(index, protocol)| {
+                (
+                    *protocol,
+                    protocol_message(protocol, block_12.clone(), index as u8 + 3),
+                )
+            })
+            .collect(),
+        PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol, block_12.clone()))
+            .collect(),
+    );
+    let compact = cache
+        .apply_feed_message(&second)
+        .await?
+        .ok_or_else(|| anyhow!("aligned recovery should emit one compact update"))?;
+    assert_eq!(
+        compact
+            .partitions
+            .iter()
+            .flat_map(|partition| &partition.messages)
+            .map(|message| message.message.snapshots.states.len())
+            .sum::<usize>(),
+        1
+    );
+
+    let clean_cache = BroadcasterSnapshotCache::new_with_initial_generation(
+        8453,
+        vec![BroadcasterBackend::Native],
+        7,
+    );
+    let clean_block_12 = feed(
+        PROTOCOLS
+            .iter()
+            .enumerate()
+            .map(|(index, protocol)| {
+                (
+                    *protocol,
+                    protocol_message(
+                        protocol,
+                        block_12.clone(),
+                        if index == 0 { 9 } else { index as u8 + 1 },
+                    ),
+                )
+            })
+            .collect(),
+        PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol, block_12.clone()))
+            .collect(),
+    );
+    clean_cache.apply_feed_message(&clean_block_12).await?;
+    let recovered_export = cache.export_snapshot(8_388_608).await?;
+    let clean_export = clean_cache.export_snapshot(8_388_608).await?;
+    assert_eq!(boundary.generation, 7);
+    assert_eq!(recovered_export.stream_id, initial_stream_id);
+    assert_eq!(recovered_export.snapshot_id, initial_snapshot_id);
+    assert_eq!(clean_export.stream_id, initial_stream_id);
+    assert_eq!(clean_export.snapshot_id, initial_snapshot_id);
+    assert_eq!(
+        serde_json::to_vec(&recovered_export.payloads)?,
+        serde_json::to_vec(&clean_export.payloads)?,
+        "recovered cache export must match a clean block-12 cache"
+    );
+
+    let envelope = BroadcasterEnvelope::new(
+        boundary.stream_id.clone(),
+        104,
+        BroadcasterPayload::Update(compact),
+    );
+    let entry = BroadcasterRedisStreamEntry::from_envelope(8453, &envelope)?;
+    processor.observe_redis_delta(&entry, &envelope).await?;
+    controls
+        .native_subscription
+        .mark_redis_catch_up_checkpoint("7-104")
+        .await;
+
+    assert!(processor.bootstrap_complete());
+    assert_eq!(processor.next_message_seq(), Some(105));
+    let subscription = controls.native_subscription.snapshot().await;
+    assert!(subscription.bootstrap_complete);
+    assert!(subscription.redis_replay_caught_up);
+    assert_eq!(subscription.restart_count, 0);
+    assert_eq!(
+        subscription.stream_id.as_deref(),
+        Some(boundary.stream_id.as_str())
+    );
+    assert_eq!(
+        subscription.snapshot_id.as_deref(),
+        Some(boundary.snapshot_id.as_str())
+    );
+    assert_eq!(subscription.redis_replay_boundary.as_ref(), Some(&boundary));
+    assert_eq!(controls.native_state_store.current_block().await, 12);
+    let updated = controls
+        .native_state_store
+        .pool_by_id("0x0000000000000000000000000000000000000001")
+        .await
+        .ok_or_else(|| anyhow!("updated consumer pool missing"))?;
+    let state = updated
+        .0
+        .as_any()
+        .downcast_ref::<StatefulSim>()
+        .ok_or_else(|| anyhow!("unexpected consumer state type"))?;
+    assert_eq!(state.attributes["value"], Bytes::from([9u8; 32]));
     Ok(())
 }
 

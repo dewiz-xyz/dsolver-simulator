@@ -76,6 +76,26 @@ pub struct BroadcasterSnapshotPayload {
     pub configured_backends: Vec<BroadcasterBackend>,
     pub total_states: usize,
     pub max_payload_bytes: usize,
+    pub exportable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_check_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_success_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_payload_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub largest_payload_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_limit_utilization_bps: Option<u16>,
+    pub recovery_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_error: Option<String>,
 }
 
 impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
@@ -87,6 +107,17 @@ impl From<BroadcasterSnapshotStatus> for BroadcasterSnapshotPayload {
             configured_backends: snapshot.configured_backends,
             total_states: snapshot.total_states,
             max_payload_bytes: snapshot.max_payload_bytes,
+            exportable: snapshot.exportable,
+            last_export_check_age_ms: snapshot.last_export_check_age_ms,
+            last_export_success_age_ms: snapshot.last_export_success_age_ms,
+            last_export_duration_ms: snapshot.last_export_duration_ms,
+            last_export_payload_count: snapshot.last_export_payload_count,
+            largest_payload_bytes: snapshot.largest_payload_bytes,
+            payload_limit_utilization_bps: snapshot.payload_limit_utilization_bps,
+            recovery_pending: snapshot.recovery_pending,
+            recovery_id: snapshot.recovery_id,
+            recovery_error: snapshot.recovery_error,
+            last_export_error: snapshot.last_export_error,
         }
     }
 }
