@@ -140,3 +140,26 @@ fn snapshot_session_error_response(error: SnapshotSessionError) -> Response {
     };
     (status, Json(json!({ "error": message }))).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warming_readiness_returns_service_unavailable() {
+        assert_eq!(
+            readiness_status_code(BroadcasterReadiness::SnapshotWarmingUp),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn degraded_readiness_keeps_status_available() {
+        for readiness in [
+            BroadcasterReadiness::UpstreamRecovering,
+            BroadcasterReadiness::SnapshotUnexportable,
+        ] {
+            assert_eq!(readiness_status_code(readiness), StatusCode::OK);
+        }
+    }
+}
