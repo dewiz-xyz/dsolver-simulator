@@ -93,10 +93,15 @@ pub async fn token_snapshot(State(state): State<BroadcasterAppState>) -> Respons
 }
 
 fn readiness_status_code(readiness: BroadcasterReadiness) -> StatusCode {
-    if readiness == BroadcasterReadiness::Ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+    match readiness {
+        BroadcasterReadiness::Ready
+        | BroadcasterReadiness::UpstreamRecovering
+        | BroadcasterReadiness::SnapshotUnexportable => StatusCode::OK,
+        BroadcasterReadiness::RedisPublisherPassive
+        | BroadcasterReadiness::RedisPublisherRetired
+        | BroadcasterReadiness::RedisPublisherUnhealthy
+        | BroadcasterReadiness::SnapshotWarmingUp
+        | BroadcasterReadiness::UpstreamDisconnected => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 

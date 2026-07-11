@@ -93,8 +93,16 @@ impl BroadcasterAppState {
             snapshot = combine_status_snapshots(snapshot, rfq_service.status_snapshot().await);
         }
         let redis_status = self.redis_publisher.verified_status_snapshot().await;
-        if snapshot.readiness == BroadcasterReadiness::Ready {
-            snapshot.readiness = redis_readiness(redis_status.mode);
+        let redis_readiness = redis_readiness(redis_status.mode);
+        match snapshot.readiness {
+            BroadcasterReadiness::Ready => snapshot.readiness = redis_readiness,
+            BroadcasterReadiness::SnapshotUnexportable
+            | BroadcasterReadiness::UpstreamRecovering
+                if redis_readiness != BroadcasterReadiness::Ready =>
+            {
+                snapshot.readiness = redis_readiness;
+            }
+            _ => {}
         }
         snapshot.redis_publisher = Some(redis_status);
         snapshot
@@ -214,6 +222,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     // New broadcasters start passive and warm their caches first. This task is
     // the local promotion loop; /status stays non-ready until it wins the fence.
     spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
+    spawn_snapshot_export_preflight_task(generation_services.clone(), Duration::from_secs(60));
     spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
@@ -521,6 +530,21 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
                     info!(error = %error, "Broadcaster active writer promotion skipped");
                 }
             }
+        }
+    });
+}
+
+fn spawn_snapshot_export_preflight_task(
+    services: Vec<BroadcasterServiceState>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Promotion performs the first check once every cache is ready.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let _ = BroadcasterServiceState::run_snapshot_export_preflight(&services).await;
         }
     });
 }

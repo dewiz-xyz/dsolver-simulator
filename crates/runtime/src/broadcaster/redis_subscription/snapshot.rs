@@ -53,9 +53,43 @@ fn merge_snapshot_protocol_message(
     let mut incoming_message = incoming.message;
     let incoming_vm_storage = std::mem::take(&mut incoming_message.snapshots.vm_storage);
     merge_vm_storage(&mut merged_vm_storage, incoming_vm_storage)?;
+    let (incoming_new_tokens, incoming_dci_update) = incoming_message
+        .deltas
+        .as_mut()
+        .map(|deltas| {
+            (
+                std::mem::take(&mut deltas.new_tokens),
+                std::mem::take(&mut deltas.dci_update),
+            )
+        })
+        .unwrap_or_default();
 
     let mut merged_message = existing.message.clone().merge(incoming_message);
     merged_message.snapshots.vm_storage = merged_vm_storage;
+    if let Some(deltas) = merged_message.deltas.as_mut() {
+        // BlockChanges::merge omits these bootstrap-only fields.
+        deltas.new_tokens.extend(incoming_new_tokens);
+        for (component_id, entrypoints) in incoming_dci_update.new_entrypoints {
+            deltas
+                .dci_update
+                .new_entrypoints
+                .entry(component_id)
+                .or_default()
+                .extend(entrypoints);
+        }
+        for (entrypoint_id, params) in incoming_dci_update.new_entrypoint_params {
+            deltas
+                .dci_update
+                .new_entrypoint_params
+                .entry(entrypoint_id)
+                .or_default()
+                .extend(params);
+        }
+        deltas
+            .dci_update
+            .trace_results
+            .extend(incoming_dci_update.trace_results);
+    }
     existing.message = merged_message;
     Ok(())
 }
