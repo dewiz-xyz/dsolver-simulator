@@ -9,7 +9,7 @@ use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
 use rayon::prelude::*;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
@@ -538,6 +538,25 @@ impl QuoteRequestRunner {
         let (token_in_address, token_in_bytes) = self.parse_address(&token_in_raw, "token_in")?;
         let (token_out_address, token_out_bytes) =
             self.parse_address(&token_out_raw, "token_out")?;
+        if token_in_bytes == token_out_bytes {
+            info!(
+                scope = "request_validation",
+                request_id = self.request.request_id.as_str(),
+                auction_id = self.request.auction_id.as_deref(),
+                token = token_in_address.as_str(),
+                reason = "same_token",
+                "Simulate request rejected during validation"
+            );
+            self.push_failure(make_failure(
+                QuoteFailureKind::InvalidRequest,
+                "Same-token quotes are unsupported".to_string(),
+                None,
+            ));
+            return Err(RequestExit::new(
+                QuoteStatus::InvalidRequest,
+                QuoteResultQuality::RequestLevelFailure,
+            ));
+        }
         let wrapped_native = self.state.tokens.wrapped_native_token();
         if is_direct_native_wrapped_pair(&token_in_bytes, &token_out_bytes, wrapped_native.as_ref())
         {
@@ -742,8 +761,6 @@ impl QuoteRequestRunner {
         self.prepare_candidate_metadata(
             &pair.token_in_address,
             &pair.token_out_address,
-            &token_in_ref,
-            &token_out_ref,
             expected_len,
             &mut candidates,
         )?;
@@ -818,8 +835,6 @@ impl QuoteRequestRunner {
         &mut self,
         token_in_address: &str,
         token_out_address: &str,
-        token_in_ref: &Token,
-        token_out_ref: &Token,
         expected_len: usize,
         candidates: &mut CandidateSets,
     ) -> Result<(), RequestExit> {
@@ -843,14 +858,18 @@ impl QuoteRequestRunner {
                 QuoteResultQuality::NoResults,
             ));
         }
-        debug!(
-            "Quote candidates prepared: matching_pools={} amounts_per_pool={}, {} ({}) -> {} ({})",
-            self.run.meta.matching_pools,
-            expected_len,
-            token_in_ref.symbol,
-            token_in_address,
-            token_out_ref.symbol,
-            token_out_address
+        let estimated_work = total_candidates * expected_len;
+        info!(
+            scope = "simulation_work",
+            request_id = self.request.request_id.as_str(),
+            auction_id = self.request.auction_id.as_deref(),
+            amount_count = expected_len,
+            native_candidates = candidates.native_candidates.len(),
+            vm_candidates = candidates.vm_candidates.len(),
+            rfq_candidates = candidates.rfq_candidates.len(),
+            total_candidates,
+            estimated_work,
+            "Simulate work prepared"
         );
         candidates.native_candidates.sort_by(|a, b| a.0.cmp(&b.0));
         candidates.vm_candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3463,6 +3482,49 @@ mod tests {
         fn eq(&self, other: &dyn ProtocolSim) -> bool {
             other.as_any().is::<Self>()
         }
+    }
+
+    #[tokio::test]
+    async fn get_amounts_out_rejects_same_token_pair_invalid_request() {
+        let token_store = make_token_store(Vec::new());
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            make_test_state_stores(Arc::clone(&token_store));
+        let app_state = make_test_app_state(
+            token_store,
+            native_state_store,
+            vm_state_store,
+            rfq_state_store,
+            TestAppStateConfig::default(),
+        );
+        let request = make_amount_out_request(
+            "req-same-token",
+            "0x00000000000000000000000000000000000000aA",
+            "00000000000000000000000000000000000000Aa",
+            &["1"],
+        );
+
+        let computation = get_amounts_out(app_state, request, None).await;
+
+        assert!(computation.responses.is_empty());
+        assert!(matches!(
+            computation.meta.status,
+            QuoteStatus::InvalidRequest
+        ));
+        assert_eq!(
+            computation.meta.result_quality,
+            QuoteResultQuality::RequestLevelFailure
+        );
+        assert_eq!(computation.meta.matching_pools, 0);
+        assert_eq!(computation.meta.candidate_pools, 0);
+        assert_eq!(computation.meta.failures.len(), 1);
+        assert!(matches!(
+            computation.meta.failures[0].kind,
+            QuoteFailureKind::InvalidRequest
+        ));
+        assert_eq!(
+            computation.meta.failures[0].message,
+            "Same-token quotes are unsupported"
+        );
     }
 
     #[tokio::test]
