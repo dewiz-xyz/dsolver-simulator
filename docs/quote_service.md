@@ -60,15 +60,16 @@ Contract invariants:
 - `"0"` in `amounts_out` means that requested amount did not produce a usable quote for that pool; only positive outputs are usable quotes
 - `data[]` contains only pools with at least one positive output across the requested amounts; fully-zero rows stay visible only through `meta.failures` and `meta.pool_results`
 - `data[]` is stabilized for reproducibility, but row position is not a ranking signal; clients should not treat `data[0]` as "best pool"
+- same-token and direct native/wrapped requests are rejected before readiness checks, token lookup, or candidate selection
 
 ## Request lifecycle
 
 `POST /simulate` flows through these stages:
 
 1. The handler logs the request and wraps quote computation in a request-level timeout guard.
-2. The quote runner parses addresses and amounts, rejects invalid native-wrapped direct pairs, and loads request metadata.
+2. The quote runner parses token addresses and rejects identical-token and direct native/wrapped pairs.
 3. Native readiness is checked before quoting. If native state is still warming up or stale, the request exits as `warming_up + request_level_failure`.
-4. Token metadata is loaded for both sides. Missing or timed-out token coverage exits as `token_missing + request_level_failure`.
+4. Token metadata is loaded for both sides, then request amounts are parsed. Missing or timed-out token coverage exits as `token_missing + request_level_failure`; invalid amounts exit as `invalid_request + request_level_failure`.
 5. Candidate pools are loaded from native state and, when available, VM state.
 6. Unsupported ERC4626 candidates are filtered before execution.
 7. Pool tasks run until they complete or the request-level timeout guard ends the computation.
