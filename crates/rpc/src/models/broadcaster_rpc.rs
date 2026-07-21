@@ -5,7 +5,7 @@ use serde::Serialize;
 use runtime::broadcaster::redis_publisher::BroadcasterRedisPublisherStatus;
 use runtime::broadcaster::state::{
     BroadcasterBackendStatus, BroadcasterSnapshotSessionsSnapshot, BroadcasterSnapshotStatus,
-    BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
+    BroadcasterStateHistoryStatus, BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
 };
 use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
 
@@ -19,6 +19,8 @@ pub struct BroadcasterStatusPayload {
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_history: Option<BroadcasterStateHistoryPayload>,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -40,6 +42,73 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                 })
                 .collect(),
             redis_publisher: snapshot.redis_publisher,
+            state_history: snapshot.state_history.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterStateHistoryPayload {
+    pub healthy: bool,
+    pub queue_capacity: usize,
+    pub retry_window_ms: u64,
+    pub enqueued_deltas: u64,
+    pub persisted_deltas: u64,
+    pub recorded_gaps: u64,
+    pub dropped_deltas: u64,
+    pub failed_deltas: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_stream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_redis_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_message_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<BroadcasterStateHistoryCheckpointPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterStateHistoryCheckpointPayload {
+    pub healthy: bool,
+    pub attempted_checkpoints: u64,
+    pub completed_checkpoints: u64,
+    pub failed_checkpoints: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_s3_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<BroadcasterStateHistoryStatus> for BroadcasterStateHistoryPayload {
+    fn from(status: BroadcasterStateHistoryStatus) -> Self {
+        Self {
+            healthy: status.healthy,
+            queue_capacity: status.queue_capacity,
+            retry_window_ms: status.retry_window_ms,
+            enqueued_deltas: status.enqueued_deltas,
+            persisted_deltas: status.persisted_deltas,
+            recorded_gaps: status.recorded_gaps,
+            dropped_deltas: status.dropped_deltas,
+            failed_deltas: status.failed_deltas,
+            last_persisted_stream_id: status.last_persisted_stream_id,
+            last_persisted_redis_entry_id: status.last_persisted_redis_entry_id,
+            last_persisted_message_seq: status.last_persisted_message_seq,
+            last_error: status.last_error,
+            checkpoints: status.checkpoints.map(|checkpoints| {
+                BroadcasterStateHistoryCheckpointPayload {
+                    healthy: checkpoints.healthy,
+                    attempted_checkpoints: checkpoints.attempted_checkpoints,
+                    completed_checkpoints: checkpoints.completed_checkpoints,
+                    failed_checkpoints: checkpoints.failed_checkpoints,
+                    last_checkpoint_block_number: checkpoints.last_checkpoint_block_number,
+                    last_checkpoint_s3_key: checkpoints.last_checkpoint_s3_key,
+                    last_error: checkpoints.last_error,
+                }
+            }),
         }
     }
 }

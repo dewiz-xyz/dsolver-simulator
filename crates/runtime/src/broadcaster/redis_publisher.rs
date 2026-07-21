@@ -20,6 +20,7 @@ use simulator_core::broadcaster::{
     BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterRedisReplayBoundary,
     BroadcasterRedisStreamEntry,
 };
+use state_history::StateHistoryWriter;
 
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
@@ -129,7 +130,7 @@ for offset = 0, marker_field_count - 1 do
 end
 
 redis.call(unpack(command))
-return {tostring(generation), entry_id}
+return {tostring(generation), entry_id, previous_stream_id, previous_entry_id}
 "#;
 
 const APPEND_FENCED_SCRIPT: &str = r#"
@@ -277,6 +278,16 @@ pub struct RedisRenewCommand<'a> {
 pub struct RedisPromotionResult {
     pub generation: u64,
     pub entry_id: String,
+    pub previous_stream_id: Option<String>,
+    pub previous_entry_id: Option<String>,
+    pub marker_entry: BroadcasterRedisStreamEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcasterRedisPromotion {
+    pub boundary: BroadcasterRedisReplayBoundary,
+    pub marker_entry: BroadcasterRedisStreamEntry,
+    pub marker_redis_entry_id: String,
 }
 
 pub struct TokioRedisStreamWriter {
@@ -337,18 +348,30 @@ impl RedisStreamWriter for TokioRedisStreamWriter {
                 .query_async::<Vec<String>>(&mut connection)
                 .await
                 .context("Redis active writer promotion failed")?;
-            let [generation, entry_id] = reply.as_slice() else {
+            let [generation, entry_id, previous_stream_id, previous_entry_id] = reply.as_slice()
+            else {
                 return Err(anyhow!(
                     "Redis active writer promotion returned invalid reply"
                 ));
             };
+            let generation = generation.parse::<u64>().with_context(|| {
+                format!("Redis active writer promotion returned invalid generation: {generation}")
+            })?;
+            let previous_stream_id = non_empty_string(previous_stream_id);
+            let previous_entry_id = non_empty_string(previous_entry_id);
+            let marker_entry = promotion_marker_entry_from_fields(
+                request.normal_marker_fields,
+                request.handoff_marker_fields,
+                generation,
+                previous_stream_id.as_deref(),
+                previous_entry_id.as_deref(),
+            )?;
             Ok(RedisPromotionResult {
-                generation: generation.parse::<u64>().with_context(|| {
-                    format!(
-                        "Redis active writer promotion returned invalid generation: {generation}"
-                    )
-                })?,
+                generation,
                 entry_id: entry_id.clone(),
+                previous_stream_id,
+                previous_entry_id,
+                marker_entry,
             })
         })
     }
@@ -427,6 +450,7 @@ pub struct BroadcasterRedisPublisher {
     writer_key: String,
     writer_generation_key: String,
     writer_token: String,
+    state_history: Option<StateHistoryWriter>,
     inner: Arc<Mutex<BroadcasterRedisPublisherState>>,
 }
 
@@ -563,6 +587,7 @@ impl BroadcasterRedisPublisher {
             writer_key,
             writer_generation_key,
             writer_token: new_writer_token(),
+            state_history: None,
             inner: Arc::new(Mutex::new(BroadcasterRedisPublisherState {
                 mode,
                 generation,
@@ -579,10 +604,18 @@ impl BroadcasterRedisPublisher {
         }
     }
 
-    pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
+    pub fn with_state_history_writer(mut self, state_history: Option<StateHistoryWriter>) -> Self {
+        self.state_history = state_history;
+        self
+    }
+
+    pub async fn publish_accepted_payload(
+        &self,
+        payload: BroadcasterPayload,
+    ) -> Result<Option<(BroadcasterRedisStreamEntry, String)>> {
         let mut guard = self.inner.lock().await;
         match guard.mode {
-            BroadcasterRedisPublisherMode::Passive => return Ok(()),
+            BroadcasterRedisPublisherMode::Passive => return Ok(None),
             BroadcasterRedisPublisherMode::Retired => {
                 return Err(anyhow!(
                     "Redis broadcaster publisher is retired; this process is no longer the active writer"
@@ -607,7 +640,10 @@ impl BroadcasterRedisPublisher {
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
         match self.append_payload_locked(&mut guard, payload).await {
-            Ok(_) => Ok(()),
+            Ok((entry, entry_id)) => {
+                self.enqueue_state_history(&entry, &entry_id).await;
+                Ok(Some((entry, entry_id)))
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 if is_stale_writer_error(&error) {
@@ -626,6 +662,14 @@ impl BroadcasterRedisPublisher {
         base_heads: Vec<BroadcasterBackendHead>,
         reason: impl Into<String>,
     ) -> Result<BroadcasterRedisReplayBoundary> {
+        Ok(self.promote_with_marker(base_heads, reason).await?.boundary)
+    }
+
+    pub async fn promote_with_marker(
+        &self,
+        base_heads: Vec<BroadcasterBackendHead>,
+        reason: impl Into<String>,
+    ) -> Result<BroadcasterRedisPromotion> {
         let backends = backends_from_base_heads(&base_heads);
         self.promote_locked(backends, Some(base_heads), reason.into(), false, false)
             .await
@@ -658,8 +702,10 @@ impl BroadcasterRedisPublisher {
         reason: impl Into<String>,
         backends: Vec<BroadcasterBackend>,
     ) -> Result<BroadcasterRedisReplayBoundary> {
-        self.promote_locked(backends, None, reason.into(), true, true)
-            .await
+        Ok(self
+            .promote_locked(backends, None, reason.into(), true, true)
+            .await?
+            .boundary)
     }
 
     pub async fn mode(&self) -> BroadcasterRedisPublisherMode {
@@ -771,7 +817,7 @@ impl BroadcasterRedisPublisher {
         reason: String,
         count_generation_reset: bool,
         require_current_writer: bool,
-    ) -> Result<BroadcasterRedisReplayBoundary> {
+    ) -> Result<BroadcasterRedisPromotion> {
         let mut guard = self.inner.lock().await;
         if guard.mode == BroadcasterRedisPublisherMode::Retired {
             return Err(anyhow!(
@@ -862,7 +908,14 @@ impl BroadcasterRedisPublisher {
             reason,
             "Redis broadcaster generation promoted"
         );
-        self.replay_boundary_locked(&guard)
+        let boundary = self.replay_boundary_locked(&guard)?;
+        self.enqueue_state_history(&promotion.marker_entry, &promotion.entry_id)
+            .await;
+        Ok(BroadcasterRedisPromotion {
+            boundary,
+            marker_entry: promotion.marker_entry,
+            marker_redis_entry_id: promotion.entry_id,
+        })
     }
 
     async fn append_payload_locked(
@@ -987,6 +1040,25 @@ impl BroadcasterRedisPublisher {
             "Redis broadcaster stream append retry window exhausted"
         );
     }
+
+    async fn enqueue_state_history(
+        &self,
+        entry: &BroadcasterRedisStreamEntry,
+        redis_entry_id: &str,
+    ) {
+        let Some(state_history) = &self.state_history else {
+            return;
+        };
+        if let Err(error) = state_history
+            .enqueue_entry(entry.clone(), redis_entry_id.to_string())
+            .await
+        {
+            warn!(
+                error = %error,
+                "State history writer did not accept Redis broadcaster entry"
+            );
+        }
+    }
 }
 
 fn normalize_live_payload(
@@ -1057,6 +1129,50 @@ fn generation_marker_template_fields(
     let envelope = BroadcasterEnvelope::new(stream_id, 1, BroadcasterPayload::Progress(marker));
     let entry = BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope)?;
     redis_entry_fields(&entry)
+}
+
+fn promotion_marker_entry_from_fields(
+    normal_marker_fields: &[(String, String)],
+    handoff_marker_fields: &[(String, String)],
+    generation: u64,
+    previous_stream_id: Option<&str>,
+    previous_entry_id: Option<&str>,
+) -> Result<BroadcasterRedisStreamEntry> {
+    let marker_fields = if previous_stream_id.is_some()
+        && previous_entry_id.is_some()
+        && !handoff_marker_fields.is_empty()
+    {
+        handoff_marker_fields
+    } else {
+        normal_marker_fields
+    };
+    let mut value = serde_json::Map::new();
+    for (field, field_value) in marker_fields {
+        let mut field_value = field_value.replace(GENERATION_PLACEHOLDER, &generation.to_string());
+        if let Some(previous_stream_id) = previous_stream_id {
+            field_value = field_value.replace(PREVIOUS_STREAM_ID_PLACEHOLDER, previous_stream_id);
+        }
+        if let Some(previous_entry_id) = previous_entry_id {
+            field_value = field_value.replace(PREVIOUS_ENTRY_ID_PLACEHOLDER, previous_entry_id);
+        }
+        value.insert(field.clone(), Value::String(field_value));
+    }
+    let marker_entry: BroadcasterRedisStreamEntry = serde_json::from_value(Value::Object(value))
+        .context("failed to build Redis promotion marker from Lua result")?;
+    anyhow::ensure!(
+        !marker_entry
+            .payload_json
+            .contains(PREVIOUS_STREAM_ID_PLACEHOLDER)
+            && !marker_entry
+                .payload_json
+                .contains(PREVIOUS_ENTRY_ID_PLACEHOLDER),
+        "Redis promotion marker still contains handoff placeholders"
+    );
+    Ok(marker_entry)
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn redis_writer_key(stream_key: &str) -> String {

@@ -24,6 +24,7 @@ reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+state_history = { package = "state-history", path = "../state-history" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true

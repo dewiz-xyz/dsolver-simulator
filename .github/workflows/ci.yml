@@ -91,3 +91,44 @@ jobs:
         run: cargo build -p apps --bin dsolver-simulator-service --release
       - name: Build broadcaster release binary
         run: cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+
+  pg-redis-integration:
+    name: pg-redis-integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      BROADCASTER_REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+      - name: Run state-history Postgres tests
+        run: cargo test -p state-history -- --ignored --nocapture
+      - name: Run Redis promotion marker parity test
+        run: cargo test -p runtime real_redis_promotion_marker_uses_lua_tail_values -- --ignored --nocapture

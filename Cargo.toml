@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/simulator-core",
+    "crates/state-history",
     "crates/broadcaster-replay-client",
     "crates/runtime",
     "crates/rpc",
@@ -11,7 +12,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91.0"
+rust-version = "1.91.1"
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 
@@ -19,6 +20,8 @@ repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 alloy-primitives = "1.5.4"
 alloy-sol-types = "1.5.2"
 anyhow = "1.0"
+aws-config = "=1.8.18"
+aws-sdk-s3 = "=1.137.0"
 axum = "0.7"
 chrono = "0.4"
 csv = "1.4.0"
@@ -35,6 +38,8 @@ reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "chrono"] }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1.18"
 tokio-util = "0.7"
@@ -46,6 +51,7 @@ tycho-common = "0.158.0"
 tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
 tycho-simulation = "0.258.0"
 typetag = "0.2"
+zstd = "0.13.3"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
