@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
@@ -49,6 +51,53 @@ pub struct BroadcasterAppState {
     tokens: Arc<TokenStore>,
     chain_id: u64,
     snapshot_session_ttl: Duration,
+    producer_lifecycle: ProducerLifecycle,
+}
+
+#[derive(Clone)]
+struct ProducerLifecycle {
+    cancellation: CancellationToken,
+    handles: Arc<tokio::sync::Mutex<Option<Vec<JoinHandle<()>>>>>,
+}
+
+impl ProducerLifecycle {
+    fn idle() -> Self {
+        Self::new(CancellationToken::new(), Vec::new())
+    }
+
+    fn new(cancellation: CancellationToken, handles: Vec<JoinHandle<()>>) -> Self {
+        Self {
+            cancellation,
+            handles: Arc::new(tokio::sync::Mutex::new(Some(handles))),
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.cancellation.cancel();
+    }
+
+    async fn join(&self, grace_period: Duration) {
+        self.begin_shutdown();
+        let Some(handles) = self.handles.lock().await.take() else {
+            return;
+        };
+        let mut join_all = Box::pin(async move {
+            for handle in handles {
+                match handle.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => warn!(error = %error, "Broadcaster producer task failed"),
+                }
+            }
+        });
+        if tokio::time::timeout(grace_period, &mut join_all)
+            .await
+            .is_err()
+        {
+            warn!("Broadcaster producers are still draining after the shutdown grace period");
+            join_all.await;
+        }
+    }
 }
 
 impl BroadcasterAppState {
@@ -66,6 +115,34 @@ impl BroadcasterAppState {
         state_history: Option<StateHistoryWriter>,
         state_history_checkpoints: Option<StateHistoryCheckpointWriter>,
     ) -> Self {
+        Self::with_producer_lifecycle(
+            raw_service,
+            rfq_service,
+            tokens,
+            chain_id,
+            snapshot_session_ttl,
+            redis_publisher,
+            state_history,
+            state_history_checkpoints,
+            ProducerLifecycle::idle(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "app state is assembled from independent runtime handles at startup"
+    )]
+    fn with_producer_lifecycle(
+        raw_service: BroadcasterServiceState,
+        rfq_service: Option<BroadcasterServiceState>,
+        tokens: Arc<TokenStore>,
+        chain_id: u64,
+        snapshot_session_ttl: Duration,
+        redis_publisher: Arc<BroadcasterRedisPublisher>,
+        state_history: Option<StateHistoryWriter>,
+        state_history_checkpoints: Option<StateHistoryCheckpointWriter>,
+        producer_lifecycle: ProducerLifecycle,
+    ) -> Self {
         Self {
             raw_service,
             rfq_service,
@@ -75,6 +152,7 @@ impl BroadcasterAppState {
             tokens,
             chain_id,
             snapshot_session_ttl,
+            producer_lifecycle,
         }
     }
 
@@ -159,11 +237,21 @@ impl BroadcasterAppState {
         }
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
+    pub fn begin_shutdown(&self) {
+        self.producer_lifecycle.begin_shutdown();
+    }
+
+    pub async fn finish_shutdown(&self) -> Result<()> {
+        self.producer_lifecycle.join(Duration::from_secs(10)).await;
         if let Some(state_history) = &self.state_history {
             state_history.shutdown(Duration::from_secs(10)).await?;
         }
         Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.begin_shutdown();
+        self.finish_shutdown().await
     }
 }
 
@@ -172,6 +260,10 @@ pub struct BroadcasterServiceParts {
     pub app_state: BroadcasterAppState,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "startup keeps service construction and producer ownership in one place"
+)]
 pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     init_logging();
 
@@ -205,6 +297,8 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
+    let cancellation = CancellationToken::new();
+    let mut producer_handles = Vec::new();
 
     let rfq_service =
         if let (Some(rfq_cache), Some(rfq_upstream_state)) = (rfq_cache, rfq_upstream_state) {
@@ -227,14 +321,15 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
                 liquorice_key: &config.liquorice_key,
             })
             .await?;
-            spawn_broadcaster_rfq_stream_task(
+            producer_handles.push(spawn_broadcaster_rfq_stream_task(
                 &config,
                 supervisor_cfg.clone(),
                 service.clone(),
                 vec![raw_service.clone(), service.clone()],
                 vec![service.clone()],
                 rfq_token_stores,
-            );
+                cancellation.clone(),
+            ));
             Some(service)
         } else {
             None
@@ -245,24 +340,37 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     };
     // New broadcasters start passive and warm their caches first. This task is
     // the local promotion loop; /status stays non-ready until it wins the fence.
-    spawn_promotion_task(generation_services.clone(), Duration::from_secs(1));
-    spawn_broadcaster_stream_task(
+    producer_handles.push(spawn_promotion_task(
+        generation_services.clone(),
+        Duration::from_secs(1),
+        cancellation.clone(),
+    ));
+    producer_handles.push(spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
         Arc::clone(&raw_health),
         raw_service.clone(),
         generation_services.clone(),
         vec![raw_service.clone()],
-    );
-    spawn_heartbeat_task(generation_services, heartbeat_interval);
-    maybe_spawn_state_history_checkpoint_task(
+        cancellation.clone(),
+    ));
+    producer_handles.push(spawn_heartbeat_task(
+        generation_services,
+        heartbeat_interval,
+        cancellation.clone(),
+    ));
+    if let Some(handle) = maybe_spawn_state_history_checkpoint_task(
         &config,
         &raw_service,
         rfq_service.as_ref(),
         state_history_checkpoints.clone(),
-    );
+        cancellation.clone(),
+    ) {
+        producer_handles.push(handle);
+    }
+    let producer_lifecycle = ProducerLifecycle::new(cancellation, producer_handles);
     let snapshot_session_ttl = Duration::from_secs(config.tuning.snapshot_session_ttl_secs);
-    let app_state = BroadcasterAppState::with_snapshot_session_ttl(
+    let app_state = BroadcasterAppState::with_producer_lifecycle(
         raw_service,
         rfq_service,
         tokens,
@@ -271,6 +379,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         redis_publisher,
         state_history,
         state_history_checkpoints,
+        producer_lifecycle,
     );
 
     Ok(BroadcasterServiceParts { config, app_state })
@@ -305,11 +414,17 @@ fn spawn_state_history_checkpoint_task(
     checkpoints: StateHistoryCheckpointWriter,
     checkpoint_block_interval: u64,
     poll_interval: Duration,
-) {
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_checkpoint_block: Option<u64> = None;
+        let mut failure_backoff = CheckpointFailureBackoff::default();
+        let mut next_delay = poll_interval;
         loop {
-            sleep(poll_interval).await;
+            if sleep_or_cancel(next_delay, &cancellation).await {
+                return;
+            }
+            next_delay = poll_interval;
             let Some(current_block) = checkpoint_block_candidate(&services).await else {
                 continue;
             };
@@ -329,6 +444,7 @@ fn spawn_state_history_checkpoint_task(
                     match checkpoints.write_checkpoint(archive).await {
                         Ok(outcome) => {
                             last_checkpoint_block = Some(block_number);
+                            failure_backoff.reset();
                             info!(
                                 event = "state_history_checkpoint_complete",
                                 block_number,
@@ -337,6 +453,7 @@ fn spawn_state_history_checkpoint_task(
                             );
                         }
                         Err(error) => {
+                            next_delay = failure_backoff.record_failure();
                             warn!(
                                 event = "state_history_checkpoint_failed",
                                 block_number,
@@ -348,6 +465,7 @@ fn spawn_state_history_checkpoint_task(
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    next_delay = failure_backoff.record_failure();
                     warn!(
                         event = "state_history_checkpoint_capture_failed",
                         error = %error,
@@ -356,7 +474,7 @@ fn spawn_state_history_checkpoint_task(
                 }
             }
         }
-    });
+    })
 }
 
 fn maybe_spawn_state_history_checkpoint_task(
@@ -364,21 +482,44 @@ fn maybe_spawn_state_history_checkpoint_task(
     raw_service: &BroadcasterServiceState,
     rfq_service: Option<&BroadcasterServiceState>,
     checkpoints: Option<StateHistoryCheckpointWriter>,
-) {
+    cancellation: CancellationToken,
+) -> Option<JoinHandle<()>> {
     let (Some(checkpoints), Some(history_config)) = (checkpoints, config.state_history.as_ref())
     else {
-        return;
+        return None;
     };
     let services = match rfq_service {
         Some(rfq_service) => vec![raw_service.clone(), rfq_service.clone()],
         None => vec![raw_service.clone()],
     };
-    spawn_state_history_checkpoint_task(
+    Some(spawn_state_history_checkpoint_task(
         services,
         checkpoints,
         history_config.checkpoint_block_interval,
         Duration::from_secs(history_config.checkpoint_poll_interval_secs),
-    );
+        cancellation,
+    ))
+}
+
+const CHECKPOINT_FAILURE_BACKOFF_SECS: [u64; 6] = [30, 60, 120, 240, 480, 600];
+
+#[derive(Default)]
+struct CheckpointFailureBackoff {
+    failure_count: usize,
+}
+
+impl CheckpointFailureBackoff {
+    fn record_failure(&mut self) -> Duration {
+        let index = self
+            .failure_count
+            .min(CHECKPOINT_FAILURE_BACKOFF_SECS.len() - 1);
+        self.failure_count = self.failure_count.saturating_add(1);
+        Duration::from_secs(CHECKPOINT_FAILURE_BACKOFF_SECS[index])
+    }
+
+    fn reset(&mut self) {
+        self.failure_count = 0;
+    }
 }
 
 async fn checkpoint_block_candidate(services: &[BroadcasterServiceState]) -> Option<u64> {
@@ -563,7 +704,8 @@ fn spawn_broadcaster_stream_task(
     service: BroadcasterServiceState,
     generation_services: Vec<BroadcasterServiceState>,
     cache_reset_services: Vec<BroadcasterServiceState>,
-) {
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     let chain = config.chain_profile.chain;
     let tycho_url = config.tycho_url.clone();
     let api_key = config.api_key.clone();
@@ -600,9 +742,10 @@ fn spawn_broadcaster_stream_task(
                 generation_services,
                 cache_reset_services,
             },
+            cancellation,
         )
         .await;
-    });
+    })
 }
 
 fn spawn_broadcaster_rfq_stream_task(
@@ -612,7 +755,8 @@ fn spawn_broadcaster_rfq_stream_task(
     generation_services: Vec<BroadcasterServiceState>,
     cache_reset_services: Vec<BroadcasterServiceState>,
     token_stores: RFQTokenStores,
-) {
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     let chain = config.chain_profile.chain;
     let tvl_threshold = config.tvl_threshold;
     let protocols = config.chain_profile.rfq_protocols.clone();
@@ -645,17 +789,26 @@ fn spawn_broadcaster_rfq_stream_task(
                 generation_services,
                 cache_reset_services,
             },
+            cancellation,
         )
         .await;
-    });
+    })
 }
 
-fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Duration) {
+fn spawn_heartbeat_task(
+    services: Vec<BroadcasterServiceState>,
+    interval: Duration,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
             for service in &services {
                 if let Err(error) = service.broadcast_heartbeat().await {
                     let error = error.to_string();
@@ -670,15 +823,23 @@ fn spawn_heartbeat_task(services: Vec<BroadcasterServiceState>, interval: Durati
                 }
             }
         }
-    });
+    })
 }
 
-fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Duration) {
+fn spawn_promotion_task(
+    services: Vec<BroadcasterServiceState>,
+    interval: Duration,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
             match BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
                 .await
             {
@@ -697,19 +858,31 @@ fn spawn_promotion_task(services: Vec<BroadcasterServiceState>, interval: Durati
                 }
             }
         }
-    });
+    })
+}
+
+async fn sleep_or_cancel(duration: Duration, cancellation: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => true,
+        _ = sleep(duration) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
 
     use simulator_core::broadcaster::BroadcasterBackend;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
     use super::{
         raw_configured_backends, rfq_configured_backends, should_write_state_history_checkpoint,
+        CheckpointFailureBackoff, ProducerLifecycle,
     };
     use crate::config::{BroadcasterConfig, BroadcasterTuning, ChainProfile, MemoryConfig};
 
@@ -806,5 +979,60 @@ mod tests {
             u64::MAX,
             500
         ));
+    }
+
+    #[test]
+    fn checkpoint_failure_backoff_caps_and_resets() {
+        let mut backoff = CheckpointFailureBackoff::default();
+        let observed = (0..7)
+            .map(|_| backoff.record_failure().as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![30, 60, 120, 240, 480, 600, 600]);
+
+        backoff.reset();
+        assert_eq!(backoff.record_failure().as_secs(), 30);
+    }
+
+    #[tokio::test]
+    async fn producer_join_finishes_history_enqueue_before_drain() {
+        let (release, wait_for_release) = oneshot::channel();
+        let (events, mut observed_events) = tokio::sync::mpsc::unbounded_channel();
+        let producer_events = events.clone();
+        let cancellation = CancellationToken::new();
+        let producer_cancellation = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            let _ = wait_for_release.await;
+            let _ = producer_events.send("same_block_update_published");
+            let _ = producer_events.send("history_enqueued");
+            if !producer_cancellation.is_cancelled() {
+                let _ = producer_events.send("published_after_shutdown");
+            }
+        });
+        let lifecycle = ProducerLifecycle::new(cancellation, vec![handle]);
+        let mut join = tokio::spawn(async move {
+            lifecycle.join(Duration::ZERO).await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut join)
+                .await
+                .is_err(),
+            "producer join returned before the in-flight task completed"
+        );
+
+        assert!(release.send(()).is_ok());
+        assert!(join.await.is_ok());
+        let _ = events.send("history_drained");
+        let mut sequence = Vec::new();
+        while let Ok(event) = observed_events.try_recv() {
+            sequence.push(event);
+        }
+        assert_eq!(
+            sequence,
+            vec![
+                "same_block_update_published",
+                "history_enqueued",
+                "history_drained"
+            ]
+        );
     }
 }

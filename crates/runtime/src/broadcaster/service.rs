@@ -17,14 +17,48 @@ use crate::broadcaster::redis_publisher::{
 };
 use crate::broadcaster::state::{
     combine_snapshot_exports, BroadcasterReadiness, BroadcasterSnapshotCache,
-    BroadcasterSnapshotExport, BroadcasterSnapshotSessionsSnapshot, BroadcasterStatusSnapshot,
-    BroadcasterUpstreamState,
+    BroadcasterSnapshotCapture, BroadcasterSnapshotExport, BroadcasterSnapshotSessionsSnapshot,
+    BroadcasterStatusSnapshot, BroadcasterUpstreamState,
 };
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
     BroadcasterSnapshotSessionResponse,
 };
-use state_history::{CheckpointArchive, CheckpointArchiveMetadata};
+use state_history::{rfq_timestamp_ms_from_seconds, CheckpointArchive, CheckpointArchiveMetadata};
+
+struct CapturedServiceSnapshots {
+    chain_id: u64,
+    captures: Vec<(BroadcasterSnapshotCapture, usize)>,
+    backend_heads: Vec<(BroadcasterBackend, u64)>,
+    redis_replay_boundary: BroadcasterRedisReplayBoundary,
+}
+
+struct BuiltServiceSnapshots {
+    snapshot: BroadcasterSnapshotExport,
+    chain_id: u64,
+    redis_replay_boundary: BroadcasterRedisReplayBoundary,
+}
+
+impl CapturedServiceSnapshots {
+    fn build_export(self) -> Result<BuiltServiceSnapshots> {
+        let Self {
+            chain_id,
+            captures,
+            backend_heads: _,
+            redis_replay_boundary,
+        } = self;
+        let exports = captures
+            .into_iter()
+            .map(|(capture, max_payload_bytes)| capture.build_export(max_payload_bytes))
+            .collect::<Result<Vec<_>>>()?;
+        let snapshot = combine_snapshot_exports(chain_id, exports)?;
+        Ok(BuiltServiceSnapshots {
+            snapshot,
+            chain_id,
+            redis_replay_boundary,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotSessionError {
@@ -480,48 +514,34 @@ impl BroadcasterServiceState {
         );
         ensure_shared_lifecycle(services, "combined broadcaster snapshot session")?;
 
-        let _gate = services[0].lifecycle_gate.lock().await;
-        if !services[0].redis_publisher_is_active().await {
+        let Some(capture) = Self::capture_service_snapshots(services, "snapshot session").await?
+        else {
             return Ok(None);
-        }
-        let mut chain_id = None;
-        let mut exports = Vec::with_capacity(services.len());
-
-        for service in services {
-            let status = service.status_snapshot().await;
-            if status.readiness != BroadcasterReadiness::Ready {
-                return Ok(None);
-            }
-            match chain_id {
-                Some(expected) => anyhow::ensure!(
-                    status.chain_id == expected,
-                    "combined broadcaster snapshot session chain_id mismatch: expected {expected}, found {}",
-                    status.chain_id
-                ),
-                None => chain_id = Some(status.chain_id),
-            }
-            let export = service
-                .cache
-                .export_snapshot(service.snapshot_max_payload_bytes)
-                .await?;
-            exports.push(export);
-        }
-
-        let chain_id = chain_id.ok_or_else(|| {
-            anyhow::anyhow!("combined broadcaster snapshot session missing chain_id")
-        })?;
-        let snapshot = combine_snapshot_exports(chain_id, exports)?;
-        // Snapshot export and replay-boundary capture have to describe the same
-        // active writer. Passive or stale writers fail closed here.
-        let Some(redis_replay_boundary) = services[0]
-            .replay_boundary_or_none("snapshot session")
+        };
+        let built = tokio::task::spawn_blocking(move || capture.build_export())
+            .await
+            .context("snapshot export task failed")??;
+        let _gate = services[0].lifecycle_gate.lock().await;
+        let Some(current_boundary) = services[0]
+            .replay_boundary_or_none("snapshot session registration")
             .await?
         else {
             return Ok(None);
         };
+        if current_boundary.generation != built.redis_replay_boundary.generation
+            || current_boundary.stream_id != built.redis_replay_boundary.stream_id
+            || current_boundary.snapshot_id != built.redis_replay_boundary.snapshot_id
+        {
+            return Ok(None);
+        }
         services[0]
             .snapshot_sessions
-            .create_snapshot_session(snapshot, chain_id, redis_replay_boundary, ttl)
+            .create_snapshot_session(
+                built.snapshot,
+                built.chain_id,
+                built.redis_replay_boundary,
+                ttl,
+            )
             .await
             .context("failed to create combined broadcaster snapshot session")
             .map(Some)
@@ -536,55 +556,36 @@ impl BroadcasterServiceState {
         );
         ensure_shared_lifecycle(services, "combined state history checkpoint")?;
 
-        let _gate = services[0].lifecycle_gate.lock().await;
-        if !services[0].redis_publisher_is_active().await {
+        let Some(capture) =
+            Self::capture_service_snapshots(services, "state history checkpoint").await?
+        else {
             return Ok(None);
-        }
-        let mut chain_id = None;
+        };
         let mut backends = Vec::new();
         let mut block_number = None;
         let mut rfq_update_timestamps = Vec::new();
-        let mut exports = Vec::with_capacity(services.len());
-
-        for service in services {
-            let status = service.status_snapshot().await;
-            if status.readiness != BroadcasterReadiness::Ready {
-                return Ok(None);
-            }
-            match chain_id {
-                Some(expected) => anyhow::ensure!(
-                    status.chain_id == expected,
-                    "combined state history checkpoint chain_id mismatch: expected {expected}, found {}",
-                    status.chain_id
-                ),
-                None => chain_id = Some(status.chain_id),
-            }
-            for (backend, backend_status) in &status.backends {
-                backends.push(*backend);
-                match backend {
-                    BroadcasterBackend::Native | BroadcasterBackend::Vm => {
-                        let Some(backend_block_number) = backend_status.block_number else {
-                            return Ok(None);
-                        };
-                        match block_number {
-                            Some(expected) if expected != backend_block_number => return Ok(None),
-                            Some(_) => {}
-                            None => block_number = Some(backend_block_number),
-                        }
+        for (backend, head) in &capture.backend_heads {
+            backends.push(*backend);
+            match backend {
+                BroadcasterBackend::Native | BroadcasterBackend::Vm => match block_number {
+                    Some(expected) if expected != *head => {
+                        warn!(
+                            event = "state_history_checkpoint_skipped",
+                            reason = "backend_skew",
+                            expected_block = expected,
+                            observed_block = *head,
+                            backend = backend.as_str(),
+                            "Skipping state history checkpoint while backend heads differ"
+                        );
+                        return Ok(None);
                     }
-                    BroadcasterBackend::Rfq => {
-                        let Some(update_timestamp_ms) = backend_status.block_number else {
-                            return Ok(None);
-                        };
-                        rfq_update_timestamps.push(update_timestamp_ms);
-                    }
+                    Some(_) => {}
+                    None => block_number = Some(*head),
+                },
+                BroadcasterBackend::Rfq => {
+                    rfq_update_timestamps.push(rfq_timestamp_ms_from_seconds(*head)?);
                 }
             }
-            let export = service
-                .cache
-                .export_snapshot(service.snapshot_max_payload_bytes)
-                .await?;
-            exports.push(export);
         }
 
         let Some(block_number) = block_number else {
@@ -592,19 +593,13 @@ impl BroadcasterServiceState {
         };
         backends.sort();
         backends.dedup();
-        let chain_id = chain_id
-            .ok_or_else(|| anyhow::anyhow!("combined state history checkpoint missing chain_id"))?;
-        let snapshot = combine_snapshot_exports(chain_id, exports)?;
-        let rfq_update_timestamp_ms = backends
-            .contains(&BroadcasterBackend::Rfq)
-            .then(|| rfq_update_timestamps.into_iter().min())
-            .flatten();
-        let Some(redis_replay_boundary) = services[0]
-            .replay_boundary_or_none("state history checkpoint")
-            .await?
-        else {
-            return Ok(None);
-        };
+        let chain_id = capture.chain_id;
+        let rfq_update_timestamp_ms = rfq_update_timestamps.into_iter().min();
+        let built = tokio::task::spawn_blocking(move || capture.build_export())
+            .await
+            .context("state history checkpoint export task failed")??;
+        let snapshot = built.snapshot;
+        let redis_replay_boundary = built.redis_replay_boundary;
         anyhow::ensure!(
             snapshot.stream_id == redis_replay_boundary.stream_id,
             "snapshot stream_id mismatch with Redis replay boundary: snapshot={}, boundary={}",
@@ -629,6 +624,54 @@ impl BroadcasterServiceState {
                 backends,
             },
             payloads,
+        }))
+    }
+
+    async fn capture_service_snapshots(
+        services: &[Self],
+        context: &'static str,
+    ) -> Result<Option<CapturedServiceSnapshots>> {
+        let _gate = services[0].lifecycle_gate.lock().await;
+        if !services[0].redis_publisher_is_active().await {
+            return Ok(None);
+        }
+        let mut chain_id = None;
+        let mut captures = Vec::with_capacity(services.len());
+        let mut backend_heads = Vec::new();
+        for service in services {
+            let status = service.status_snapshot().await;
+            if status.readiness != BroadcasterReadiness::Ready {
+                return Ok(None);
+            }
+            match chain_id {
+                Some(expected) => anyhow::ensure!(
+                    status.chain_id == expected,
+                    "combined {context} chain_id mismatch: expected {expected}, found {}",
+                    status.chain_id
+                ),
+                None => chain_id = Some(status.chain_id),
+            }
+            let capture = service.cache.capture_snapshot().await;
+            backend_heads.extend(
+                capture
+                    .checkpoint_backend_heads()
+                    .into_iter()
+                    .map(|head| (head.backend, head.block_number)),
+            );
+            captures.push((capture, service.snapshot_max_payload_bytes));
+        }
+        let chain_id =
+            chain_id.ok_or_else(|| anyhow::anyhow!("combined {context} missing chain_id"))?;
+        // Capture the Redis boundary while publication is still gated. Chunking happens later.
+        let Some(redis_replay_boundary) = services[0].replay_boundary_or_none(context).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CapturedServiceSnapshots {
+            chain_id,
+            captures,
+            backend_heads,
+            redis_replay_boundary,
         }))
     }
 
@@ -1012,8 +1055,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_history_checkpoint_uses_rfq_update_timestamp_as_rfq_cursor() -> Result<()> {
+    async fn state_history_checkpoint_uses_rfq_state_high_water_as_cursor() -> Result<()> {
         let (raw_service, rfq_service, _writer, publisher) = ready_raw_and_rfq_services().await?;
+        rfq_service
+            .apply_update(&rfq_only_update(201, "rfq-2", 8))
+            .await?;
+        let rfq_status = rfq_service.status_snapshot().await;
+        let rfq_backend = rfq_status
+            .backends
+            .get(&BroadcasterBackend::Rfq)
+            .ok_or_else(|| anyhow!("RFQ status should be present"))?;
+        assert_eq!(rfq_backend.block_number, Some(201));
+        assert_eq!(rfq_backend.pool_count, 2);
+
         let checkpoint = BroadcasterServiceState::create_state_history_checkpoint_for_services(&[
             raw_service,
             rfq_service,
@@ -1024,7 +1078,7 @@ mod tests {
 
         assert_eq!(checkpoint.metadata.chain_id, Chain::Ethereum.id());
         assert_eq!(checkpoint.metadata.block_number, 101);
-        assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, Some(202));
+        assert_eq!(checkpoint.metadata.rfq_update_timestamp_ms, Some(202_000));
         assert_ne!(
             checkpoint.metadata.rfq_update_timestamp_ms,
             Some(checkpoint.metadata.captured_at_timestamp_ms)

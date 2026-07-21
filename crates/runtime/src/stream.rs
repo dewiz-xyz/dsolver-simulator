@@ -5,6 +5,7 @@ use futures::StreamExt;
 use rand::Rng;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use tokio::time::{sleep, timeout, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tycho_simulation::{
     evm::engine_db::SHARED_TYCHO_DB,
@@ -206,7 +207,8 @@ pub async fn process_broadcaster_stream(
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     service: &BroadcasterServiceState,
-) -> StreamExit {
+    cancellation: &CancellationToken,
+) -> Option<StreamExit> {
     info!(
         stream = StreamKind::Broadcaster.as_str(),
         "Starting stream processing"
@@ -216,14 +218,19 @@ pub async fn process_broadcaster_stream(
     let mut ready_logged = false;
 
     loop {
-        match next_stream_message(StreamKind::Broadcaster, &mut stream, &health, &cfg).await {
-            StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
-            StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
+        let message = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            message = next_stream_message(StreamKind::Broadcaster, &mut stream, &health, &cfg) => message,
+        };
+        match message {
+            StreamMessage::Stale => return Some(stream_exit(StreamRestartReason::Stale, None)),
+            StreamMessage::Ended => return Some(stream_exit(StreamRestartReason::Ended, None)),
             StreamMessage::Error(err_msg) => {
                 if let Some(exit) =
                     handle_stream_error(StreamKind::Broadcaster, err_msg, &health, &cfg).await
                 {
-                    return exit;
+                    return Some(exit);
                 }
             }
             StreamMessage::Update(update) => {
@@ -231,7 +238,7 @@ pub async fn process_broadcaster_stream(
                     handle_broadcaster_update(update, service, &health, &cfg, &mut ready_logged)
                         .await
                 {
-                    return exit;
+                    return Some(exit);
                 }
             }
         }
@@ -249,7 +256,8 @@ pub async fn process_broadcaster_raw_stream(
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     service: &BroadcasterServiceState,
-) -> StreamExit {
+    cancellation: &CancellationToken,
+) -> Option<StreamExit> {
     info!(
         stream = StreamKind::Broadcaster.as_str(),
         "Starting raw broadcaster stream processing"
@@ -259,18 +267,23 @@ pub async fn process_broadcaster_raw_stream(
     let mut ready_logged = false;
 
     loop {
-        match next_broadcaster_raw_stream_message(&mut stream, &health, &cfg).await {
+        let message = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            message = next_broadcaster_raw_stream_message(&mut stream, &health, &cfg) => message,
+        };
+        match message {
             BroadcasterRawStreamMessage::Stale => {
-                return stream_exit(StreamRestartReason::Stale, None)
+                return Some(stream_exit(StreamRestartReason::Stale, None));
             }
             BroadcasterRawStreamMessage::Ended => {
-                return stream_exit(StreamRestartReason::Ended, None)
+                return Some(stream_exit(StreamRestartReason::Ended, None));
             }
             BroadcasterRawStreamMessage::Error(err_msg) => {
                 if let Some(exit) =
                     handle_stream_error(StreamKind::Broadcaster, err_msg, &health, &cfg).await
                 {
-                    return exit;
+                    return Some(exit);
                 }
             }
             BroadcasterRawStreamMessage::Update(update) => {
@@ -278,7 +291,7 @@ pub async fn process_broadcaster_raw_stream(
                     handle_broadcaster_raw_update(update, service, &health, &cfg, &mut ready_logged)
                         .await
                 {
-                    return exit;
+                    return Some(exit);
                 }
             }
         }
@@ -804,6 +817,7 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     controls: BroadcasterStreamControls,
+    cancellation: CancellationToken,
 ) where
     F: Fn() -> Fut + Send + Sync,
     Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
@@ -815,7 +829,11 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
-        let stream = match build_stream().await {
+        let stream = match tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            stream = build_stream() => stream,
+        } {
             Ok(stream) => {
                 controls.service.mark_upstream_connected().await;
                 stream
@@ -829,15 +847,28 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
                     "Failed to build broadcaster stream"
                 );
                 let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
+                if sleep_or_cancel(Duration::from_millis(backoff_ms), &cancellation).await {
+                    return;
+                }
                 backoff = next_backoff(backoff, cfg.restart_backoff_max);
                 continue;
             }
         };
 
-        let exit =
-            process_broadcaster_stream(stream, Arc::clone(&health), cfg.clone(), &controls.service)
-                .await;
+        let Some(exit) = process_broadcaster_stream(
+            stream,
+            Arc::clone(&health),
+            cfg.clone(),
+            &controls.service,
+            &cancellation,
+        )
+        .await
+        else {
+            return;
+        };
+        if cancellation.is_cancelled() {
+            return;
+        }
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
@@ -869,7 +900,9 @@ pub async fn supervise_broadcaster_stream<F, Fut, S>(
             .await;
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
-        sleep(Duration::from_millis(backoff_ms)).await;
+        if sleep_or_cancel(Duration::from_millis(backoff_ms), &cancellation).await {
+            return;
+        }
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
     }
 }
@@ -879,6 +912,7 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
     controls: BroadcasterStreamControls,
+    cancellation: CancellationToken,
 ) where
     F: Fn() -> Fut + Send + Sync,
     Fut: std::future::Future<Output = anyhow::Result<S>> + Send,
@@ -893,7 +927,11 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
     let mut backoff = cfg.restart_backoff_min;
 
     loop {
-        let stream = match build_stream().await {
+        let stream = match tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            stream = build_stream() => stream,
+        } {
             Ok(stream) => {
                 controls.service.mark_upstream_connected().await;
                 stream
@@ -907,19 +945,28 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
                     "Failed to build raw broadcaster stream"
                 );
                 let backoff_ms = jittered_backoff_ms(backoff, cfg.restart_backoff_jitter_pct);
-                sleep(Duration::from_millis(backoff_ms)).await;
+                if sleep_or_cancel(Duration::from_millis(backoff_ms), &cancellation).await {
+                    return;
+                }
                 backoff = next_backoff(backoff, cfg.restart_backoff_max);
                 continue;
             }
         };
 
-        let exit = process_broadcaster_raw_stream(
+        let Some(exit) = process_broadcaster_raw_stream(
             stream,
             Arc::clone(&health),
             cfg.clone(),
             &controls.service,
+            &cancellation,
         )
-        .await;
+        .await
+        else {
+            return;
+        };
+        if cancellation.is_cancelled() {
+            return;
+        }
 
         let restart_count = health.increment_restart().await;
         health.reset_bursts().await;
@@ -951,8 +998,18 @@ pub async fn supervise_broadcaster_raw_stream<F, Fut, S>(
             .await;
         maybe_purge_allocator("broadcaster_restart", cfg.memory);
 
-        sleep(Duration::from_millis(backoff_ms)).await;
+        if sleep_or_cancel(Duration::from_millis(backoff_ms), &cancellation).await {
+            return;
+        }
         backoff = next_backoff(backoff, cfg.restart_backoff_max);
+    }
+}
+
+async fn sleep_or_cancel(duration: Duration, cancellation: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => true,
+        _ = sleep(duration) => false,
     }
 }
 
@@ -1162,11 +1219,13 @@ mod tests {
     use std::time::Duration;
 
     use tokio::sync::{Mutex, RwLock};
+    use tokio_util::sync::CancellationToken;
     use tycho_simulation::protocol::models::Update;
 
     use super::{
-        begin_vm_rebuild, classify_stream_error, handle_broadcaster_update, BroadcasterResetScope,
-        StreamRestartReason, StreamSupervisorConfig, VmStreamControls,
+        begin_vm_rebuild, classify_stream_error, handle_broadcaster_update,
+        process_broadcaster_stream, BroadcasterResetScope, StreamRestartReason,
+        StreamSupervisorConfig, VmStreamControls,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
@@ -1437,6 +1496,35 @@ mod tests {
                 snapshots_emit_emf: false,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn broadcaster_stream_cancellation_stops_at_receive_boundary() -> anyhow::Result<()> {
+        type StreamError = Box<dyn std::error::Error + Send + Sync + 'static>;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            1024,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            test_redis_publisher(1),
+            Arc::new(Mutex::new(())),
+        );
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            process_broadcaster_stream(
+                futures::stream::pending::<Result<Update, StreamError>>(),
+                Arc::new(StreamHealth::new()),
+                test_supervisor_config(),
+                &service,
+                &task_cancellation,
+            )
+            .await
+        });
+
+        cancellation.cancel();
+        let exit = tokio::time::timeout(Duration::from_millis(100), task).await??;
+        assert!(exit.is_none());
+        Ok(())
     }
 
     fn entry_from_fields(

@@ -244,13 +244,80 @@ pub struct BroadcasterSnapshotCache {
     inner: Arc<RwLock<BroadcasterSnapshotCacheData>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BroadcasterSnapshotCacheData {
     generation: u64,
     stream_id: String,
     snapshot_id: String,
+    rfq_checkpoint_timestamp_seconds: Option<u64>,
     partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     known_backends: HashMap<String, BroadcasterBackend>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BroadcasterSnapshotCapture {
+    chain_id: u64,
+    configured_backends: Vec<BroadcasterBackend>,
+    data: BroadcasterSnapshotCacheData,
+}
+
+impl BroadcasterSnapshotCapture {
+    pub(crate) fn checkpoint_backend_heads(&self) -> Vec<BroadcasterBackendHead> {
+        self.configured_backends
+            .iter()
+            .filter_map(|backend| {
+                let head = match backend {
+                    BroadcasterBackend::Rfq => self.data.rfq_checkpoint_timestamp_seconds,
+                    BroadcasterBackend::Native | BroadcasterBackend::Vm => self
+                        .data
+                        .partitions
+                        .get(backend)
+                        .and_then(|partition| partition.block_number),
+                }?;
+                Some(BroadcasterBackendHead::new(*backend, head))
+            })
+            .collect()
+    }
+
+    pub(crate) fn build_export(
+        self,
+        max_payload_bytes: usize,
+    ) -> Result<BroadcasterSnapshotExport> {
+        let snapshot_id = self.data.snapshot_id;
+        let stream_id = self.data.stream_id;
+        let chunks = build_snapshot_chunks(
+            &stream_id,
+            &snapshot_id,
+            &self.configured_backends,
+            &self.data.partitions,
+            max_payload_bytes,
+        )?;
+        let total_chunks = chunks.len() as u32;
+        let mut payloads = Vec::with_capacity(chunks.len().saturating_add(2));
+        payloads.push(BroadcasterPayload::SnapshotStart(
+            BroadcasterSnapshotStart::new(
+                snapshot_id.clone(),
+                self.chain_id,
+                self.configured_backends,
+                total_chunks,
+            )?,
+        ));
+        payloads.extend(chunks.into_iter().map(BroadcasterPayload::SnapshotChunk));
+        payloads.push(BroadcasterPayload::SnapshotEnd(
+            BroadcasterSnapshotEnd::new(snapshot_id.clone()),
+        ));
+        for (index, payload) in payloads.iter().enumerate() {
+            ensure_payload_fits(&stream_id, index as u64 + 1, payload, max_payload_bytes)
+                .with_context(|| format!("snapshot payload {index} exceeds byte cap"))?;
+        }
+
+        Ok(BroadcasterSnapshotExport {
+            stream_id,
+            snapshot_id,
+            max_payload_bytes,
+            payloads,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -282,6 +349,7 @@ impl BroadcasterSnapshotCache {
                 generation,
                 stream_id: format_stream_id(chain_id, generation),
                 snapshot_id: format_snapshot_id(chain_id, generation),
+                rfq_checkpoint_timestamp_seconds: None,
                 partitions: BTreeMap::new(),
                 known_backends: HashMap::new(),
             })),
@@ -293,6 +361,7 @@ impl BroadcasterSnapshotCache {
         Self::relabel_generation_locked(self.chain_id, &mut guard, generation);
         guard.partitions.clear();
         guard.known_backends.clear();
+        guard.rfq_checkpoint_timestamp_seconds = None;
     }
 
     pub async fn relabel_generation(&self, generation: u64) {
@@ -359,43 +428,17 @@ impl BroadcasterSnapshotCache {
         &self,
         max_payload_bytes: usize,
     ) -> Result<BroadcasterSnapshotExport> {
-        let guard = self.inner.read().await;
-        let snapshot_id = guard.snapshot_id.clone();
-        let stream_id = guard.stream_id.clone();
-        let chunks = build_snapshot_chunks(
-            &stream_id,
-            &snapshot_id,
-            &self.configured_backends,
-            &guard.partitions,
-            max_payload_bytes,
-        )?;
-        let total_chunks = chunks.len() as u32;
-        let mut payloads = Vec::with_capacity(chunks.len().saturating_add(2));
-        payloads.push(BroadcasterPayload::SnapshotStart(
-            BroadcasterSnapshotStart::new(
-                snapshot_id.clone(),
-                self.chain_id,
-                self.configured_backends.clone(),
-                total_chunks,
-            )?,
-        ));
+        self.capture_snapshot()
+            .await
+            .build_export(max_payload_bytes)
+    }
 
-        payloads.extend(chunks.into_iter().map(BroadcasterPayload::SnapshotChunk));
-
-        payloads.push(BroadcasterPayload::SnapshotEnd(
-            BroadcasterSnapshotEnd::new(snapshot_id),
-        ));
-        for (index, payload) in payloads.iter().enumerate() {
-            ensure_payload_fits(&stream_id, index as u64 + 1, payload, max_payload_bytes)
-                .with_context(|| format!("snapshot payload {index} exceeds byte cap"))?;
+    pub(crate) async fn capture_snapshot(&self) -> BroadcasterSnapshotCapture {
+        BroadcasterSnapshotCapture {
+            chain_id: self.chain_id,
+            configured_backends: self.configured_backends.clone(),
+            data: self.inner.read().await.clone(),
         }
-
-        Ok(BroadcasterSnapshotExport {
-            stream_id,
-            snapshot_id: guard.snapshot_id.clone(),
-            max_payload_bytes,
-            payloads,
-        })
     }
 
     pub async fn heartbeat(&self) -> Result<Option<BroadcasterPayload>> {
@@ -659,6 +702,7 @@ fn apply_raw_update_message(
     message: &BroadcasterUpdateMessage,
 ) {
     for partition in &message.partitions {
+        update_rfq_checkpoint_high_water(guard, partition);
         let partition_state = guard.partitions.entry(partition.backend).or_default();
         partition_state.block_number = Some(partition.block_number);
         partition_state.sync_statuses = partition.sync_statuses.clone();
@@ -740,6 +784,7 @@ fn apply_update_message(
     message: &BroadcasterUpdateMessage,
 ) {
     for partition in &message.partitions {
+        update_rfq_checkpoint_high_water(guard, partition);
         let partition_state = guard.partitions.entry(partition.backend).or_default();
         partition_state.block_number = Some(partition.block_number);
         partition_state.sync_statuses = partition.sync_statuses.clone();
@@ -761,6 +806,17 @@ fn apply_update_message(
             guard.known_backends.remove(&removed.component_id);
             partition_state.states.remove(&removed.component_id);
         }
+    }
+}
+
+fn update_rfq_checkpoint_high_water(
+    guard: &mut BroadcasterSnapshotCacheData,
+    partition: &simulator_core::broadcaster::BroadcasterUpdatePartition,
+) {
+    if partition.backend == BroadcasterBackend::Rfq {
+        guard.rfq_checkpoint_timestamp_seconds = guard
+            .rfq_checkpoint_timestamp_seconds
+            .max(Some(partition.block_number));
     }
 }
 
@@ -2185,6 +2241,41 @@ mod tests {
         assert_eq!(snapshot_after.stream_id, "chain-1-stream-2");
         assert_eq!(snapshot_after.snapshot_id, "chain-1-snapshot-2");
         assert!(cache.heartbeat().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn captured_snapshot_does_not_block_updates_and_remains_immutable() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+        );
+        cache.apply_update(&native_only_update()).await?;
+        cache.apply_update(&rfq_only_update(12, "rfq-1", 7)).await?;
+        let capture = cache.capture_snapshot().await;
+        let expected = cache.export_snapshot(8_388_608).await?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            cache.apply_update(&native_update_state(11, "native-1", 9)),
+        )
+        .await??;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            cache.apply_update(&rfq_only_update(13, "rfq-2", 8)),
+        )
+        .await??;
+        let captured = capture.build_export(8_388_608)?;
+        let current = cache.export_snapshot(8_388_608).await?;
+
+        assert_eq!(
+            serde_json::to_value(&captured.payloads)?,
+            serde_json::to_value(&expected.payloads)?
+        );
+        assert_ne!(
+            serde_json::to_value(&current.payloads)?,
+            serde_json::to_value(&expected.payloads)?
+        );
         Ok(())
     }
 

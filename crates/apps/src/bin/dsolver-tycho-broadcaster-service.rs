@@ -9,10 +9,14 @@ async fn main() -> anyhow::Result<()> {
     let app = rpc::create_broadcaster_router(app_state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal(app_state))
+    let result = axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal(app_state.clone()))
         .await
-        .map_err(|error| anyhow::anyhow!("Failed to start server: {error}"))
+        .map_err(|error| anyhow::anyhow!("Failed to start server: {error}"));
+    if let Err(error) = app_state.finish_shutdown().await {
+        eprintln!("Broadcaster shutdown drain failed: {error}");
+    }
+    result
 }
 
 async fn shutdown_signal(app_state: runtime::broadcaster::app::BroadcasterAppState) {
@@ -20,9 +24,8 @@ async fn shutdown_signal(app_state: runtime::broadcaster::app::BroadcasterAppSta
         eprintln!("Failed to listen for shutdown signal: {error:#}");
         return;
     }
-    if let Err(error) = app_state.shutdown().await {
-        eprintln!("Broadcaster shutdown drain failed: {error}");
-    }
+    // Stop producers now; state history drains after Axum finishes active requests.
+    app_state.begin_shutdown();
 }
 
 #[cfg(unix)]
