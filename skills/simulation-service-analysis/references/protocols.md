@@ -44,15 +44,13 @@ The service subscribes to chain-specific Tycho exchanges at startup (see
 ### Ethereum (`CHAIN_ID=1`)
 
 - `rfq:bebop`
-- `rfq:hashflow`
 
-> **NOTE:** `rfq:liquorice` simulation is wired in the quote, but encoding and full support will be
-> introduced in the future. For now it's unsupported.
+> **NOTE:** Hashflow remains implemented but is disabled in the active chain profiles. Liquorice
+> simulation is wired in the quote, but encoding and full support will be introduced in the future.
 
 ### Base (`CHAIN_ID=8453`)
 
 - `rfq:bebop`
-- `rfq:hashflow`
 
 ## Effective VM enablement
 
@@ -63,9 +61,8 @@ The service subscribes to chain-specific Tycho exchanges at startup (see
 ## Effective RFQ enablement
 
 - Runtime RFQ state is `effective_rfq_enabled = ENABLE_RFQ_POOLS && rfq_protocols_not_empty`.
-- Enabling RFQ analysis requires credentials for the providers on that chain. Ethereum and Base use
-  the Bebop and Hashflow pairs. Liquorice credentials are only needed after `rfq:liquorice` is added
-  to the active chain list.
+- Enabling RFQ analysis requires credentials for the providers on that chain. Ethereum and Base
+  currently use only the Bebop pair.
 - When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
 - The local analyzer waits for RFQ readiness automatically when RFQ pools are enabled on either chain.
 - On Base, RFQ-enabled analyzer runs include a Bebop partial-fill encode diagnostic. It is required only when RFQ is enabled and ready, and it reports degraded evidence if `rfq:bebop` or the non-RFQ comparison leg is not visible.

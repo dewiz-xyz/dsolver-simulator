@@ -64,10 +64,6 @@ id = "rfq:bebop"
 backend = "rfq"
 
 [[protocols]]
-id = "rfq:hashflow"
-backend = "rfq"
-
-[[protocols]]
 id = "rfq:liquorice"
 backend = "rfq"
 
@@ -129,7 +125,7 @@ native_protocols = [
 ]
 vm_protocols = ["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
 # TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
-rfq_protocols = ["rfq:bebop", "rfq:hashflow"]
+rfq_protocols = ["rfq:bebop"]
 route_policy = "ethereum"
 
 [[chains]]
@@ -145,5 +141,5 @@ native_protocols = [
     "aerodrome_slipstreams",
 ]
 vm_protocols = []
-rfq_protocols = ["rfq:bebop", "rfq:hashflow"]
+rfq_protocols = ["rfq:bebop"]
 route_policy = "base"
