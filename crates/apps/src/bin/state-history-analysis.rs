@@ -17,8 +17,8 @@ use simulator_core::broadcaster::{
     BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 use state_history::{
-    BacktestRangePlan, BacktestRangeRequest, BlockTimestampRecord, CheckpointArchive,
-    CheckpointArchiveMetadata, CheckpointWriteOutcome, DecodedCheckpointArchive,
+    rfq_timestamp_ms_from_seconds, BacktestRangePlan, BacktestRangeRequest, BlockTimestampRecord,
+    CheckpointArchive, CheckpointArchiveMetadata, CheckpointWriteOutcome, DecodedCheckpointArchive,
     HistoryRangeGapSource, HistoryRangePlan, HistoryRangeRequest, IngestionGap, PersistedDelta,
     S3CheckpointStore, StateHistoryCheckpointWriter, StateHistoryPgStore, StateHistoryReader,
     StateHistoryWriter, StateHistoryWriterConfig,
@@ -43,6 +43,7 @@ const INITIAL_HEAD_HASH_SEED: u8 = 0x0A;
 const REORG_HASH_SEED: u8 = 0x0B;
 const STALE_WRITER_HASH_SEED: u8 = 0x0C;
 const CROSS_STREAM_HASH_SEED: u8 = 0x0D;
+const OLDER_GENERATION_HASH_SEED: u8 = 0x0E;
 const CONFLICT_NATIVE_HASH_SEED: u8 = 0x20;
 const CONFLICT_VM_HASH_SEED: u8 = 0x21;
 
@@ -81,10 +82,15 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
     let run_id = current_timestamp_ms()?;
     let chain_id = 9_000_000_000u64.saturating_add(run_id % 1_000_000);
     let stream_id = format!("chain-{chain_id}-stream-1");
-    let rfq_cursor_timestamp_ms = 1_700_000_000_000u64.saturating_add(run_id % 1_000_000);
-    let (inserted_deltas, handoff_stream_id) =
-        insert_synthetic_delta_fixtures(&pg_store, chain_id, &stream_id, rfq_cursor_timestamp_ms)
-            .await?;
+    let rfq_cursor_timestamp_seconds = 1_700_000_000u64.saturating_add(run_id % 1_000);
+    let rfq_cursor_timestamp_ms = rfq_timestamp_ms_from_seconds(rfq_cursor_timestamp_seconds)?;
+    let (inserted_deltas, handoff_stream_id) = insert_synthetic_delta_fixtures(
+        &pg_store,
+        chain_id,
+        &stream_id,
+        rfq_cursor_timestamp_seconds,
+    )
+    .await?;
 
     let checkpoint_archive =
         synthetic_checkpoint_archive(chain_id, &stream_id, run_id, rfq_cursor_timestamp_ms)?;
@@ -195,6 +201,7 @@ async fn run(args: CliArgs) -> Result<StateHistoryAnalysisReport> {
         duplicate_write_left_updated_at_untouched: backtest
             .duplicate_write_left_updated_at_untouched,
         cross_stream_superseded: backtest.cross_stream_superseded,
+        older_generation_write_kept: backtest.older_generation_write_kept,
         source_advanced_without_churn: backtest.source_advanced_without_churn,
         snapshot_seeded_start_boundary: backtest.snapshot_seeded_start_boundary,
         head_range_unresolvable: backtest.head_range_unresolvable,
@@ -209,9 +216,9 @@ async fn insert_synthetic_delta_fixtures(
     pg_store: &StateHistoryPgStore,
     chain_id: u64,
     stream_id: &str,
-    rfq_cursor_timestamp_ms: u64,
+    rfq_cursor_timestamp_seconds: u64,
 ) -> Result<(usize, String)> {
-    let redis_entries = synthetic_delta_entries(chain_id, stream_id, rfq_cursor_timestamp_ms)?;
+    let redis_entries = synthetic_delta_entries(chain_id, stream_id, rfq_cursor_timestamp_seconds)?;
     let mut inserted_deltas = 0usize;
     for (index, entry) in redis_entries.iter().enumerate() {
         let redis_entry_id = format!("1-{}", index + 1);
@@ -223,7 +230,13 @@ async fn insert_synthetic_delta_fixtures(
     }
 
     let handoff_stream_id = format!("chain-{chain_id}-stream-2");
-    let handoff_marker = synthetic_handoff_marker(chain_id, stream_id, "1-4", &handoff_stream_id)?;
+    let handoff_marker = synthetic_handoff_marker(
+        chain_id,
+        stream_id,
+        "1-4",
+        &handoff_stream_id,
+        rfq_cursor_timestamp_seconds,
+    )?;
     assert_duplicate_handoff_enqueue_is_healthy(pg_store, handoff_marker).await?;
     inserted_deltas = inserted_deltas.saturating_add(1);
 
@@ -287,7 +300,10 @@ fn synthetic_history_request(
             BroadcasterBackend::Rfq,
         ],
     )?
-    .with_rfq_timestamp_range(rfq_cursor_timestamp_ms + 1, rfq_cursor_timestamp_ms + 100)
+    .with_rfq_timestamp_range(
+        rfq_cursor_timestamp_ms + 1,
+        rfq_cursor_timestamp_ms + 100_000,
+    )
 }
 
 fn assert_replay_plan(
@@ -405,6 +421,7 @@ async fn record_pre_checkpoint_gap(
             stream_id: stream_id.to_string(),
             from_message_seq: 1,
             to_message_seq: 1,
+            prev_persistable_message_seq: None,
             backend_scope: vec![BroadcasterBackend::Native],
             from_block_number: Some(100),
             to_block_number: Some(100),
@@ -435,6 +452,7 @@ async fn record_visible_gap_fixtures(
                 stream_id: stream_id.to_string(),
                 from_message_seq: 9,
                 to_message_seq: 9,
+                prev_persistable_message_seq: Some(8),
                 backend_scope: vec![BroadcasterBackend::Native],
                 from_block_number: Some(108),
                 to_block_number: Some(109),
@@ -454,6 +472,7 @@ async fn record_unseen_generation_gap(pg_store: &StateHistoryPgStore, chain_id: 
             stream_id: format!("chain-{chain_id}-stream-3"),
             from_message_seq: 1,
             to_message_seq: 1,
+            prev_persistable_message_seq: None,
             backend_scope: vec![BroadcasterBackend::Native],
             from_block_number: Some(108),
             to_block_number: Some(109),
@@ -502,13 +521,17 @@ async fn s3_client(args: &CliArgs) -> S3Client {
 fn synthetic_delta_entries(
     chain_id: u64,
     stream_id: &str,
-    rfq_cursor_timestamp_ms: u64,
+    rfq_cursor_timestamp_seconds: u64,
 ) -> Result<Vec<BroadcasterRedisStreamEntry>> {
     [
         (1, BroadcasterBackend::Native, 100),
         (2, BroadcasterBackend::Native, 100),
         (3, BroadcasterBackend::Vm, 101),
-        (4, BroadcasterBackend::Rfq, rfq_cursor_timestamp_ms + 10),
+        (
+            4,
+            BroadcasterBackend::Rfq,
+            rfq_cursor_timestamp_seconds + 10,
+        ),
     ]
     .into_iter()
     .map(|(message_seq, backend, cursor)| {
@@ -537,6 +560,7 @@ fn synthetic_handoff_marker(
     previous_stream_id: &str,
     previous_entry_id: &str,
     next_stream_id: &str,
+    rfq_cursor_timestamp_seconds: u64,
 ) -> Result<BroadcasterRedisStreamEntry> {
     let backends = vec![
         BroadcasterBackend::Native,
@@ -549,7 +573,7 @@ fn synthetic_handoff_marker(
         vec![
             BroadcasterBackendHead::new(BroadcasterBackend::Native, 100),
             BroadcasterBackendHead::new(BroadcasterBackend::Vm, 101),
-            BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 1_700_000_000_000),
+            BroadcasterBackendHead::new(BroadcasterBackend::Rfq, rfq_cursor_timestamp_seconds),
         ],
     )?;
     let progress = BroadcasterProgress::new_with_handoff(
@@ -759,6 +783,7 @@ struct BacktestScenarioReport {
     stale_write_kept: bool,
     duplicate_write_left_updated_at_untouched: bool,
     cross_stream_superseded: bool,
+    older_generation_write_kept: bool,
     source_advanced_without_churn: bool,
     snapshot_seeded_start_boundary: bool,
     head_range_unresolvable: bool,
@@ -816,6 +841,8 @@ async fn run_backtest_scenario(
         &mut inserted_deltas,
     )
     .await?;
+    seed_backtest_lineage_checkpoints(&checkpoint_writer, chain_id, &stream_id, run_id, &times)
+        .await?;
     advance_backtest_cursor_heads(pg_store, chain_id, &stream_id, &times).await?;
 
     let reader = StateHistoryReader::new(pg_store.clone(), checkpoint_store);
@@ -865,6 +892,7 @@ async fn run_backtest_scenario(
         stale_write_kept: supersession.stale_write_kept,
         duplicate_write_left_updated_at_untouched,
         cross_stream_superseded: supersession.cross_stream_superseded,
+        older_generation_write_kept: supersession.older_generation_write_kept,
         source_advanced_without_churn: supersession.source_advanced_without_churn,
         snapshot_seeded_start_boundary,
         head_range_unresolvable,
@@ -965,7 +993,7 @@ async fn advance_backtest_cursor_heads(
                     BroadcasterBackendHead::new(BroadcasterBackend::Vm, NEXT_BLOCK_NUMBER),
                     BroadcasterBackendHead::new(
                         BroadcasterBackend::Rfq,
-                        times.next_block_timestamp_ms,
+                        times.next_block_timestamp_seconds(),
                     ),
                 ],
             )?),
@@ -1004,6 +1032,14 @@ impl FixtureTimestamps {
     fn rfq_end_timestamp_ms(&self) -> u64 {
         self.next_block_timestamp_ms - 1
     }
+
+    fn rfq_cursor_timestamp_seconds(&self) -> u64 {
+        self.rfq_cursor_timestamp_ms / 1_000
+    }
+
+    fn next_block_timestamp_seconds(&self) -> u64 {
+        self.next_block_timestamp_ms / 1_000
+    }
 }
 
 #[expect(
@@ -1015,6 +1051,7 @@ struct SupersessionCheckOutcomes {
     stale_write_kept: bool,
     source_advanced_without_churn: bool,
     cross_stream_superseded: bool,
+    older_generation_write_kept: bool,
 }
 
 #[expect(
@@ -1053,12 +1090,56 @@ async fn run_supersession_checks(
     let (source_advanced_without_churn, cross_stream_superseded) =
         assert_stale_stream_writes(pg_store, chain_id, stale_stream_id, times, inserted_deltas)
             .await?;
+    let older_generation_write_kept = assert_older_generation_write_kept(
+        pg_store,
+        chain_id,
+        stale_stream_id,
+        times,
+        inserted_deltas,
+    )
+    .await?;
     Ok(SupersessionCheckOutcomes {
         reorg_superseded,
         stale_write_kept,
         source_advanced_without_churn,
         cross_stream_superseded,
+        older_generation_write_kept,
     })
+}
+
+async fn assert_older_generation_write_kept(
+    pg_store: &StateHistoryPgStore,
+    chain_id: u64,
+    newer_stream_id: &str,
+    times: &FixtureTimestamps,
+    inserted_deltas: &mut usize,
+) -> Result<bool> {
+    let older_stream_id = format!("chain-{chain_id}-stream-8");
+    let older = backtest_delta_entry(
+        chain_id,
+        &older_stream_id,
+        100,
+        BroadcasterBackend::Native,
+        NEXT_BLOCK_NUMBER,
+        Some(times.next_block_timestamp_ms),
+        Some(OLDER_GENERATION_HASH_SEED),
+    )?;
+    insert_delta_checked(pg_store, &older, "8-100", inserted_deltas).await?;
+    let retained = expect_block_timestamp_record(
+        pg_store,
+        chain_id,
+        NEXT_BLOCK_NUMBER,
+        times.next_block_timestamp_ms,
+        CROSS_STREAM_HASH_SEED,
+        newer_stream_id,
+        3,
+    )
+    .await?;
+    anyhow::ensure!(
+        retained.updated_at > retained.created_at,
+        "older generation write changed the retained generation-9 row"
+    );
+    Ok(true)
 }
 
 async fn insert_backtest_live_stream_fixtures(
@@ -1127,14 +1208,24 @@ async fn assert_idempotent_duplicate(
             .is_none(),
         "start boundary block {START_BLOCK_NUMBER} must stay absent until the checkpoint seeds it"
     );
-    let duplicate = backtest_delta_entry(
+    let duplicate = backtest_delta_entry_with_partitions(
         chain_id,
         stream_id,
         5,
-        BroadcasterBackend::Native,
-        END_BLOCK_NUMBER,
-        Some(times.end_block_timestamp_ms),
-        None,
+        vec![
+            (
+                BroadcasterBackend::Native,
+                END_BLOCK_NUMBER,
+                Some(times.end_block_timestamp_ms),
+                None,
+            ),
+            (
+                BroadcasterBackend::Rfq,
+                times.next_block_timestamp_seconds() + 1,
+                None,
+                None,
+            ),
+        ],
     )?;
     let persisted = insert_delta_checked(pg_store, &duplicate, "1-5", inserted_deltas).await?;
     anyhow::ensure!(
@@ -1248,6 +1339,31 @@ async fn write_and_verify_checkpoint(
     Ok((checkpoint, snapshot_seeded_start_boundary))
 }
 
+async fn seed_backtest_lineage_checkpoints(
+    checkpoint_writer: &StateHistoryCheckpointWriter,
+    chain_id: u64,
+    stream_id: &str,
+    run_id: u64,
+    times: &FixtureTimestamps,
+) -> Result<()> {
+    for block_number in (VM_BLOCK_NUMBER + 1)..END_BLOCK_NUMBER {
+        let archive = backtest_checkpoint_archive_with_cursor(
+            chain_id,
+            stream_id,
+            run_id.saturating_add(block_number),
+            times.rfq_cursor_timestamp_ms,
+            block_number,
+            block_number,
+            times
+                .start_block_timestamp_ms
+                .saturating_add((block_number - START_BLOCK_NUMBER) * 1_000),
+            NATIVE_HASH_SEED,
+        )?;
+        checkpoint_writer.write_checkpoint(archive).await?;
+    }
+    Ok(())
+}
+
 async fn fetch_decoded_checkpoint(
     reader: &StateHistoryReader,
     plan: &HistoryRangePlan,
@@ -1324,6 +1440,7 @@ async fn assert_conflicted_checkpoint_rejected(
     times: &FixtureTimestamps,
 ) -> Result<bool> {
     let before = fetch_block_timestamp_record(pg_store, chain_id, START_BLOCK_NUMBER).await?;
+    let status_before = checkpoint_writer.snapshot().await;
     let archive = conflicted_checkpoint_archive(chain_id, stream_id, run_id, times)?;
     let Err(error) = checkpoint_writer.write_checkpoint(archive).await else {
         anyhow::bail!("conflicted-boundary checkpoint must be rejected")
@@ -1342,13 +1459,14 @@ async fn assert_conflicted_checkpoint_rejected(
     );
     let snapshot = checkpoint_writer.snapshot().await;
     anyhow::ensure!(
-        snapshot.failed_checkpoints == 1,
-        "expected exactly one failed checkpoint, got {}",
-        snapshot.failed_checkpoints
+        snapshot.failed_checkpoints == status_before.failed_checkpoints.saturating_add(1),
+        "conflicted checkpoint did not increment the failed count to {}",
+        status_before.failed_checkpoints.saturating_add(1)
     );
     anyhow::ensure!(
-        snapshot.attempted_checkpoints == 4 && snapshot.completed_checkpoints == 3,
-        "conflicted checkpoint must be counted after the three completed checkpoint fixtures"
+        snapshot.attempted_checkpoints == status_before.attempted_checkpoints.saturating_add(1)
+            && snapshot.completed_checkpoints == status_before.completed_checkpoints,
+        "conflicted checkpoint must increment attempts without completing"
     );
     Ok(true)
 }
@@ -1408,6 +1526,7 @@ async fn record_backtest_visible_gap_fixtures(
                 stream_id: stream_id.to_string(),
                 from_message_seq: 9,
                 to_message_seq: 9,
+                prev_persistable_message_seq: Some(8),
                 backend_scope: vec![BroadcasterBackend::Native],
                 from_block_number: Some(108),
                 to_block_number: Some(109),
@@ -1515,7 +1634,34 @@ fn assert_backtest_replay_plan(plan: &HistoryRangePlan, stream_id: &str) -> Resu
             .all(|delta| delta.entry.stream_id == stream_id),
         "reader replayed a delta from outside the checkpoint stream"
     );
+    assert_projected_backends(&plan.deltas[1], &[BroadcasterBackend::Vm])?;
+    assert_projected_backends(
+        &plan.deltas[2],
+        &[BroadcasterBackend::Native, BroadcasterBackend::Rfq],
+    )?;
+    assert_projected_backends(&plan.deltas[3], &[BroadcasterBackend::Native])?;
     Ok(replayed_message_sequences)
+}
+
+fn assert_projected_backends(
+    delta: &state_history::StoredDeltaEntry,
+    expected: &[BroadcasterBackend],
+) -> Result<()> {
+    let envelope: BroadcasterEnvelope = serde_json::from_str(&delta.entry.payload_json)
+        .context("failed to decode projected replay envelope")?;
+    let BroadcasterPayload::Update(update) = envelope.payload else {
+        anyhow::bail!("expected projected replay entry to remain an update")
+    };
+    let actual = update
+        .partitions
+        .iter()
+        .map(|partition| partition.backend)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        actual == expected,
+        "replay projection kept backends {actual:?}, expected {expected:?}"
+    );
+    Ok(())
 }
 
 fn assert_backtest_plan(
@@ -1560,43 +1706,75 @@ fn backtest_delta_entries(
     // Seqs 1-2 carry no refs on purpose: the start boundary must come from the
     // checkpoint, not from update harvesting. Seq 6 records the end+1 head
     // that bounds the RFQ range and anchors the reorg fixtures.
-    [
-        (
+    vec![
+        backtest_delta_entry(
+            chain_id,
+            stream_id,
             1,
             BroadcasterBackend::Native,
             START_BLOCK_NUMBER,
             None,
             None,
         ),
-        (
+        backtest_delta_entry(
+            chain_id,
+            stream_id,
             2,
             BroadcasterBackend::Native,
             START_BLOCK_NUMBER,
             None,
             None,
         ),
-        (
+        backtest_delta_entry(
+            chain_id,
+            stream_id,
             3,
             BroadcasterBackend::Vm,
             VM_BLOCK_NUMBER,
             Some(times.start_block_timestamp_ms + 1_000),
             None,
         ),
-        (
+        backtest_delta_entry_with_partitions(
+            chain_id,
+            stream_id,
             4,
-            BroadcasterBackend::Rfq,
-            times.rfq_cursor_timestamp_ms + 10_000,
-            None,
-            None,
+            vec![
+                (
+                    BroadcasterBackend::Native,
+                    START_BLOCK_NUMBER - 1,
+                    None,
+                    None,
+                ),
+                (
+                    BroadcasterBackend::Rfq,
+                    times.rfq_cursor_timestamp_seconds() + 10,
+                    None,
+                    None,
+                ),
+            ],
         ),
-        (
+        backtest_delta_entry_with_partitions(
+            chain_id,
+            stream_id,
             5,
-            BroadcasterBackend::Native,
-            END_BLOCK_NUMBER,
-            Some(times.end_block_timestamp_ms),
-            None,
+            vec![
+                (
+                    BroadcasterBackend::Native,
+                    END_BLOCK_NUMBER,
+                    Some(times.end_block_timestamp_ms),
+                    None,
+                ),
+                (
+                    BroadcasterBackend::Rfq,
+                    times.next_block_timestamp_seconds() + 1,
+                    None,
+                    None,
+                ),
+            ],
         ),
-        (
+        backtest_delta_entry(
+            chain_id,
+            stream_id,
             6,
             BroadcasterBackend::Native,
             NEXT_BLOCK_NUMBER,
@@ -1605,19 +1783,6 @@ fn backtest_delta_entries(
         ),
     ]
     .into_iter()
-    .map(
-        |(message_seq, backend, cursor, block_timestamp_ms, hash_seed)| {
-            backtest_delta_entry(
-                chain_id,
-                stream_id,
-                message_seq,
-                backend,
-                cursor,
-                block_timestamp_ms,
-                hash_seed,
-            )
-        },
-    )
     .collect()
 }
 
@@ -1630,15 +1795,34 @@ fn backtest_delta_entry(
     block_timestamp_ms: Option<u64>,
     hash_seed: Option<u8>,
 ) -> Result<BroadcasterRedisStreamEntry> {
-    let partition = BroadcasterUpdatePartition::new(
-        backend,
-        cursor,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        backtest_sync_statuses(backend, cursor, block_timestamp_ms, hash_seed)?,
-    );
-    let payload = BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![partition])?);
+    backtest_delta_entry_with_partitions(
+        chain_id,
+        stream_id,
+        message_seq,
+        vec![(backend, cursor, block_timestamp_ms, hash_seed)],
+    )
+}
+
+fn backtest_delta_entry_with_partitions(
+    chain_id: u64,
+    stream_id: &str,
+    message_seq: u64,
+    partitions: Vec<(BroadcasterBackend, u64, Option<u64>, Option<u8>)>,
+) -> Result<BroadcasterRedisStreamEntry> {
+    let partitions = partitions
+        .into_iter()
+        .map(|(backend, cursor, block_timestamp_ms, hash_seed)| {
+            Ok(BroadcasterUpdatePartition::new(
+                backend,
+                cursor,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                backtest_sync_statuses(backend, cursor, block_timestamp_ms, hash_seed)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let payload = BroadcasterPayload::Update(BroadcasterUpdateMessage::new(partitions)?);
     let envelope = BroadcasterEnvelope::new(stream_id, message_seq, payload);
     BroadcasterRedisStreamEntry::from_envelope(chain_id, &envelope).map_err(Into::into)
 }
@@ -1819,7 +2003,21 @@ fn backtest_sync_statuses(
         BroadcasterBackend::Rfq => "rfq:hashflow",
     };
     let block = block_timestamp_ms
-        .map(|timestamp_ms| backtest_block_ref(block_number, backend, timestamp_ms, hash_seed))
+        .map(|timestamp_ms| {
+            let mut block = backtest_block_ref(block_number, backend, timestamp_ms, hash_seed)?;
+            if backend == BroadcasterBackend::Vm && block_number == VM_BLOCK_NUMBER {
+                block.parent_hash = vec![NATIVE_HASH_SEED; 32].into();
+            } else if backend == BroadcasterBackend::Native && block_number > VM_BLOCK_NUMBER {
+                // The first native child follows the VM fixture; later children follow native.
+                let parent_seed = if block_number == VM_BLOCK_NUMBER + 1 {
+                    VM_HASH_SEED
+                } else {
+                    NATIVE_HASH_SEED
+                };
+                block.parent_hash = vec![parent_seed; 32].into();
+            }
+            Ok::<_, anyhow::Error>(block)
+        })
         .transpose()?;
     Ok(BTreeMap::from([(
         protocol.to_string(),
@@ -1982,6 +2180,7 @@ struct StateHistoryAnalysisReport {
     stale_write_kept: bool,
     duplicate_write_left_updated_at_untouched: bool,
     cross_stream_superseded: bool,
+    older_generation_write_kept: bool,
     source_advanced_without_churn: bool,
     snapshot_seeded_start_boundary: bool,
     head_range_unresolvable: bool,

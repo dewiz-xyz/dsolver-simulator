@@ -80,6 +80,7 @@ CREATE TABLE state_history.block_timestamps (
     block_hash BYTEA NOT NULL,
     parent_hash BYTEA NOT NULL,
     source_stream_id TEXT NOT NULL,
+    source_generation BIGINT NOT NULL,
     source_message_seq BIGINT NOT NULL,
     source_backend TEXT NOT NULL CHECK (source_backend IN ('native', 'vm')),
     source_protocol TEXT NOT NULL,
@@ -127,6 +128,7 @@ CREATE TABLE state_history.ingestion_gaps (
     stream_id TEXT NOT NULL,
     from_message_seq BIGINT NOT NULL,
     to_message_seq BIGINT NOT NULL,
+    prev_persistable_message_seq BIGINT,
     backend_scope TEXT[] NOT NULL,
     from_block_number BIGINT,
     to_block_number BIGINT,
@@ -134,7 +136,16 @@ CREATE TABLE state_history.ingestion_gaps (
     to_timestamp_ms BIGINT,
     reason TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (from_message_seq <= to_message_seq)
+    CHECK (from_message_seq <= to_message_seq),
+    CHECK (
+        prev_persistable_message_seq IS NULL
+        OR prev_persistable_message_seq < from_message_seq
+    ),
+    CONSTRAINT ingestion_gaps_identity UNIQUE NULLS NOT DISTINCT (
+        chain_id, stream_id, from_message_seq, to_message_seq,
+        prev_persistable_message_seq, backend_scope, from_block_number, to_block_number,
+        from_timestamp_ms, to_timestamp_ms, reason
+    )
 );
 
 CREATE INDEX state_history_ingestion_gaps_stream_idx
