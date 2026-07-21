@@ -53,7 +53,7 @@ Run the opt-in local stack and storage harness:
 scripts/verify_state_history.sh --repo .
 ```
 
-The script starts Postgres and MinIO from `docker-compose.state-history.yml`, runs `cargo run -p apps --bin state-history-analysis`, and stops the storage stack when the harness exits. Use `--keep-services` to keep Postgres and MinIO running for manual inspection.
+The script starts Postgres and MinIO from `docker-compose.state-history.yml`, passes their connection settings directly to `state-history-analysis`, and stops the storage stack when the harness exits. It ignores inherited state-history storage and AWS session settings so this local verifier cannot target external storage. Bind and port environment variables remain available for avoiding local conflicts. Use `--keep-services` to keep Postgres and MinIO running for manual inspection.
 
 The harness:
 
@@ -74,7 +74,7 @@ The harness:
 
 The `state-history` crate exposes the reader API for external harnesses:
 
-- `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. When a checkpoint is selected, replay is scoped to the validated Redis stream handoff chain and starts at the first message after the checkpoint's recorded source sequence. RFQ ranges use the checkpoint's RFQ update timestamp, not its wall-clock capture time, as the RFQ replay cursor.
+- `StateHistoryReader::resolve_range` selects the latest complete checkpoint and ordered deltas for a requested block/timestamp range. The checkpoint's RFQ high-water timestamp controls eligibility, while replay starts at the first message after its recorded source sequence. Every later arrival is replayed even if a block or RFQ provider timestamp decreased; the requested end block and timestamp remain upper bounds.
 - `StateHistoryReader::resolve_backtest_range` accepts only block bounds and rejects an end block of `u64::MAX`. If RFQ is in scope, the start, end, and end+1 blocks must already exist in `state_history.block_timestamps`, and the end+1 timestamp must be strictly greater than the end timestamp. Missing metadata or a non-increasing next timestamp is a hard error before the reader builds the lower-level history request. Native/VM-only requests skip the timestamp lookup and delegate directly to `resolve_range`.
 - `StateHistoryReader::fetch_checkpoint` fetches and verifies the S3 object for a complete manifest.
 - `HistoryRangePlan::ensure_gap_free` turns recorded gaps, missing checkpoints, generation switches, or unproven ingestion into a hard error for callers that require complete ranges.

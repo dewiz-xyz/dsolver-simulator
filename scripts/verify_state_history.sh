@@ -151,6 +151,10 @@ postgres_bind="${STATE_HISTORY_POSTGRES_BIND:-127.0.0.1}"
 postgres_port="${STATE_HISTORY_POSTGRES_PORT:-55432}"
 minio_bind="${STATE_HISTORY_MINIO_BIND:-127.0.0.1}"
 minio_port="${STATE_HISTORY_MINIO_PORT:-59000}"
+export STATE_HISTORY_POSTGRES_BIND="$postgres_bind"
+export STATE_HISTORY_POSTGRES_PORT="$postgres_port"
+export STATE_HISTORY_MINIO_BIND="$minio_bind"
+export STATE_HISTORY_MINIO_PORT="$minio_port"
 
 cleanup() {
   if [[ "$keep_services" == "true" ]]; then
@@ -174,17 +178,25 @@ wait_for_tcp "MinIO" "$minio_bind" "$minio_port" 60
 wait_for_compose_health "Postgres" postgres 60
 wait_for_compose_health "MinIO" minio 60
 
-export STATE_HISTORY_DATABASE_URL="${STATE_HISTORY_DATABASE_URL:-postgres://postgres:postgres@${postgres_bind}:${postgres_port}/state_history}"
-export STATE_HISTORY_S3_BUCKET="${STATE_HISTORY_S3_BUCKET:-state-history}"
-export STATE_HISTORY_S3_PREFIX="${STATE_HISTORY_S3_PREFIX:-state-history/local-analysis}"
-export STATE_HISTORY_S3_REGION="${STATE_HISTORY_S3_REGION:-us-east-1}"
-export STATE_HISTORY_S3_ENDPOINT_URL="${STATE_HISTORY_S3_ENDPOINT_URL:-http://${minio_bind}:${minio_port}}"
-export STATE_HISTORY_S3_FORCE_PATH_STYLE="${STATE_HISTORY_S3_FORCE_PATH_STYLE:-true}"
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-state-history}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-state-history-secret}"
-export AWS_REGION="${AWS_REGION:-$STATE_HISTORY_S3_REGION}"
+database_url="postgres://postgres:postgres@${postgres_bind}:${postgres_port}/state_history"
+s3_bucket="state-history"
+s3_prefix="state-history/local-analysis"
+s3_region="us-east-1"
+s3_endpoint_url="http://${minio_bind}:${minio_port}"
 
 (
   cd "$repo"
-  cargo run -p apps --bin state-history-analysis
+  unset STATE_HISTORY_DATABASE_URL STATE_HISTORY_S3_BUCKET STATE_HISTORY_S3_PREFIX
+  unset STATE_HISTORY_S3_REGION STATE_HISTORY_S3_ENDPOINT_URL STATE_HISTORY_S3_FORCE_PATH_STYLE
+  unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+  export AWS_ACCESS_KEY_ID="state-history"
+  export AWS_SECRET_ACCESS_KEY="state-history-secret"
+  export AWS_REGION="$s3_region"
+  cargo run -p apps --bin state-history-analysis -- \
+    --database-url "$database_url" \
+    --s3-bucket "$s3_bucket" \
+    --s3-prefix "$s3_prefix" \
+    --s3-region "$s3_region" \
+    --s3-endpoint-url "$s3_endpoint_url" \
+    --s3-force-path-style
 )
