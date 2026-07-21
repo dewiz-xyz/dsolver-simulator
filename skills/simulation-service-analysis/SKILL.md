@@ -12,7 +12,7 @@ metadata:
 1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
 2. Ensure `.env` exists and contains `TYCHO_API_KEY`, `TYCHO_BROADCASTER_URL`, `BROADCASTER_REDIS_URL`, and `BROADCASTER_REDIS_STREAM_KEY`.
    The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator, while Redis carries deltas after each HTTP snapshot replay boundary.
-   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently need the Bebop and Hashflow credential pairs; Liquorice credentials are only needed after `rfq:liquorice` is added to an active chain profile.
+   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently enable Bebop only; Hashflow and Liquorice remain implemented but are not part of an active chain profile.
    When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:

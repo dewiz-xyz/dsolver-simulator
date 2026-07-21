@@ -1085,7 +1085,7 @@ mod tests {
         assert!(chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:hashflow".to_string()));
+            .contains(&"rfq:bebop".to_string()));
         assert!(!chain
             .chain_profile
             .rfq_protocols
@@ -1401,19 +1401,17 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_broadcaster_config_requires_hashflow_credentials_when_effective() {
-        let message = with_isolated_config_env(None, || {
+    fn load_broadcaster_config_does_not_require_unconfigured_hashflow_credentials() {
+        let config = with_isolated_config_env(None, || {
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
             std::env::set_var("BEBOP_USER", "bebop-user");
             std::env::set_var("BEBOP_KEY", "bebop-key");
-            match std::panic::catch_unwind(load_broadcaster_config) {
-                Ok(_) => unreachable!("broadcaster config should require Hashflow credentials"),
-                Err(panic) => panic_message(panic),
-            }
+            load_broadcaster_config()
         });
 
-        assert!(message.contains("HASHFLOW_USER"));
+        assert!(config.hashflow_user.is_empty());
+        assert!(config.hashflow_key.is_empty());
     }
 
     #[test]
@@ -1434,14 +1432,12 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_broadcaster_config_carries_rfq_provider_config() {
+    fn load_broadcaster_config_carries_enabled_rfq_provider_config() {
         let config = with_isolated_config_env(None, || {
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
             std::env::set_var("BEBOP_USER", "bebop-user");
             std::env::set_var("BEBOP_KEY", "bebop-key");
-            std::env::set_var("HASHFLOW_USER", "hashflow-user");
-            std::env::set_var("HASHFLOW_KEY", "hashflow-key");
             load_broadcaster_config()
         });
 
@@ -1460,8 +1456,8 @@ route_policy = " default "
         );
         assert_eq!(config.bebop_user, "bebop-user");
         assert_eq!(config.bebop_key, "bebop-key");
-        assert_eq!(config.hashflow_user, "hashflow-user");
-        assert_eq!(config.hashflow_key, "hashflow-key");
+        assert!(config.hashflow_user.is_empty());
+        assert!(config.hashflow_key.is_empty());
         assert!(config.liquorice_user.is_empty());
         assert!(config.liquorice_key.is_empty());
     }
