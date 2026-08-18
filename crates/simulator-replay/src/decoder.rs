@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use serde_json::value::RawValue;
 use thiserror::Error;
 use tycho_simulation::{
     evm::{
@@ -28,7 +29,8 @@ use tycho_simulation::{
 };
 
 use simulator_core::broadcaster::{
-    BroadcasterProtocolMessage, BroadcasterSnapshotPartition, BroadcasterUpdateMessage,
+    BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
+    BroadcasterSnapshotPartition, BroadcasterUpdateMessage,
 };
 
 use crate::payload::{live_partition_update, snapshot_partition_update};
@@ -36,10 +38,37 @@ use crate::{DecodedReplay, ReplayBackend};
 
 pub type TokenMap = HashMap<Bytes, Token>;
 
+pub const RETAINED_DELTA_FORMAT_VERSION_V1: i16 = 1;
+pub const RETAINED_TOKEN_QUALITY_V1: u32 = 0;
+
+const RETAINED_NATIVE_PROTOCOLS_V1: &[&str] = &[
+    "aerodrome_slipstreams",
+    "ekubo_v2",
+    "ekubo_v3",
+    "erc4626",
+    "fluid_v1",
+    "pancakeswap_v2",
+    "pancakeswap_v3",
+    "rocketpool",
+    "sushiswap_v2",
+    "uniswap_v2",
+    "uniswap_v3",
+    "uniswap_v4",
+];
+const RETAINED_VM_PROTOCOLS_V1: &[&str] = &["vm:balancer_v2", "vm:curve", "vm:maverick_v2"];
+const RETAINED_RFQ_PROTOCOLS_V1: &[&str] = &["rfq:bebop", "rfq:hashflow", "rfq:liquorice"];
+
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
-    pub min_token_quality: u32,
+    min_token_quality: u32,
     protocols: BTreeMap<ReplayBackend, Vec<String>>,
+    profile: DecoderProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderProfile {
+    Live,
+    RetainedV1,
 }
 
 impl DecoderConfig {
@@ -51,6 +80,7 @@ impl DecoderConfig {
         Self {
             min_token_quality,
             protocols,
+            profile: DecoderProfile::Live,
         }
     }
 
@@ -60,6 +90,42 @@ impl DecoderConfig {
         min_token_quality: u32,
     ) -> Self {
         Self::new(min_token_quality, [(backend, protocols)])
+    }
+
+    pub fn retained_v1() -> Self {
+        Self {
+            min_token_quality: RETAINED_TOKEN_QUALITY_V1,
+            protocols: [
+                (
+                    ReplayBackend::Native,
+                    RETAINED_NATIVE_PROTOCOLS_V1
+                        .iter()
+                        .map(|protocol| (*protocol).to_owned())
+                        .collect(),
+                ),
+                (
+                    ReplayBackend::Vm,
+                    RETAINED_VM_PROTOCOLS_V1
+                        .iter()
+                        .map(|protocol| (*protocol).to_owned())
+                        .collect(),
+                ),
+                (
+                    ReplayBackend::Rfq,
+                    RETAINED_RFQ_PROTOCOLS_V1
+                        .iter()
+                        .map(|protocol| (*protocol).to_owned())
+                        .collect(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            profile: DecoderProfile::RetainedV1,
+        }
+    }
+
+    pub const fn min_token_quality(&self) -> u32 {
+        self.min_token_quality
     }
 
     pub fn protocols(&self, backend: ReplayBackend) -> Option<&[String]> {
@@ -90,6 +156,12 @@ pub enum ReplayDecodeError {
     RawRfqUnsupported,
     #[error("failed to decode broadcaster raw payload: {0}")]
     PayloadDecode(String),
+    #[error("unsupported delta payload format {0}")]
+    UnsupportedDeltaFormat(i16),
+    #[error("delta payload format {0} requires its pinned retained decoder profile")]
+    RetainedDecoderProfileRequired(i16),
+    #[error("stored delta payload is not a broadcaster update")]
+    StoredDeltaIsNotUpdate,
 }
 
 pub struct ReplayDecoder {
@@ -172,6 +244,38 @@ impl ReplayDecoder {
     }
 
     pub async fn decode_delta(
+        &self,
+        payload_format_version: i16,
+        payload: &RawValue,
+        applicable_backends: &[ReplayBackend],
+    ) -> Result<DecodedReplay, ReplayDecodeError> {
+        match payload_format_version {
+            RETAINED_DELTA_FORMAT_VERSION_V1 => {
+                if self.config.profile != DecoderProfile::RetainedV1 {
+                    return Err(ReplayDecodeError::RetainedDecoderProfileRequired(
+                        payload_format_version,
+                    ));
+                }
+                let envelope: BroadcasterEnvelope = serde_json::from_str(payload.get())
+                    .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
+                let BroadcasterPayload::Update(update) = envelope.payload else {
+                    return Err(ReplayDecodeError::StoredDeltaIsNotUpdate);
+                };
+                self.decode_delta_v1(update, applicable_backends).await
+            }
+            other => Err(ReplayDecodeError::UnsupportedDeltaFormat(other)),
+        }
+    }
+
+    pub async fn decode_live_delta(
+        &self,
+        update: BroadcasterUpdateMessage,
+        applicable_backends: &[ReplayBackend],
+    ) -> Result<DecodedReplay, ReplayDecodeError> {
+        self.decode_delta_v1(update, applicable_backends).await
+    }
+
+    async fn decode_delta_v1(
         &self,
         update: BroadcasterUpdateMessage,
         applicable_backends: &[ReplayBackend],
@@ -319,4 +423,107 @@ fn register_vm_decoder(
         other => return Err(ReplayDecodeError::UnknownVmProtocol(other.to_string())),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_v1_profile_is_pinned() {
+        let config = DecoderConfig::retained_v1();
+
+        assert_eq!(config.min_token_quality(), RETAINED_TOKEN_QUALITY_V1);
+        assert_eq!(
+            config.protocols(ReplayBackend::Native),
+            Some(
+                RETAINED_NATIVE_PROTOCOLS_V1
+                    .iter()
+                    .map(|protocol| (*protocol).to_owned())
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
+        assert_eq!(
+            config.protocols(ReplayBackend::Vm),
+            Some(
+                RETAINED_VM_PROTOCOLS_V1
+                    .iter()
+                    .map(|protocol| (*protocol).to_owned())
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
+        assert_eq!(
+            config.protocols(ReplayBackend::Rfq),
+            Some(
+                RETAINED_RFQ_PROTOCOLS_V1
+                    .iter()
+                    .map(|protocol| (*protocol).to_owned())
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_delta_version_one_decodes_the_stored_envelope() -> anyhow::Result<()> {
+        let payload = RawValue::from_string(
+            include_str!("../../simulator-core/tests/fixtures/wire/native_update.json").to_owned(),
+        )?;
+        let decoder = test_decoder();
+
+        let decoded = decoder
+            .decode_delta(RETAINED_DELTA_FORMAT_VERSION_V1, &payload, &[])
+            .await?;
+
+        assert!(!decoded.had_applicable_partition);
+        assert_eq!(decoded.block_number, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_retained_delta_version_fails_closed() -> anyhow::Result<()> {
+        let payload = RawValue::from_string("{}".to_owned())?;
+        let Err(error) = test_decoder().decode_delta(99, &payload, &[]).await else {
+            anyhow::bail!("unknown retained delta formats must fail closed");
+        };
+
+        assert!(matches!(
+            error,
+            ReplayDecodeError::UnsupportedDeltaFormat(99)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_delta_version_one_rejects_a_live_decoder_profile() -> anyhow::Result<()> {
+        let payload = RawValue::from_string(
+            include_str!("../../simulator-core/tests/fixtures/wire/native_update.json").to_owned(),
+        )?;
+        let decoder = ReplayDecoder::with_decoder(
+            DecoderConfig::for_backend(ReplayBackend::Native, Vec::new(), 100),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+        );
+
+        let Err(error) = decoder
+            .decode_delta(RETAINED_DELTA_FORMAT_VERSION_V1, &payload, &[])
+            .await
+        else {
+            anyhow::bail!("format 1 must reject a live decoder profile");
+        };
+
+        assert!(matches!(
+            error,
+            ReplayDecodeError::RetainedDecoderProfileRequired(RETAINED_DELTA_FORMAT_VERSION_V1)
+        ));
+        Ok(())
+    }
+
+    fn test_decoder() -> ReplayDecoder {
+        ReplayDecoder::with_decoder(
+            DecoderConfig::retained_v1(),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+        )
+    }
 }

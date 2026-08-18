@@ -6,7 +6,10 @@ use sqlx::{migrate::Migrator, Connection, Postgres, Transaction};
 
 use crate::{
     BlockTimeObservation, CapturedState, DeltaEntry, GapRecord, StreamPosition, TokenSnapshotRef,
+    DELTA_PAYLOAD_FORMAT_VERSION,
 };
+
+pub const STATE_HISTORY_SCHEMA_VERSION: i32 = 2;
 
 const BLOCK_TIME_UPSERT: &str = r#"
     INSERT INTO state_history.block_times AS bt (chain_id, block_number, timestamp_ms, block_hash,
@@ -60,8 +63,8 @@ impl StateHistoryStore {
             .await
             .context("failed to read state history schema version")?;
         ensure!(
-            version == 1,
-            "unsupported state history schema version {version}; expected 1"
+            version == STATE_HISTORY_SCHEMA_VERSION,
+            "unsupported state history schema version {version}; expected {STATE_HISTORY_SCHEMA_VERSION}"
         );
 
         for table in [
@@ -292,8 +295,9 @@ impl StateHistoryStore {
 
         let inserted_id: Option<i64> = sqlx::query_scalar(
             "INSERT INTO state_history.deltas
-                (chain_id, generation, message_seq, block_number, observed_at_ms, payload, payload_sha256)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (chain_id, generation, message_seq, block_number, observed_at_ms, payload,
+                 payload_sha256, payload_format_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (chain_id, generation, message_seq) DO NOTHING
              RETURNING id",
         )
@@ -304,6 +308,7 @@ impl StateHistoryStore {
         .bind(observed_at_ms)
         .bind(payload)
         .bind(&payload_sha256)
+        .bind(DELTA_PAYLOAD_FORMAT_VERSION)
         .fetch_optional(&mut *conn)
         .await
         .context("failed to insert state history delta")?;
@@ -311,24 +316,15 @@ impl StateHistoryStore {
         let (delta_id, outcome) = if let Some(id) = inserted_id {
             (id, DeltaInsertOutcome::Inserted(id))
         } else {
-            let (id, stored_sha256): (i64, String) = sqlx::query_as(
-                "SELECT id, payload_sha256
-                 FROM state_history.deltas
-                 WHERE chain_id = $1 AND generation = $2 AND message_seq = $3",
+            let id = validate_existing_delta(
+                conn,
+                delta,
+                chain_id,
+                generation,
+                message_seq,
+                &payload_sha256,
             )
-            .bind(chain_id)
-            .bind(generation)
-            .bind(message_seq)
-            .fetch_one(&mut *conn)
-            .await
-            .context("failed to read conflicting state history delta")?;
-            ensure!(
-                stored_sha256 == payload_sha256,
-                "delta content drift at chain_id={}, generation={}, message_seq={}",
-                delta.chain_id(),
-                position.generation,
-                position.message_seq
-            );
+            .await?;
             (id, DeltaInsertOutcome::Duplicate)
         };
 
@@ -678,6 +674,45 @@ pub struct EncodedArchiveInfo {
     pub compressed_bytes: u64,
 }
 
+async fn validate_existing_delta(
+    connection: &mut sqlx::PgConnection,
+    delta: &DeltaEntry,
+    chain_id: i64,
+    generation: i64,
+    message_seq: i64,
+    payload_sha256: &str,
+) -> anyhow::Result<i64> {
+    let (id, stored_sha256, stored_format): (i64, String, i16) = sqlx::query_as(
+        "SELECT id, payload_sha256, payload_format_version
+         FROM state_history.deltas
+         WHERE chain_id = $1 AND generation = $2 AND message_seq = $3",
+    )
+    .bind(chain_id)
+    .bind(generation)
+    .bind(message_seq)
+    .fetch_one(connection)
+    .await
+    .context("failed to read conflicting state history delta")?;
+    let position = delta.position();
+    ensure!(
+        stored_sha256 == payload_sha256,
+        "delta content drift at chain_id={}, generation={}, message_seq={}",
+        delta.chain_id(),
+        position.generation,
+        position.message_seq
+    );
+    ensure!(
+        stored_format == DELTA_PAYLOAD_FORMAT_VERSION,
+        "delta format drift at chain_id={}, generation={}, message_seq={}: stored {}, writer {}",
+        delta.chain_id(),
+        position.generation,
+        position.message_seq,
+        stored_format,
+        DELTA_PAYLOAD_FORMAT_VERSION
+    );
+    Ok(id)
+}
+
 async fn upsert_block_times(
     conn: &mut sqlx::PgConnection,
     chain_id: u64,
@@ -726,18 +761,23 @@ mod tests {
     };
 
     #[test]
-    fn embedded_migration_catalog_matches_schema_version_one() {
+    fn embedded_migration_catalog_keeps_initial_migration_and_adds_schema_version_two() {
         let migrations = STATE_HISTORY_MIGRATOR
             .iter()
             .filter(|migration| migration.migration_type.is_up_migration())
             .collect::<Vec<_>>();
 
-        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.len(), 2);
         assert_eq!(migrations[0].version, 20_260_728_000_100);
         assert_eq!(migrations[0].description, "create state history");
         assert_eq!(
             hex::encode(migrations[0].checksum.as_ref()),
             "7e6f16f9c3faa11685000d13138297e01c39d192d239ac149edf24bfb51826300e6535b6e655398461e03171c6308884"
+        );
+        assert_eq!(migrations[1].version, 20_260_813_000_100);
+        assert_eq!(
+            migrations[1].description,
+            "add delta payload format version"
         );
     }
 

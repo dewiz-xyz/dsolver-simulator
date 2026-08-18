@@ -39,6 +39,7 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterSnapshotSessionResponse,
     BroadcasterTokenDto, BroadcasterTokenLookupResponse, BroadcasterTokenSnapshotResponse,
 };
+use simulator_replay::RETAINED_TOKEN_QUALITY_V1;
 use state_history::{CheckpointKind, StreamPosition};
 use tokio_util::sync::CancellationToken;
 use tycho_simulation::tycho_common::Bytes;
@@ -356,7 +357,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         .token_catalog_store()
         .context("raw cache is missing its token catalog")?;
     let (state_history_config, state_history) =
-        initialize_state_history(&config, capture_tokens).await?;
+        initialize_state_history(&config, capture_tokens, token_min_quality).await?;
     let redis_publisher =
         build_redis_publisher(&config, heartbeat_interval, state_history.as_ref()).await?;
     let raw_upstream_state = BroadcasterUpstreamState::default();
@@ -475,11 +476,13 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
 async fn initialize_state_history(
     config: &BroadcasterConfig,
     tokens: Arc<TokenStore>,
+    token_min_quality: u32,
 ) -> Result<(
     Option<crate::config::StateHistoryConfig>,
     Option<Arc<StateHistoryRuntime>>,
 )> {
     let state_history_config = load_state_history_config();
+    validate_retained_history_decoder_profile(state_history_config.is_some(), token_min_quality)?;
     let state_history = match state_history_config.as_ref() {
         Some(state_history_config) => match build_state_history_runtime(
             state_history_config,
@@ -511,6 +514,19 @@ async fn initialize_state_history(
         None => None,
     };
     Ok((state_history_config, state_history))
+}
+
+fn validate_retained_history_decoder_profile(
+    state_history_enabled: bool,
+    token_min_quality: u32,
+) -> Result<()> {
+    if state_history_enabled {
+        anyhow::ensure!(
+            token_min_quality == RETAINED_TOKEN_QUALITY_V1,
+            "state history delta format 1 requires BROADCASTER_TOKEN_MIN_QUALITY={RETAINED_TOKEN_QUALITY_V1}; got {token_min_quality}"
+        );
+    }
+    Ok(())
 }
 
 fn combine_status_snapshots(
@@ -995,7 +1011,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
-    use super::{raw_configured_backends, rfq_configured_backends, BroadcasterTasks};
+    use super::{
+        raw_configured_backends, rfq_configured_backends,
+        validate_retained_history_decoder_profile, BroadcasterTasks,
+    };
     use crate::config::{BroadcasterConfig, BroadcasterTuning, ChainProfile, MemoryConfig};
 
     #[tokio::test]
@@ -1140,5 +1159,12 @@ mod tests {
         config.enable_rfq_pools = false;
 
         assert_eq!(rfq_configured_backends(&config), None);
+    }
+
+    #[test]
+    fn state_history_format_one_rejects_nonzero_token_quality() {
+        assert!(validate_retained_history_decoder_profile(true, 1).is_err());
+        assert!(validate_retained_history_decoder_profile(true, 0).is_ok());
+        assert!(validate_retained_history_decoder_profile(false, 100).is_ok());
     }
 }

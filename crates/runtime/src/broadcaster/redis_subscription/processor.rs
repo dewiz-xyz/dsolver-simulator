@@ -357,7 +357,7 @@ impl BroadcasterSubscriptionProcessor {
         };
 
         let backend = ReplayBackend::from(self.controls.backend());
-        let decoded = self.decoder.decode_delta(update, &[backend]).await?;
+        let decoded = self.decoder.decode_live_delta(update, &[backend]).await?;
         if !decoded.had_applicable_partition {
             return Ok(());
         }

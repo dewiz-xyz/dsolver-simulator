@@ -48,7 +48,7 @@ async fn run() -> anyhow::Result<String> {
     let start_block = end_block.saturating_sub(arguments.block_count - 1);
 
     let objects = checkpoint_object_store_from_env(bucket).await?;
-    let reader = StateHistoryReader::new(store, objects);
+    let reader = StateHistoryReader::new(store.pool().clone(), objects);
     let plan = reader
         .resolve_backtest_range(&BacktestRequest::new(
             arguments.chain_id,

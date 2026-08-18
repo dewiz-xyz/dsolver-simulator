@@ -4,10 +4,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
+use crate::reader::{decode_zstd_with_limit, ReadLimitError};
 use crate::{Backend, CheckpointKind, EncodedArchiveInfo, StreamPosition};
 
 pub const ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ArchiveCodecError {
+    #[error("unsupported checkpoint archive schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointArchive {
@@ -107,25 +114,56 @@ pub(crate) fn decode_archive_with_info(
         actual_sha256 == expected_sha256,
         "checkpoint archive sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
     );
+    let envelope: DecodedArchiveEnvelope =
+        serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
+    match envelope.schema_version {
+        ARCHIVE_SCHEMA_VERSION => {
+            decode_archive_v1(envelope, archive_json, bytes).map_err(anyhow::Error::from)
+        }
+        other => Err(ArchiveCodecError::UnsupportedSchemaVersion(other).into()),
+    }
+}
+
+pub(crate) fn decode_archive_with_info_and_limit(
+    bytes: &[u8],
+    expected_sha256: &str,
+    max_decoded_bytes: u64,
+) -> Result<DecodedArchive, ReadLimitError> {
+    let archive_json = decode_zstd_with_limit(bytes, max_decoded_bytes, "checkpoint archive")?;
+    let actual_sha256 = hex::encode(Sha256::digest(&archive_json));
+    if actual_sha256 != expected_sha256 {
+        return Err(ReadLimitError::Read(anyhow::anyhow!(
+            "checkpoint archive sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+        )));
+    }
 
     let envelope: DecodedArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
-    ensure!(
-        envelope.schema_version == ARCHIVE_SCHEMA_VERSION,
-        "unsupported checkpoint archive schema version {}; expected {ARCHIVE_SCHEMA_VERSION}",
-        envelope.schema_version
-    );
-    ensure!(
-        envelope.metadata.schema_version == envelope.schema_version,
-        "checkpoint archive metadata schema version {} does not match envelope version {}",
-        envelope.metadata.schema_version,
-        envelope.schema_version
-    );
+    match envelope.schema_version {
+        ARCHIVE_SCHEMA_VERSION => decode_archive_v1(envelope, archive_json, bytes),
+        other => Err(ReadLimitError::Read(
+            ArchiveCodecError::UnsupportedSchemaVersion(other).into(),
+        )),
+    }
+}
+
+fn decode_archive_v1(
+    envelope: DecodedArchiveEnvelope,
+    archive_json: Vec<u8>,
+    compressed: &[u8],
+) -> Result<DecodedArchive, ReadLimitError> {
+    if envelope.metadata.schema_version != envelope.schema_version {
+        return Err(ReadLimitError::Read(anyhow::anyhow!(
+            "checkpoint archive metadata schema version {} does not match envelope version {}",
+            envelope.metadata.schema_version,
+            envelope.schema_version
+        )));
+    }
 
     Ok(DecodedArchive {
         archive_bytes: u64::try_from(archive_json.len())
             .context("checkpoint archive length exceeds u64")?,
-        compressed_bytes: u64::try_from(bytes.len())
+        compressed_bytes: u64::try_from(compressed.len())
             .context("compressed checkpoint archive length exceeds u64")?,
         archive: CheckpointArchive {
             metadata: envelope.metadata,
@@ -211,6 +249,18 @@ impl CheckpointObjectStore {
     }
 
     pub async fn fetch(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.fetch_with_limit(key, u64::MAX)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub async fn fetch_with_limit(
+        &self,
+        key: &str,
+        max_compressed_bytes: u64,
+    ) -> Result<Vec<u8>, ReadLimitError> {
+        use tokio::io::AsyncReadExt;
+
         let output = self
             .client
             .get_object()
@@ -224,18 +274,35 @@ impl CheckpointObjectStore {
                     self.bucket
                 )
             })?;
-        let bytes = output
+        if let Some(content_length) = output.content_length() {
+            let content_length = u64::try_from(content_length)
+                .context("checkpoint object content length is negative")?;
+            if content_length > max_compressed_bytes {
+                return Err(ReadLimitError::CompressedBytesExceeded {
+                    declared: content_length,
+                    limit: max_compressed_bytes,
+                });
+            }
+        }
+        let mut reader = output
             .body
-            .collect()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to read checkpoint object s3://{}/{key}",
-                    self.bucket
-                )
-            })?
-            .into_bytes()
-            .to_vec();
+            .into_async_read()
+            .take(max_compressed_bytes.saturating_add(1));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.with_context(|| {
+            format!(
+                "failed to read checkpoint object s3://{}/{key}",
+                self.bucket
+            )
+        })?;
+        let compressed_bytes =
+            u64::try_from(bytes.len()).context("checkpoint object length exceeds u64")?;
+        if compressed_bytes > max_compressed_bytes {
+            return Err(ReadLimitError::CompressedBytesExceeded {
+                declared: compressed_bytes,
+                limit: max_compressed_bytes,
+            });
+        }
         Ok(bytes)
     }
 }
@@ -255,6 +322,34 @@ mod tests {
         let decoded = decode_archive(&encoded.bytes, &encoded.info.sha256).unwrap();
         assert_eq!(decoded.payloads_json, archive.payloads_json);
         assert!(decode_archive(&encoded.bytes, "deadbeef").is_err());
+    }
+
+    #[expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "the generated unknown-version fixture must stay valid"
+    )]
+    #[test]
+    fn unknown_archive_schema_version_fails_closed() {
+        let archive = CheckpointArchive {
+            metadata: test_metadata(),
+            payloads_json: vec![r#"{"k":1}"#.into()],
+        };
+        let encoded = encode_archive(archive).unwrap();
+        let json = zstd::stream::decode_all(encoded.bytes.as_slice()).unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        envelope["schema_version"] = serde_json::json!(99);
+        envelope["metadata"]["schema_version"] = serde_json::json!(99);
+        let json = serde_json::to_vec(&envelope).unwrap();
+        let sha256 = hex::encode(Sha256::digest(&json));
+        let bytes = zstd::stream::encode_all(json.as_slice(), ZSTD_COMPRESSION_LEVEL).unwrap();
+
+        let error = decode_archive(&bytes, &sha256)
+            .expect_err("unknown checkpoint archive schemas must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported checkpoint archive schema version 99"));
     }
 
     #[test]

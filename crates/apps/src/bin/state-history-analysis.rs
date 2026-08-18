@@ -98,7 +98,7 @@ async fn run() -> anyhow::Result<()> {
 
     let pool = store.pool().clone();
     let reader = StateHistoryReader::new(
-        store,
+        pool.clone(),
         object_store(&bucket, &prefix, &region, &endpoint).await,
     );
 
@@ -114,13 +114,7 @@ async fn run() -> anyhow::Result<()> {
 
     let explicit_request = range_request(100, 115)?;
     let explicit_plan = reader.resolve_range(&explicit_request).await?;
-    let recorded_gap = RangeGap {
-        kind: RangeGapKind::Recorded,
-        generation: Some(2),
-        from_message_seq: Some(8),
-        to_message_seq: Some(10),
-        reason: "queue_overflow".to_owned(),
-    };
+    let recorded_gap = expected_recorded_gap();
     let replay_legs = [
         (position(1, 10), positions(1, 11, 40)),
         (position(2, 1), positions(2, 2, 15)),
@@ -698,6 +692,12 @@ fn assert_failed_boundary(failed_plan: &RangePlan, recorded_gap: RangeGap) -> an
         generation: Some(2),
         from_message_seq: Some(1),
         to_message_seq: Some(15),
+        from_position: Some(position(2, 1)),
+        to_position: Some(position(2, 15)),
+        from_block: None,
+        to_block_inclusive: None,
+        from_observed_at_ms: None,
+        to_observed_at_ms: None,
         reason: "no complete boundary checkpoint at generation 2 message sequence 1".to_owned(),
     };
     assert_plan(
@@ -705,6 +705,22 @@ fn assert_failed_boundary(failed_plan: &RangePlan, recorded_gap: RangeGap) -> an
         &[(position(1, 10), positions(1, 11, 40))],
         &[missing_checkpoint, recorded_gap],
     )
+}
+
+fn expected_recorded_gap() -> RangeGap {
+    RangeGap {
+        kind: RangeGapKind::Recorded,
+        generation: Some(2),
+        from_message_seq: Some(8),
+        to_message_seq: Some(10),
+        from_position: Some(position(2, 8)),
+        to_position: Some(position(2, 10)),
+        from_block: Some(112),
+        to_block_inclusive: Some(113),
+        from_observed_at_ms: Some(block_timestamp_ms(113) - 1),
+        to_observed_at_ms: Some(block_timestamp_ms(114) - 1),
+        reason: "queue_overflow".to_owned(),
+    }
 }
 
 struct SeededCheckpoint {

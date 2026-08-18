@@ -5,6 +5,8 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::BroadcasterTokenDto;
 
+use crate::reader::{decode_zstd_with_limit, ReadLimitError};
+
 pub const TOKEN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
@@ -169,6 +171,24 @@ pub(crate) fn decode_token_snapshot_raw_with_info(
     })
 }
 
+pub(crate) fn decode_token_snapshot_raw_with_info_and_limit(
+    bytes: &[u8],
+    expected_sha256: &str,
+    max_decoded_bytes: u64,
+) -> Result<DecodedRawTokenSnapshot, ReadLimitError> {
+    let snapshot_json =
+        decode_verified_token_snapshot_bytes_with_limit(bytes, expected_sha256, max_decoded_bytes)?;
+    let snapshot: RawTokenSnapshot =
+        serde_json::from_slice(&snapshot_json).context("failed to parse token snapshot")?;
+    validate_schema_version(&snapshot)?;
+
+    Ok(DecodedRawTokenSnapshot {
+        snapshot,
+        token_bytes: u64::try_from(snapshot_json.len())
+            .context("token snapshot length exceeds u64")?,
+    })
+}
+
 fn decode_verified_token_snapshot<T>(bytes: &[u8], expected_sha256: &str) -> anyhow::Result<T>
 where
     T: DeserializeOwned + DecodedTokenSnapshot,
@@ -176,8 +196,7 @@ where
     let snapshot_json = decode_verified_token_snapshot_bytes(bytes, expected_sha256)?;
     let envelope: T =
         serde_json::from_slice(&snapshot_json).context("failed to parse token snapshot")?;
-    validate_schema_version(&envelope)?;
-    Ok(envelope)
+    decode_token_snapshot_version(envelope)
 }
 
 fn decode_verified_token_snapshot_bytes(
@@ -194,19 +213,49 @@ fn decode_verified_token_snapshot_bytes(
         }
         .into());
     }
+    Ok(snapshot_json)
+}
+
+fn decode_verified_token_snapshot_bytes_with_limit(
+    bytes: &[u8],
+    expected_sha256: &str,
+    max_decoded_bytes: u64,
+) -> Result<Vec<u8>, ReadLimitError> {
+    let snapshot_json = decode_zstd_with_limit(bytes, max_decoded_bytes, "token snapshot")?;
+    let actual_sha256 = hex::encode(Sha256::digest(&snapshot_json));
+    if actual_sha256 != expected_sha256 {
+        return Err(ReadLimitError::Read(
+            TokenSnapshotCodecError::Sha256Mismatch {
+                expected: expected_sha256.to_owned(),
+                actual: actual_sha256,
+            }
+            .into(),
+        ));
+    }
 
     Ok(snapshot_json)
 }
 
 fn validate_schema_version<T: DecodedTokenSnapshot>(envelope: &T) -> anyhow::Result<()> {
-    if envelope.schema_version() != TOKEN_SNAPSHOT_SCHEMA_VERSION {
-        return Err(TokenSnapshotCodecError::UnsupportedSchemaVersion {
-            found: envelope.schema_version(),
+    match envelope.schema_version() {
+        TOKEN_SNAPSHOT_SCHEMA_VERSION => Ok(()),
+        found => Err(TokenSnapshotCodecError::UnsupportedSchemaVersion {
+            found,
             expected: TOKEN_SNAPSHOT_SCHEMA_VERSION,
         }
-        .into());
+        .into()),
     }
-    Ok(())
+}
+
+fn decode_token_snapshot_version<T: DecodedTokenSnapshot>(envelope: T) -> anyhow::Result<T> {
+    match envelope.schema_version() {
+        TOKEN_SNAPSHOT_SCHEMA_VERSION => Ok(envelope),
+        found => Err(TokenSnapshotCodecError::UnsupportedSchemaVersion {
+            found,
+            expected: TOKEN_SNAPSHOT_SCHEMA_VERSION,
+        }
+        .into()),
+    }
 }
 
 pub fn token_snapshot_s3_key(prefix: &str, chain_id: u64, sha256: &str) -> String {

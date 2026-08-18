@@ -1,13 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    future::Future,
+    ops::{Deref, DerefMut},
 };
 
 use anyhow::{ensure, Context};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::BroadcasterTokenDto;
-use sqlx::{postgres::PgRow, Postgres, Row, Transaction};
+use sqlx::{
+    pool::PoolConnection, postgres::PgRow, Connection, PgConnection, PgPool, Postgres, Row,
+    Transaction,
+};
 
 use crate::{
     archive::decode_archive_with_info, tokens::decode_token_snapshot_raw_with_info, Backend,
@@ -16,20 +21,67 @@ use crate::{
     TokenSnapshotRef,
 };
 
-pub struct StateHistoryReader {
-    store: StateHistoryStore,
-    objects: CheckpointObjectStore,
+mod checkpoints;
+mod coverage;
+mod limits;
+
+pub use checkpoints::*;
+pub use coverage::*;
+pub use limits::*;
+
+pub trait ReadConnectionProvider: Send + Sync + 'static {
+    type Connection<'a>: Deref<Target = PgConnection> + DerefMut + Send + 'a
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> impl Future<Output = Result<Self::Connection<'_>, sqlx::Error>> + Send;
 }
 
-impl StateHistoryReader {
-    pub fn new(store: StateHistoryStore, objects: CheckpointObjectStore) -> Self {
-        Self { store, objects }
+impl ReadConnectionProvider for PgPool {
+    type Connection<'a> = PoolConnection<Postgres>;
+
+    fn acquire(&self) -> impl Future<Output = Result<Self::Connection<'_>, sqlx::Error>> + Send {
+        PgPool::acquire(self)
+    }
+}
+
+impl ReadConnectionProvider for StateHistoryStore {
+    type Connection<'a> = PoolConnection<Postgres>;
+
+    fn acquire(&self) -> impl Future<Output = Result<Self::Connection<'_>, sqlx::Error>> + Send {
+        self.pool().acquire()
+    }
+}
+
+pub struct StateHistoryReader<P: ReadConnectionProvider = PgPool> {
+    pub(super) connections: P,
+    pub(super) objects: CheckpointObjectStore,
+}
+
+impl<P: ReadConnectionProvider> StateHistoryReader<P> {
+    pub fn new(connections: P, objects: CheckpointObjectStore) -> Self {
+        Self {
+            connections,
+            objects,
+        }
     }
 
     pub async fn resolve_range(&self, request: &RangeRequest) -> anyhow::Result<RangePlan> {
         let rfq_bounds = request.rfq_bounds()?;
-        let mut transaction = self.begin_range_transaction().await?;
-        let plan = resolve_range_in_transaction(&mut transaction, request, rfq_bounds).await?;
+        let mut connection = self
+            .connections
+            .acquire()
+            .await
+            .context("failed to acquire state history read connection")?;
+        let mut transaction = begin_range_transaction(&mut connection).await?;
+        let plan = resolve_range_in_transaction(
+            &mut transaction,
+            request,
+            rfq_bounds,
+            ReadLimits::unbounded(),
+        )
+        .await?
+        .plan;
         transaction
             .commit()
             .await
@@ -50,16 +102,33 @@ impl StateHistoryReader {
         &self,
         request: &BacktestRequest,
     ) -> anyhow::Result<BacktestPlan> {
+        let mut connection = self
+            .connections
+            .acquire()
+            .await
+            .context("failed to acquire state history read connection")?;
+        let mut transaction = begin_range_transaction(&mut connection).await?;
         if !request.includes_rfq() {
-            let range = self.resolve_range(&request.range_request(None)).await?;
+            let range = resolve_range_in_transaction(
+                &mut transaction,
+                &request.range_request(None),
+                None,
+                ReadLimits::unbounded(),
+            )
+            .await?
+            .plan;
             let (start_block_timestamp_ms, end_block_timestamp_ms) =
                 fetch_informational_timestamps(
-                    self.store.pool(),
+                    &mut transaction,
                     request.chain_id,
                     request.start_block,
                     request.end_block,
                 )
                 .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit state history backtest transaction")?;
             return Ok(BacktestPlan {
                 start_block_timestamp_ms,
                 end_block_timestamp_ms,
@@ -69,7 +138,6 @@ impl StateHistoryReader {
         }
 
         let end_plus_one = request.end_block + 1;
-        let mut transaction = self.begin_range_transaction().await?;
         let start = require_block_time(
             fetch_block_time(&mut transaction, request.chain_id, request.start_block).await?,
             RequiredBlockTime::Start {
@@ -99,9 +167,14 @@ impl StateHistoryReader {
 
         let rfq_bounds = (start.timestamp_ms, next.timestamp_ms - 1);
         let range_request = request.range_request(Some(rfq_bounds));
-        let range =
-            resolve_range_in_transaction(&mut transaction, &range_request, Some(rfq_bounds))
-                .await?;
+        let range = resolve_range_in_transaction(
+            &mut transaction,
+            &range_request,
+            Some(rfq_bounds),
+            ReadLimits::unbounded(),
+        )
+        .await?
+        .plan;
         transaction
             .commit()
             .await
@@ -277,20 +350,20 @@ impl StateHistoryReader {
         );
         Ok(decoded.snapshot)
     }
+}
 
-    async fn begin_range_transaction(&self) -> anyhow::Result<Transaction<'_, Postgres>> {
-        let mut transaction = self
-            .store
-            .pool()
-            .begin()
-            .await
-            .context("failed to start state history range transaction")?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
-            .await
-            .context("failed to configure state history range transaction")?;
-        Ok(transaction)
-    }
+async fn begin_range_transaction(
+    connection: &mut PgConnection,
+) -> anyhow::Result<Transaction<'_, Postgres>> {
+    let mut transaction = connection
+        .begin()
+        .await
+        .context("failed to start state history range transaction")?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .context("failed to configure state history range transaction")?;
+    Ok(transaction)
 }
 
 /// A validated block range and backend set for backtest resolution.
@@ -433,6 +506,11 @@ pub struct RangePlan {
     pub gaps: Vec<RangeGap>,
 }
 
+pub(super) struct RangeResolution {
+    pub(super) plan: RangePlan,
+    pub(super) estimated_decoded_bytes: u64,
+}
+
 impl RangePlan {
     pub fn ensure_gap_free(&self) -> Result<(), GapFreeError> {
         if self.gaps.is_empty() {
@@ -459,6 +537,7 @@ pub struct RangeLeg {
 pub struct StoredDelta {
     pub position: StreamPosition,
     pub observed_at_ms: u64,
+    pub payload_format_version: i16,
     /// Exact stored payload. Apply only partitions listed in `applicable_backends`.
     pub raw_payload: Box<RawValue>,
     pub applicable_backends: Vec<DeltaBackendCursor>,
@@ -488,6 +567,12 @@ pub struct RangeGap {
     pub generation: Option<u64>,
     pub from_message_seq: Option<u64>,
     pub to_message_seq: Option<u64>,
+    pub from_position: Option<StreamPosition>,
+    pub to_position: Option<StreamPosition>,
+    pub from_block: Option<u64>,
+    pub to_block_inclusive: Option<u64>,
+    pub from_observed_at_ms: Option<u64>,
+    pub to_observed_at_ms: Option<u64>,
     pub reason: String,
 }
 
@@ -514,8 +599,14 @@ impl std::error::Error for GapFreeError {}
 struct DeltaRow {
     position: StreamPosition,
     observed_at_ms: u64,
+    payload_format_version: i16,
     payload: Box<RawValue>,
     backends: Vec<DeltaBackendCursor>,
+}
+
+struct DeltaFetch {
+    rows: Vec<DeltaRow>,
+    decoded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,8 +630,15 @@ struct EncodedDeltaRow {
     id: i64,
     position: StreamPosition,
     observed_at_ms: u64,
+    payload_format_version: i16,
     payload: Vec<u8>,
     payload_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StoredPayloadError {
+    #[error("unsupported delta payload format {0}")]
+    UnsupportedDeltaFormat(i16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,11 +663,12 @@ enum RequiredBlockTime {
     EndPlusOne { block_number: u64 },
 }
 
-async fn resolve_range_in_transaction(
+pub(super) async fn resolve_range_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     request: &RangeRequest,
     rfq_bounds: Option<(u64, u64)>,
-) -> anyhow::Result<RangePlan> {
+    limits: ReadLimits,
+) -> anyhow::Result<RangeResolution> {
     let Some(anchor) = fetch_anchor(
         &mut *transaction,
         request,
@@ -577,30 +676,115 @@ async fn resolve_range_in_transaction(
     )
     .await?
     else {
-        return Ok(RangePlan {
-            legs: vec![],
-            gaps: vec![RangeGap {
-                kind: RangeGapKind::MissingCheckpoint,
-                generation: None,
-                from_message_seq: None,
-                to_message_seq: None,
-                reason: format!(
-                    "no complete checkpoint at or before block {}",
-                    request.start_block
-                ),
-            }],
+        return Ok(RangeResolution {
+            plan: RangePlan {
+                legs: vec![],
+                gaps: vec![RangeGap {
+                    kind: RangeGapKind::MissingCheckpoint,
+                    generation: None,
+                    from_message_seq: None,
+                    to_message_seq: None,
+                    from_position: None,
+                    to_position: None,
+                    from_block: Some(request.start_block),
+                    to_block_inclusive: Some(request.end_block),
+                    from_observed_at_ms: rfq_bounds.map(|bounds| bounds.0),
+                    to_observed_at_ms: rfq_bounds.map(|bounds| bounds.1),
+                    reason: format!(
+                        "no complete checkpoint at or before block {}",
+                        request.start_block
+                    ),
+                }],
+            },
+            estimated_decoded_bytes: 0,
         });
     };
 
-    let deltas = fetch_deltas(&mut *transaction, request, &anchor, rfq_bounds).await?;
     let boundaries = fetch_boundaries(&mut *transaction, &anchor).await?;
+    let (checkpoint_compressed_bytes, checkpoint_decoded_bytes) =
+        declared_checkpoint_bytes(&mut *transaction, &anchor, &boundaries, request).await?;
+    limits.check_compressed(checkpoint_compressed_bytes)?;
+    limits.check_decoded(checkpoint_decoded_bytes)?;
+    let delta_limits = ReadLimits {
+        max_compressed_bytes: limits
+            .max_compressed_bytes
+            .saturating_sub(checkpoint_compressed_bytes),
+        max_decoded_bytes: limits
+            .max_decoded_bytes
+            .saturating_sub(checkpoint_decoded_bytes),
+    };
+    let delta_fetch = fetch_deltas(
+        &mut *transaction,
+        request,
+        &anchor,
+        rfq_bounds,
+        delta_limits,
+    )
+    .await?;
     let gaps = fetch_gap_rows(&mut *transaction, request, &anchor, rfq_bounds).await?;
-    let (legs, gaps) = build_legs(anchor, deltas, boundaries, gaps, request);
-    Ok(RangePlan { legs, gaps })
+    let (legs, gaps) = build_legs(anchor, delta_fetch.rows, boundaries, gaps, request);
+    Ok(RangeResolution {
+        plan: RangePlan { legs, gaps },
+        estimated_decoded_bytes: checkpoint_decoded_bytes
+            .checked_add(delta_fetch.decoded_bytes)
+            .context("state history decoded byte estimate overflowed")?,
+    })
+}
+
+async fn declared_checkpoint_bytes(
+    connection: &mut PgConnection,
+    anchor: &CheckpointManifest,
+    boundaries: &[ManifestRow],
+    request: &RangeRequest,
+) -> anyhow::Result<(u64, u64)> {
+    let manifests =
+        std::iter::once(anchor).chain(boundaries.iter().map(|row| &row.manifest).filter(
+            |manifest| {
+                manifest.status == CheckpointStatus::Complete
+                    && boundary_fits_request_end(manifest, request)
+                    && request
+                        .backends
+                        .iter()
+                        .all(|backend| manifest.backends.binary_search(backend).is_ok())
+            },
+        ));
+    let mut compressed_bytes = 0_u64;
+    let mut decoded_bytes = 0_u64;
+    let mut token_hashes = BTreeSet::new();
+    for manifest in manifests {
+        compressed_bytes = compressed_bytes
+            .checked_add(
+                manifest
+                    .compressed_bytes
+                    .context("complete checkpoint is missing its compressed byte length")?,
+            )
+            .context("checkpoint compressed byte estimate overflowed")?;
+        decoded_bytes = decoded_bytes
+            .checked_add(
+                manifest
+                    .archive_bytes
+                    .context("complete checkpoint is missing its archive byte length")?,
+            )
+            .context("checkpoint decoded byte estimate overflowed")?;
+        let token_reference = match manifest.token_reference.clone() {
+            Some(reference) => Some(reference),
+            None => checkpoints::token_fallback_in_segment(connection, manifest)
+                .await?
+                .and_then(|checkpoint| checkpoint.token_reference),
+        };
+        if let Some(reference) =
+            token_reference.filter(|reference| token_hashes.insert(reference.sha256.clone()))
+        {
+            decoded_bytes = decoded_bytes
+                .checked_add(reference.token_bytes)
+                .context("token snapshot decoded byte estimate overflowed")?;
+        }
+    }
+    Ok((compressed_bytes, decoded_bytes))
 }
 
 async fn fetch_informational_timestamps(
-    pool: &sqlx::PgPool,
+    connection: &mut PgConnection,
     chain_id: u64,
     start_block: u64,
     end_block: u64,
@@ -616,7 +800,7 @@ async fn fetch_informational_timestamps(
         database_i64(start_block, "backtest start_block")?,
         database_i64(end_block, "backtest end_block")?,
     ])
-    .fetch_all(pool)
+    .fetch_all(connection)
     .await
     .context("failed to select informational backtest block timestamps")?;
 
@@ -806,10 +990,99 @@ async fn fetch_deltas(
     request: &RangeRequest,
     anchor: &CheckpointManifest,
     rfq_bounds: Option<(u64, u64)>,
-) -> anyhow::Result<Vec<DeltaRow>> {
+    limits: ReadLimits,
+) -> anyhow::Result<DeltaFetch> {
+    preflight_delta_payloads(connection, request, anchor, rfq_bounds, limits).await?;
+    let encoded = fetch_encoded_deltas(connection, request, anchor, rfq_bounds).await?;
+    let backend_cursors = fetch_delta_backends(
+        connection,
+        &encoded.iter().map(|row| row.id).collect::<Vec<_>>(),
+    )
+    .await?;
+    let mut decoded_bytes = 0_u64;
+    let mut decoded = Vec::with_capacity(encoded.len());
+    for row in encoded {
+        let remaining = limits.max_decoded_bytes.saturating_sub(decoded_bytes);
+        let (row, row_decoded_bytes) =
+            decode_delta_row_with_limit(row, &backend_cursors, remaining)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(row_decoded_bytes)
+            .context("delta decoded byte total overflowed")?;
+        decoded.push(row);
+    }
+    Ok(DeltaFetch {
+        rows: decoded,
+        decoded_bytes,
+    })
+}
+
+async fn preflight_delta_payloads(
+    connection: &mut PgConnection,
+    request: &RangeRequest,
+    anchor: &CheckpointManifest,
+    rfq_bounds: Option<(u64, u64)>,
+    limits: ReadLimits,
+) -> anyhow::Result<()> {
+    let (compressed_bytes, payload_formats): (i64, Vec<i16>) = sqlx::query_as(
+        "SELECT COALESCE(sum(octet_length(d.payload)), 0)::bigint,
+                COALESCE(
+                    array_agg(DISTINCT d.payload_format_version ORDER BY d.payload_format_version),
+                    ARRAY[]::smallint[]
+                )
+         FROM state_history.deltas d
+         WHERE d.chain_id = $1
+           AND (d.generation, d.message_seq) > ($2, $3)
+           AND EXISTS (
+               SELECT 1
+               FROM state_history.delta_backends matched
+               WHERE matched.delta_id = d.id
+                 AND matched.backend = ANY($4::text[])
+                 AND (
+                     (matched.backend <> 'rfq' AND matched.block_number <= $5)
+                     OR
+                     (matched.backend = 'rfq' AND matched.observed_at_ms <= $6)
+                 )
+           )",
+    )
+    .bind(database_i64(request.chain_id, "range chain_id")?)
+    .bind(database_i64(
+        anchor.position.generation,
+        "anchor generation",
+    )?)
+    .bind(database_i64(
+        anchor.position.message_seq,
+        "anchor message_seq",
+    )?)
+    .bind(database_backends(&request.backends))
+    .bind(database_i64(request.end_block, "range end_block")?)
+    .bind(
+        rfq_bounds
+            .map(|bounds| database_i64(bounds.1, "range RFQ end_ms"))
+            .transpose()?,
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .context("failed to preflight state history delta bytes")?;
+    let compressed_bytes = database_u64(compressed_bytes, "delta compressed byte total")?;
+    limits.check_compressed(compressed_bytes)?;
+    if let Some(format) = payload_formats
+        .into_iter()
+        .find(|format| *format != crate::DELTA_PAYLOAD_FORMAT_VERSION)
+    {
+        return Err(StoredPayloadError::UnsupportedDeltaFormat(format).into());
+    }
+    Ok(())
+}
+
+async fn fetch_encoded_deltas(
+    connection: &mut PgConnection,
+    request: &RangeRequest,
+    anchor: &CheckpointManifest,
+    rfq_bounds: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<EncodedDeltaRow>> {
     let rows = sqlx::query(
         "SELECT d.id, d.generation, d.message_seq, d.observed_at_ms,
-                d.payload, d.payload_sha256
+                d.payload_format_version, d.payload, d.payload_sha256
          FROM state_history.deltas d
          WHERE d.chain_id = $1
            AND (d.generation, d.message_seq) > ($2, $3)
@@ -845,20 +1118,7 @@ async fn fetch_deltas(
     .fetch_all(&mut *connection)
     .await
     .context("failed to select state history range deltas")?;
-
-    let encoded = rows
-        .iter()
-        .map(encoded_delta_from_row)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let backend_cursors = fetch_delta_backends(
-        connection,
-        &encoded.iter().map(|row| row.id).collect::<Vec<_>>(),
-    )
-    .await?;
-    encoded
-        .into_iter()
-        .map(|row| decode_delta_row(row, &backend_cursors))
-        .collect()
+    rows.iter().map(encoded_delta_from_row).collect()
 }
 
 async fn fetch_delta_backends(
@@ -1028,17 +1288,25 @@ fn encoded_delta_from_row(row: &PgRow) -> anyhow::Result<EncodedDeltaRow> {
             message_seq: database_u64(row.try_get("message_seq")?, "delta message_seq")?,
         },
         observed_at_ms: database_u64(row.try_get("observed_at_ms")?, "delta observed_at_ms")?,
+        payload_format_version: row.try_get("payload_format_version")?,
         payload: row.try_get("payload")?,
         payload_sha256: row.try_get("payload_sha256")?,
     })
 }
 
-fn decode_delta_row(
+fn decode_delta_row_with_limit(
     row: EncodedDeltaRow,
     backend_cursors: &BTreeMap<i64, Vec<DeltaBackendCursor>>,
-) -> anyhow::Result<DeltaRow> {
-    let payload_json =
-        zstd::stream::decode_all(row.payload.as_slice()).context("failed to decompress delta")?;
+    max_decoded_bytes: u64,
+) -> anyhow::Result<(DeltaRow, u64)> {
+    let payload_json = match row.payload_format_version {
+        crate::DELTA_PAYLOAD_FORMAT_VERSION => {
+            decode_zstd_with_limit(row.payload.as_slice(), max_decoded_bytes, "delta format 1")?
+        }
+        other => return Err(StoredPayloadError::UnsupportedDeltaFormat(other).into()),
+    };
+    let decoded_bytes =
+        u64::try_from(payload_json.len()).context("delta decoded byte length exceeds u64")?;
     let actual_sha256 = hex::encode(Sha256::digest(&payload_json));
     ensure!(
         actual_sha256 == row.payload_sha256,
@@ -1049,12 +1317,16 @@ fn decode_delta_row(
     let payload_json =
         String::from_utf8(payload_json).context("delta payload is not valid UTF-8")?;
     let payload = RawValue::from_string(payload_json).context("delta payload is not valid JSON")?;
-    Ok(DeltaRow {
-        position: row.position,
-        observed_at_ms: row.observed_at_ms,
-        payload,
-        backends: backend_cursors.get(&row.id).cloned().unwrap_or_default(),
-    })
+    Ok((
+        DeltaRow {
+            position: row.position,
+            observed_at_ms: row.observed_at_ms,
+            payload_format_version: row.payload_format_version,
+            payload,
+            backends: backend_cursors.get(&row.id).cloned().unwrap_or_default(),
+        },
+        decoded_bytes,
+    ))
 }
 
 fn manifest_from_row(row: &PgRow) -> anyhow::Result<CheckpointManifest> {
@@ -1352,6 +1624,7 @@ fn stored_delta(row: &DeltaRow, request: &RangeRequest) -> StoredDelta {
     StoredDelta {
         position: row.position,
         observed_at_ms: row.observed_at_ms,
+        payload_format_version: row.payload_format_version,
         raw_payload: row.payload.clone(),
         applicable_backends: row
             .backends
@@ -1387,11 +1660,25 @@ fn missing_span(position: StreamPosition, deltas: &[&DeltaRow]) -> PositionSpan 
 }
 
 fn missing_checkpoint_gap(span: PositionSpan) -> RangeGap {
+    let from_position = StreamPosition {
+        generation: span.generation,
+        message_seq: span.from_message_seq,
+    };
+    let to_position = StreamPosition {
+        generation: span.generation,
+        message_seq: span.to_message_seq,
+    };
     RangeGap {
         kind: RangeGapKind::MissingCheckpoint,
         generation: Some(span.generation),
         from_message_seq: Some(span.from_message_seq),
         to_message_seq: Some(span.to_message_seq),
+        from_position: Some(from_position),
+        to_position: Some(to_position),
+        from_block: None,
+        to_block_inclusive: None,
+        from_observed_at_ms: None,
+        to_observed_at_ms: None,
         reason: format!(
             "no complete boundary checkpoint at generation {} message sequence {}",
             span.generation, span.from_message_seq
@@ -1420,6 +1707,18 @@ fn recorded_range_gaps(
             generation: Some(gap.generation),
             from_message_seq: Some(gap.from_message_seq),
             to_message_seq: Some(gap.to_message_seq),
+            from_position: Some(StreamPosition {
+                generation: gap.generation,
+                message_seq: gap.from_message_seq,
+            }),
+            to_position: Some(StreamPosition {
+                generation: gap.generation,
+                message_seq: gap.to_message_seq,
+            }),
+            from_block: gap.from_block_number,
+            to_block_inclusive: gap.to_block_number,
+            from_observed_at_ms: gap.from_observed_at_ms,
+            to_observed_at_ms: gap.to_observed_at_ms,
             reason: gap.reason.clone(),
         })
         .collect()
@@ -1493,6 +1792,18 @@ fn incomplete_tail_gaps(
                 generation: None,
                 from_message_seq: None,
                 to_message_seq: None,
+                from_position: None,
+                to_position: None,
+                from_block: matches!(backend, Backend::Native | Backend::Vm)
+                    .then_some(covered.map_or(request.start_block, |head| head.saturating_add(1))),
+                to_block_inclusive: matches!(backend, Backend::Native | Backend::Vm)
+                    .then_some(request.end_block),
+                from_observed_at_ms: (*backend == Backend::Rfq).then_some(
+                    covered.map_or(request.rfq_start_ms.unwrap_or_default(), |head| {
+                        head.saturating_add(1)
+                    }),
+                ),
+                to_observed_at_ms: (*backend == Backend::Rfq).then_some(requested_end),
                 reason: incomplete_tail_reason(*backend, covered, requested_end),
             })
         })
@@ -1786,6 +2097,12 @@ mod tests {
                 generation: Some(2),
                 from_message_seq: Some(1),
                 to_message_seq: Some(1),
+                from_position: Some(position(2, 1)),
+                to_position: Some(position(2, 1)),
+                from_block: None,
+                to_block_inclusive: None,
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
                 reason: "no complete boundary checkpoint at generation 2 message sequence 1"
                     .to_owned(),
             }]
@@ -1920,6 +2237,12 @@ mod tests {
                 generation: Some(2),
                 from_message_seq: Some(500),
                 to_message_seq: Some(600),
+                from_position: Some(position(2, 500)),
+                to_position: Some(position(2, 600)),
+                from_block: None,
+                to_block_inclusive: None,
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
                 reason: "no complete boundary checkpoint at generation 2 message sequence 500"
                     .to_owned(),
             }]
@@ -1978,6 +2301,12 @@ mod tests {
                 generation: Some(1),
                 from_message_seq: Some(2),
                 to_message_seq: Some(3),
+                from_position: Some(position(1, 2)),
+                to_position: Some(position(1, 3)),
+                from_block: None,
+                to_block_inclusive: None,
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
                 reason: "no complete boundary checkpoint at generation 1 message sequence 2"
                     .to_owned(),
             }]
@@ -2665,6 +2994,12 @@ mod tests {
                 generation: Some(1),
                 from_message_seq: Some(2),
                 to_message_seq: Some(2),
+                from_position: Some(position(1, 2)),
+                to_position: Some(position(1, 2)),
+                from_block: None,
+                to_block_inclusive: None,
+                from_observed_at_ms: None,
+                to_observed_at_ms: None,
                 reason: "no complete boundary checkpoint at generation 1 message sequence 2"
                     .to_owned(),
             }
@@ -2684,6 +3019,12 @@ mod tests {
                     generation: Some(2),
                     from_message_seq: Some(1),
                     to_message_seq: Some(2),
+                    from_position: Some(position(2, 1)),
+                    to_position: Some(position(2, 2)),
+                    from_block: None,
+                    to_block_inclusive: None,
+                    from_observed_at_ms: None,
+                    to_observed_at_ms: None,
                     reason: "missing boundary".to_owned(),
                 },
                 RangeGap {
@@ -2691,6 +3032,12 @@ mod tests {
                     generation: Some(2),
                     from_message_seq: Some(2),
                     to_message_seq: Some(2),
+                    from_position: Some(position(2, 2)),
+                    to_position: Some(position(2, 2)),
+                    from_block: None,
+                    to_block_inclusive: None,
+                    from_observed_at_ms: None,
+                    to_observed_at_ms: None,
                     reason: "write_failed".to_owned(),
                 },
             ],
@@ -3905,6 +4252,7 @@ mod tests {
         DeltaRow {
             position: position(generation, message_seq),
             observed_at_ms: block_number * 1_000,
+            payload_format_version: crate::DELTA_PAYLOAD_FORMAT_VERSION,
             payload: RawValue::from_string(format!(
                 r#"{{"generation":{generation},"message_seq":{message_seq}}}"#
             ))
@@ -3922,6 +4270,7 @@ mod tests {
         DeltaRow {
             position: position(generation, message_seq),
             observed_at_ms,
+            payload_format_version: crate::DELTA_PAYLOAD_FORMAT_VERSION,
             payload: RawValue::from_string(format!(
                 r#"{{"generation":{generation},"message_seq":{message_seq}}}"#
             ))

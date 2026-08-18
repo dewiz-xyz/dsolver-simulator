@@ -4,7 +4,7 @@ use anyhow::{ensure, Context};
 use serde_json::json;
 use state_history::{
     StateHistoryStore, STATE_HISTORY_MIGRATOR, STATE_HISTORY_OBSERVER_ROLE,
-    STATE_HISTORY_WRITER_ROLE,
+    STATE_HISTORY_SCHEMA_VERSION, STATE_HISTORY_WRITER_ROLE,
 };
 
 const DATABASE_URL_ENV: &str = "STATE_HISTORY_MIGRATION_DATABASE_URL";
@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         serde_json::to_string(&json!({
             "event": "state_history_migration_complete",
             "migrationCatalogEntries": migration_count,
-            "schemaVersion": 1,
+            "schemaVersion": STATE_HISTORY_SCHEMA_VERSION,
             "writerRole": STATE_HISTORY_WRITER_ROLE,
             "observerRole": STATE_HISTORY_OBSERVER_ROLE,
         }))?

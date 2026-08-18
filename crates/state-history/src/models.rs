@@ -2,6 +2,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub const DELTA_PAYLOAD_FORMAT_VERSION: i16 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StreamPosition {
     pub generation: u64,
@@ -372,6 +374,10 @@ pub enum ModelError {
     InvalidGapReason(String),
     #[error("backends must not be empty")]
     EmptyBackends,
+    #[error("target blocks must not be empty")]
+    EmptyTargetBlocks,
+    #[error("RFQ target block {0} has no representable next block")]
+    RfqTargetHasNoSuccessor(u64),
     #[error("range start block {start} must not exceed end block {end}")]
     InvalidBlockRange { start: u64, end: u64 },
     #[error("RFQ range start timestamp {start_ms} must not exceed end timestamp {end_ms}")]

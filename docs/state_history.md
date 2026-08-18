@@ -48,7 +48,7 @@ The uncompressed JSON envelope has this shape:
 }
 ```
 
-`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION`. Both constants are currently `1`.
+`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION` and the delta payload format. All three retained formats are currently `1`.
 
 Canonical encoding sorts tokens by address and rejects duplicate addresses. Serde emits deterministic JSON from the fixed envelope and token DTO fields. The writer computes SHA-256 over those uncompressed canonical bytes, then compresses them with Zstandard level 3. The manifest `token_bytes` column records the uncompressed canonical JSON length. `TokenSnapshotCodecError` provides the typed `Sha256Mismatch`, `UnsupportedSchemaVersion`, and `DuplicateTokenAddress` variants.
 
@@ -56,14 +56,14 @@ Token snapshots are content-addressed because an unchanged token catalog can be 
 
 ## PostgreSQL schema
 
-The migration in `crates/state-history/migrations/20260728000100_create_state_history.sql` is the source of truth for this schema.
+The append-only migrations under `crates/state-history/migrations/` are the source of truth for this schema. The initial migration creates schema version 1. `20260813000100_add_delta_payload_format_version.sql` upgrades it to version 2 without rewriting the initial migration.
 
 ### `state_history.schema_meta`
 
 | Column | Meaning |
 | --- | --- |
 | `singleton` | Primary key fixed to `TRUE`, which keeps this table to one schema metadata row. |
-| `version` | State history schema version. The current migration inserts version `1`. |
+| `version` | State history schema version. The current migration catalog requires version `2`. |
 
 ### `state_history.deltas`
 
@@ -79,7 +79,16 @@ One row represents one accepted update. `(chain_id, generation, message_seq)` is
 | `observed_at_ms` | Time the update was observed, in Unix milliseconds. |
 | `payload` | Zstandard-compressed serialized update payload. |
 | `payload_sha256` | SHA-256 digest of the uncompressed serialized payload. |
+| `payload_format_version` | Complete retained delta payload and decoder profile version. Existing and new rows default to version `1`. |
 | `created_at` | Time PostgreSQL inserted the row. |
+
+### Retained payload formats
+
+Checkpoint archives, token snapshots, and deltas dispatch through explicit stored-version matches. Unknown versions fail closed. Delta payload format 1 means the current broadcaster update envelope plus the fixed `DecoderConfig::retained_v1()` profile. That profile registers every protocol implementation a format 1 writer could emit and pins token quality to `0`; it never reads the current simulator manifest.
+
+When state history is enabled, broadcaster startup refuses `BROADCASTER_TOKEN_MIN_QUALITY` values other than `0`. Any JSON-shape, protocol-decoder, or decoder-setting change that changes retained decoding requires a new delta payload format before its writer can be enabled.
+
+Deploy reader support for format `N + 1` before any writer emits `N + 1`. Keep each decoder while matching retained rows or objects exist. This is a stored-data retention rule, not public API backward compatibility.
 
 ### `state_history.delta_backends`
 
@@ -324,11 +333,17 @@ async fn load_range(reader: &StateHistoryReader) -> anyhow::Result<()> {
 }
 ```
 
-Construct the reader with `StateHistoryReader::new(StateHistoryStore, CheckpointObjectStore)`. See `crates/state-history/src/reader.rs` for the complete API and replay plan types.
+Construct the reader with `StateHistoryReader::new(PgPool, CheckpointObjectStore)`. `StateHistoryReader<P>` accepts any service-owned `ReadConnectionProvider`, so the historical service can supply an observer or replica pool without giving the reader a primary fallback. Every range, coverage, target-planning, token-anchor, and checkpoint-pair query uses one repeatable-read, read-only transaction.
+
+`coverage` returns continuous safe block intervals and `visible_through_block` separately. Replica delay only lowers that cutoff; it never becomes a stored gap. Stored gaps retain their complete stream-position, block, and RFQ observation-time bounds. A gap without block or time cursors fails closed from the prior compatible boundary through the next compatible boundary.
+
+`plan_targets` returns observations for every unique target block and, for RFQ, each target's next block. It validates canonical parent/hash lineage across the requested span and reports unsafe lineage intervals separately from stored gaps. `resolve_checkpoint_pairs` returns adjacent complete checkpoints without crossing a boundary, while explicit pairs must resolve to exact, ordered positions in one segment. `select_token_anchor` uses the selected checkpoint's token snapshot or the newest earlier token snapshot after the same segment boundary; it never attaches a token snapshot across a boundary.
+
+Use `ReadLimits` with target planning and the bounded object fetch methods. Planning sums manifest sizes and SQL `octet_length(payload)` before selecting compressed delta bodies. Object fetches reject an oversized manifest or S3 content length before reading the body, and all Zstandard decoders use counted readers capped at the remaining decoded-byte limit.
 
 `state-history-check` is the read-only operational wrapper around this flow. It reads the observer database URL and S3 settings from the state-history environment variables, selects a closed recent Base range, requires `ensure_gap_free()`, and verifies every replay-leg checkpoint and token object. It never runs migrations or writes PostgreSQL or S3. The production image intentionally does not contain this local tool.
 
-When replaying deltas with a Tycho decoder, set its `min_token_quality` to the broadcaster's `BROADCASTER_TOKEN_MIN_QUALITY` value. The broadcaster default is `0`, while Tycho 0.341.8 defaults the decoder floor to `100`. Without matching floors, the decoder refuses mid-stream `new_tokens` below quality `100` even though the checkpoint token snapshot includes tokens admitted by the broadcaster.
+When replaying format 1 deltas, use `DecoderConfig::retained_v1()`. Its token quality is fixed at `0`; do not derive retained decoding from the live manifest or current runtime tuning.
 
 ## Operations
 
@@ -354,7 +369,7 @@ State history is inert when `STATE_HISTORY_ENABLED=false`. When it is disabled, 
 
 Token snapshots add no environment variables. They use the existing state history S3 settings. Stream token admission uses the existing `BROADCASTER_TOKEN_MIN_QUALITY` setting.
 
-`state-history-migrate` is a one-shot task. It requires `STATE_HISTORY_MIGRATION_DATABASE_URL` for the migration master and `STATE_HISTORY_WRITER_PASSWORD` for `state_history_writer`. It runs and verifies the exact embedded SQLx catalog, validates schema version 1, and converges `state_history_writer` plus the passwordless, `rds_iam`-enabled `state_history_observer`. It does not construct an S3 client or write application rows. The migration task must override the broadcaster image entrypoint with `/usr/local/bin/state-history-migrate`.
+`state-history-migrate` is a one-shot task. It requires `STATE_HISTORY_MIGRATION_DATABASE_URL` for the migration master and `STATE_HISTORY_WRITER_PASSWORD` for `state_history_writer`. It runs and verifies the exact embedded SQLx catalog, validates schema version 2, and converges `state_history_writer` plus the passwordless, `rds_iam`-enabled `state_history_observer`. It does not construct an S3 client or write application rows. The migration task must override the broadcaster image entrypoint with `/usr/local/bin/state-history-migrate`.
 
 ### `/status.state_history`
 

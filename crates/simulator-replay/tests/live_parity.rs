@@ -109,7 +109,7 @@ async fn delta_applies_only_listed_backends() -> Result<()> {
             .ok_or_else(|| anyhow!("checkpoint did not decode"))?,
     );
 
-    let decoded_delta = decoder.decode_delta(delta.update, &[]).await?;
+    let decoded_delta = decoder.decode_live_delta(delta.update, &[]).await?;
     assert!(!decoded_delta.had_applicable_partition);
     assert!(decoded_delta.update.is_none());
     assert_eq!(decoded_delta.block_number, 0);
@@ -254,7 +254,7 @@ async fn run_extracted_fixture(
         .map(ReplayBackend::from)
         .collect::<Vec<_>>();
     let decoded_delta = decoder
-        .decode_delta(delta.update, &applicable_backends)
+        .decode_live_delta(delta.update, &applicable_backends)
         .await?;
     let delta_report = world.apply(
         decoded_delta
