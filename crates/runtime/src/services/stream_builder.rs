@@ -4,34 +4,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use futures::StreamExt;
 use simulator_core::broadcaster::BroadcasterBackend;
+use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 use crate::models::tokens::TokenStore;
 use tycho_simulation::{
-    evm::{
-        decoder::TychoStreamDecoder,
-        engine_db::tycho_db::PreCachedDB,
-        protocol::{
-            aerodrome_slipstreams::state::AerodromeSlipstreamsState,
-            ekubo::state::EkuboState,
-            ekubo_v3::state::EkuboV3State,
-            erc4626::state::ERC4626State,
-            filters::{balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter},
-            fluid::FluidV1,
-            pancakeswap_v2::state::PancakeswapV2State,
-            rocketpool::state::RocketpoolState,
-            uniswap_v2::state::UniswapV2State,
-            uniswap_v3::state::UniswapV3State,
-            uniswap_v4::hooks::hook_handler_creator::initialize_hook_handlers,
-            uniswap_v4::state::UniswapV4State,
-            vm::state::EVMPoolState,
-        },
-    },
     protocol::models::Update,
     rfq::{
         protocols::{
@@ -105,29 +87,11 @@ pub async fn build_broadcaster_subscription_decoder(
     tokens: Arc<TokenStore>,
     backend: BroadcasterBackend,
     protocols: &[String],
-) -> Result<Arc<TychoStreamDecoder<BlockHeader>>> {
-    let mut decoder = TychoStreamDecoder::new();
-    decoder.skip_state_decode_failures(true);
-
-    match backend {
-        BroadcasterBackend::Native => {
-            for protocol in protocols {
-                register_native_decoder(&mut decoder, protocol)?;
-            }
-        }
-        BroadcasterBackend::Vm => {
-            for protocol in protocols {
-                register_vm_decoder(&mut decoder, protocol)?;
-            }
-        }
-        BroadcasterBackend::Rfq => {}
-    }
-
-    initialize_hook_handlers().map_err(|error| {
-        anyhow::anyhow!("failed to initialize Uniswap v4 hook handlers: {error:?}")
-    })?;
-    decoder.set_tokens(tokens.snapshot().await).await;
-    Ok(Arc::new(decoder))
+) -> Result<Arc<ReplayDecoder>> {
+    let config = DecoderConfig::for_backend(ReplayBackend::from(backend), protocols.to_vec(), 0);
+    Ok(Arc::new(
+        ReplayDecoder::new(config, tokens.snapshot().await).await?,
+    ))
 }
 
 #[derive(Clone)]
@@ -270,49 +234,6 @@ fn merge_missing_tokens(tokens: &mut HashMap<Bytes, Token>, extra: HashMap<Bytes
     }
 }
 
-fn register_native_decoder(
-    decoder: &mut TychoStreamDecoder<BlockHeader>,
-    protocol: &str,
-) -> Result<()> {
-    match protocol {
-        "uniswap_v2" | "sushiswap_v2" => decoder.register_decoder::<UniswapV2State>(protocol),
-        "pancakeswap_v2" => decoder.register_decoder::<PancakeswapV2State>(protocol),
-        "uniswap_v3" | "pancakeswap_v3" => decoder.register_decoder::<UniswapV3State>(protocol),
-        "uniswap_v4" => decoder.register_decoder::<UniswapV4State>(protocol),
-        "ekubo_v2" => decoder.register_decoder::<EkuboState>(protocol),
-        "fluid_v1" => {
-            decoder.register_decoder::<FluidV1>(protocol);
-            decoder.register_filter(protocol, fluid_v1_paused_pools_filter);
-        }
-        "rocketpool" => decoder.register_decoder::<RocketpoolState>(protocol),
-        "ekubo_v3" => decoder.register_decoder::<EkuboV3State>(protocol),
-        "aerodrome_slipstreams" => decoder.register_decoder::<AerodromeSlipstreamsState>(protocol),
-        "erc4626" => {
-            decoder.register_decoder::<ERC4626State>(protocol);
-            decoder.register_filter(protocol, erc4626_filter);
-        }
-        other => bail!("Unknown native protocol in chain profile: {}", other),
-    }
-    Ok(())
-}
-
-fn register_vm_decoder(
-    decoder: &mut TychoStreamDecoder<BlockHeader>,
-    protocol: &str,
-) -> Result<()> {
-    match protocol {
-        "vm:balancer_v2" => {
-            decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol);
-            decoder.register_filter(protocol, balancer_v2_pool_filter);
-        }
-        "vm:curve" | "vm:maverick_v2" => {
-            decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol);
-        }
-        other => bail!("Unknown VM protocol in chain profile: {}", other),
-    }
-    Ok(())
-}
-
 fn raw_base_builder(
     tycho_url: &str,
     api_key: &str,
@@ -357,17 +278,12 @@ mod tests {
         time::Duration,
     };
 
-    use super::{
-        merge_missing_tokens, register_native_decoder, register_vm_decoder, rfq_decoder_tokens,
-    };
+    use super::{merge_missing_tokens, rfq_decoder_tokens};
     use crate::config::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
-    use tycho_simulation::{
-        evm::decoder::TychoStreamDecoder,
-        tycho_client::feed::BlockHeader,
-        tycho_common::{
-            models::{token::Token, Chain},
-            Bytes,
-        },
+    use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
+    use tycho_simulation::tycho_common::{
+        models::{token::Token, Chain},
+        Bytes,
     };
 
     use crate::models::tokens::TokenStore;
@@ -426,44 +342,46 @@ mod tests {
         assert!(!super::rfq_protocol_enabled(&protocols, "rfq:other"));
     }
 
-    #[test]
-    fn manifest_native_protocols_all_register_successfully() {
+    #[tokio::test]
+    async fn manifest_native_protocols_all_register_successfully() {
         let (ethereum_native_protocols, _) = chain_protocols(1);
         let (base_native_protocols, _) = chain_protocols(8453);
-
-        for protocol in ethereum_native_protocols
+        let protocols = ethereum_native_protocols
             .iter()
             .chain(base_native_protocols.iter())
-            .map(String::as_str)
+            .cloned()
             .collect::<BTreeSet<_>>()
-        {
-            let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
-            let result = register_native_decoder(&mut decoder, protocol);
-            assert!(
-                result.is_ok(),
-                "expected native protocol {protocol} to register"
-            );
-        }
+            .into_iter()
+            .collect();
+
+        let result = ReplayDecoder::new(
+            DecoderConfig::for_backend(ReplayBackend::Native, protocols, 0),
+            HashMap::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected all native protocols to register");
     }
 
-    #[test]
-    fn manifest_vm_protocols_all_register_successfully() {
+    #[tokio::test]
+    async fn manifest_vm_protocols_all_register_successfully() {
         let (_, ethereum_vm_protocols) = chain_protocols(1);
         let (_, base_vm_protocols) = chain_protocols(8453);
-
-        for protocol in ethereum_vm_protocols
+        let protocols = ethereum_vm_protocols
             .iter()
             .chain(base_vm_protocols.iter())
-            .map(String::as_str)
+            .cloned()
             .collect::<BTreeSet<_>>()
-        {
-            let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
-            let result = register_vm_decoder(&mut decoder, protocol);
-            assert!(
-                result.is_ok(),
-                "expected VM protocol {protocol} to register"
-            );
-        }
+            .into_iter()
+            .collect();
+
+        let result = ReplayDecoder::new(
+            DecoderConfig::for_backend(ReplayBackend::Vm, protocols, 0),
+            HashMap::new(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected all VM protocols to register");
     }
 
     #[test]

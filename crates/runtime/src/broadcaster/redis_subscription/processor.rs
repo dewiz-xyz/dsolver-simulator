@@ -1,23 +1,21 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use simulator_replay::{ReplayBackend, ReplayDecoder};
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
 use tracing::{info, warn};
-use tycho_simulation::{
-    evm::decoder::TychoStreamDecoder,
-    evm::engine_db::SHARED_TYCHO_DB,
-    protocol::models::{ProtocolComponent, Update},
-    tycho_client::feed::{BlockHeader, FeedMessage},
-    tycho_common::simulation::protocol_sim::ProtocolSim,
-};
+use tycho_simulation::evm::engine_db::SHARED_TYCHO_DB;
+
+#[cfg(test)]
+use simulator_replay::DecoderConfig;
+#[cfg(test)]
+use tycho_simulation::{evm::decoder::TychoStreamDecoder, tycho_client::feed::BlockHeader};
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterProtocolMessage, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterSubscriptionTracker,
-    BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotPartition,
+    BroadcasterSnapshotStart, BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
 };
 
 use crate::broadcaster::redis_publisher::current_time_ms;
@@ -47,7 +45,7 @@ pub(super) struct PreparedRedisProcessor {
 pub(super) struct BroadcasterSubscriptionProcessor {
     expected_chain_id: u64,
     pub(super) controls: BroadcasterSubscriptionControls,
-    decoder: Arc<TychoStreamDecoder<BlockHeader>>,
+    decoder: Arc<ReplayDecoder>,
     tracker: BroadcasterSubscriptionTracker,
     raw_snapshot: RawSnapshotReassembly,
     bootstrap_block: Option<u64>,
@@ -62,12 +60,16 @@ impl BroadcasterSubscriptionProcessor {
         controls: BroadcasterSubscriptionControls,
         rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
-        let mut processor = Self::with_decoder(
-            expected_chain_id,
-            controls,
-            Arc::new(TychoStreamDecoder::new()),
-            rebuild,
+        let decoder = ReplayDecoder::with_decoder(
+            DecoderConfig::for_backend(
+                ReplayBackend::from(controls.backend()),
+                controls.protocols().to_vec(),
+                0,
+            ),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
         );
+        let mut processor =
+            Self::with_decoder(expected_chain_id, controls, Arc::new(decoder), rebuild);
         processor.set_bootstrap_redis_replay_boundary(default_test_redis_replay_boundary());
         processor
     }
@@ -75,7 +77,7 @@ impl BroadcasterSubscriptionProcessor {
     pub(super) fn with_decoder(
         expected_chain_id: u64,
         controls: BroadcasterSubscriptionControls,
-        decoder: Arc<TychoStreamDecoder<BlockHeader>>,
+        decoder: Arc<ReplayDecoder>,
         rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
         Self {
@@ -308,8 +310,10 @@ impl BroadcasterSubscriptionProcessor {
             ));
         }
 
-        let update = snapshot_partition_update(partition);
-        self.controls.state_store().apply_update(update).await;
+        let decoded = self.decoder.decode_snapshot_partition(partition).await?;
+        if let Some(update) = decoded.update {
+            self.controls.state_store().apply_update(update).await;
+        }
         Ok(())
     }
 
@@ -330,7 +334,14 @@ impl BroadcasterSubscriptionProcessor {
 
     async fn apply_reassembled_snapshot_messages(&mut self) -> Result<()> {
         let messages = self.raw_snapshot.take_messages();
-        self.apply_protocol_messages(messages).await
+        if let Some(update) = self
+            .decoder
+            .decode_snapshot_messages(ReplayBackend::from(self.controls.backend()), messages)
+            .await?
+        {
+            self.controls.state_store().apply_update(update).await;
+        }
+        Ok(())
     }
 
     async fn apply_live_update(
@@ -345,50 +356,21 @@ impl BroadcasterSubscriptionProcessor {
             _ => None,
         };
 
-        let mut combined: Option<Update> = None;
-        let mut block_number: Option<u64> = None;
-        let mut complete_native_block: Option<u64> = None;
-        for partition in update
-            .partitions
-            .into_iter()
-            .filter(|partition| partition.backend == self.controls.backend())
-        {
-            if let Some(complete_block) = partition.complete_native_block() {
-                complete_native_block = Some(
-                    complete_native_block
-                        .unwrap_or_default()
-                        .max(complete_block),
-                );
-            }
-            block_number = Some(block_number.unwrap_or_default().max(partition.block_number));
-            let decoded = if partition.messages.is_empty() {
-                Some(live_partition_update(partition))
-            } else {
-                self.ensure_raw_messages_supported()?;
-                self.decode_protocol_messages(partition.messages).await?
-            };
-            if let Some(decoded) = decoded {
-                combined = Some(match combined {
-                    Some(current) => current.merge(decoded),
-                    None => decoded,
-                });
-            }
-        }
-
-        let Some(block_number) = block_number else {
+        let backend = ReplayBackend::from(self.controls.backend());
+        let decoded = self.decoder.decode_delta(update, &[backend]).await?;
+        if !decoded.had_applicable_partition {
             return Ok(());
-        };
-        if let Some(mut combined) = combined {
-            combined.block_number_or_timestamp = block_number;
+        }
+        if let Some(update) = decoded.update {
             match state_version {
                 Some(state_version) => {
                     self.controls
                         .state_store()
-                        .apply_update_at_version(combined, state_version)
+                        .apply_update_at_version(update, state_version)
                         .await?;
                 }
                 None => {
-                    self.controls.state_store().apply_update(combined).await;
+                    self.controls.state_store().apply_update(update).await;
                 }
             }
         }
@@ -396,11 +378,11 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterBackend::Rfq => {
                 self.controls
                     .stream_health()
-                    .record_update(block_number)
+                    .record_update(decoded.block_number)
                     .await;
             }
             BroadcasterBackend::Native => {
-                if let Some(complete_block) = complete_native_block {
+                if let Some(complete_block) = decoded.complete_native_block {
                     self.controls
                         .stream_health()
                         .record_progress(complete_block)
@@ -410,50 +392,11 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterBackend::Vm => {
                 self.controls
                     .stream_health()
-                    .record_progress(block_number)
+                    .record_progress(decoded.block_number)
                     .await;
             }
         }
         Ok(())
-    }
-
-    async fn apply_protocol_messages(
-        &self,
-        messages: Vec<BroadcasterProtocolMessage>,
-    ) -> Result<()> {
-        if let Some(update) = self.decode_protocol_messages(messages).await? {
-            self.controls.state_store().apply_update(update).await;
-        }
-        Ok(())
-    }
-
-    async fn decode_protocol_messages(
-        &self,
-        messages: Vec<BroadcasterProtocolMessage>,
-    ) -> Result<Option<Update>> {
-        let mut combined: Option<Update> = None;
-        for raw in messages {
-            if !self.controls.protocols().contains(&raw.protocol) {
-                continue;
-            }
-            let mut state_msgs = HashMap::new();
-            state_msgs.insert(raw.protocol.clone(), raw.message);
-            let mut sync_states = HashMap::new();
-            sync_states.insert(raw.protocol, raw.sync_state);
-            let feed = FeedMessage {
-                state_msgs,
-                sync_states,
-            };
-            let update =
-                self.decoder.decode(&feed).await.map_err(|error| {
-                    anyhow!("failed to decode broadcaster raw payload: {error}")
-                })?;
-            combined = Some(match combined {
-                Some(current) => current.merge(update),
-                None => update,
-            });
-        }
-        Ok(combined)
     }
 
     fn apply_heartbeat(&self, _head: BroadcasterBackendHead) {}
@@ -588,38 +531,4 @@ async fn begin_or_continue_rfq_rebuild(
     let guard = controls.simulation_rebuild_gate.clone().write_owned().await;
 
     SubscriptionRebuildState { guard }
-}
-
-fn snapshot_partition_update(partition: BroadcasterSnapshotPartition) -> Update {
-    let mut states = HashMap::new();
-    let mut new_pairs = HashMap::new();
-
-    for entry in partition.states {
-        states.insert(entry.component_id.clone(), entry.state);
-        new_pairs.insert(entry.component_id, entry.component);
-    }
-
-    Update::new(partition.block_number, states, new_pairs)
-}
-
-fn live_partition_update(partition: BroadcasterUpdatePartition) -> Update {
-    let block_number = partition.block_number;
-    let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
-    let mut new_pairs: HashMap<String, ProtocolComponent> = HashMap::new();
-    let mut removed_pairs = HashMap::new();
-
-    for entry in partition.new_pairs {
-        states.insert(entry.component_id.clone(), entry.state);
-        new_pairs.insert(entry.component_id, entry.component);
-    }
-
-    for delta in partition.updated_states {
-        states.insert(delta.component_id, delta.state);
-    }
-
-    for removed in partition.removed_pairs {
-        removed_pairs.insert(removed.component_id, removed.component);
-    }
-
-    Update::new(block_number, states, new_pairs).set_removed_pairs(removed_pairs)
 }

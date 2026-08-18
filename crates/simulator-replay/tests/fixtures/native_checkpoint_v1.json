@@ -1,0 +1,78 @@
+{
+  "chainId": 8453,
+  "tokens": [
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "symbol": "TOKEN_A",
+      "decimals": 6,
+      "tax": 0,
+      "gas": [50000],
+      "chainId": 8453,
+      "quality": 100
+    },
+    {
+      "address": "0x2222222222222222222222222222222222222222",
+      "symbol": "TOKEN_B",
+      "decimals": 6,
+      "tax": 0,
+      "gas": [50000],
+      "chainId": 8453,
+      "quality": 100
+    }
+  ],
+  "partition": {
+    "backend": "native",
+    "blockNumber": 100,
+    "states": [
+      {
+        "componentId": "native:uniswap-v2:fixture",
+        "component": {
+          "address": "0x",
+          "id": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "tokens": [
+            {
+              "address": "0x1111111111111111111111111111111111111111",
+              "symbol": "TOKEN_A",
+              "decimals": 6,
+              "tax": 0,
+              "gas": [50000],
+              "chain": "base",
+              "quality": 100
+            },
+            {
+              "address": "0x2222222222222222222222222222222222222222",
+              "symbol": "TOKEN_B",
+              "decimals": 6,
+              "tax": 0,
+              "gas": [50000],
+              "chain": "base",
+              "quality": 100
+            }
+          ],
+          "protocol_system": "uniswap_v2",
+          "protocol_type_name": "uniswap_v2_pool",
+          "chain": "base",
+          "contract_ids": [],
+          "static_attributes": {},
+          "creation_tx": "0xa2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+          "created_at": "1970-01-01T00:00:00"
+        },
+        "state": {
+          "protocol": "UniswapV2State",
+          "state": {
+            "reserve0": "0x3b9aca00",
+            "reserve1": "0x77359400"
+          }
+        }
+      }
+    ]
+  },
+  "quote": {
+    "backend": "native",
+    "protocol": "uniswap_v2",
+    "componentId": "native:uniswap-v2:fixture",
+    "tokenIn": "0x1111111111111111111111111111111111111111",
+    "tokenOut": "0x2222222222222222222222222222222222222222",
+    "amountIn": "1000000"
+  }
+}

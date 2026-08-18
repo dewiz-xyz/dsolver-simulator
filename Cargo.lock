@@ -5957,7 +5957,9 @@ dependencies = [
  "rustls 0.23.39",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "simulator-core",
+ "simulator-replay",
  "state-history",
  "tokio",
  "tokio-stream",
@@ -6591,6 +6593,26 @@ dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
+ "tycho-simulation",
+ "typetag",
+]
+
+[[package]]
+name = "simulator-replay"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives 1.5.7",
+ "anyhow",
+ "chrono",
+ "num-bigint",
+ "num-traits",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "simulator-core",
+ "thiserror 2.0.18",
+ "tokio",
  "tycho-simulation",
  "typetag",
 ]

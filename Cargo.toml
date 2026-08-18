@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/simulator-core",
+    "crates/simulator-replay",
     "crates/broadcaster-replay-client",
     "crates/state-history",
     "crates/historical-quote",

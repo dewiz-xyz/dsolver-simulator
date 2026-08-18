@@ -1,0 +1,24 @@
+{
+  "applicableBackends": ["native"],
+  "update": {
+    "partitions": [
+      {
+        "backend": "native",
+        "blockNumber": 101,
+        "updatedStates": [
+          {
+            "componentId": "native:uniswap-v2:fixture",
+            "backend": "native",
+            "state": {
+              "protocol": "UniswapV2State",
+              "state": {
+                "reserve0": "0x59682f00",
+                "reserve1": "0x9502f900"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

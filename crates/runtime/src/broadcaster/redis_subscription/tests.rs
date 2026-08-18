@@ -6,6 +6,8 @@ use std::time::Duration;
 use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
+use sha2::{Digest, Sha256};
+use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
 use tokio::sync::RwLock;
 use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -13,7 +15,7 @@ use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
     protocol::{
         errors::InvalidSnapshotError,
-        models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        models::{DecoderContext, ProtocolComponent, TryFromWithBlock, Update},
     },
     tycho_client::feed::{
         synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
@@ -49,6 +51,7 @@ use crate::config::MemoryConfig;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
+use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::stream::StreamSupervisorConfig;
 use broadcaster_replay_client::{
     BroadcasterReplayClientError, ReplayBatch, ReplayCheckpoint, ReplayMessage, ReplayPoll,
@@ -60,8 +63,26 @@ use simulator_core::broadcaster::{
     BroadcasterRecoveryManifest, BroadcasterRecoveryStart, BroadcasterRedisReplayBoundary,
     BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
     BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-    BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    BroadcasterStateEntry, BroadcasterTokenDto, BroadcasterUpdateMessage,
+    BroadcasterUpdatePartition,
 };
+
+const NATIVE_CHECKPOINT_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/native_checkpoint_v1.json"
+));
+const NATIVE_DELTA_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/native_delta_v1.json"
+));
+const RFQ_CHECKPOINT_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/rfq_checkpoint_v1.json"
+));
+const RFQ_DELTA_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/rfq_delta_v1.json"
+));
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DummySim(u8);
@@ -313,6 +334,257 @@ impl TestControls {
             protocols: vec!["rfq:hashflow".to_string()],
             simulation_rebuild_gate: Arc::clone(&self.rfq_simulation_rebuild_gate),
         })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveParityCheckpoint {
+    chain_id: u64,
+    tokens: Vec<BroadcasterTokenDto>,
+    partition: BroadcasterSnapshotPartition,
+    quote: LiveParityQuote,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveParityDelta {
+    applicable_backends: Vec<BroadcasterBackend>,
+    update: BroadcasterUpdateMessage,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveParityQuote {
+    backend: BroadcasterBackend,
+    protocol: String,
+    component_id: String,
+    token_in: Bytes,
+    token_out: Bytes,
+    amount_in: String,
+}
+
+struct LiveParityObservation {
+    state_digest: String,
+    amount_out: String,
+    block_number: u64,
+    state_count: usize,
+}
+
+#[tokio::test]
+async fn native_and_bebop_fixtures_characterize_current_live_path() -> Result<()> {
+    let native = run_current_live_fixture(NATIVE_CHECKPOINT_V1, NATIVE_DELTA_V1).await?;
+    assert_eq!(native.block_number, 101);
+    assert_eq!(native.state_count, 1);
+    assert_eq!(native.amount_out, "1660562");
+    assert_eq!(
+        native.state_digest,
+        "2ced602b273a04c50000edb041a94f9df77862c2889cbce5ca76438adf4596e3"
+    );
+
+    let rfq = run_current_live_fixture(RFQ_CHECKPOINT_V1, RFQ_DELTA_V1).await?;
+    assert_eq!(rfq.block_number, 1_710_000_005);
+    assert_eq!(rfq.state_count, 1);
+    assert_eq!(rfq.amount_out, "1995000000");
+    assert_eq!(
+        rfq.state_digest,
+        "e3f5c9f476d43de6e4eb7840644c5beccd90e00c9076334e02a958bee6d3f201"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_apply_anomaly_report_is_characterized() {
+    let controls = TestControls::new();
+    let update = Update::new(
+        102,
+        HashMap::new(),
+        HashMap::from([("missing-state".to_string(), native_component())]),
+    );
+
+    let report = controls.native_state_store.apply_update(update).await;
+
+    assert_eq!(report.block_number, 102);
+    assert_eq!(report.new_pairs_missing_state, 1);
+    assert_eq!(report.total_pairs, 0);
+    assert_eq!(
+        report.anomaly_samples,
+        vec!["new_pairs_missing_state:missing-state"]
+    );
+    assert!(report.has_anomalies());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::panic,
+    reason = "the characterization test verifies current panic containment"
+)]
+async fn live_quote_worker_panic_is_contained() {
+    let result = SimulationExecutor::new()
+        .run(|| panic!("fixture quote panic"))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(SimulationExecutionError::WorkerPanicked(_))
+    ));
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the characterization keeps one complete runtime replay path visible"
+)]
+async fn run_current_live_fixture(
+    checkpoint_json: &str,
+    delta_json: &str,
+) -> Result<LiveParityObservation> {
+    let checkpoint: LiveParityCheckpoint = serde_json::from_str(checkpoint_json)?;
+    let delta: LiveParityDelta = serde_json::from_str(delta_json)?;
+    let chain = Chain::Base;
+    if checkpoint.chain_id != chain.id() {
+        return Err(anyhow!(
+            "fixture chain mismatch: expected {}, got {}",
+            chain.id(),
+            checkpoint.chain_id
+        ));
+    }
+    if checkpoint.partition.backend != checkpoint.quote.backend {
+        return Err(anyhow!("fixture checkpoint backend does not match quote"));
+    }
+    if !delta
+        .applicable_backends
+        .contains(&checkpoint.quote.backend)
+    {
+        return Err(anyhow!("fixture delta does not apply to the quote backend"));
+    }
+
+    let tokens = checkpoint
+        .tokens
+        .into_iter()
+        .map(|token| token.into_token(chain))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let initial_tokens = tokens
+        .into_iter()
+        .map(|token| (token.address.clone(), token))
+        .collect();
+    let token_store = Arc::new(TokenStore::new(
+        initial_tokens,
+        "http://localhost".to_string(),
+        "fixture".to_string(),
+        chain,
+        Duration::from_millis(10),
+    ));
+    let state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let controls = fixture_subscription_controls(
+        checkpoint.quote.backend,
+        checkpoint.quote.protocol.clone(),
+        Arc::clone(&token_store),
+        Arc::clone(&state_store),
+    )?;
+    let mut processor = BroadcasterSubscriptionProcessor::new(chain.id(), controls, None);
+
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            1,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                "fixture-snapshot",
+                chain.id(),
+                vec![checkpoint.quote.backend],
+                1,
+            )?),
+        ))
+        .await?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "fixture-snapshot",
+                0,
+                vec![checkpoint.partition],
+            )?),
+        ))
+        .await?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            3,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("fixture-snapshot")),
+        ))
+        .await?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            4,
+            BroadcasterPayload::Update(delta.update),
+        ))
+        .await?;
+
+    let pin = state_store.pin().await;
+    let (pool_state, component) = pin
+        .pool_by_id(&checkpoint.quote.component_id)
+        .ok_or_else(|| anyhow!("fixture pool was not published"))?;
+    if component.protocol_system != checkpoint.quote.protocol {
+        return Err(anyhow!("fixture protocol was not preserved"));
+    }
+    let token_in = pin
+        .token(&checkpoint.quote.token_in)
+        .ok_or_else(|| anyhow!("fixture input token was not published"))?;
+    let token_out = pin
+        .token(&checkpoint.quote.token_out)
+        .ok_or_else(|| anyhow!("fixture output token was not published"))?;
+    let amount_out = pool_state
+        .get_amount_out(checkpoint.quote.amount_in.parse()?, &token_in, &token_out)?
+        .amount
+        .to_string();
+    let canonical = serde_json::json!({
+        "blockNumber": pin.current_block(),
+        "component": serde_json::to_value(component.as_ref())?,
+        "state": serde_json::to_value(pool_state.as_ref())?,
+        "tokenIn": token_in,
+        "tokenOut": token_out,
+        "totalStates": pin.total_states(),
+    });
+    let state_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&canonical)?));
+
+    Ok(LiveParityObservation {
+        state_digest,
+        amount_out,
+        block_number: pin.current_block(),
+        state_count: pin.total_states(),
+    })
+}
+
+fn fixture_subscription_controls(
+    backend: BroadcasterBackend,
+    protocol: String,
+    tokens: Arc<TokenStore>,
+    state_store: Arc<StateStore>,
+) -> Result<BroadcasterSubscriptionControls> {
+    let broadcaster_subscription = BroadcasterSubscriptionStatus::default();
+    let stream_health = Arc::new(StreamHealth::new());
+    match backend {
+        BroadcasterBackend::Native => Ok(BroadcasterSubscriptionControls::Native(
+            NativeBroadcasterSubscriptionControls {
+                broadcaster_subscription,
+                state_store,
+                stream_health,
+                tokens,
+                protocols: vec![protocol],
+            },
+        )),
+        BroadcasterBackend::Rfq => Ok(BroadcasterSubscriptionControls::Rfq(
+            super::RfqBroadcasterSubscriptionControls {
+                broadcaster_subscription,
+                state_store,
+                stream_health,
+                tokens,
+                protocols: vec![protocol],
+                simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            },
+        )),
+        BroadcasterBackend::Vm => Err(anyhow!("VM is outside the Phase 2 parity fixture set")),
     }
 }
 
@@ -1610,16 +1882,22 @@ fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
     )
 }
 
-fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+fn raw_decoder() -> Arc<ReplayDecoder> {
     let mut decoder = TychoStreamDecoder::new();
     decoder.register_decoder::<DummySim>("vm:curve");
-    Arc::new(decoder)
+    Arc::new(ReplayDecoder::with_decoder(
+        DecoderConfig::for_backend(ReplayBackend::Vm, vec!["vm:curve".to_string()], 0),
+        Arc::new(decoder),
+    ))
 }
 
-fn stateful_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+fn stateful_decoder() -> Arc<ReplayDecoder> {
     let mut decoder = TychoStreamDecoder::new();
     decoder.register_decoder::<StatefulSim>("vm:curve");
-    Arc::new(decoder)
+    Arc::new(ReplayDecoder::with_decoder(
+        DecoderConfig::for_backend(ReplayBackend::Vm, vec!["vm:curve".to_string()], 0),
+        Arc::new(decoder),
+    ))
 }
 
 #[test]

@@ -35,10 +35,12 @@ tycho-execution.workspace = true
 tycho-simulation.workspace = true
 broadcaster_replay_client = { package = "broadcaster-replay-client", path = "../broadcaster-replay-client" }
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
+simulator_replay = { package = "simulator-replay", path = "../simulator-replay" }
 state_history = { package = "state-history", path = "../state-history" }
 
 [dev-dependencies]
 chrono.workspace = true
+sha2.workspace = true
 typetag.workspace = true
 state_history = { package = "state-history", path = "../state-history", features = ["test-util"] }
 

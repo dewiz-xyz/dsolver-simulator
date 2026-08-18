@@ -1,0 +1,56 @@
+{
+  "applicableBackends": ["rfq"],
+  "update": {
+    "partitions": [
+      {
+        "backend": "rfq",
+        "blockNumber": 1710000005,
+        "updatedStates": [
+          {
+            "componentId": "rfq:bebop:WETH-USDC-fixture",
+            "backend": "rfq",
+            "state": {
+              "protocol": "BebopState",
+              "state": {
+                "base_token": {
+                  "address": "0x3333333333333333333333333333333333333333",
+                  "symbol": "WETH",
+                  "decimals": 18,
+                  "tax": 0,
+                  "gas": [50000],
+                  "chain": "base",
+                  "quality": 100
+                },
+                "quote_token": {
+                  "address": "0x4444444444444444444444444444444444444444",
+                  "symbol": "USDC",
+                  "decimals": 6,
+                  "tax": 0,
+                  "gas": [50000],
+                  "chain": "base",
+                  "quality": 100
+                },
+                "price_data": {
+                  "base": [51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51],
+                  "quote": [68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68],
+                  "last_update_ts": 1710000000,
+                  "bids": [1995.0, 10.0],
+                  "asks": [1996.0, 11.0]
+                },
+                "client": {
+                  "chain": "base",
+                  "price_ws": "wss://api.bebop.xyz/pmm/base/v3/pricing?format=protobuf",
+                  "quote_endpoint": "https://api.bebop.xyz/pmm/base/v3/quote",
+                  "tokens": ["0x3333333333333333333333333333333333333333"],
+                  "tvl": 100.0,
+                  "quote_tokens": ["0x4444444444444444444444444444444444444444"],
+                  "quote_timeout": {"secs": 5, "nanos": 0}
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

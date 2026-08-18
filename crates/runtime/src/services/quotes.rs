@@ -9,6 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use num_bigint::BigUint;
 use num_traits::{cast::ToPrimitive, Zero};
 use rayon::prelude::*;
+use simulator_replay::simulate_amount_out;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tycho_simulation::{
@@ -1620,25 +1621,26 @@ impl PoolSimulationRunner {
             };
         }
 
-        let outcome =
-            match self
-                .pool_state
-                .get_amount_out(amount_in.clone(), &self.token_in, &self.token_out)
-            {
-                Ok(result) => {
-                    let Some(gas_used) = result.gas.to_u64() else {
-                        return AmountQuote {
-                            amount_in: amount_in.clone(),
-                            outcome: AmountQuoteOutcome::MissingGas,
-                        };
+        let outcome = match simulate_amount_out(
+            self.pool_state.as_ref(),
+            amount_in.clone(),
+            &self.token_in,
+            &self.token_out,
+        ) {
+            Ok(result) => {
+                let Some(gas_used) = result.gas.to_u64() else {
+                    return AmountQuote {
+                        amount_in: amount_in.clone(),
+                        outcome: AmountQuoteOutcome::MissingGas,
                     };
-                    AmountQuoteOutcome::Quoted {
-                        amount_out: result.amount,
-                        gas_used,
-                    }
+                };
+                AmountQuoteOutcome::Quoted {
+                    amount_out: result.amount,
+                    gas_used,
                 }
-                Err(error) => AmountQuoteOutcome::Error(error.to_string()),
-            };
+            }
+            Err(error) => AmountQuoteOutcome::Error(error.to_string()),
+        };
 
         AmountQuote {
             amount_in: amount_in.clone(),

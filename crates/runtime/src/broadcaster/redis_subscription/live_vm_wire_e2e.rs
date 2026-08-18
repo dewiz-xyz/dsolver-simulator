@@ -17,11 +17,10 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
     BroadcasterSnapshotPartition, BroadcasterTokenSnapshotResponse, BroadcasterUpdatePartition,
 };
+use simulator_replay::{ReplayBackend, ReplayDecoder};
 use tokio::{sync::RwLock, time::Instant};
 use tycho_simulation::{
-    evm::decoder::TychoStreamDecoder,
     protocol::models::{ProtocolComponent, Update},
-    tycho_client::feed::{BlockHeader, FeedMessage},
     tycho_common::{
         models::{token::Token, Chain},
         simulation::protocol_sim::ProtocolSim,
@@ -287,7 +286,7 @@ async fn require_broadcaster_ready(broadcaster_url: &str) -> Result<()> {
 async fn bootstrap_snapshot(
     replay_client: &BroadcasterReplayClient,
     processor: &mut BroadcasterSubscriptionProcessor,
-    evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+    evidence_decoder: &ReplayDecoder,
     state_store: &StateStore,
 ) -> Result<(
     RequiredProtocolEvidence,
@@ -371,7 +370,7 @@ async fn require_captured_pools_are_present(
 async fn poll_live_redis_until_quotes(
     replay_client: &BroadcasterReplayClient,
     prepared: &mut PreparedBroadcasterRedisSubscription,
-    evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+    evidence_decoder: &ReplayDecoder,
     state_store: &Arc<StateStore>,
 ) -> Result<()> {
     let mut checkpoint =
@@ -605,7 +604,7 @@ impl RequiredProtocolEvidence {
     async fn observe_replay_items(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         items: &[ReplayMessage],
     ) {
         for message in items {
@@ -621,7 +620,7 @@ impl RequiredProtocolEvidence {
     async fn observe_live_envelope(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         envelope: &BroadcasterEnvelope,
     ) -> Result<()> {
         let BroadcasterPayload::Update(update) = &envelope.payload else {
@@ -660,7 +659,7 @@ impl RequiredProtocolEvidence {
     async fn observe_live_partition(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         partition: &BroadcasterUpdatePartition,
     ) -> Result<()> {
         if partition.backend != BroadcasterBackend::Vm {
@@ -694,13 +693,14 @@ impl RequiredProtocolEvidence {
         for component_id in message.message.snapshots.states.keys() {
             self.record_snapshot_material(message.protocol.as_str(), component_id.as_str());
         }
-        self.raw_snapshot.push(message.clone())
+        self.raw_snapshot.push(message.clone())?;
+        Ok(())
     }
 
     async fn observe_raw_live_message(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         message: &BroadcasterProtocolMessage,
     ) -> Result<()> {
         if raw_message_has_live_material(message) {
@@ -725,10 +725,7 @@ impl RequiredProtocolEvidence {
         Ok(())
     }
 
-    async fn decode_snapshot_messages(
-        &mut self,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
-    ) -> Result<()> {
+    async fn decode_snapshot_messages(&mut self, evidence_decoder: &ReplayDecoder) -> Result<()> {
         for message in self.raw_snapshot.take_messages() {
             let update = decode_protocol_message(evidence_decoder, &message)
                 .await
@@ -866,21 +863,14 @@ struct QuoteResult {
 }
 
 async fn decode_protocol_message(
-    decoder: &TychoStreamDecoder<BlockHeader>,
+    decoder: &ReplayDecoder,
     raw: &BroadcasterProtocolMessage,
 ) -> Result<Update> {
-    let mut state_msgs = HashMap::new();
-    state_msgs.insert(raw.protocol.clone(), raw.message.clone());
-    let mut sync_states = HashMap::new();
-    sync_states.insert(raw.protocol.clone(), raw.sync_state.clone());
-    let feed = FeedMessage {
-        state_msgs,
-        sync_states,
-    };
     decoder
-        .decode(&feed)
+        .decode_snapshot_messages(ReplayBackend::Vm, vec![raw.clone()])
         .await
-        .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))
+        .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))?
+        .ok_or_else(|| anyhow!("configured VM message produced no decoded update"))
 }
 
 fn raw_message_has_live_material(message: &BroadcasterProtocolMessage) -> bool {
