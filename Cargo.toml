@@ -5,6 +5,7 @@ members = [
     "crates/broadcaster-replay-client",
     "crates/state-history",
     "crates/historical-quote",
+    "crates/historical-quote-service",
     "crates/runtime",
     "crates/rpc",
     "crates/apps",
@@ -23,8 +24,10 @@ alloy-primitives = "1.5.4"
 alloy-sol-types = "1.5.2"
 anyhow = "1.0"
 aws-config = "1"
+aws-sdk-rds = "1"
 aws-sdk-s3 = "1"
 axum = "0.7"
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.4.0"
 dotenv = "0.15.0"
@@ -43,6 +46,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
+subtle = "2"
 thiserror = "2"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-stream = "0.1.18"

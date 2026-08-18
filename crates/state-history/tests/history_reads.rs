@@ -347,6 +347,17 @@ async fn checkpoint_pairs_are_adjacent_and_never_cross_segments(
     assert_eq!(pairs[2].earlier.position, position(2, 0));
     assert_eq!(pairs[2].target.position, position(2, 10));
 
+    let bounded_pairs = reader
+        .resolve_checkpoint_pairs(
+            &CheckpointPairQuery::new(
+                CHAIN_ID,
+                CheckpointPairSelection::BlockRange(BlockInterval::new(100, 210)?),
+            )
+            .with_max_pairs(1),
+        )
+        .await?;
+    assert_eq!(bounded_pairs.len(), 2);
+
     let error = reader
         .resolve_checkpoint_pairs(&CheckpointPairQuery::new(
             CHAIN_ID,

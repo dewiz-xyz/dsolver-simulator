@@ -357,7 +357,7 @@ async fn required_block_times(
     Ok((observations, missing))
 }
 
-pub(super) async fn visible_through_block(
+pub(crate) async fn visible_through_block(
     connection: &mut sqlx::PgConnection,
     chain_id: u64,
     backends: &[Backend],

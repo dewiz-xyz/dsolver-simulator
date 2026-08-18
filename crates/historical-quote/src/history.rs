@@ -11,6 +11,8 @@ use crate::HistoricalError;
 pub trait EngineProgress: Send + Sync {
     fn quote_comparison_completed(&self) {}
 
+    fn checkpoint_pair_total(&self, _total: u64) {}
+
     fn checkpoint_pair_completed(&self) {}
 }
 

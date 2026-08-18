@@ -66,6 +66,34 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         }
     }
 
+    /// Returns the latest block that is safe for every requested backend.
+    ///
+    /// This is the bounded cutoff query used by service status. It does not
+    /// calculate retained intervals or load state-history objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replica cannot provide a cutoff for every
+    /// requested backend.
+    pub async fn visible_through_block(
+        &self,
+        chain_id: u64,
+        backends: &[Backend],
+    ) -> anyhow::Result<u64> {
+        let mut connection = self
+            .connections
+            .acquire()
+            .await
+            .context("failed to acquire state history read connection")?;
+        let mut transaction = begin_range_transaction(&mut connection).await?;
+        let cutoff = coverage::visible_through_block(&mut transaction, chain_id, backends).await?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit state history cutoff transaction")?;
+        Ok(cutoff)
+    }
+
     pub async fn resolve_range(&self, request: &RangeRequest) -> anyhow::Result<RangePlan> {
         let rfq_bounds = request.rfq_bounds()?;
         let mut connection = self

@@ -30,6 +30,7 @@ pub struct ConsistencyChecker<S> {
     source: Arc<S>,
     read_limits: ReadLimits,
     max_differences: usize,
+    max_pairs: usize,
 }
 
 impl<S> ConsistencyChecker<S> {
@@ -38,6 +39,21 @@ impl<S> ConsistencyChecker<S> {
             source,
             read_limits,
             max_differences,
+            max_pairs: usize::MAX,
+        }
+    }
+
+    pub fn with_limits(
+        source: Arc<S>,
+        read_limits: ReadLimits,
+        max_differences: usize,
+        max_pairs: usize,
+    ) -> Self {
+        Self {
+            source,
+            read_limits,
+            max_differences,
+            max_pairs,
         }
     }
 
@@ -57,8 +73,14 @@ impl<S: HistorySource> ConsistencyChecker<S> {
         if request.backends.contains(&Backend::Vm) {
             return Err(HistoricalError::UnsupportedCanonicalVm);
         }
-        let query = checkpoint_pair_query(request)?;
+        let query = checkpoint_pair_query(request)?.with_max_pairs(self.max_pairs);
         let pairs = self.source.resolve_checkpoint_pairs(query).await?;
+        if pairs.len() > self.max_pairs {
+            return Err(HistoricalError::CheckBudgetExceeded);
+        }
+        progress.checkpoint_pair_total(
+            u64::try_from(pairs.len()).map_err(|_| HistoricalError::CheckBudgetExceeded)?,
+        );
         if pairs.is_empty() {
             return Ok(empty_report(request));
         }

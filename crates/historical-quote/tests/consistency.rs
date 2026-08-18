@@ -144,6 +144,27 @@ async fn structured_differences_are_bounded_without_losing_total_count(
 }
 
 #[tokio::test]
+async fn resolved_checkpoint_pairs_cannot_exceed_the_worker_limit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let checker = ConsistencyChecker::with_limits(
+        Arc::new(FixtureSource::native_consistency(true)?),
+        ReadLimits::unbounded(),
+        100,
+        0,
+    );
+    let result = checker
+        .execute(
+            &consistency_request(native_pool()),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await;
+
+    assert!(matches!(result, Err(HistoricalError::CheckBudgetExceeded)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn canonical_vm_comparison_is_rejected_and_cancellation_is_observed(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = Arc::new(FixtureSource::native()?);

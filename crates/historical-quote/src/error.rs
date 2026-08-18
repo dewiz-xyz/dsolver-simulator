@@ -16,6 +16,8 @@ pub enum HistoricalError {
     StateReconstructionFailed(String),
     #[error("historical request selector is invalid: {0}")]
     InvalidSelector(String),
+    #[error("historical state consistency check exceeds the checkpoint pair limit")]
+    CheckBudgetExceeded,
     #[error("canonical VM comparison is unsupported")]
     UnsupportedCanonicalVm,
 }

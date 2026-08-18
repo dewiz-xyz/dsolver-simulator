@@ -1,4 +1,5 @@
 use anyhow::{ensure, Context};
+use futures::TryStreamExt;
 use sqlx::Row;
 
 use super::{
@@ -35,6 +36,7 @@ pub struct CheckpointPairQuery {
     pub chain_id: u64,
     pub selection: CheckpointPairSelection,
     pub backends: Vec<Backend>,
+    pub max_pairs: Option<usize>,
 }
 
 impl CheckpointPairQuery {
@@ -43,6 +45,7 @@ impl CheckpointPairQuery {
             chain_id,
             selection,
             backends: Vec::new(),
+            max_pairs: None,
         }
     }
 
@@ -57,7 +60,14 @@ impl CheckpointPairQuery {
             chain_id,
             selection,
             backends,
+            max_pairs: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_max_pairs(mut self, max_pairs: usize) -> Self {
+        self.max_pairs = Some(max_pairs);
+        self
     }
 }
 
@@ -131,8 +141,14 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         let mut transaction = begin_range_transaction(&mut connection).await?;
         let pairs = match &query.selection {
             CheckpointPairSelection::BlockRange(bounds) => {
-                range_checkpoint_pairs(&mut transaction, query.chain_id, *bounds, &query.backends)
-                    .await?
+                range_checkpoint_pairs(
+                    &mut transaction,
+                    query.chain_id,
+                    *bounds,
+                    &query.backends,
+                    query.max_pairs,
+                )
+                .await?
             }
             CheckpointPairSelection::Explicit(selections) => {
                 explicit_checkpoint_pairs(
@@ -140,6 +156,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
                     query.chain_id,
                     selections,
                     &query.backends,
+                    query.max_pairs,
                 )
                 .await?
             }
@@ -509,8 +526,9 @@ async fn range_checkpoint_pairs(
     chain_id: u64,
     bounds: BlockInterval,
     backends: &[Backend],
+    max_pairs: Option<usize>,
 ) -> anyhow::Result<Vec<CheckpointPair>> {
-    let rows = sqlx::query(
+    let mut rows = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
                 rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
@@ -526,17 +544,22 @@ async fn range_checkpoint_pairs(
         bounds.end_inclusive,
         "checkpoint pair range end",
     )?)
-    .fetch_all(connection)
-    .await
-    .context("failed to select checkpoint pair range")?;
-    let manifests = rows
-        .iter()
-        .map(manifest_from_row)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    ensure_unique_positions(&manifests)?;
+    .fetch(&mut *connection);
+    let sentinel_limit = max_pairs.and_then(|limit| limit.checked_add(1));
     let mut pairs = Vec::new();
     let mut previous: Option<CheckpointManifest> = None;
-    for manifest in manifests {
+    let mut previous_position = None;
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .context("failed to select checkpoint pair range")?
+    {
+        let manifest = manifest_from_row(&row)?;
+        ensure!(
+            previous_position != Some(manifest.position),
+            "checkpoint position is ambiguous because multiple complete kinds exist"
+        );
+        previous_position = Some(manifest.position);
         if manifest.kind == CheckpointKind::Boundary {
             previous = checkpoint_supports(&manifest, backends).then_some(manifest);
             continue;
@@ -549,6 +572,9 @@ async fn range_checkpoint_pairs(
                 earlier,
                 target: manifest,
             });
+            if sentinel_limit == Some(pairs.len()) {
+                break;
+            }
         }
     }
     Ok(pairs)
@@ -559,9 +585,13 @@ async fn explicit_checkpoint_pairs(
     chain_id: u64,
     selections: &[ExplicitCheckpointPair],
     backends: &[Backend],
+    max_pairs: Option<usize>,
 ) -> anyhow::Result<Vec<CheckpointPair>> {
-    let mut pairs = Vec::with_capacity(selections.len());
-    for selection in selections {
+    let sentinel_limit = max_pairs
+        .and_then(|limit| limit.checked_add(1))
+        .unwrap_or(usize::MAX);
+    let mut pairs = Vec::with_capacity(selections.len().min(sentinel_limit));
+    for selection in selections.iter().take(sentinel_limit) {
         ensure!(
             selection.earlier_position < selection.target_position,
             "explicit checkpoint pair must be ordered"
@@ -664,14 +694,4 @@ async fn segment_boundary_position(
         })
     })
     .transpose()
-}
-
-fn ensure_unique_positions(manifests: &[CheckpointManifest]) -> anyhow::Result<()> {
-    for pair in manifests.windows(2) {
-        ensure!(
-            pair[0].position != pair[1].position,
-            "checkpoint position is ambiguous because multiple complete kinds exist"
-        );
-    }
-    Ok(())
 }

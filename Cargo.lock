@@ -1470,6 +1470,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-rds"
+version = "1.132.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa1e30b6464d7af541056ede9ed0acca3202bbdbb7df8c2983cf6e78ac9ee2dc"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sigv4",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3558,6 +3585,34 @@ dependencies = [
  "tokio-util",
  "tycho-simulation",
  "utoipa 5.5.0",
+ "uuid",
+]
+
+[[package]]
+name = "historical-quote-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-rds",
+ "axum 0.7.9",
+ "bytes",
+ "chrono",
+ "futures 0.3.32",
+ "hex",
+ "historical-quote",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "state-history",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber 0.3.23",
  "uuid",
 ]
 
@@ -6906,6 +6961,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "futures 0.3.32",
  "hex",
  "serde",
  "serde_json",
