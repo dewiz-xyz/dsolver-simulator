@@ -77,6 +77,12 @@ export STATE_HISTORY_S3_REGION="$AWS_REGION"
 export STATE_HISTORY_S3_ENDPOINT_URL="$AWS_ENDPOINT_URL_S3"
 export STATE_HISTORY_S3_FORCE_PATH_STYLE="true"
 
+# The AWS SDK initializes TLS even for the local HTTP endpoint. Some macOS shells expose no native
+# roots, so use the system PEM bundle unless the caller already selected a trust source.
+if [[ "$(uname -s)" == "Darwin" && -z "${SSL_CERT_FILE:-}" && -r /etc/ssl/cert.pem ]]; then
+  export SSL_CERT_FILE="/etc/ssl/cert.pem"
+fi
+
 echo "Starting local state history storage stack..."
 (
   cd "$repo"

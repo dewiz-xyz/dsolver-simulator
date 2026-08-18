@@ -34,9 +34,16 @@ utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 hex.workspace = true
+nix = { version = "0.26.4", features = ["resource"] }
+simulator-core = { path = "../simulator-core" }
 tokio.workspace = true
 zstd.workspace = true
+
+[[bench]]
+name = "replay"
+harness = false
 
 [lints]
 workspace = true

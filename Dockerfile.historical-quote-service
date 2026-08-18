@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+FROM public.ecr.aws/docker/library/rust:1.91.0-bookworm AS builder
+WORKDIR /app
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev clang cmake git && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY . .
+
+# Cargo auto-discovers packages below the workspace root. Exclude the application path that reaches
+# the private execution repository so this service image needs no source credential.
+RUN sed -i \
+        -e '/"crates\/runtime",/d' \
+        -e '/"crates\/rpc",/d' \
+        -e '/"crates\/apps",/d' \
+        -e '/resolver = "2"/a exclude = ["crates/runtime", "crates/rpc", "crates/apps"]' \
+        -e '/^tycho-execution = /d' \
+        Cargo.toml \
+    && cargo build -p historical-quote-service --release
+
+
+FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    ca-certificates openssl && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin appuser
+
+COPY --from=builder /app/target/release/historical-quote-service /usr/local/bin/historical-quote-service
+
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/historical-quote-service"]

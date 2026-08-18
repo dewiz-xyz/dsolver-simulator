@@ -44,6 +44,28 @@ async fn grouped_quotes_are_sorted_and_replay_each_leg_once(
 }
 
 #[tokio::test]
+async fn native_reconstruction_ignores_unrequested_rfq_checkpoint_provenance(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native()?;
+    source.target_plan.legs[0].checkpoint.rfq_observed_at_ms = Some(10_000);
+    let result = executor(Arc::new(source))
+        .execute(
+            &native_quote_request(100, 100),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await?;
+
+    let QuoteOutcome::Ok { provenance, .. } = &result.results[0].start_outcome else {
+        return Err("native start quote must succeed".into());
+    };
+    assert_eq!(provenance.rfq_observation_cursor, None);
+    assert_eq!(provenance.rfq_observed_at, None);
+    assert_eq!(provenance.rfq_observation_age_ms, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn only_target_crossing_gap_is_unavailable() -> Result<(), Box<dyn std::error::Error>> {
     let mut source = FixtureSource::native()?;
     source

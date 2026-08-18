@@ -110,3 +110,9 @@ jobs:
         run: cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
       - name: Build state history migration binary
         run: cargo build -p apps --bin state-history-migrate --release
+      - name: Build historical quote service
+        run: cargo build -p historical-quote-service --release
+      - name: Build dsolver history CLI
+        run: cargo build -p dsolver-history --release
+      - name: Check historical API contract
+        run: cargo test -p historical-quote --test contract checked_in_openapi_matches_rust_types

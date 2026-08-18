@@ -13,8 +13,18 @@ const DEFAULT_MAX_RUNNING_JOBS: usize = 4;
 const DEFAULT_MAX_WAITING_JOBS: usize = 16;
 const DEFAULT_MAX_TERMINAL_JOBS: usize = 20;
 const DEFAULT_TERMINAL_TTL_SECONDS: u64 = 3_600;
+pub const DEFAULT_MAX_COMBINATION_COUNT: u64 = 20_000;
+pub const DEFAULT_MAX_BLOCK_SPAN: u64 = 1_800;
+pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_MAX_TIMEOUT_MS: u64 = 900_000;
+pub const DEFAULT_JOB_DECODED_BYTE_RESERVATION: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_DECODED_BYTE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_CONSISTENCY_PAIRS: usize = 100;
+pub const DEFAULT_MAX_QUOTE_SELECTORS: usize = 20;
+pub const DEFAULT_MAX_AMOUNTS_PER_QUOTE: usize = 20;
+pub const DEFAULT_MAX_STRUCTURED_DIFFERENCES: usize = 100;
 const DEFAULT_DATABASE_PORT: u16 = 5_432;
-const DEFAULT_DATABASE_CONNECTIONS: usize = 4;
+const DEFAULT_DATABASE_CONNECTIONS: usize = 5;
 const DEFAULT_DATABASE_CONNECTION_LIFETIME_SECONDS: u64 = 3_600;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 
@@ -62,8 +72,8 @@ pub struct ObjectStoreConfig {
 impl ServiceConfig {
     /// Loads the strict production configuration from the process environment.
     ///
-    /// Workload sizes are required here because Phase 7 owns their measured
-    /// production values.
+    /// Workload limits default to the checked benchmark envelope. Deployment
+    /// configuration can override them explicitly.
     ///
     /// # Errors
     ///
@@ -88,33 +98,7 @@ impl ServiceConfig {
         }
         let enabled_backends = parse_backends(&required("DSOLVER_HISTORY_ENABLED_BACKENDS")?)?;
         let expected_bearer_digest = parse_digest(&required("DSOLVER_HISTORY_TOKEN_SHA256")?)?;
-        let max_running =
-            parse_optional("DSOLVER_HISTORY_MAX_RUNNING_JOBS", DEFAULT_MAX_RUNNING_JOBS)?;
-        let max_waiting =
-            parse_optional("DSOLVER_HISTORY_MAX_WAITING_JOBS", DEFAULT_MAX_WAITING_JOBS)?;
-        let decoded_byte_budget = parse_required("DSOLVER_HISTORY_DECODED_BYTE_BUDGET")?;
-        let max_terminal_jobs = parse_optional(
-            "DSOLVER_HISTORY_MAX_TERMINAL_JOBS",
-            DEFAULT_MAX_TERMINAL_JOBS,
-        )?;
-        let terminal_ttl_seconds = parse_optional(
-            "DSOLVER_HISTORY_TERMINAL_TTL_SECONDS",
-            DEFAULT_TERMINAL_TTL_SECONDS,
-        )?;
-        let default_timeout_ms = parse_required("DSOLVER_HISTORY_DEFAULT_TIMEOUT_MS")?;
-        let max_timeout_ms = parse_required("DSOLVER_HISTORY_MAX_TIMEOUT_MS")?;
-        if default_timeout_ms > max_timeout_ms {
-            return Err(ConfigError::Invalid(
-                "default timeout must not exceed maximum timeout".to_owned(),
-            ));
-        }
-        let job_decoded_byte_reservation =
-            parse_required("DSOLVER_HISTORY_JOB_DECODED_BYTE_RESERVATION")?;
-        if job_decoded_byte_reservation > decoded_byte_budget {
-            return Err(ConfigError::Invalid(
-                "job decoded-byte reservation must not exceed the global budget".to_owned(),
-            ));
-        }
+        let workload = workload_config()?;
 
         let username = required("DSOLVER_HISTORY_REPLICA_DB_USER")?;
         if username != "state_history_observer" {
@@ -129,24 +113,16 @@ impl ServiceConfig {
             service_revision,
             enabled_backends,
             expected_bearer_digest,
-            scheduler: JobLimits {
-                max_running,
-                max_waiting,
-                decoded_byte_budget,
-                max_terminal_jobs,
-                terminal_ttl: Duration::from_secs(terminal_ttl_seconds),
-            },
-            max_combination_count: parse_required("DSOLVER_HISTORY_MAX_COMBINATION_COUNT")?,
-            max_block_span: parse_required("DSOLVER_HISTORY_MAX_BLOCK_SPAN")?,
-            default_timeout_ms,
-            max_timeout_ms,
-            job_decoded_byte_reservation,
-            max_consistency_pairs: parse_required("DSOLVER_HISTORY_MAX_CONSISTENCY_PAIRS")?,
-            max_quote_selectors: parse_required("DSOLVER_HISTORY_MAX_QUOTE_SELECTORS")?,
-            max_amounts_per_quote: parse_required("DSOLVER_HISTORY_MAX_AMOUNTS_PER_QUOTE")?,
-            max_structured_differences: parse_required(
-                "DSOLVER_HISTORY_MAX_STRUCTURED_DIFFERENCES",
-            )?,
+            scheduler: workload.scheduler,
+            max_combination_count: workload.max_combination_count,
+            max_block_span: workload.max_block_span,
+            default_timeout_ms: workload.default_timeout_ms,
+            max_timeout_ms: workload.max_timeout_ms,
+            job_decoded_byte_reservation: workload.job_decoded_byte_reservation,
+            max_consistency_pairs: workload.max_consistency_pairs,
+            max_quote_selectors: workload.max_quote_selectors,
+            max_amounts_per_quote: workload.max_amounts_per_quote,
+            max_structured_differences: workload.max_structured_differences,
             database: database_config(username)?,
             object_store: object_store_config()?,
             shutdown_timeout: Duration::from_secs(parse_optional(
@@ -207,6 +183,89 @@ impl ServiceConfig {
         }
         Ok(())
     }
+}
+
+struct WorkloadConfig {
+    scheduler: JobLimits,
+    max_combination_count: u64,
+    max_block_span: u64,
+    default_timeout_ms: u64,
+    max_timeout_ms: u64,
+    job_decoded_byte_reservation: u64,
+    max_consistency_pairs: usize,
+    max_quote_selectors: usize,
+    max_amounts_per_quote: usize,
+    max_structured_differences: usize,
+}
+
+fn workload_config() -> Result<WorkloadConfig, ConfigError> {
+    let decoded_byte_budget = parse_optional(
+        "DSOLVER_HISTORY_DECODED_BYTE_BUDGET",
+        DEFAULT_DECODED_BYTE_BUDGET,
+    )?;
+    let default_timeout_ms =
+        parse_optional("DSOLVER_HISTORY_DEFAULT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)?;
+    let max_timeout_ms = parse_optional("DSOLVER_HISTORY_MAX_TIMEOUT_MS", DEFAULT_MAX_TIMEOUT_MS)?;
+    if default_timeout_ms > max_timeout_ms {
+        return Err(ConfigError::Invalid(
+            "default timeout must not exceed maximum timeout".to_owned(),
+        ));
+    }
+    let job_decoded_byte_reservation = parse_optional(
+        "DSOLVER_HISTORY_JOB_DECODED_BYTE_RESERVATION",
+        DEFAULT_JOB_DECODED_BYTE_RESERVATION,
+    )?;
+    if job_decoded_byte_reservation > decoded_byte_budget {
+        return Err(ConfigError::Invalid(
+            "job decoded-byte reservation must not exceed the global budget".to_owned(),
+        ));
+    }
+
+    Ok(WorkloadConfig {
+        scheduler: JobLimits {
+            max_running: parse_optional(
+                "DSOLVER_HISTORY_MAX_RUNNING_JOBS",
+                DEFAULT_MAX_RUNNING_JOBS,
+            )?,
+            max_waiting: parse_optional(
+                "DSOLVER_HISTORY_MAX_WAITING_JOBS",
+                DEFAULT_MAX_WAITING_JOBS,
+            )?,
+            decoded_byte_budget,
+            max_terminal_jobs: parse_optional(
+                "DSOLVER_HISTORY_MAX_TERMINAL_JOBS",
+                DEFAULT_MAX_TERMINAL_JOBS,
+            )?,
+            terminal_ttl: Duration::from_secs(parse_optional(
+                "DSOLVER_HISTORY_TERMINAL_TTL_SECONDS",
+                DEFAULT_TERMINAL_TTL_SECONDS,
+            )?),
+        },
+        max_combination_count: parse_optional(
+            "DSOLVER_HISTORY_MAX_COMBINATION_COUNT",
+            DEFAULT_MAX_COMBINATION_COUNT,
+        )?,
+        max_block_span: parse_optional("DSOLVER_HISTORY_MAX_BLOCK_SPAN", DEFAULT_MAX_BLOCK_SPAN)?,
+        default_timeout_ms,
+        max_timeout_ms,
+        job_decoded_byte_reservation,
+        max_consistency_pairs: parse_optional(
+            "DSOLVER_HISTORY_MAX_CONSISTENCY_PAIRS",
+            DEFAULT_MAX_CONSISTENCY_PAIRS,
+        )?,
+        max_quote_selectors: parse_optional(
+            "DSOLVER_HISTORY_MAX_QUOTE_SELECTORS",
+            DEFAULT_MAX_QUOTE_SELECTORS,
+        )?,
+        max_amounts_per_quote: parse_optional(
+            "DSOLVER_HISTORY_MAX_AMOUNTS_PER_QUOTE",
+            DEFAULT_MAX_AMOUNTS_PER_QUOTE,
+        )?,
+        max_structured_differences: parse_optional(
+            "DSOLVER_HISTORY_MAX_STRUCTURED_DIFFERENCES",
+            DEFAULT_MAX_STRUCTURED_DIFFERENCES,
+        )?,
+    })
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -317,4 +376,30 @@ pub enum ConfigError {
     Malformed(&'static str),
     #[error("configuration is invalid: {0}")]
     Invalid(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_DATABASE_CONNECTIONS, DEFAULT_DECODED_BYTE_BUDGET,
+        DEFAULT_JOB_DECODED_BYTE_RESERVATION, DEFAULT_MAX_AMOUNTS_PER_QUOTE,
+        DEFAULT_MAX_BLOCK_SPAN, DEFAULT_MAX_COMBINATION_COUNT, DEFAULT_MAX_CONSISTENCY_PAIRS,
+        DEFAULT_MAX_QUOTE_SELECTORS, DEFAULT_MAX_STRUCTURED_DIFFERENCES, DEFAULT_MAX_TIMEOUT_MS,
+        DEFAULT_TIMEOUT_MS,
+    };
+
+    #[test]
+    fn measured_workload_defaults_cover_the_release_benchmark_envelope() {
+        assert_eq!(DEFAULT_MAX_COMBINATION_COUNT, 20_000);
+        assert_eq!(DEFAULT_MAX_BLOCK_SPAN, 1_800);
+        assert_eq!(DEFAULT_TIMEOUT_MS, 600_000);
+        assert_eq!(DEFAULT_MAX_TIMEOUT_MS, 900_000);
+        assert_eq!(DEFAULT_JOB_DECODED_BYTE_RESERVATION, 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_DECODED_BYTE_BUDGET, 4 * 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_DATABASE_CONNECTIONS, 5);
+        assert_eq!(DEFAULT_MAX_CONSISTENCY_PAIRS, 100);
+        assert_eq!(DEFAULT_MAX_QUOTE_SELECTORS, 20);
+        assert_eq!(DEFAULT_MAX_AMOUNTS_PER_QUOTE, 20);
+        assert_eq!(DEFAULT_MAX_STRUCTURED_DIFFERENCES, 100);
+    }
 }

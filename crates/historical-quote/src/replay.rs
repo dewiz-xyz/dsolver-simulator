@@ -462,7 +462,17 @@ fn reconstructed_state(
     let block_hash = observation.block_hash.clone().ok_or_else(|| {
         HistoricalError::HistoricalDataInvalid(format!("block {block} has no canonical hash"))
     })?;
-    let (rfq_observed_at, rfq_observation_age_ms) = rfq_provenance(restored, next_block_timestamp)?;
+    let (rfq_observation_cursor, rfq_observed_at, rfq_observation_age_ms) =
+        if request.backends.contains(&Backend::Rfq) {
+            let (observed_at, observation_age_ms) = rfq_provenance(restored, next_block_timestamp)?;
+            (
+                restored.rfq_observation_position.map(public_position),
+                observed_at,
+                observation_age_ms,
+            )
+        } else {
+            (None, None, None)
+        };
     Ok(Ok(ReconstructedState {
         point: restored.world.pin(),
         provenance: StateProvenance {
@@ -470,7 +480,7 @@ fn reconstructed_state(
             final_position: public_position(restored.final_position),
             anchor_checkpoint_position: public_position(restored.anchor_checkpoint_position),
             token_snapshot_digest: restored.token_snapshot_digest.clone(),
-            rfq_observation_cursor: restored.rfq_observation_position.map(public_position),
+            rfq_observation_cursor,
             rfq_observed_at,
             rfq_observation_age_ms,
         },

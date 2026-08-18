@@ -90,6 +90,26 @@ async fn byte_budget_preserves_fifo_head_blocking_and_one_based_positions() {
     run_task.await.expect("runner task must stop");
 }
 
+#[tokio::test]
+async fn job_one_byte_above_global_budget_is_rejected_before_execution() {
+    let registry = JobRegistry::new(JobLimits {
+        decoded_byte_budget: 100,
+        ..JobLimits::default()
+    });
+    let outcome = registry
+        .submit(ScheduledJob::new(
+            JobRequest::HistoricalQuote(quote_request(Uuid::new_v4(), 60_000)),
+            101,
+        ))
+        .await;
+
+    assert!(matches!(outcome, SubmitOutcome::ServiceUnavailable));
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.counts.queued, 0);
+    assert_eq!(snapshot.counts.running, 0);
+    assert_eq!(snapshot.reserved_decoded_bytes, 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn retained_request_id_reuses_same_content_and_conflicts_on_change() {
     let registry = JobRegistry::new(JobLimits::default());

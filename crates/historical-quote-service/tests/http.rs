@@ -21,7 +21,12 @@ use historical_quote::EngineProgress;
 use historical_quote_service::app::{
     router, AppState, CoverageResolver, ServiceDependencyError, StatusDependencies, StatusProbe,
 };
-use historical_quote_service::config::{ObjectStoreConfig, ReplicaDatabaseConfig, ServiceConfig};
+use historical_quote_service::config::{
+    ObjectStoreConfig, ReplicaDatabaseConfig, ServiceConfig, DEFAULT_DECODED_BYTE_BUDGET,
+    DEFAULT_JOB_DECODED_BYTE_RESERVATION, DEFAULT_MAX_AMOUNTS_PER_QUOTE, DEFAULT_MAX_BLOCK_SPAN,
+    DEFAULT_MAX_COMBINATION_COUNT, DEFAULT_MAX_CONSISTENCY_PAIRS, DEFAULT_MAX_QUOTE_SELECTORS,
+    DEFAULT_MAX_STRUCTURED_DIFFERENCES, DEFAULT_MAX_TIMEOUT_MS, DEFAULT_TIMEOUT_MS,
+};
 use historical_quote_service::jobs::{
     ExecutionContext, JobExecutionError, JobExecutor, JobLimits, JobRegistry, JobRequest, JobRunner,
 };
@@ -115,7 +120,9 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
     let request_id = Uuid::new_v4();
     let mut body = serde_json::to_value(quote_request(request_id, 60_000))
         .expect("quote request must serialize");
-    body["blocks"]["endInclusive"] = serde_json::json!(200);
+    body["blocks"]["endInclusive"] = serde_json::json!(1_900);
+    body["lags"] = serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    body["amountsIn"] = serde_json::json!(["1", "2"]);
     let response = send(
         &app,
         request("POST", "/jobs/quote", Some(&body), true, false),
@@ -124,7 +131,11 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let error = json_body(response).await;
     assert_eq!(error["code"], "comparison_budget_exceeded");
-    assert_eq!(error["details"]["startBlockCount"], 101);
+    assert_eq!(error["details"]["startBlockCount"], 1_801);
+    assert_eq!(error["details"]["lagCount"], 10);
+    assert_eq!(error["details"]["inputAmountCount"], 2);
+    assert_eq!(error["details"]["combinationCount"], 36_020);
+    assert_eq!(error["details"]["maxCombinationCount"], 20_000);
     assert!(error.get("stack").is_none());
 
     let malformed = send(
@@ -143,6 +154,33 @@ async fn admission_errors_use_safe_shapes_and_budget_details() {
         json_body(malformed).await["message"],
         "request body is invalid"
     );
+    registry.begin_shutdown().await;
+}
+
+#[tokio::test]
+async fn span_and_deadline_limits_fail_at_admission() {
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor));
+    let mut over_span = serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_TIMEOUT_MS))
+        .expect("quote request must serialize");
+    over_span["blocks"]["endInclusive"] = serde_json::json!(1_901);
+    let response = send(
+        &app,
+        request("POST", "/jobs/quote", Some(&over_span), true, false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["details"]["field"], "blocks");
+
+    let over_deadline =
+        serde_json::to_value(quote_request(Uuid::new_v4(), DEFAULT_MAX_TIMEOUT_MS + 1))
+            .expect("quote request must serialize");
+    let response = send(
+        &app,
+        request("POST", "/jobs/quote", Some(&over_deadline), true, false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["details"]["field"], "timeoutMs");
     registry.begin_shutdown().await;
 }
 
@@ -278,6 +316,14 @@ async fn protected_status_and_coverage_return_bounded_safe_data() {
     assert_eq!(status["apiRevision"], 1);
     assert_eq!(status["visibleThroughBlock"], 123);
     assert_eq!(status["limits"]["maxRunningJobs"], 4);
+    assert_eq!(status["limits"]["maxCombinationCount"], 20_000);
+    assert_eq!(status["limits"]["maxBlockSpan"], 1_800);
+    assert_eq!(status["limits"]["defaultTimeoutMs"], 600_000);
+    assert_eq!(status["limits"]["maxTimeoutMs"], 900_000);
+    assert_eq!(
+        status["limits"]["decodedByteBudget"],
+        4_u64 * 1024 * 1024 * 1024
+    );
     assert!(status.get("databaseHost").is_none());
 
     let coverage_request = serde_json::json!({
@@ -299,7 +345,7 @@ fn test_app<E>(executor: Arc<E>) -> (axum::Router, JobRegistry)
 where
     E: JobExecutor,
 {
-    test_app_with_limits(executor, JobLimits::default())
+    test_app_with_limits(executor, test_job_limits())
 }
 
 fn test_app_with_limits<E>(executor: Arc<E>, limits: JobLimits) -> (axum::Router, JobRegistry)
@@ -327,16 +373,16 @@ fn test_config() -> ServiceConfig {
         service_revision: "test-revision".to_owned(),
         enabled_backends: vec![Backend::Native, Backend::Rfq],
         expected_bearer_digest: Sha256::digest(TOKEN.as_bytes()).into(),
-        scheduler: JobLimits::default(),
-        max_combination_count: 100,
-        max_block_span: 10_000,
-        default_timeout_ms: 60_000,
-        max_timeout_ms: 300_000,
-        job_decoded_byte_reservation: 1,
-        max_consistency_pairs: 10,
-        max_quote_selectors: 10,
-        max_amounts_per_quote: 10,
-        max_structured_differences: 100,
+        scheduler: test_job_limits(),
+        max_combination_count: DEFAULT_MAX_COMBINATION_COUNT,
+        max_block_span: DEFAULT_MAX_BLOCK_SPAN,
+        default_timeout_ms: DEFAULT_TIMEOUT_MS,
+        max_timeout_ms: DEFAULT_MAX_TIMEOUT_MS,
+        job_decoded_byte_reservation: DEFAULT_JOB_DECODED_BYTE_RESERVATION,
+        max_consistency_pairs: DEFAULT_MAX_CONSISTENCY_PAIRS,
+        max_quote_selectors: DEFAULT_MAX_QUOTE_SELECTORS,
+        max_amounts_per_quote: DEFAULT_MAX_AMOUNTS_PER_QUOTE,
+        max_structured_differences: DEFAULT_MAX_STRUCTURED_DIFFERENCES,
         database: ReplicaDatabaseConfig {
             host: "replica.invalid".to_owned(),
             port: 5_432,
@@ -353,6 +399,16 @@ fn test_config() -> ServiceConfig {
             force_path_style: false,
         },
         shutdown_timeout: Duration::from_secs(1),
+    }
+}
+
+fn test_job_limits() -> JobLimits {
+    JobLimits {
+        max_running: 4,
+        max_waiting: 16,
+        decoded_byte_budget: DEFAULT_DECODED_BYTE_BUDGET,
+        max_terminal_jobs: 20,
+        terminal_ttl: Duration::from_secs(3_600),
     }
 }
 
