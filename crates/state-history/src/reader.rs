@@ -669,7 +669,7 @@ pub(super) async fn resolve_range_in_transaction(
     rfq_bounds: Option<(u64, u64)>,
     limits: ReadLimits,
 ) -> anyhow::Result<RangeResolution> {
-    let Some(anchor) = fetch_anchor(
+    let Some(mut anchor) = fetch_anchor(
         &mut *transaction,
         request,
         rfq_bounds.map(|bounds| bounds.0),
@@ -699,6 +699,17 @@ pub(super) async fn resolve_range_in_transaction(
             estimated_decoded_bytes: 0,
         });
     };
+
+    let needs_token_snapshot = request
+        .backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
+    if needs_token_snapshot && anchor.token_reference.is_none() {
+        if let Some(fallback) = checkpoints::token_fallback_in_segment(transaction, &anchor).await?
+        {
+            anchor = fallback;
+        }
+    }
 
     let boundaries = fetch_boundaries(&mut *transaction, &anchor).await?;
     let (checkpoint_compressed_bytes, checkpoint_decoded_bytes) =
@@ -3064,7 +3075,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    async fn resolved_plan_surfaces_optional_token_references(pool: PgPool) -> anyhow::Result<()> {
+    async fn resolved_plan_uses_same_segment_token_fallback(pool: PgPool) -> anyhow::Result<()> {
         configure_test_aws();
         let token_reference = TokenSnapshotRef {
             s3_key: "reader/chain=8453/tokens/token-sha256.zst".to_owned(),
@@ -3106,7 +3117,7 @@ mod tests {
         assert_eq!(referenced_plan.legs.len(), 1);
         assert_eq!(
             referenced_plan.legs[0].checkpoint.token_reference,
-            Some(token_reference)
+            Some(token_reference.clone())
         );
         assert!(referenced_plan.gaps.is_empty());
         referenced_plan.ensure_gap_free()?;
@@ -3115,7 +3126,7 @@ mod tests {
             1,
             2,
             101,
-            CheckpointKind::Boundary,
+            CheckpointKind::Interval,
             r#"{"state":"unreferenced"}"#,
         )?;
         let mut connection = pool.acquire().await?;
@@ -3133,13 +3144,21 @@ mod tests {
         )
         .await?;
         drop(connection);
+        persist_delta(&pool, database_delta(1, 2, 101, false)?).await?;
 
         let unreferenced_plan = reader
             .resolve_range(&RangeRequest::new(8453, 101, 101, vec![Backend::Native])?)
             .await?;
 
         assert_eq!(unreferenced_plan.legs.len(), 1);
-        assert_eq!(unreferenced_plan.legs[0].checkpoint.token_reference, None);
+        assert_eq!(
+            unreferenced_plan.legs[0].checkpoint.position,
+            referenced_capture.position()
+        );
+        assert_eq!(
+            unreferenced_plan.legs[0].checkpoint.token_reference,
+            Some(token_reference)
+        );
         assert!(unreferenced_plan.gaps.is_empty());
         unreferenced_plan.ensure_gap_free()?;
         Ok(())

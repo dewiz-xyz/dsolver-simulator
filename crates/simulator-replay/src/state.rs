@@ -123,7 +123,11 @@ impl StatePoint {
         backends: &[ReplayBackend],
     ) -> Result<CanonicalState, CanonicalStateError> {
         let selected = backends.iter().copied().collect::<BTreeSet<_>>();
+        if selected.contains(&ReplayBackend::Vm) {
+            return Err(CanonicalStateError::UnsupportedBackend(ReplayBackend::Vm));
+        }
         let mut pools = Vec::new();
+        let mut components = Vec::new();
         let mut token_addresses = BTreeSet::new();
         let mut backend_counts = BTreeMap::new();
 
@@ -136,11 +140,19 @@ impl StatePoint {
                 for token in &component.tokens {
                     token_addresses.insert(token.address.clone());
                 }
+                let component_value = canonicalize_json(serde_json::to_value(component.as_ref())?);
+                let state_value = canonicalize_json(serde_json::to_value(state.as_ref())?);
+                components.push(CanonicalComponentState {
+                    backend,
+                    component_id: component_id.clone(),
+                    component_bytes: serde_json::to_vec(&component_value)?,
+                    state_bytes: serde_json::to_vec(&state_value)?,
+                });
                 pools.push(CanonicalPool {
                     backend,
                     component_id: component_id.clone(),
-                    component: serde_json::to_value(component.as_ref())?,
-                    state: serde_json::to_value(state.as_ref())?,
+                    component: component_value,
+                    state: state_value,
                 });
                 *backend_counts.entry(backend).or_insert(0) += 1;
             }
@@ -150,20 +162,35 @@ impl StatePoint {
                 .cmp(&(right.backend, right.component_id.as_str()))
         });
 
-        let tokens = token_addresses
+        let token_values = token_addresses
             .into_iter()
             .filter_map(|address| self.state.tokens.get(&address))
-            .map(serde_json::to_value)
+            .map(|token| serde_json::to_value(token).map(canonicalize_json))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tokens = token_values
+            .iter()
+            .map(|value| {
+                Ok::<_, serde_json::Error>(CanonicalTokenState {
+                    address: value
+                        .get("address")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    token_bytes: serde_json::to_vec(value)?,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let bytes = serde_json::to_vec(&CanonicalDocument {
             block_number: self.state.block_number,
             pools,
-            tokens,
+            tokens: token_values,
         })?;
         Ok(CanonicalState {
             bytes,
             component_count: backend_counts.values().sum(),
             backend_counts,
+            components,
+            tokens,
         })
     }
 
@@ -268,6 +295,10 @@ impl ReplayWorld {
             state: Arc::clone(&self.state),
         }
     }
+
+    pub fn set_current_block(&mut self, block_number: u64) {
+        Arc::make_mut(&mut self.state).block_number = block_number;
+    }
 }
 
 pub struct ApplyReport {
@@ -304,16 +335,58 @@ pub struct CanonicalState {
     bytes: Vec<u8>,
     pub component_count: usize,
     pub backend_counts: BTreeMap<ReplayBackend, usize>,
+    components: Vec<CanonicalComponentState>,
+    tokens: Vec<CanonicalTokenState>,
 }
 
 impl CanonicalState {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn components(&self) -> &[CanonicalComponentState] {
+        &self.components
+    }
+
+    pub fn tokens(&self) -> &[CanonicalTokenState] {
+        &self.tokens
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalComponentState {
+    pub backend: ReplayBackend,
+    pub component_id: String,
+    component_bytes: Vec<u8>,
+    state_bytes: Vec<u8>,
+}
+
+impl CanonicalComponentState {
+    pub fn component_bytes(&self) -> &[u8] {
+        &self.component_bytes
+    }
+
+    pub fn state_bytes(&self) -> &[u8] {
+        &self.state_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalTokenState {
+    pub address: String,
+    token_bytes: Vec<u8>,
+}
+
+impl CanonicalTokenState {
+    pub fn token_bytes(&self) -> &[u8] {
+        &self.token_bytes
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum CanonicalStateError {
+    #[error("canonical state comparison does not support backend {0:?}")]
+    UnsupportedBackend(ReplayBackend),
     #[error("failed to serialize canonical simulator state: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -333,6 +406,22 @@ struct CanonicalPool {
     component_id: String,
     component: serde_json::Value,
     state: serde_json::Value,
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        value => value,
+    }
 }
 
 #[derive(Default)]
@@ -763,6 +852,29 @@ mod tests {
         assert_eq!(report.removed_unknown_pair, 0);
         assert!(report.anomaly_samples.is_empty());
         assert!(!report.has_anomalies());
+    }
+
+    #[test]
+    fn canonical_json_sorts_nested_object_keys() -> Result<(), serde_json::Error> {
+        let mut left_nested = serde_json::Map::new();
+        left_nested.insert("z".to_owned(), serde_json::json!(1));
+        left_nested.insert("a".to_owned(), serde_json::json!(2));
+        let mut left = serde_json::Map::new();
+        left.insert("second".to_owned(), serde_json::Value::Object(left_nested));
+        left.insert("first".to_owned(), serde_json::json!(0));
+
+        let mut right_nested = serde_json::Map::new();
+        right_nested.insert("a".to_owned(), serde_json::json!(2));
+        right_nested.insert("z".to_owned(), serde_json::json!(1));
+        let mut right = serde_json::Map::new();
+        right.insert("first".to_owned(), serde_json::json!(0));
+        right.insert("second".to_owned(), serde_json::Value::Object(right_nested));
+
+        assert_eq!(
+            serde_json::to_vec(&canonicalize_json(serde_json::Value::Object(left)))?,
+            serde_json::to_vec(&canonicalize_json(serde_json::Value::Object(right)))?
+        );
+        Ok(())
     }
 
     #[test]

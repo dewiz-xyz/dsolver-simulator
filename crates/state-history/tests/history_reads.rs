@@ -94,6 +94,41 @@ async fn coverage_starts_at_the_first_retained_checkpoint(pool: PgPool) -> anyho
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
+async fn rfq_coverage_excludes_block_without_next_boundary(pool: PgPool) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 102).await?;
+    sqlx::query(
+        "DELETE FROM state_history.block_times
+         WHERE chain_id = $1 AND block_number = 101",
+    )
+    .bind(database_i64(CHAIN_ID)?)
+    .execute(&pool)
+    .await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        0,
+        100,
+        CheckpointKind::Boundary,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let snapshot = reader
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Rfq],
+            Some(BlockInterval::new(100, 101)?),
+        )?)
+        .await?;
+
+    assert!(snapshot.continuous_intervals.is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
 async fn cursorless_gap_uses_its_full_span_for_boundary_projection(
     pool: PgPool,
 ) -> anyhow::Result<()> {
@@ -152,6 +187,78 @@ async fn target_plan_returns_every_required_next_block_time(pool: PgPool) -> any
     );
     assert!(plan.lineage_invalid_intervals.is_empty());
     assert_eq!(plan.visible_through_block, 110);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn target_plan_accepts_rfq_checkpoint_before_next_block(pool: PgPool) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 101).await?;
+    let checkpoint = seed_checkpoint_with_backends(
+        &pool,
+        1,
+        1,
+        100,
+        CheckpointKind::Boundary,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE state_history.checkpoints
+         SET rfq_observed_at_ms = 100500
+         WHERE id = $1",
+    )
+    .bind(checkpoint.id)
+    .execute(&pool)
+    .await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let plan = reader
+        .plan_targets(&TargetPlanQuery::new(
+            CHAIN_ID,
+            vec![Backend::Rfq],
+            BTreeSet::from([100]),
+            ReadLimits::new(1_000_000, 1_000_000)?,
+        )?)
+        .await?;
+
+    assert_eq!(plan.legs.len(), 1);
+    assert_eq!(plan.legs[0].checkpoint.id, checkpoint.id);
+    assert_eq!(plan.legs[0].checkpoint.rfq_observed_at_ms, Some(100_500));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn target_plan_keeps_safe_cells_when_one_block_time_is_missing(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_block_times(&pool, 100, 102).await?;
+    sqlx::query(
+        "DELETE FROM state_history.block_times
+         WHERE chain_id = $1 AND block_number = 101",
+    )
+    .bind(database_i64(CHAIN_ID)?)
+    .execute(&pool)
+    .await?;
+    seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_delta(&pool, 1, 1, 102, 1, &[Backend::Native]).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let plan = reader
+        .plan_targets(&TargetPlanQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            BTreeSet::from([100, 101, 102]),
+            ReadLimits::new(1_000_000, 1_000_000)?,
+        )?)
+        .await?;
+
+    assert_eq!(plan.missing_block_times, BTreeSet::from([101]));
+    assert!(plan.block_times.contains_key(&100));
+    assert!(plan.block_times.contains_key(&102));
+    assert!(!plan.legs.is_empty());
     Ok(())
 }
 
@@ -251,6 +358,40 @@ async fn checkpoint_pairs_are_adjacent_and_never_cross_segments(
         .await
         .expect_err("an explicit pair must not cross a segment boundary");
     assert!(error.to_string().contains("same segment"));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn backend_filter_keeps_incompatible_boundaries_as_segment_breaks(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(&pool, 1, 10, 110, CheckpointKind::Interval, true).await?;
+    seed_checkpoint_with_backends(
+        &pool,
+        2,
+        0,
+        200,
+        CheckpointKind::Boundary,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+    seed_checkpoint(&pool, 2, 10, 210, CheckpointKind::Interval, true).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let pairs = reader
+        .resolve_checkpoint_pairs(&CheckpointPairQuery::for_backends(
+            CHAIN_ID,
+            CheckpointPairSelection::BlockRange(BlockInterval::new(100, 210)?),
+            vec![Backend::Native],
+        ))
+        .await?;
+
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].earlier.position, position(1, 0));
+    assert_eq!(pairs[0].target.position, position(1, 10));
     Ok(())
 }
 

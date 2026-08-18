@@ -3544,12 +3544,19 @@ dependencies = [
 name = "historical-quote"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives 1.5.7",
+ "anyhow",
  "chrono",
  "num-bigint",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "simulator-replay",
+ "state-history",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tycho-simulation",
  "utoipa 5.5.0",
  "uuid",
 ]

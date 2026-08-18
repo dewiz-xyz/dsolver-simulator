@@ -25,16 +25,20 @@ use tycho_simulation::{
     },
     protocol::models::Update,
     tycho_client::feed::{BlockHeader, FeedMessage},
-    tycho_common::{models::token::Token, Bytes},
+    tycho_common::{
+        models::{token::Token, Chain},
+        Bytes,
+    },
 };
 
 use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
-    BroadcasterSnapshotPartition, BroadcasterUpdateMessage,
+    BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
+    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterTokenDto,
+    BroadcasterUpdateMessage,
 };
 
 use crate::payload::{live_partition_update, snapshot_partition_update};
-use crate::{DecodedReplay, ReplayBackend};
+use crate::{DecodedReplay, RawSnapshotReassembly, ReplayBackend};
 
 pub type TokenMap = HashMap<Bytes, Token>;
 
@@ -162,6 +166,14 @@ pub enum ReplayDecodeError {
     RetainedDecoderProfileRequired(i16),
     #[error("stored delta payload is not a broadcaster update")]
     StoredDeltaIsNotUpdate,
+    #[error("checkpoint payload sequence is invalid: {0}")]
+    InvalidCheckpoint(String),
+    #[error("checkpoint is missing backend {0}")]
+    MissingCheckpointBackend(&'static str),
+    #[error("unsupported retained token chain {0}")]
+    UnsupportedTokenChain(u64),
+    #[error("failed to decode retained token snapshot: {0}")]
+    TokenSnapshot(String),
 }
 
 pub struct ReplayDecoder {
@@ -206,6 +218,103 @@ impl ReplayDecoder {
         decoder: Arc<TychoStreamDecoder<BlockHeader>>,
     ) -> Self {
         Self { config, decoder }
+    }
+
+    /// Decodes one verified checkpoint archive into a deterministic replay update.
+    pub async fn decode_checkpoint_payloads(
+        &self,
+        payloads_json: &[String],
+        selected_backends: &[ReplayBackend],
+    ) -> Result<DecodedReplay, ReplayDecodeError> {
+        let selected = selected_backends.iter().copied().collect::<HashSet<_>>();
+        if selected.is_empty() {
+            return Err(ReplayDecodeError::InvalidCheckpoint(
+                "selected backends must not be empty".to_owned(),
+            ));
+        }
+        for backend in &selected {
+            self.ensure_backend_configured(*backend)?;
+        }
+
+        let (start, chunks) = parse_checkpoint_payloads(payloads_json)?;
+        let advertised = start
+            .backends
+            .iter()
+            .copied()
+            .map(ReplayBackend::from)
+            .collect::<HashSet<_>>();
+        if let Some(missing) = selected
+            .iter()
+            .find(|backend| !advertised.contains(backend))
+        {
+            return Err(ReplayDecodeError::MissingCheckpointBackend(
+                missing.as_str(),
+            ));
+        }
+
+        self.decode_checkpoint_chunks(&start.snapshot_id, chunks, &selected)
+            .await
+    }
+
+    async fn decode_checkpoint_chunks(
+        &self,
+        snapshot_id: &str,
+        chunks: BTreeMap<u32, BroadcasterSnapshotChunk>,
+        selected: &HashSet<ReplayBackend>,
+    ) -> Result<DecodedReplay, ReplayDecodeError> {
+        let mut raw_messages = BTreeMap::<ReplayBackend, RawSnapshotReassembly>::new();
+        let mut seen_backends = HashSet::new();
+        let mut combined = None;
+        let mut block_number = 0;
+        for chunk in chunks.into_values() {
+            if chunk.snapshot_id != snapshot_id {
+                return Err(ReplayDecodeError::InvalidCheckpoint(
+                    "snapshot chunk identifier differs from snapshot start".to_owned(),
+                ));
+            }
+            for partition in chunk.partitions {
+                let backend = ReplayBackend::from(partition.backend);
+                if !selected.contains(&backend) {
+                    continue;
+                }
+                seen_backends.insert(backend);
+                block_number = block_number.max(partition.block_number);
+                if partition.messages.is_empty() {
+                    let decoded = self.decode_snapshot_partition(partition).await?;
+                    merge_update(&mut combined, decoded.update);
+                } else {
+                    let reassembly = raw_messages.entry(backend).or_default();
+                    for message in partition.messages {
+                        reassembly.push(message).map_err(|error| {
+                            ReplayDecodeError::InvalidCheckpoint(error.to_string())
+                        })?;
+                    }
+                }
+            }
+        }
+        for (backend, mut reassembly) in raw_messages {
+            let update = self
+                .decode_snapshot_messages(backend, reassembly.take_messages())
+                .await?;
+            merge_update(&mut combined, update);
+        }
+        if let Some(missing) = selected
+            .iter()
+            .find(|backend| !seen_backends.contains(backend))
+        {
+            return Err(ReplayDecodeError::MissingCheckpointBackend(
+                missing.as_str(),
+            ));
+        }
+        if let Some(update) = combined.as_mut() {
+            update.block_number_or_timestamp = block_number;
+        }
+        Ok(DecodedReplay {
+            had_applicable_partition: true,
+            block_number,
+            complete_native_block: None,
+            update: combined,
+        })
     }
 
     pub async fn decode_snapshot_partition(
@@ -380,6 +489,103 @@ impl ReplayDecoder {
             Ok(())
         }
     }
+}
+
+fn parse_checkpoint_payloads(
+    payloads_json: &[String],
+) -> Result<
+    (
+        BroadcasterSnapshotStart,
+        BTreeMap<u32, BroadcasterSnapshotChunk>,
+    ),
+    ReplayDecodeError,
+> {
+    let mut start = None;
+    let mut chunks = BTreeMap::new();
+    let mut end = None;
+    for payload_json in payloads_json {
+        let payload: BroadcasterPayload = serde_json::from_str(payload_json)
+            .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
+        match payload {
+            BroadcasterPayload::SnapshotStart(value) if start.is_none() => start = Some(value),
+            BroadcasterPayload::SnapshotChunk(value) => {
+                if chunks.insert(value.chunk_index, value).is_some() {
+                    return Err(ReplayDecodeError::InvalidCheckpoint(
+                        "duplicate snapshot chunk index".to_owned(),
+                    ));
+                }
+            }
+            BroadcasterPayload::SnapshotEnd(value) if end.is_none() => end = Some(value),
+            _ => {
+                return Err(ReplayDecodeError::InvalidCheckpoint(
+                    "archive must contain one snapshot start, chunks, and one snapshot end"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    let start = start
+        .ok_or_else(|| ReplayDecodeError::InvalidCheckpoint("missing snapshot start".to_owned()))?;
+    let end =
+        end.ok_or_else(|| ReplayDecodeError::InvalidCheckpoint("missing snapshot end".to_owned()))?;
+    if start.snapshot_id != end.snapshot_id {
+        return Err(ReplayDecodeError::InvalidCheckpoint(
+            "snapshot start and end identifiers differ".to_owned(),
+        ));
+    }
+    if usize::try_from(start.total_chunks).ok() != Some(chunks.len())
+        || chunks.keys().copied().ne(0..start.total_chunks)
+    {
+        return Err(ReplayDecodeError::InvalidCheckpoint(
+            "snapshot chunks are incomplete or out of range".to_owned(),
+        ));
+    }
+    Ok((start, chunks))
+}
+
+/// Decodes the canonical retained token array for a supported chain.
+pub fn decode_token_map(
+    chain_id: u64,
+    tokens: &serde_json::value::RawValue,
+) -> Result<TokenMap, ReplayDecodeError> {
+    let chain = [
+        Chain::Ethereum,
+        Chain::Starknet,
+        Chain::ZkSync,
+        Chain::Arbitrum,
+        Chain::Base,
+        Chain::Bsc,
+        Chain::Unichain,
+        Chain::Polygon,
+        Chain::Plasma,
+    ]
+    .into_iter()
+    .find(|chain| chain.id() == chain_id)
+    .ok_or(ReplayDecodeError::UnsupportedTokenChain(chain_id))?;
+    let decoded: Vec<BroadcasterTokenDto> = serde_json::from_str(tokens.get())
+        .map_err(|error| ReplayDecodeError::TokenSnapshot(error.to_string()))?;
+    let mut result = HashMap::with_capacity(decoded.len());
+    for token in decoded {
+        let token = token
+            .into_token(chain)
+            .map_err(|error| ReplayDecodeError::TokenSnapshot(error.to_string()))?;
+        if result.insert(token.address.clone(), token).is_some() {
+            return Err(ReplayDecodeError::TokenSnapshot(
+                "retained token snapshot contains a duplicate address".to_owned(),
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn merge_update(current: &mut Option<Update>, incoming: Option<Update>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    *current = Some(match current.take() {
+        Some(existing) => existing.merge(incoming),
+        None => incoming,
+    });
 }
 
 fn register_native_decoder(

@@ -105,6 +105,7 @@ impl TargetPlanQuery {
 pub struct TargetPlan {
     pub visible_through_block: u64,
     pub block_times: BTreeMap<u64, BlockTimeObservation>,
+    pub missing_block_times: BTreeSet<u64>,
     pub legs: Vec<RangeLeg>,
     pub gaps: Vec<RangeGap>,
     pub lineage_invalid_intervals: Vec<BlockInterval>,
@@ -153,6 +154,17 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             )
             .await?,
         );
+        if query.backends.binary_search(&Backend::Rfq).is_ok() {
+            unsafe_intervals.extend(
+                missing_rfq_boundary_intervals(
+                    &mut transaction,
+                    query.chain_id,
+                    retained_start,
+                    interval_end,
+                )
+                .await?,
+            );
+        }
         let continuous_intervals = if retained_start > interval_end {
             Vec::new()
         } else {
@@ -202,39 +214,38 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         let mut transaction = begin_range_transaction(&mut connection).await?;
         let visible_through_block =
             visible_through_block(&mut transaction, query.chain_id, &query.backends).await?;
-        let block_times =
+        let (block_times, missing_block_times) =
             required_block_times(&mut transaction, query.chain_id, &required_blocks).await?;
         let lineage_end = required_blocks.last().copied().unwrap_or(end_block);
         let lineage_invalid_intervals =
             lineage_invalid_intervals(&mut transaction, query.chain_id, start_block, lineage_end)
                 .await?;
 
+        let Some((range_start, range_end)) = replay_target_range(query, &block_times) else {
+            transaction
+                .commit()
+                .await
+                .context("failed to commit target planning transaction")?;
+            return Ok(TargetPlan {
+                visible_through_block,
+                block_times,
+                missing_block_times,
+                legs: Vec::new(),
+                gaps: Vec::new(),
+                lineage_invalid_intervals,
+                estimated_decoded_bytes: 0,
+            });
+        };
         let mut range_request = RangeRequest::new(
             query.chain_id,
-            start_block,
-            end_block,
+            range_start,
+            range_end,
             query.backends.clone(),
         )?;
-        let rfq_bounds = if includes_rfq {
-            let start_timestamp = block_times
-                .get(&start_block)
-                .context("target start block is missing its required timestamp")?
-                .timestamp_ms;
-            let end_plus_one = end_block
-                .checked_add(1)
-                .ok_or(ModelError::RfqTargetHasNoSuccessor(end_block))?;
-            let next_timestamp = block_times
-                .get(&end_plus_one)
-                .context("target end block is missing its required next-block timestamp")?
-                .timestamp_ms;
-            let end_timestamp = next_timestamp
-                .checked_sub(1)
-                .context("target next-block timestamp must be positive")?;
+        let rfq_bounds = replay_rfq_bounds(includes_rfq, range_start, range_end, &block_times)?;
+        if let Some((start_timestamp, end_timestamp)) = rfq_bounds {
             range_request = range_request.with_rfq_bounds(start_timestamp, end_timestamp)?;
-            Some((start_timestamp, end_timestamp))
-        } else {
-            None
-        };
+        }
         let resolution = resolve_range_in_transaction(
             &mut transaction,
             &range_request,
@@ -249,6 +260,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         Ok(TargetPlan {
             visible_through_block,
             block_times,
+            missing_block_times,
             legs: resolution.plan.legs,
             gaps: resolution.plan.gaps,
             lineage_invalid_intervals,
@@ -257,11 +269,61 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
     }
 }
 
+fn replay_target_range(
+    query: &TargetPlanQuery,
+    block_times: &BTreeMap<u64, BlockTimeObservation>,
+) -> Option<(u64, u64)> {
+    if query.backends.binary_search(&Backend::Rfq).is_err() {
+        return query
+            .target_blocks
+            .first()
+            .copied()
+            .zip(query.target_blocks.last().copied());
+    }
+    let mut safe = query.target_blocks.iter().copied().filter(|target| {
+        target
+            .checked_add(1)
+            .is_some_and(|next| block_times.contains_key(target) && block_times.contains_key(&next))
+    });
+    let start = safe.next()?;
+    Some((start, safe.next_back().unwrap_or(start)))
+}
+
+fn replay_rfq_bounds(
+    includes_rfq: bool,
+    range_start: u64,
+    range_end: u64,
+    block_times: &BTreeMap<u64, BlockTimeObservation>,
+) -> anyhow::Result<Option<(u64, u64)>> {
+    if !includes_rfq {
+        return Ok(None);
+    }
+    let start_plus_one = range_start
+        .checked_add(1)
+        .ok_or(ModelError::RfqTargetHasNoSuccessor(range_start))?;
+    let start_timestamp = block_times
+        .get(&start_plus_one)
+        .context("safe RFQ target is missing its next-block timestamp")?
+        .timestamp_ms
+        .checked_sub(1)
+        .context("target next-block timestamp must be positive")?;
+    let end_plus_one = range_end
+        .checked_add(1)
+        .ok_or(ModelError::RfqTargetHasNoSuccessor(range_end))?;
+    let end_timestamp = block_times
+        .get(&end_plus_one)
+        .context("safe RFQ target is missing its next-block timestamp")?
+        .timestamp_ms
+        .checked_sub(1)
+        .context("target next-block timestamp must be positive")?;
+    Ok(Some((start_timestamp, end_timestamp)))
+}
+
 async fn required_block_times(
     connection: &mut sqlx::PgConnection,
     chain_id: u64,
     required_blocks: &BTreeSet<u64>,
-) -> anyhow::Result<BTreeMap<u64, BlockTimeObservation>> {
+) -> anyhow::Result<(BTreeMap<u64, BlockTimeObservation>, BTreeSet<u64>)> {
     let database_blocks = required_blocks
         .iter()
         .map(|block| database_i64(*block, "required target block"))
@@ -291,11 +353,8 @@ async fn required_block_times(
         .iter()
         .filter(|block| !observations.contains_key(block))
         .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        anyhow::bail!("missing required block_times rows for blocks {missing:?}");
-    }
-    Ok(observations)
+        .collect::<BTreeSet<_>>();
+    Ok((observations, missing))
 }
 
 pub(super) async fn visible_through_block(
@@ -556,6 +615,42 @@ async fn rfq_time_gap_to_blocks(
         (None, None) => Ok(None),
         _ => anyhow::bail!("RFQ gap projection returned incomplete bounds"),
     }
+}
+
+async fn missing_rfq_boundary_intervals(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    start: u64,
+    end: u64,
+) -> anyhow::Result<Vec<BlockInterval>> {
+    if start > end {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT current.block_number
+         FROM state_history.block_times current
+         LEFT JOIN state_history.block_times successor
+           ON successor.chain_id = current.chain_id
+          AND successor.block_number = current.block_number + 1
+         WHERE current.chain_id = $1
+           AND current.block_number BETWEEN $2 AND $3
+           AND successor.block_number IS NULL
+         ORDER BY current.block_number",
+    )
+    .bind(database_i64(chain_id, "coverage chain_id")?)
+    .bind(database_i64(start, "coverage RFQ boundary start")?)
+    .bind(database_i64(end, "coverage RFQ boundary end")?)
+    .fetch_all(connection)
+    .await
+    .context("failed to select missing RFQ next-block boundaries")?;
+    let intervals = rows
+        .into_iter()
+        .map(|block| {
+            let block = database_u64(block, "coverage RFQ missing boundary block")?;
+            BlockInterval::new(block, block).map_err(anyhow::Error::from)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(merge_intervals(intervals))
 }
 
 pub(super) async fn lineage_invalid_intervals(
