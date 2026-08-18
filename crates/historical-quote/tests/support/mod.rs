@@ -176,6 +176,29 @@ impl FixtureSource {
         })
     }
 
+    pub fn rfq_consistency(with_tokens: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut source = Self::rfq()?;
+        let earlier = manifest(10, 100, position(1), Backend::Rfq, with_tokens, Some(1_000));
+        let target = manifest(11, 101, position(3), Backend::Rfq, with_tokens, Some(5_000));
+        source.archives.clear();
+        source.archives.insert(earlier.id, rfq_archive(&earlier)?);
+        source.archives.insert(target.id, rfq_archive(&target)?);
+        source.token_snapshots.clear();
+        if with_tokens {
+            source.token_snapshots.insert(earlier.id, native_tokens()?);
+            source.token_snapshots.insert(target.id, native_tokens()?);
+        }
+        let pair = CheckpointPair { earlier, target };
+        source.pairs = vec![pair.clone()];
+        source.pair_plan = Some(CheckpointPairReplayPlan {
+            pair,
+            deltas: vec![rfq_delta(2, 3_000)?],
+            gaps: Vec::new(),
+            estimated_decoded_bytes: 2_048,
+        });
+        Ok(source)
+    }
+
     pub fn checkpoint_fetch_count(&self) -> usize {
         self.checkpoint_fetches.load(Ordering::SeqCst)
     }
@@ -352,7 +375,7 @@ pub const fn public_position(message_seq: u64) -> PublicPosition {
     }
 }
 
-fn manifest(
+pub fn manifest(
     id: i64,
     block_number: u64,
     position: StreamPosition,
@@ -411,7 +434,11 @@ fn rfq_archive(
     Ok(archive(manifest, "rfq", checkpoint["partition"].clone()))
 }
 
-fn archive(manifest: &CheckpointManifest, backend: &str, partition: Value) -> CheckpointArchive {
+pub fn archive(
+    manifest: &CheckpointManifest,
+    backend: &str,
+    partition: Value,
+) -> CheckpointArchive {
     let snapshot_id = format!("snapshot-{}", manifest.id);
     CheckpointArchive {
         metadata: ArchiveMetadata {
@@ -449,7 +476,7 @@ fn archive(manifest: &CheckpointManifest, backend: &str, partition: Value) -> Ch
     }
 }
 
-fn native_tokens() -> Result<RawTokenSnapshot, Box<dyn std::error::Error>> {
+pub fn native_tokens() -> Result<RawTokenSnapshot, Box<dyn std::error::Error>> {
     let checkpoint: Value = serde_json::from_str(NATIVE_CHECKPOINT)?;
     raw_tokens(checkpoint["tokens"].clone())
 }

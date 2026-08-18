@@ -273,10 +273,12 @@ impl CheckpointObjectStore {
                     "failed to fetch checkpoint object s3://{}/{key}",
                     self.bucket
                 )
-            })?;
+            })
+            .map_err(ReadLimitError::ObjectRead)?;
         if let Some(content_length) = output.content_length() {
             let content_length = u64::try_from(content_length)
-                .context("checkpoint object content length is negative")?;
+                .context("checkpoint object content length is negative")
+                .map_err(ReadLimitError::ObjectRead)?;
             if content_length > max_compressed_bytes {
                 return Err(ReadLimitError::CompressedBytesExceeded {
                     declared: content_length,
@@ -289,14 +291,19 @@ impl CheckpointObjectStore {
             .into_async_read()
             .take(max_compressed_bytes.saturating_add(1));
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await.with_context(|| {
-            format!(
-                "failed to read checkpoint object s3://{}/{key}",
-                self.bucket
-            )
-        })?;
-        let compressed_bytes =
-            u64::try_from(bytes.len()).context("checkpoint object length exceeds u64")?;
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read checkpoint object s3://{}/{key}",
+                    self.bucket
+                )
+            })
+            .map_err(ReadLimitError::ObjectRead)?;
+        let compressed_bytes = u64::try_from(bytes.len())
+            .context("checkpoint object length exceeds u64")
+            .map_err(ReadLimitError::ObjectRead)?;
         if compressed_bytes > max_compressed_bytes {
             return Err(ReadLimitError::CompressedBytesExceeded {
                 declared: compressed_bytes,

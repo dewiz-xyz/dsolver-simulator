@@ -19,6 +19,16 @@ const CONSISTENCY_REPORT_GOLDEN: &str = r#"{
     "endInclusive": 34100000
   },
   "selectionStatus": "notComparable",
+  "storage": {
+    "rangePlanValid": true,
+    "checkpointObjectsValid": true,
+    "tokenObjectsValid": true,
+    "deltaOrderValid": true,
+    "replayPlansVerified": 0,
+    "checkpointObjectsVerified": 0,
+    "tokenObjectsVerified": 0,
+    "deltasVerified": 0
+  },
   "summary": {
     "selectedCheckpointPairs": 0,
     "comparedCheckpointPairs": 0,

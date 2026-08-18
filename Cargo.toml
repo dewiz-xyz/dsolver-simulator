@@ -6,6 +6,7 @@ members = [
     "crates/state-history",
     "crates/historical-quote",
     "crates/historical-quote-service",
+    "crates/dsolver-history",
     "crates/runtime",
     "crates/rpc",
     "crates/apps",
@@ -29,6 +30,7 @@ aws-sdk-s3 = "1"
 axum = "0.7"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
 csv = "1.4.0"
 dotenv = "0.15.0"
 futures = "0.3"

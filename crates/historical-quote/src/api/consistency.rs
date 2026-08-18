@@ -301,6 +301,24 @@ pub struct ConsistencySummary {
     pub not_comparable: u64,
 }
 
+/// Storage validation completed before state and quote comparison.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is a separate check in the verification wire contract"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageVerificationSummary {
+    pub range_plan_valid: bool,
+    pub checkpoint_objects_valid: bool,
+    pub token_objects_valid: bool,
+    pub delta_order_valid: bool,
+    pub replay_plans_verified: u64,
+    pub checkpoint_objects_verified: u64,
+    pub token_objects_verified: u64,
+    pub deltas_verified: u64,
+}
+
 /// Completed report for a historical state consistency check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -312,6 +330,7 @@ pub struct ConsistencyCheckReport {
     pub backends: Vec<Backend>,
     pub selection: ConsistencySelection,
     pub selection_status: ConsistencySelectionStatus,
+    pub storage: StorageVerificationSummary,
     pub summary: ConsistencySummary,
     pub pairs: Vec<ConsistencyPairReport>,
 }

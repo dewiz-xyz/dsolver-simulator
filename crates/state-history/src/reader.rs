@@ -667,6 +667,12 @@ struct EncodedDeltaRow {
 pub enum StoredPayloadError {
     #[error("unsupported delta payload format {0}")]
     UnsupportedDeltaFormat(i16),
+    #[error("delta payload sha256 mismatch at {0:?}")]
+    Sha256Mismatch(StreamPosition),
+    #[error("delta payload is not valid UTF-8 at {0:?}")]
+    InvalidUtf8(StreamPosition),
+    #[error("delta payload is not valid JSON at {0:?}")]
+    InvalidJson(StreamPosition),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1347,15 +1353,13 @@ fn decode_delta_row_with_limit(
     let decoded_bytes =
         u64::try_from(payload_json.len()).context("delta decoded byte length exceeds u64")?;
     let actual_sha256 = hex::encode(Sha256::digest(&payload_json));
-    ensure!(
-        actual_sha256 == row.payload_sha256,
-        "delta payload sha256 mismatch at generation {} message sequence {}",
-        row.position.generation,
-        row.position.message_seq
-    );
-    let payload_json =
-        String::from_utf8(payload_json).context("delta payload is not valid UTF-8")?;
-    let payload = RawValue::from_string(payload_json).context("delta payload is not valid JSON")?;
+    if actual_sha256 != row.payload_sha256 {
+        return Err(StoredPayloadError::Sha256Mismatch(row.position).into());
+    }
+    let payload_json = String::from_utf8(payload_json)
+        .map_err(|_| StoredPayloadError::InvalidUtf8(row.position))?;
+    let payload = RawValue::from_string(payload_json)
+        .map_err(|_| StoredPayloadError::InvalidJson(row.position))?;
     Ok((
         DeltaRow {
             position: row.position,

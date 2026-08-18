@@ -341,7 +341,9 @@ Construct the reader with `StateHistoryReader::new(PgPool, CheckpointObjectStore
 
 Use `ReadLimits` with target planning and the bounded object fetch methods. Planning sums manifest sizes and SQL `octet_length(payload)` before selecting compressed delta bodies. Object fetches reject an oversized manifest or S3 content length before reading the body, and all Zstandard decoders use counted readers capped at the remaining decoded-byte limit.
 
-`state-history-check` is the read-only operational wrapper around this flow. It reads the observer database URL and S3 settings from the state-history environment variables, selects a closed recent Base range, requires `ensure_gap_free()`, and verifies every replay-leg checkpoint and token object. It never runs migrations or writes PostgreSQL or S3. The production image intentionally does not contain this local tool.
+Use `dsolver-history verify` for the historical state consistency check. The command submits an asynchronous job to the Historical Pool Quote API, waits for the service to verify the selected range, checkpoint archives, token snapshots, delta order, reconstructed state, and directed pool quotes, then writes the JSON report to stdout and a human summary to stderr. It uses `DSOLVER_HISTORY_URL` and `DSOLVER_HISTORY_TOKEN`; it needs no database URL, AWS credential, or direct S3 access.
+
+The report records the storage checks that the former `state-history-check` binary performed. A storage key, digest, compressed or decoded size, checkpoint metadata, token count, token chain, token order, or delta-order failure makes the service job fail with `historical_data_invalid`. A recorded gap, state mismatch, or matching quote failure remains a completed report and makes the CLI exit with status `1`. The check stays an operator action; readiness, admission, deployment, and continuous integration do not call it.
 
 When replaying format 1 deltas, use `DecoderConfig::retained_v1()`. Its token quality is fixed at `0`; do not derive retained decoding from the live manifest or current runtime tuning.
 

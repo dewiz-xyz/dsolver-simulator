@@ -18,8 +18,8 @@ use crate::api::{
     HistoricalQuoteProgress, HistoricalQuoteResult, HistoricalQuoteTarget, JobCounts, JobEnvelope,
     JobFailure, JobFailureCode, JobProgress, JobResult, JobState, JobSubmission, JobType, KnownGap,
     PairStatus, PoolSelector, QuoteComparisonRequest, QuoteFailureReason, QuoteJobRequest,
-    QuoteOutcome, QuoteProvenance, ReadyResponse, ServiceLimits, StatusResponse, StreamPosition,
-    UnavailableReason, UnsignedAmount,
+    QuoteOutcome, QuoteProvenance, ReadyResponse, ServiceLimits, StatusResponse,
+    StorageVerificationSummary, StreamPosition, UnavailableReason, UnsignedAmount,
 };
 
 #[utoipa::path(
@@ -232,6 +232,7 @@ pub(crate) fn get_ready() {}
         ReadyResponse,
         ServiceLimits,
         StatusResponse,
+        StorageVerificationSummary,
         StreamPosition,
         UnavailableReason,
         UnsignedAmount

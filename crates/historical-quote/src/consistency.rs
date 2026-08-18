@@ -15,7 +15,8 @@ use crate::api::{
     Backend, CanonicalStateSummary, ConsistencyCheckReport, ConsistencyCheckRequest,
     ConsistencyDifference, ConsistencyPairReport, ConsistencyQuoteComparison,
     ConsistencyQuoteOutcome, ConsistencySelection, ConsistencySelectionStatus, ConsistencySummary,
-    PairStatus, PoolSelector, QuoteComparisonRequest, QuoteFailureReason, UnsignedAmount,
+    PairStatus, PoolSelector, QuoteComparisonRequest, QuoteFailureReason,
+    StorageVerificationSummary, UnsignedAmount,
 };
 use crate::quote_job::quote_failure_reason;
 use crate::replay::{
@@ -87,6 +88,7 @@ impl<S: HistorySource> ConsistencyChecker<S> {
 
         let mut remaining_differences = self.max_differences;
         let mut reports = Vec::with_capacity(pairs.len());
+        let mut storage = StorageEvidence::default();
         for pair in pairs {
             check_cancelled(cancellation)?;
             let plan = self
@@ -103,9 +105,14 @@ impl<S: HistorySource> ConsistencyChecker<S> {
                 )
                 .await?;
             let report = if plan.gaps.is_empty() {
-                self.compare_pair(request, plan, cancellation, remaining_differences)
-                    .await?
+                let comparison = self
+                    .compare_pair(request, plan, cancellation, remaining_differences)
+                    .await?;
+                storage.merge(comparison.storage);
+                comparison.report
             } else {
+                validate_pair_storage(&plan, &request.backends)?;
+                storage.record_plan(&plan, false);
                 gap_report(request, &plan.pair)
             };
             remaining_differences = remaining_differences.saturating_sub(report.differences.len());
@@ -121,6 +128,7 @@ impl<S: HistorySource> ConsistencyChecker<S> {
             backends,
             selection: request.selection.clone(),
             selection_status: ConsistencySelectionStatus::Compared,
+            storage: storage.summary(),
             summary,
             pairs: reports,
         })
@@ -132,8 +140,11 @@ impl<S: HistorySource> ConsistencyChecker<S> {
         plan: state_history::CheckpointPairReplayPlan,
         cancellation: &CancellationToken,
         difference_limit: usize,
-    ) -> Result<ConsistencyPairReport, HistoricalError> {
+    ) -> Result<PairComparison, HistoricalError> {
+        validate_pair_storage(&plan, &request.backends)?;
         let backends = request.backends.iter().copied().collect::<BTreeSet<_>>();
+        self.validate_rfq_token_objects(&plan, &backends, cancellation)
+            .await?;
         let direct = restore_checkpoint(
             self.source.as_ref(),
             &plan.pair.target,
@@ -151,7 +162,9 @@ impl<S: HistorySource> ConsistencyChecker<S> {
         )
         .await?;
         let (Some(direct), Some(mut replayed)) = (direct, replayed) else {
-            return Ok(gap_report(request, &plan.pair));
+            return Err(HistoricalError::HistoricalDataInvalid(
+                "checkpoint pair requires a token snapshot for on-chain state".to_owned(),
+            ));
         };
         if direct.checkpoint_application_invalid
             || apply_all_pair_deltas(&mut replayed, &plan.deltas, &backends, cancellation).await?
@@ -203,7 +216,7 @@ impl<S: HistorySource> ConsistencyChecker<S> {
                 affected_component_ids.insert(comparison.pool.component_id.clone());
             }
         }
-        Ok(ConsistencyPairReport {
+        let report = ConsistencyPairReport {
             earlier_position: public_position(plan.pair.earlier.position),
             target_position: public_position(plan.pair.target.position),
             status,
@@ -214,8 +227,161 @@ impl<S: HistorySource> ConsistencyChecker<S> {
             quote_comparisons,
             total_difference_count: difference_set.total_count,
             differences: difference_set.differences,
-        })
+        };
+        let mut storage = StorageEvidence::default();
+        storage.record_plan(&plan, true);
+        Ok(PairComparison { report, storage })
     }
+
+    async fn validate_rfq_token_objects(
+        &self,
+        plan: &state_history::CheckpointPairReplayPlan,
+        backends: &BTreeSet<Backend>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), HistoricalError> {
+        if backends
+            .iter()
+            .any(|backend| matches!(backend, Backend::Native | Backend::Vm))
+        {
+            return Ok(());
+        }
+        for manifest in [&plan.pair.earlier, &plan.pair.target] {
+            check_cancelled(cancellation)?;
+            if manifest.token_reference.is_none() {
+                return Err(invalid_storage(
+                    "checkpoint requires a token snapshot reference for storage verification",
+                ));
+            }
+            let snapshot = self
+                .source
+                .fetch_checkpoint_token_snapshot(manifest.clone(), self.read_limits)
+                .await?
+                .ok_or_else(|| {
+                    invalid_storage("checkpoint token reference resolved without a token snapshot")
+                })?;
+            if snapshot.chain_id != manifest.chain_id {
+                return Err(invalid_storage(
+                    "checkpoint token snapshot chain does not match the manifest",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PairComparison {
+    report: ConsistencyPairReport,
+    storage: StorageEvidence,
+}
+
+#[derive(Default)]
+struct StorageEvidence {
+    replay_plans_verified: u64,
+    checkpoint_positions: BTreeSet<state_history::StreamPosition>,
+    token_digests: BTreeSet<String>,
+    delta_positions: BTreeSet<state_history::StreamPosition>,
+}
+
+impl StorageEvidence {
+    fn record_plan(&mut self, plan: &state_history::CheckpointPairReplayPlan, objects_read: bool) {
+        self.replay_plans_verified = self.replay_plans_verified.saturating_add(1);
+        self.delta_positions
+            .extend(plan.deltas.iter().map(|delta| delta.position));
+        if !objects_read {
+            return;
+        }
+        for manifest in [&plan.pair.earlier, &plan.pair.target] {
+            self.checkpoint_positions.insert(manifest.position);
+            if let Some(reference) = &manifest.token_reference {
+                self.token_digests.insert(reference.sha256.clone());
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.replay_plans_verified = self
+            .replay_plans_verified
+            .saturating_add(other.replay_plans_verified);
+        self.checkpoint_positions.extend(other.checkpoint_positions);
+        self.token_digests.extend(other.token_digests);
+        self.delta_positions.extend(other.delta_positions);
+    }
+
+    fn summary(&self) -> StorageVerificationSummary {
+        StorageVerificationSummary {
+            range_plan_valid: true,
+            checkpoint_objects_valid: true,
+            token_objects_valid: true,
+            delta_order_valid: true,
+            replay_plans_verified: self.replay_plans_verified,
+            checkpoint_objects_verified: count(&self.checkpoint_positions),
+            token_objects_verified: count(&self.token_digests),
+            deltas_verified: count(&self.delta_positions),
+        }
+    }
+}
+
+fn validate_pair_storage(
+    plan: &state_history::CheckpointPairReplayPlan,
+    requested_backends: &[Backend],
+) -> Result<(), HistoricalError> {
+    let earlier = plan.pair.earlier.position;
+    let target = plan.pair.target.position;
+    if earlier >= target || plan.pair.earlier.chain_id != plan.pair.target.chain_id {
+        return Err(invalid_storage("checkpoint pair range is invalid"));
+    }
+    let mut previous = earlier;
+    for delta in &plan.deltas {
+        if delta.position <= previous || delta.position > target {
+            return Err(invalid_storage(
+                "checkpoint pair deltas are not strictly ordered",
+            ));
+        }
+        validate_applicable_backends(delta, requested_backends)?;
+        previous = delta.position;
+    }
+    Ok(())
+}
+
+fn validate_applicable_backends(
+    delta: &state_history::StoredDelta,
+    requested_backends: &[Backend],
+) -> Result<(), HistoricalError> {
+    if delta.applicable_backends.is_empty() {
+        return Err(invalid_storage(
+            "checkpoint pair delta has no applicable backend",
+        ));
+    }
+    let requested = requested_backends
+        .iter()
+        .copied()
+        .map(history_backend)
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    for cursor in &delta.applicable_backends {
+        let cursor_is_valid = requested.contains(&cursor.backend)
+            && seen.insert(cursor.backend)
+            && match cursor.backend {
+                state_history::Backend::Native | state_history::Backend::Vm => {
+                    cursor.block_number.is_some()
+                }
+                state_history::Backend::Rfq => cursor.observed_at_ms.is_some(),
+            };
+        if !cursor_is_valid {
+            return Err(invalid_storage(
+                "checkpoint pair delta has invalid applicable backend metadata",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_storage(message: &str) -> HistoricalError {
+    HistoricalError::HistoricalDataInvalid(message.to_owned())
+}
+
+fn count<T>(values: &BTreeSet<T>) -> u64 {
+    u64::try_from(values.len()).unwrap_or(u64::MAX)
 }
 
 fn compare_quotes(
@@ -306,6 +472,7 @@ fn empty_report(request: &ConsistencyCheckRequest) -> ConsistencyCheckReport {
         backends,
         selection: request.selection.clone(),
         selection_status: ConsistencySelectionStatus::NotComparable,
+        storage: StorageEvidence::default().summary(),
         summary: ConsistencySummary {
             selected_checkpoint_pairs: 0,
             compared_checkpoint_pairs: 0,

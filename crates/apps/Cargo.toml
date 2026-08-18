@@ -34,10 +34,6 @@ path = "src/bin/state-history-analysis.rs"
 name = "state-history-migrate"
 path = "src/bin/state-history-migrate.rs"
 
-[[bin]]
-name = "state-history-check"
-path = "src/bin/state-history-check.rs"
-
 [dev-dependencies]
 chrono.workspace = true
 futures.workspace = true
