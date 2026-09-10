@@ -489,7 +489,7 @@ impl BroadcasterServiceState {
         }
     }
 
-    pub(crate) async fn chain_head_agreements(
+    pub(crate) async fn recovery_head_agreements(
         &self,
         observation: &ChainHeadSnapshot,
     ) -> BTreeMap<BroadcasterBackend, ChainHeadAgreement> {
@@ -497,15 +497,22 @@ impl BroadcasterServiceState {
             .cache
             .complete_backend_heads(&self.required_protocols)
             .await;
+        // Missing publication is expected until the first snapshot is installed. Keep
+        // checking local state during passive warmup without starting a publication timeout.
+        let snapshot_installed = self.snapshot_artifact.read().await.is_some();
         let published = self.redis_publisher.published_backend_heads();
         local
             .into_iter()
             .map(|(backend, head)| {
-                let agreement = backend_head_agreement(
-                    observation,
-                    head.as_ref(),
-                    published.get(&backend).and_then(Option::as_ref),
-                );
+                let agreement = if snapshot_installed {
+                    backend_head_agreement(
+                        observation,
+                        head.as_ref(),
+                        published.get(&backend).and_then(Option::as_ref),
+                    )
+                } else {
+                    observation.agreement(head.as_ref())
+                };
                 (backend, agreement)
             })
             .collect()

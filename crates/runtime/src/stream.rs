@@ -828,7 +828,7 @@ async fn monitor_broadcaster_recovery(
         let Some(observation) = service.chain_head_snapshot() else {
             continue;
         };
-        let agreements = service.chain_head_agreements(&observation).await;
+        let agreements = service.recovery_head_agreements(&observation).await;
         if let Some(exit) = mismatches.observe(
             Instant::now(),
             &agreements,
@@ -1001,17 +1001,19 @@ mod tests {
     };
 
     use super::{
-        classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
-        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterHeadMismatches,
-        BroadcasterRecoveryConfig, BroadcasterStreamControls, StreamMessage, StreamRestartReason,
-        StreamSupervisorConfig,
+        classify_stream_error, handle_broadcaster_update, monitor_broadcaster_recovery,
+        process_broadcaster_raw_stream, process_broadcaster_stream,
+        run_broadcaster_raw_stream_once, BroadcasterHeadMismatches, BroadcasterRecoveryConfig,
+        BroadcasterStreamControls, StreamMessage, StreamRestartReason, StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
         RedisPromotionCommand, RedisPromotionResult, RedisRenewCommand, RedisStreamWriter,
     };
     use crate::broadcaster::service::BroadcasterServiceState;
-    use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
+    use crate::broadcaster::state::{
+        BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterUpstreamState,
+    };
     use crate::broadcaster::state_history::test_state_history_runtime;
     use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
     use crate::config::MemoryConfig;
@@ -1155,6 +1157,102 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn passive_bootstrap_waits_for_snapshot_before_monitoring_published_heads(
+    ) -> anyhow::Result<()> {
+        let (service, observer, publisher) = passive_recovery_service().await?;
+        let monitor =
+            monitor_broadcaster_recovery(&service, test_recovery_config(), Instant::now());
+        tokio::pin!(monitor);
+
+        assert!(timeout(Duration::from_secs(61), &mut monitor)
+            .await
+            .is_err());
+        let status = service.status_snapshot().await;
+        assert_ne!(status.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(
+            status.backends[&BroadcasterBackend::Native].head_agreement,
+            Some(ChainHeadAgreement::AppliedStateIncomplete)
+        );
+
+        let boundary = BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "test_delayed_promotion",
+        )
+        .await?;
+        assert!(boundary.is_some(), "the warmed cache must still promote");
+        assert_eq!(
+            service.status_snapshot().await.readiness,
+            BroadcasterReadiness::Ready
+        );
+
+        observer.observe_for_test(BlockIdentity {
+            number: 10,
+            hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 10)],
+                "test_repromotion",
+            )
+            .await?;
+        let exit = timeout(Duration::from_secs(61), &mut monitor).await?;
+        assert_eq!(exit.reason, StreamRestartReason::HeadMismatchTimeout);
+        assert!(exit
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("applied_state_incomplete")));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passive_bootstrap_still_times_out_on_local_head_mismatch() -> anyhow::Result<()> {
+        let (service, observer, _publisher) = passive_recovery_service().await?;
+        observer.observe_for_test(BlockIdentity {
+            number: 11,
+            hash: native_feed(11).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        let exit = timeout(
+            Duration::from_secs(61),
+            monitor_broadcaster_recovery(&service, test_recovery_config(), Instant::now()),
+        )
+        .await?;
+        assert_eq!(exit.reason, StreamRestartReason::HeadMismatchTimeout);
+        assert!(exit
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("chain_ahead")));
+        Ok(())
+    }
+
+    async fn passive_recovery_service() -> anyhow::Result<(
+        BroadcasterServiceState,
+        ChainHeadObserver,
+        Arc<BroadcasterRedisPublisher>,
+    )> {
+        let protocols = vec!["uniswap_v2".to_string()];
+        let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
+            number: 10,
+            hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                test_publisher_config(8453),
+                Arc::new(RecordStreamAppendsRedisWriter {
+                    appends: Mutex::new(Vec::new()),
+                }),
+            )
+            .with_required_protocols(protocols.clone(), Vec::new()),
+        );
+        let service =
+            test_service_with_publisher(8453, BroadcasterBackend::Native, publisher.clone())
+                .with_chain_head_observer(observer.clone(), protocols, Vec::new());
+        service.mark_upstream_connected().await;
+        service.apply_feed_message(&native_feed(10)).await?;
+        assert!(service.initial_bootstrap_is_complete());
+        Ok((service, observer, publisher))
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn raw_feed_recovers_with_one_owned_lifecycle() -> anyhow::Result<()> {
         let native_protocols = vec!["uniswap_v2".to_string()];
         let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
@@ -1233,7 +1331,7 @@ mod tests {
         );
         assert_eq!(
             status_service
-                .chain_head_agreements(&observer.snapshot())
+                .recovery_head_agreements(&observer.snapshot())
                 .await[&BroadcasterBackend::Native],
             ChainHeadAgreement::Matches
         );
