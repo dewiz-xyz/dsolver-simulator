@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use alloy_primitives::keccak256;
@@ -26,13 +26,15 @@ use crate::broadcaster::redis_publisher::{
 use crate::broadcaster::state::{
     combine_snapshot_exports, BroadcasterReadiness, BroadcasterRecoverySource,
     BroadcasterRecoveryStatus, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
-    BroadcasterSnapshotSessionsSnapshot, BroadcasterStatusSnapshot, BroadcasterUpstreamState,
+    BroadcasterSnapshotSessionsSnapshot, BroadcasterStagedUpdate, BroadcasterStatusSnapshot,
+    BroadcasterUpstreamState,
 };
+use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver, ChainHeadSnapshot};
 use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapshot_export_failure};
 use simulator_core::broadcaster::{
-    BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
-    BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
+    BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
+    BroadcasterPayload, BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
+    BroadcasterUpdateMessage, ProtocolStateHeads, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
 };
 
 const SNAPSHOT_BOUNDARY_RETENTION_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -338,6 +340,7 @@ struct BroadcasterSnapshotCandidate {
     chain_id: u64,
     export: BroadcasterSnapshotExport,
     base_heads: Vec<BroadcasterBackendHead>,
+    protocol_heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
     captured_recovery_work_ids: Vec<u64>,
     handoff_id: u64,
     snapshot_chunk_count: u32,
@@ -356,6 +359,7 @@ struct StartupCandidateCapture {
         usize,
     )>,
     base_heads: Vec<BroadcasterBackendHead>,
+    protocol_heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
     recovery_work_ids: Vec<u64>,
 }
 
@@ -373,7 +377,9 @@ pub struct BroadcasterServiceState {
     recovery_workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     recovery_monitors: Arc<Mutex<Vec<JoinHandle<()>>>>,
     recovery_retry_backoff: Duration,
-    native_progress_lease: Duration,
+    chain_head_observer: Option<ChainHeadObserver>,
+    required_protocols: BTreeMap<BroadcasterBackend, Vec<String>>,
+    initial_bootstrap_completed_at: Arc<OnceLock<Instant>>,
     next_recovery_source_id: Arc<AtomicU64>,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
     // This gate keeps snapshot export and recovery source capture atomic with
@@ -417,26 +423,6 @@ impl BroadcasterServiceState {
         lifecycle_gate: Arc<Mutex<()>>,
         recovery_retry_backoff: Duration,
     ) -> Self {
-        Self::with_lifecycle_gate_and_recovery_backoff_and_lease(
-            snapshot_max_payload_bytes,
-            cache,
-            upstream,
-            redis_publisher,
-            lifecycle_gate,
-            recovery_retry_backoff,
-            Duration::from_secs(5),
-        )
-    }
-
-    pub fn with_lifecycle_gate_and_recovery_backoff_and_lease(
-        snapshot_max_payload_bytes: usize,
-        cache: BroadcasterSnapshotCache,
-        upstream: BroadcasterUpstreamState,
-        redis_publisher: Arc<BroadcasterRedisPublisher>,
-        lifecycle_gate: Arc<Mutex<()>>,
-        recovery_retry_backoff: Duration,
-        native_progress_lease: Duration,
-    ) -> Self {
         Self {
             snapshot_max_payload_bytes,
             cache,
@@ -450,11 +436,79 @@ impl BroadcasterServiceState {
             recovery_workers: Arc::new(Mutex::new(Vec::new())),
             recovery_monitors: Arc::new(Mutex::new(Vec::new())),
             recovery_retry_backoff,
-            native_progress_lease,
+            chain_head_observer: None,
+            required_protocols: BTreeMap::new(),
+            initial_bootstrap_completed_at: Arc::new(OnceLock::new()),
             next_recovery_source_id: Arc::new(AtomicU64::new(1)),
             redis_publisher,
             lifecycle_gate,
         }
+    }
+
+    pub fn with_chain_head_observer(
+        mut self,
+        observer: ChainHeadObserver,
+        native_protocols: Vec<String>,
+        vm_protocols: Vec<String>,
+    ) -> Self {
+        self.chain_head_observer = Some(observer);
+        self.required_protocols = [
+            (BroadcasterBackend::Native, native_protocols),
+            (BroadcasterBackend::Vm, vm_protocols),
+        ]
+        .into_iter()
+        .filter(|(_, protocols)| !protocols.is_empty())
+        .collect();
+        self
+    }
+
+    pub(crate) fn chain_head_snapshot(&self) -> Option<ChainHeadSnapshot> {
+        self.chain_head_observer
+            .as_ref()
+            .map(ChainHeadObserver::snapshot)
+    }
+
+    pub(crate) fn initial_bootstrap_is_complete(&self) -> bool {
+        self.initial_bootstrap_completed_at.get().is_some()
+    }
+
+    pub(crate) fn initial_bootstrap_completed_at(&self) -> Option<Instant> {
+        self.initial_bootstrap_completed_at.get().copied()
+    }
+
+    async fn record_initial_bootstrap_completion(&self) {
+        if self.initial_bootstrap_is_complete() || self.required_protocols.is_empty() {
+            return;
+        }
+        let heads = self
+            .cache
+            .complete_backend_heads(&self.required_protocols)
+            .await;
+        if heads.values().all(Option::is_some) {
+            let _ = self.initial_bootstrap_completed_at.set(Instant::now());
+        }
+    }
+
+    pub(crate) async fn chain_head_agreements(
+        &self,
+        observation: &ChainHeadSnapshot,
+    ) -> BTreeMap<BroadcasterBackend, ChainHeadAgreement> {
+        let local = self
+            .cache
+            .complete_backend_heads(&self.required_protocols)
+            .await;
+        let published = self.redis_publisher.published_backend_heads();
+        local
+            .into_iter()
+            .map(|(backend, head)| {
+                let agreement = backend_head_agreement(
+                    observation,
+                    head.as_ref(),
+                    published.get(&backend).and_then(Option::as_ref),
+                );
+                (backend, agreement)
+            })
+            .collect()
     }
 
     pub(crate) fn chain_id(&self) -> u64 {
@@ -968,13 +1022,12 @@ impl BroadcasterServiceState {
     }
 
     pub async fn apply_feed_message(&self, feed: &FeedMessage<BlockHeader>) -> Result<bool> {
-        Ok(self.apply_feed_message_with_progress(feed).await?.published)
+        Ok(self
+            .apply_feed_message_with_progress(feed)
+            .await?
+            .update_available)
     }
 
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "Replacement, buffered and live updates preserve different publication-before-cache commit boundaries"
-    )]
     pub(crate) async fn apply_feed_message_with_progress(
         &self,
         feed: &FeedMessage<BlockHeader>,
@@ -993,53 +1046,63 @@ impl BroadcasterServiceState {
         let publishes_update = staged.publishes_update();
         let native_progress = (!staged.has_replacement_ready())
             .then(|| {
-                staged.message().and_then(
-                    simulator_core::broadcaster::BroadcasterUpdateMessage::complete_native_block,
-                )
+                staged
+                    .message()
+                    .and_then(BroadcasterUpdateMessage::complete_native_block)
             })
             .flatten();
-        let mut native_progress_was_published = false;
         if staged.has_replacement_ready() {
             let source = self.cache.recovery_source(&staged)?;
             self.cache.commit_staged_update(staged).await?;
             self.start_recovery_publication(source).await;
-        } else if let Some(message) = staged.message() {
-            if self.buffer_recovery_update(message.clone()).await? {
-                self.cache.commit_staged_update(staged).await?;
-            } else {
-                if let Err(error) = self
-                    .publish_to_redis(BroadcasterPayload::Update(message.clone()))
-                    .await
-                {
-                    if error.downcast_ref::<OversizedRedisEntry>().is_some() {
-                        self.cache.commit_staged_update(staged).await?;
-                        self.cache
-                            .begin_same_generation_recovery_from_current()
-                            .await;
-                        warn!(
-                            error = %error,
-                            "Oversized live update retained for full-replacement recovery"
-                        );
-                        return Ok(BroadcasterFeedApply {
-                            published: true,
-                            native_progress,
-                        });
-                    }
-                    return Err(error);
-                }
-                self.cache.commit_staged_update(staged).await?;
-                native_progress_was_published = true;
-            }
+        } else if let Some(message) = staged.message().cloned() {
+            self.publish_staged_feed_update(staged, message, native_progress)
+                .await?;
         } else {
             self.cache.commit_staged_update(staged).await?;
         }
-        if let Some(block_number) = native_progress.filter(|_| native_progress_was_published) {
-            self.upstream.record_native_progress(block_number).await;
-        }
+        self.record_initial_bootstrap_completion().await;
         Ok(BroadcasterFeedApply {
-            published: publishes_update,
+            update_available: publishes_update,
             native_progress,
         })
+    }
+
+    async fn publish_staged_feed_update(
+        &self,
+        staged: BroadcasterStagedUpdate,
+        message: BroadcasterUpdateMessage,
+        native_progress: Option<u64>,
+    ) -> Result<()> {
+        if self.buffer_recovery_update(message.clone()).await? {
+            self.cache.commit_staged_update(staged).await?;
+            return Ok(());
+        }
+        match self
+            .publish_to_redis(BroadcasterPayload::Update(message))
+            .await
+        {
+            Ok(()) => {
+                self.cache.commit_staged_update(staged).await?;
+                if let Some(block_number) = native_progress {
+                    self.upstream.record_native_progress(block_number).await;
+                }
+                Ok(())
+            }
+            Err(error) if error.downcast_ref::<OversizedRedisEntry>().is_some() => {
+                self.cache.commit_staged_update(staged).await?;
+                self.record_initial_bootstrap_completion().await;
+                self.cache
+                    .begin_same_generation_recovery_from_current()
+                    .await;
+                warn!(
+                    error = %error,
+                    "Oversized live update retained for full-replacement recovery"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn buffer_recovery_update(
@@ -1187,6 +1250,7 @@ impl BroadcasterServiceState {
         loop {
             self.spawn_recovery_bounds_monitor(work_id).await;
             let replacement_complete_native_block = source.complete_native_block();
+            let replacement_heads = source.protocol_state_heads(&self.required_protocols);
             let cache = self.cache.clone();
             let replacement = tokio::task::spawn_blocking(move || {
                 cache.serialize_recovery_source(source, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES)
@@ -1252,6 +1316,7 @@ impl BroadcasterServiceState {
                 recovery_id,
                 backends: self.cache.configured_backends(),
                 replacement_json,
+                replacement_heads,
                 buffer_a,
             };
             let publication = self
@@ -1746,7 +1811,6 @@ impl BroadcasterServiceState {
                 self.snapshot_max_payload_bytes,
                 self.upstream.snapshot().await,
                 self.snapshot_sessions.snapshot().await,
-                self.native_progress_lease,
             )
             .await;
         let artifact_available = self.has_current_snapshot_artifact().await;
@@ -1776,6 +1840,37 @@ impl BroadcasterServiceState {
             snapshot.readiness = BroadcasterReadiness::UpstreamRecovering;
         }
         snapshot.recovery = recovery;
+        if let Some(observation) = self.chain_head_snapshot() {
+            let complete_heads = self
+                .cache
+                .complete_backend_heads(&self.required_protocols)
+                .await;
+            let published_heads = self.redis_publisher.published_backend_heads();
+            for (backend, complete_head) in complete_heads {
+                let published_head = published_heads.get(&backend).cloned().flatten();
+                let agreement = backend_head_agreement(
+                    &observation,
+                    complete_head.as_ref(),
+                    published_head.as_ref(),
+                );
+                if let Some(status) = snapshot.backends.get_mut(&backend) {
+                    status.complete_head = complete_head;
+                    status.published_head = published_head;
+                    status.head_agreement = Some(agreement);
+                }
+                snapshot.readiness = match (snapshot.readiness, agreement) {
+                    (BroadcasterReadiness::Ready, ChainHeadAgreement::Matches) => {
+                        BroadcasterReadiness::Ready
+                    }
+                    (BroadcasterReadiness::Ready, ChainHeadAgreement::ObservationUnavailable) => {
+                        BroadcasterReadiness::ChainHeadUnavailable
+                    }
+                    (BroadcasterReadiness::Ready, _) => BroadcasterReadiness::ChainHeadMismatch,
+                    (readiness, _) => readiness,
+                };
+            }
+            snapshot.chain_head = Some(observation);
+        }
         snapshot
     }
 
@@ -1792,6 +1887,7 @@ impl BroadcasterServiceState {
         let chain_id = services[0].cache.chain_id();
         let mut captured = Vec::with_capacity(services.len());
         let mut base_heads = Vec::new();
+        let mut protocol_heads = BTreeMap::new();
         let mut recovery_work_ids = Vec::with_capacity(services.len());
         for (index, service) in services.iter().enumerate() {
             anyhow::ensure!(
@@ -1807,6 +1903,7 @@ impl BroadcasterServiceState {
 
             if let Some(source) = service.cache.pin_snapshot_source().await {
                 base_heads.extend(source.backend_heads());
+                protocol_heads.extend(source.protocol_state_heads(&service.required_protocols));
                 captured.push((
                     service.cache.clone(),
                     source,
@@ -1822,6 +1919,7 @@ impl BroadcasterServiceState {
             handoff_id,
             captured,
             base_heads,
+            protocol_heads,
             recovery_work_ids,
         }))
     }
@@ -1991,6 +2089,37 @@ impl BroadcasterServiceState {
     }
 }
 
+fn backend_head_agreement(
+    observation: &ChainHeadSnapshot,
+    complete_head: Option<&BlockIdentity>,
+    published_head: Option<&BlockIdentity>,
+) -> ChainHeadAgreement {
+    let local_agreement = observation.agreement(complete_head);
+    let published_agreement = observation.agreement(published_head);
+    match (local_agreement, published_agreement) {
+        (ChainHeadAgreement::ObservationUnavailable, _)
+        | (_, ChainHeadAgreement::ObservationUnavailable) => {
+            ChainHeadAgreement::ObservationUnavailable
+        }
+        (
+            ChainHeadAgreement::AppliedStateIncomplete
+            | ChainHeadAgreement::ChainAhead
+            | ChainHeadAgreement::HashMismatch,
+            _,
+        ) => local_agreement,
+        (
+            _,
+            ChainHeadAgreement::AppliedStateIncomplete
+            | ChainHeadAgreement::ChainAhead
+            | ChainHeadAgreement::HashMismatch,
+        ) => published_agreement,
+        (ChainHeadAgreement::ObserverBehind, _) | (_, ChainHeadAgreement::ObserverBehind) => {
+            ChainHeadAgreement::ObserverBehind
+        }
+        _ => ChainHeadAgreement::Matches,
+    }
+}
+
 fn checkpoint_world_matches(
     pinned: &BroadcasterRedisReplayBoundary,
     current: &BroadcasterRedisReplayBoundary,
@@ -2081,7 +2210,7 @@ async fn state_history_aligned_backend_head(services: &[BroadcasterServiceState]
 }
 
 pub(crate) struct BroadcasterFeedApply {
-    pub(crate) published: bool,
+    pub(crate) update_available: bool,
     pub(crate) native_progress: Option<u64>,
 }
 
@@ -2104,6 +2233,7 @@ async fn prepare_startup_snapshot_candidate(
         handoff_id,
         captured,
         base_heads,
+        protocol_heads,
         recovery_work_ids,
     } = capture;
     let started_at = Instant::now();
@@ -2117,7 +2247,14 @@ async fn prepare_startup_snapshot_candidate(
             })
             .collect::<Result<Vec<_>>>()?;
         let export = combine_snapshot_exports(chain_id, exports)?;
-        build_snapshot_candidate(chain_id, export, base_heads, recovery_work_ids, handoff_id)
+        build_snapshot_candidate(
+            chain_id,
+            export,
+            base_heads,
+            protocol_heads,
+            recovery_work_ids,
+            handoff_id,
+        )
     });
     let result = match tokio::time::timeout(STARTUP_HANDOFF_ABORT_AFTER, worker).await {
         Ok(joined) => joined
@@ -2200,10 +2337,15 @@ async fn promote_prepared_startup_candidate(
     services[0]
         .redis_publisher
         .set_deployment_phase(BroadcasterDeploymentPhase::ArtifactFinalizing, None);
+    let published_heads = candidate.protocol_heads.clone();
     let artifact = Arc::new(finalize_snapshot_candidate(candidate, boundary.clone()));
     for service in services {
         *service.snapshot_artifact.write().await = Some(Arc::clone(&artifact));
     }
+    services[0]
+        .redis_publisher
+        .install_published_snapshot_heads(published_heads)
+        .await;
 
     services[0]
         .redis_publisher
@@ -2235,6 +2377,7 @@ fn build_snapshot_candidate(
     chain_id: u64,
     mut export: BroadcasterSnapshotExport,
     base_heads: Vec<BroadcasterBackendHead>,
+    protocol_heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
     captured_recovery_work_ids: Vec<u64>,
     handoff_id: u64,
 ) -> Result<BroadcasterSnapshotCandidate> {
@@ -2278,6 +2421,7 @@ fn build_snapshot_candidate(
         chain_id,
         export,
         base_heads,
+        protocol_heads,
         captured_recovery_work_ids,
         handoff_id,
         snapshot_chunk_count,
@@ -2478,7 +2622,7 @@ fn ensure_shared_lifecycle(services: &[BroadcasterServiceState], context: &str) 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -2516,12 +2660,101 @@ mod tests {
     use crate::broadcaster::state_history::{
         test_state_history_runtime, test_state_history_runtime_with_tokens, StateHistoryRuntime,
     };
+    use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
     use simulator_core::broadcaster::{
-        BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
-        BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolSyncStatus,
-        BroadcasterRedisStreamEntry, BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
-        BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+        BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
+        BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress,
+        BroadcasterProtocolSyncStatus, BroadcasterRedisStreamEntry, BroadcasterSnapshotEnd,
+        BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
+
+    #[test]
+    fn local_state_ahead_of_observer_does_not_hide_unpublished_state() {
+        let reference = BlockIdentity {
+            number: 100,
+            hash: Bytes::from([100; 32]),
+        };
+        let observer = ChainHeadObserver::ready_for_test(reference.clone());
+        let local = BlockIdentity {
+            number: 101,
+            hash: Bytes::from([101; 32]),
+        };
+        let behind = BlockIdentity {
+            number: 99,
+            hash: Bytes::from([99; 32]),
+        };
+        let conflicting = BlockIdentity {
+            number: 100,
+            hash: Bytes::from([42; 32]),
+        };
+        for (published, expected) in [
+            (None, ChainHeadAgreement::AppliedStateIncomplete),
+            (Some(&behind), ChainHeadAgreement::ChainAhead),
+            (Some(&conflicting), ChainHeadAgreement::HashMismatch),
+            (Some(&reference), ChainHeadAgreement::ObserverBehind),
+        ] {
+            assert_eq!(
+                super::backend_head_agreement(&observer.snapshot(), Some(&local), published),
+                expected
+            );
+        }
+        assert_eq!(
+            super::backend_head_agreement(&observer.snapshot(), Some(&reference), Some(&reference)),
+            ChainHeadAgreement::Matches,
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_bootstrap_waits_for_each_configured_backend_and_stays_complete() -> Result<()>
+    {
+        let native_protocols = vec!["uniswap_v2".to_string()];
+        let vm_protocols = vec!["vm:balancer_v2".to_string()];
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(
+                1,
+                vec![BroadcasterBackend::Native, BroadcasterBackend::Vm],
+            ),
+            BroadcasterUpstreamState::default(),
+            Arc::new(BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )),
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(
+            ChainHeadObserver::ready_for_test(BlockIdentity {
+                number: 10,
+                hash: Bytes::from([10; 32]),
+            }),
+            native_protocols,
+            vm_protocols,
+        );
+        service.apply_feed_message(&raw_feed(10, 10, 9)).await?;
+        assert!(
+            !service.initial_bootstrap_is_complete(),
+            "native alone must not end a configured VM bootstrap"
+        );
+        service
+            .apply_feed_message(&raw_feed_for_protocols(10, 10, 9, &["vm:balancer_v2"]))
+            .await?;
+        assert!(service.initial_bootstrap_is_complete());
+        service
+            .apply_feed_message(&partial_raw_feed(11, 11, 10))
+            .await?;
+        assert!(
+            service.initial_bootstrap_is_complete(),
+            "later incompleteness belongs to recovery, not startup"
+        );
+        assert_eq!(
+            service
+                .cache
+                .complete_backend_heads(&service.required_protocols)
+                .await[&BroadcasterBackend::Native],
+            None
+        );
+        Ok(())
+    }
 
     #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
     struct DummySim(u8);
@@ -5244,6 +5477,7 @@ mod tests {
             1,
             snapshot_export(),
             base_heads([BroadcasterBackend::Native]),
+            BTreeMap::new(),
             vec![3],
             9,
         )?;

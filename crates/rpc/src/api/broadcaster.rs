@@ -53,9 +53,10 @@ mod tests {
         broadcaster::state::{
             BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterUpstreamState,
         },
+        chain_head::ChainHeadObserver,
         models::tokens::TokenStore,
     };
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
+    use simulator_core::broadcaster::{BlockIdentity, BroadcasterBackend, BroadcasterBackendHead};
     use tokio::{
         sync::{Barrier, Mutex, Notify},
         task::JoinHandle,
@@ -150,6 +151,73 @@ mod tests {
         Disconnected,
         WarmingUp,
         Ready,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chain_head_readiness_recovers_without_closing_deployment_admission() -> Result<()> {
+        let protocols = vec!["uniswap_v2".to_string()];
+        let head = BlockIdentity {
+            number: 10,
+            hash: Bytes::from([11; 32]),
+        };
+        let observer = ChainHeadObserver::ready_for_test(head.clone());
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                redis_publisher_config(),
+                Arc::new(RpcFakeRedisWriter::healthy()),
+            )
+            .with_required_protocols(protocols.clone(), Vec::new()),
+        );
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher.clone(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(observer.clone(), protocols, Vec::new());
+        service.mark_upstream_connected().await;
+        service
+            .apply_feed_message(&raw_feed(&["uniswap_v2"], 10, None))
+            .await?;
+        BroadcasterServiceState::promote_when_ready(std::slice::from_ref(&service), "test_ready")
+            .await?;
+        let app = create_broadcaster_router(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(
+                Vec::new(),
+                "http://127.0.0.1:1".to_string(),
+                Chain::Ethereum,
+            ),
+            1,
+            Duration::from_secs(300),
+            publisher,
+        ));
+        assert_eq!(get_json(app.clone(), "/ready").await?.0, StatusCode::OK);
+        observer.observe_for_test(BlockIdentity {
+            number: 11,
+            hash: Bytes::from([12; 32]),
+        });
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["backends"]["native"]["head_agreement"], "chain_ahead");
+        assert_eq!(body["backends"]["native"]["published_head"]["number"], 10);
+        assert_eq!(
+            get_json(app.clone(), "/deployment-ready").await?.0,
+            StatusCode::OK
+        );
+        assert_eq!(get_json(app.clone(), "/status").await?.0, StatusCode::OK);
+        observer.observe_for_test(head);
+        assert_eq!(get_json(app.clone(), "/ready").await?.0, StatusCode::OK);
+        observer.fail_for_test();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "chain_head_unavailable");
+        assert_eq!(body["chain_head"]["observation_available"], false);
+        assert_eq!(get_json(app, "/deployment-ready").await?.0, StatusCode::OK);
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use axum::{extract::State, http::StatusCode, Json};
+use runtime::chain_head::ChainHeadAgreement;
 use serde::Serialize;
-use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+use simulator_core::broadcaster::{BlockIdentity, BroadcasterRedisReplayBoundary};
 
 use crate::models::state::{
     AppState, SimulatorBackendKind, SimulatorBackendStatusSnapshot,
@@ -51,6 +52,12 @@ pub struct BackendStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    applied_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_chain_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_head_agreement: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     update_timestamp: Option<u64>,
     pool_count: usize,
     restart_count: u64,
@@ -73,6 +80,11 @@ impl From<SimulatorBackendStatusSnapshot> for BackendStatusPayload {
             status: snapshot.readiness.label(),
             reason: snapshot.reason.map(SimulatorReadinessReason::label),
             block_number: snapshot.block_number,
+            applied_head: snapshot.applied_head,
+            observed_chain_head: snapshot.observed_chain_head,
+            chain_head_agreement: snapshot
+                .chain_head_agreement
+                .map(ChainHeadAgreement::as_str),
             update_timestamp: snapshot.update_timestamp,
             pool_count: snapshot.pool_count,
             restart_count: snapshot.restart_count,
@@ -146,6 +158,7 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<StatusPay
 
 #[cfg(test)]
 mod tests {
+    use runtime::chain_head::ChainHeadObserver;
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -163,7 +176,7 @@ mod tests {
     use chrono::NaiveDateTime;
     use num_bigint::BigUint;
     use num_traits::Zero;
-    use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+    use simulator_core::broadcaster::{BlockIdentity, BroadcasterRedisReplayBoundary};
     use tycho_simulation::protocol::models::{ProtocolComponent, Update};
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::models::{token::Token, Chain};
@@ -273,6 +286,7 @@ mod tests {
             Duration::from_millis(10),
         ));
         AppState {
+            chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -293,7 +307,6 @@ mod tests {
             },
             enable_vm_pools,
             enable_rfq_pools,
-            native_progress_lease: Duration::from_secs(120),
             optional_backend_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
             vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -319,13 +332,23 @@ mod tests {
         assert_eq!(payload.backends["native"].pool_count, 1);
     }
 
-    #[tokio::test]
+    async fn expire_chain_observation(state: &mut AppState) {
+        let head = BlockIdentity {
+            number: 1,
+            hash: Bytes::from(vec![1; 32]),
+        };
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        state.native_state_store.set_applied_head(Some(head)).await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn status_remains_available_for_stale_native_state() {
         let mut state = test_state(false, false);
         seed_native_ready_store(&state).await;
         assert!(state.native_state_store.is_ready());
         state.native_stream_health.record_update(1).await;
-        state.native_progress_lease = Duration::ZERO;
+        expire_chain_observation(&mut state).await;
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -337,7 +360,7 @@ mod tests {
         assert_eq!(payload.backends["native"].reason, Some("stale"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ready_status_code_matches_the_returned_status_snapshot() {
         let ready_state = test_state(false, false);
         seed_native_ready_store(&ready_state).await;
@@ -350,7 +373,7 @@ mod tests {
         let mut stale_state = test_state(false, false);
         seed_native_ready_store(&stale_state).await;
         stale_state.native_stream_health.record_update(1).await;
-        stale_state.native_progress_lease = Duration::ZERO;
+        expire_chain_observation(&mut stale_state).await;
         let (stale_code, Json(stale_payload)) = ready(State(stale_state)).await;
         assert_eq!(stale_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(stale_payload.status, "stale");

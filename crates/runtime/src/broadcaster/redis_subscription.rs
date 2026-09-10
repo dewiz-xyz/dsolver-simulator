@@ -152,6 +152,7 @@ impl BroadcasterSubscriptionControls {
                 state_store: Arc::new(StateStore::new_private_with_snapshot(
                     Arc::clone(&controls.tokens),
                     token_snapshot,
+                    controls.protocols.clone(),
                 )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
@@ -162,6 +163,7 @@ impl BroadcasterSubscriptionControls {
                 state_store: Arc::new(StateStore::new_private_with_snapshot(
                     Arc::clone(&controls.tokens),
                     token_snapshot,
+                    controls.protocols.clone(),
                 )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
@@ -176,6 +178,7 @@ impl BroadcasterSubscriptionControls {
                 state_store: Arc::new(StateStore::new_private_with_snapshot(
                     Arc::clone(&controls.tokens),
                     token_snapshot,
+                    controls.protocols.clone(),
                 )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
@@ -215,7 +218,7 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
             redis_url: redis_config.redis_url.clone(),
             block_ms: redis_config.block_ms,
             read_count: redis_config.read_count,
-            request_timeout: cfg.readiness_stale,
+            request_timeout: cfg.initialization_timeout,
         })
         .await
         {
@@ -703,7 +706,7 @@ fn incomplete_recovery_timeout(
     cfg: &StreamSupervisorConfig,
 ) -> Option<String> {
     prepared.recovery.as_ref().and_then(|recovery| {
-        (recovery.started_at.elapsed() >= cfg.readiness_stale).then(|| {
+        (recovery.started_at.elapsed() >= cfg.initialization_timeout).then(|| {
             format!(
                 "recovery {} remained incomplete at the Redis tail for {} ms",
                 recovery.manifest.recovery_id,

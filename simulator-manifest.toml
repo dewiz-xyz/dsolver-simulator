@@ -104,10 +104,15 @@ native_token_protocol_allowlist = []
 reset_allowance_tokens = []
 
 # Chain entries stay intentionally small: endpoints, enabled protocol sets, and the route policy to use.
-# Only a strictly newer complete block renews each chain's native progress lease.
+# Stream initialization bounds individual replay/bootstrap operations and the first RFQ update.
+# Tycho bootstrap spans construction through complete state; established head mismatch has its own window.
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
@@ -133,7 +138,11 @@ route_policy = "ethereum"
 
 [[chains]]
 chain_id = 8453
-native_progress_lease_secs = 10
+stream_initialization_timeout_secs = 10
+chain_head_poll_interval_ms = 500
+chain_head_observation_max_age_secs = 5
+tycho_initial_bootstrap_timeout_secs = 300
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 64
 tycho_url = "tycho-base-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/base/v3/tokens"

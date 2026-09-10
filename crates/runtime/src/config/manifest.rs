@@ -54,7 +54,11 @@ struct ChainRegistryEntry {
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
-    native_progress_lease_secs: u64,
+    stream_initialization_timeout_secs: u64,
+    chain_head_poll_interval_ms: u64,
+    chain_head_observation_max_age_secs: u64,
+    tycho_initial_bootstrap_timeout_secs: u64,
+    tycho_head_mismatch_recovery_timeout_secs: u64,
     recovery_max_buffered_native_blocks: usize,
     route_policy_id: String,
 }
@@ -114,7 +118,11 @@ struct RawChain {
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
-    native_progress_lease_secs: u64,
+    stream_initialization_timeout_secs: u64,
+    chain_head_poll_interval_ms: u64,
+    chain_head_observation_max_age_secs: u64,
+    tycho_initial_bootstrap_timeout_secs: u64,
+    tycho_head_mismatch_recovery_timeout_secs: u64,
     recovery_max_buffered_native_blocks: usize,
     route_policy: String,
 }
@@ -172,7 +180,12 @@ pub(crate) fn resolve_chain_config(
             native_protocols: chain.native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
-            native_progress_lease_secs: chain.native_progress_lease_secs,
+            stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs,
+            chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms,
+            chain_head_observation_max_age_secs: chain.chain_head_observation_max_age_secs,
+            tycho_initial_bootstrap_timeout_secs: chain.tycho_initial_bootstrap_timeout_secs,
+            tycho_head_mismatch_recovery_timeout_secs: chain
+                .tycho_head_mismatch_recovery_timeout_secs,
             recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
             native_token_protocol_allowlist: route_policy.native_token_protocol_allowlist.clone(),
             reset_allowance_tokens,
@@ -315,6 +328,48 @@ fn validate_route_policies(
     Ok(registry)
 }
 
+fn validate_chain_timing(chain: &RawChain) -> Result<()> {
+    if chain.stream_initialization_timeout_secs == 0 {
+        bail!(
+            "chain {} stream_initialization_timeout_secs must be greater than zero",
+            chain.chain_id
+        );
+    }
+    for (name, value) in [
+        (
+            "chain_head_poll_interval_ms",
+            chain.chain_head_poll_interval_ms,
+        ),
+        (
+            "chain_head_observation_max_age_secs",
+            chain.chain_head_observation_max_age_secs,
+        ),
+        (
+            "tycho_initial_bootstrap_timeout_secs",
+            chain.tycho_initial_bootstrap_timeout_secs,
+        ),
+        (
+            "tycho_head_mismatch_recovery_timeout_secs",
+            chain.tycho_head_mismatch_recovery_timeout_secs,
+        ),
+    ] {
+        if value == 0 {
+            bail!("chain {} {name} must be greater than zero", chain.chain_id);
+        }
+    }
+    if chain
+        .chain_head_observation_max_age_secs
+        .saturating_mul(1000)
+        <= chain.chain_head_poll_interval_ms
+    {
+        bail!(
+            "chain {} observation maximum age must exceed the chain head polling interval",
+            chain.chain_id
+        );
+    }
+    Ok(())
+}
+
 fn validate_chains(
     chains: &[RawChain],
     protocols: &HashMap<String, BackendKind>,
@@ -351,12 +406,7 @@ fn validate_chains(
                 route_policy_id
             );
         }
-        if chain.native_progress_lease_secs == 0 {
-            bail!(
-                "chain {} native_progress_lease_secs must be greater than zero",
-                chain.chain_id
-            );
-        }
+        validate_chain_timing(chain)?;
         if chain.recovery_max_buffered_native_blocks == 0 {
             bail!(
                 "chain {} recovery_max_buffered_native_blocks must be greater than zero",
@@ -396,7 +446,12 @@ fn validate_chains(
                 native_protocols,
                 vm_protocols,
                 rfq_protocols,
-                native_progress_lease_secs: chain.native_progress_lease_secs,
+                stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs,
+                chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms,
+                chain_head_observation_max_age_secs: chain.chain_head_observation_max_age_secs,
+                tycho_initial_bootstrap_timeout_secs: chain.tycho_initial_bootstrap_timeout_secs,
+                tycho_head_mismatch_recovery_timeout_secs: chain
+                    .tycho_head_mismatch_recovery_timeout_secs,
                 recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
                 route_policy_id: route_policy_id.to_string(),
             },

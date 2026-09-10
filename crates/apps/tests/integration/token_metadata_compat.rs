@@ -1,3 +1,4 @@
+use runtime::chain_head::ChainHeadObserver;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -263,6 +264,7 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
     native_stream_health.record_update(42).await;
 
     Ok(AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -283,7 +285,6 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),

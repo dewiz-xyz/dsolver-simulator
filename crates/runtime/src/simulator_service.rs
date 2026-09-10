@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterTokenSnapshotResponse};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{
@@ -18,6 +19,7 @@ use crate::broadcaster::redis_subscription::{
     NativeBroadcasterSubscriptionControls, RfqBroadcasterSubscriptionControls,
     VmBroadcasterSubscriptionControls,
 };
+use crate::chain_head::{ChainHeadConfig, ChainHeadObserver};
 use crate::config::{
     init_logging, load_broadcaster_redis_config, load_config, AppConfig, BroadcasterRedisConfig,
     ChainProfile, MemoryConfig,
@@ -39,6 +41,7 @@ use crate::stream::StreamSupervisorConfig;
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const TOKEN_SNAPSHOT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const OPTIONAL_BACKEND_STALE_SECS: u64 = 300;
+const HEALTH_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct SimulatorServiceParts {
     pub config: AppConfig,
@@ -91,6 +94,9 @@ impl SimulatorRuntime {
 pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> {
     init_logging();
     let config = load_config();
+    let rpc_url = config.rpc_url.clone().ok_or_else(|| {
+        anyhow::anyhow!("RPC_URL is required to observe the configured chain head")
+    })?;
     let chain = config.chain_profile.chain;
     info!(chain_id = chain.id(), chain = %chain, "Initializing price service...");
     log_memory_config(config.memory);
@@ -98,20 +104,27 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
     spawn_memory_snapshot_task(config.memory);
 
     let tokens = load_token_store(&config).await?;
-    let stream_resources = create_stream_resources(Arc::clone(&tokens));
+    let stream_resources = create_stream_resources(Arc::clone(&tokens), &config.chain_profile);
     let app_state = build_app_state(&config, Arc::clone(&tokens), &stream_resources);
     spawn_health_snapshot_task(app_state.clone());
     let supervisor_cfg = build_supervisor_config(&config);
     let redis_config = load_broadcaster_redis_config();
 
     log_rebuild_config(&config, &app_state);
-    let supervisors = spawn_broadcaster_subscription_task(
+    let mut supervisors = spawn_broadcaster_subscription_task(
         &config,
         &redis_config,
         &supervisor_cfg,
         &stream_resources,
         &app_state,
     );
+
+    let observer = Arc::clone(&app_state.chain_head_observer);
+    supervisors.push(tokio::spawn(async move {
+        observer
+            .run(&rpc_url, chain.id(), CancellationToken::new())
+            .await;
+    }));
 
     Ok(SimulatorServiceParts {
         config,
@@ -162,8 +175,7 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
 
 fn spawn_health_snapshot_task(app_state: AppState) {
     tokio::spawn(async move {
-        let mut ticker =
-            tokio::time::interval(Duration::from_millis(app_state.native_progress_lease_ms()));
+        let mut ticker = tokio::time::interval(HEALTH_SNAPSHOT_INTERVAL);
         let mut previous_status = None;
         let mut previous_backends = BTreeMap::new();
         loop {
@@ -392,9 +404,15 @@ async fn load_broadcaster_token_snapshot(
         .map_err(|error| TokenSnapshotLoadError::InvalidToken(anyhow::anyhow!("{error}")))
 }
 
-fn create_stream_resources(tokens: Arc<TokenStore>) -> StreamResources {
-    let native_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
-    let vm_state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
+fn create_stream_resources(tokens: Arc<TokenStore>, profile: &ChainProfile) -> StreamResources {
+    let native_state_store = Arc::new(StateStore::new_with_protocols(
+        Arc::clone(&tokens),
+        core_native_protocols(profile),
+    ));
+    let vm_state_store = Arc::new(StateStore::new_with_protocols(
+        Arc::clone(&tokens),
+        shared_db_protocols(profile),
+    ));
     let rfq_state_store = Arc::new(StateStore::new(tokens));
     let native_stream_health = Arc::new(StreamHealth::new());
     let vm_stream_health = Arc::new(StreamHealth::new());
@@ -419,8 +437,6 @@ fn build_app_state(
     resources: &StreamResources,
 ) -> AppState {
     let chain = config.chain_profile.chain;
-    let native_progress_lease =
-        Duration::from_secs(config.chain_profile.native_progress_lease_secs);
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
     let configured_vm_pools = !shared_db_protocols(&config.chain_profile).is_empty();
     let configured_rfq_pools = !config.chain_profile.rfq_protocols.is_empty();
@@ -429,6 +445,13 @@ fn build_app_state(
 
     AppState {
         chain,
+        chain_head_observer: Arc::new(ChainHeadObserver::new(ChainHeadConfig {
+            poll_interval: Duration::from_millis(config.chain_profile.chain_head_poll_interval_ms),
+            rpc_request_timeout: Duration::from_secs(2),
+            observation_max_age: Duration::from_secs(
+                config.chain_profile.chain_head_observation_max_age_secs,
+            ),
+        })),
         rfq_client_config: Arc::new(RfqClientConfig {
             tvl_threshold: config.tvl_threshold,
             bebop_key: config.bebop_key.clone(),
@@ -457,7 +480,6 @@ fn build_app_state(
         },
         enable_vm_pools: effective_vm_enabled,
         enable_rfq_pools: effective_rfq_enabled,
-        native_progress_lease,
         optional_backend_stale: Duration::from_secs(OPTIONAL_BACKEND_STALE_SECS),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
@@ -479,7 +501,9 @@ fn log_erc4626_capability(config: &AppConfig) {
 
 fn build_supervisor_config(config: &AppConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(config.chain_profile.native_progress_lease_secs),
+        initialization_timeout: Duration::from_secs(
+            config.chain_profile.stream_initialization_timeout_secs,
+        ),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -519,8 +543,8 @@ fn spawn_broadcaster_subscription_task(
             BroadcasterSubscriptionControls::Rfq(_) => ("rfq", BroadcasterSubscriptionBackend::Rfq),
         };
         let mut backend_supervisor_cfg = supervisor_cfg.clone();
-        backend_supervisor_cfg.readiness_stale =
-            subscription_readiness_stale(backend, &config.chain_profile);
+        backend_supervisor_cfg.initialization_timeout =
+            subscription_replay_timeout(backend, &config.chain_profile);
         supervisors.push(spawn_broadcaster_subscription_supervisor(
             scope,
             config,
@@ -580,13 +604,13 @@ enum BroadcasterSubscriptionBackend {
     Rfq,
 }
 
-fn subscription_readiness_stale(
+fn subscription_replay_timeout(
     backend: BroadcasterSubscriptionBackend,
     profile: &ChainProfile,
 ) -> Duration {
     match backend {
         BroadcasterSubscriptionBackend::Native => {
-            Duration::from_secs(profile.native_progress_lease_secs)
+            Duration::from_secs(profile.stream_initialization_timeout_secs)
         }
         BroadcasterSubscriptionBackend::Vm | BroadcasterSubscriptionBackend::Rfq => {
             Duration::from_secs(OPTIONAL_BACKEND_STALE_SECS)
@@ -763,7 +787,7 @@ mod tests {
     use super::{
         broadcaster_subscription_controls, broadcaster_subscription_plan, build_app_state,
         create_stream_resources, enabled_broadcaster_subscription_backends,
-        load_broadcaster_token_snapshot_with_retry, load_token_store, subscription_readiness_stale,
+        load_broadcaster_token_snapshot_with_retry, load_token_store, subscription_replay_timeout,
         BroadcasterSubscriptionBackend,
     };
 
@@ -1027,7 +1051,11 @@ mod tests {
             ],
             vm_protocols: Vec::new(),
             rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
-            native_progress_lease_secs: 10,
+            stream_initialization_timeout_secs: 10,
+            chain_head_poll_interval_ms: 500,
+            chain_head_observation_max_age_secs: 5,
+            tycho_initial_bootstrap_timeout_secs: 300,
+            tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 64,
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
@@ -1048,7 +1076,11 @@ mod tests {
             ],
             vm_protocols: vec!["vm:curve".to_string()],
             rfq_protocols: vec!["rfq:hashflow".to_string(), "rfq:liquorice".to_string()],
-            native_progress_lease_secs: 25,
+            stream_initialization_timeout_secs: 25,
+            chain_head_poll_interval_ms: 1000,
+            chain_head_observation_max_age_secs: 15,
+            tycho_initial_bootstrap_timeout_secs: 900,
+            tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 8,
             native_token_protocol_allowlist: vec!["rocketpool".to_string()],
             reset_allowance_tokens,
@@ -1265,7 +1297,7 @@ mod tests {
     fn build_app_state_enables_guarded_v4_and_rfq_for_base_profile() {
         let config = build_test_config(base_chain_profile(), true, true, None);
         let tokens = build_test_token_store(Chain::Base);
-        let resources = create_stream_resources(Arc::clone(&tokens));
+        let resources = create_stream_resources(Arc::clone(&tokens), &config.chain_profile);
 
         let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
@@ -1281,24 +1313,20 @@ mod tests {
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
-        assert_eq!(app_state.native_progress_lease, Duration::from_secs(10));
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(
-            subscription_readiness_stale(
+            subscription_replay_timeout(
                 BroadcasterSubscriptionBackend::Native,
                 &config.chain_profile
             ),
             Duration::from_secs(10)
         );
         assert_eq!(
-            subscription_readiness_stale(BroadcasterSubscriptionBackend::Vm, &config.chain_profile),
+            subscription_replay_timeout(BroadcasterSubscriptionBackend::Vm, &config.chain_profile),
             Duration::from_secs(300)
         );
         assert_eq!(
-            subscription_readiness_stale(
-                BroadcasterSubscriptionBackend::Rfq,
-                &config.chain_profile
-            ),
+            subscription_replay_timeout(BroadcasterSubscriptionBackend::Rfq, &config.chain_profile),
             Duration::from_secs(300)
         );
     }
@@ -1307,7 +1335,7 @@ mod tests {
     fn enabled_broadcaster_subscription_backends_include_rfq_when_effective() {
         let config = build_test_config(base_chain_profile(), true, true, None);
         let tokens = build_test_token_store(Chain::Base);
-        let resources = create_stream_resources(Arc::clone(&tokens));
+        let resources = create_stream_resources(Arc::clone(&tokens), &config.chain_profile);
         let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
         assert_eq!(
@@ -1328,7 +1356,7 @@ mod tests {
     fn base_v4_uses_guarded_store_over_native_wire_partition() -> Result<()> {
         let config = build_test_config(base_chain_profile(), true, false, None);
         let tokens = build_test_token_store(Chain::Base);
-        let resources = create_stream_resources(Arc::clone(&tokens));
+        let resources = create_stream_resources(Arc::clone(&tokens), &config.chain_profile);
         let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
         let controls = broadcaster_subscription_controls(&config, &resources, &app_state);
 
@@ -1352,7 +1380,7 @@ mod tests {
     async fn build_app_state_initializes_rfq_broadcaster_subscription_status() {
         let config = build_test_config(base_chain_profile(), false, true, None);
         let tokens = build_test_token_store(Chain::Base);
-        let resources = create_stream_resources(Arc::clone(&tokens));
+        let resources = create_stream_resources(Arc::clone(&tokens), &config.chain_profile);
         let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
         let snapshot = app_state.rfq_broadcaster_subscription.snapshot().await;
@@ -1369,7 +1397,7 @@ mod tests {
             Some("http://localhost:8545"),
         );
         let tokens = build_test_token_store(Chain::Ethereum);
-        let resources = create_stream_resources(Arc::clone(&tokens));
+        let resources = create_stream_resources(Arc::clone(&tokens), &config.chain_profile);
 
         let app_state = build_app_state(&config, Arc::clone(&tokens), &resources);
 
@@ -1382,10 +1410,9 @@ mod tests {
         );
         assert!(app_state.reset_allowance_tokens.contains_key(&1));
         assert!(app_state.erc4626_deposits_enabled);
-        assert_eq!(app_state.native_progress_lease, Duration::from_secs(25));
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(
-            subscription_readiness_stale(
+            subscription_replay_timeout(
                 BroadcasterSubscriptionBackend::Native,
                 &config.chain_profile
             ),
