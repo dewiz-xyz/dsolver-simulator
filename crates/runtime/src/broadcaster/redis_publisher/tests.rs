@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -10,7 +10,10 @@ use state_history::GapReason;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, timeout, Duration};
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
-use tycho_simulation::tycho_client::feed::{BlockHeader, SynchronizerState};
+use tycho_simulation::tycho_client::feed::{
+    synchronizer::{Snapshot, StateSyncMessage},
+    BlockHeader, SynchronizerState,
+};
 use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
 use tycho_simulation::tycho_common::models::{token::Token, Chain};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -28,9 +31,449 @@ use super::{
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use crate::broadcaster::state_history::test_state_history_runtime;
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterMessageKind,
-    BroadcasterPayload, BroadcasterProgress, BroadcasterRedisStreamEntry, BroadcasterUpdateMessage,
+    BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
+    BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolMessage,
+    BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterRedisStreamEntry,
+    BroadcasterStateDelta, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    ProtocolStateHeads,
 };
+
+#[tokio::test]
+async fn published_heads_follow_current_backend_state_after_successful_append() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = Arc::new(
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+            .with_required_protocols(vec!["uniswap_v2".into()], vec!["vm:balancer_v2".into()]),
+    );
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native, BroadcasterBackend::Vm]),
+            "test",
+        )
+        .await?;
+    for backend in [BroadcasterBackend::Native, BroadcasterBackend::Vm] {
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+                backend, 10, 1,
+            )?))
+            .await?;
+    }
+    writer.block_message_seq(4).await;
+    let publish = tokio::spawn({
+        let publisher = Arc::clone(&publisher);
+        async move {
+            publisher
+                .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+                    BroadcasterBackend::Native,
+                    10,
+                    2,
+                )?))
+                .await
+        }
+    });
+    timeout(Duration::from_secs(1), writer.wait_for_blocked_append()).await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(10, 1))
+    );
+    writer.release_blocked_append();
+    publish.await??;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(10, 2))
+    );
+
+    let mut incomplete = complete_head_update(BroadcasterBackend::Native, 11, 3)?;
+    incomplete.partitions[0].messages[0]
+        .message
+        .header
+        .partial_block_index = Some(0);
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(incomplete))
+        .await?;
+    let heads = publisher.published_backend_heads();
+    assert_eq!(heads[&BroadcasterBackend::Native], None);
+    assert_eq!(heads[&BroadcasterBackend::Vm], Some(block_identity(10, 1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn decoded_state_changes_cannot_retain_a_published_protocol_head() -> Result<()> {
+    let publisher =
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
+            .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test")
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+            BroadcasterBackend::Native,
+            10,
+            1,
+        )?))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(10, 1))
+    );
+    let mut decoded = complete_head_update(BroadcasterBackend::Native, 11, 2)?;
+    decoded.partitions[0].messages.clear();
+    decoded.partitions[0]
+        .updated_states
+        .push(BroadcasterStateDelta::new(
+            "native-state",
+            BroadcasterBackend::Native,
+            Box::new(DummySim(11)),
+        ));
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(decoded))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_only_delayed_and_stale_updates_preserve_published_state() -> Result<()> {
+    let publisher =
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
+            .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test")
+        .await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+            BroadcasterBackend::Native,
+            10,
+            1,
+        )?))
+        .await?;
+
+    for kind in [
+        BroadcasterProtocolSyncStatusKind::Delayed,
+        BroadcasterProtocolSyncStatusKind::Stale,
+    ] {
+        let mut metadata = complete_head_update(BroadcasterBackend::Native, 10, 1)?;
+        metadata.partitions[0].messages.clear();
+        metadata.partitions[0]
+            .sync_statuses
+            .get_mut("uniswap_v2")
+            .ok_or_else(|| anyhow!("native status missing from fixture"))?
+            .kind = kind;
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(metadata))
+            .await?;
+        assert_eq!(
+            publisher.published_backend_heads()[&BroadcasterBackend::Native],
+            Some(block_identity(10, 1)),
+            "metadata alone does not change the state compared with the independent chain head",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_protocol_heads_catch_up_despite_stale_sync_statuses() -> Result<()> {
+    let required_protocols = vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()];
+    let publisher =
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
+            .with_required_protocols(required_protocols.clone(), Vec::new());
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test")
+        .await?;
+    let initial_messages = vec![
+        raw_head_message("uniswap_v2", 99, 1),
+        raw_head_message("uniswap_v3", 100, 2),
+    ];
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(BroadcasterUpdateMessage::new(
+            vec![BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                100,
+                initial_messages.clone(),
+                BTreeMap::new(),
+            )],
+        )?))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        None
+    );
+
+    // A frozen incomplete snapshot must retain each protocol's installed head.
+    publisher
+        .install_published_snapshot_heads(BTreeMap::from([(
+            BroadcasterBackend::Native,
+            ProtocolStateHeads::from_snapshot(required_protocols.clone(), &initial_messages),
+        )]))
+        .await;
+    let stale_header = initial_messages[0].message.header.clone();
+    let mut catch_up = raw_head_message("uniswap_v2", 100, 2);
+    catch_up.sync_state = SynchronizerState::Stale(stale_header.clone());
+    let stale_status = BroadcasterProtocolSyncStatus::from_synchronizer_state(
+        &SynchronizerState::Stale(stale_header),
+    );
+    let statuses = required_protocols
+        .into_iter()
+        .map(|protocol| (protocol, stale_status.clone()))
+        .collect();
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(BroadcasterUpdateMessage::new(
+            vec![BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                100,
+                vec![catch_up],
+                statuses,
+            )],
+        )?))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(100, 2))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn passive_and_buffered_updates_only_advance_heads_when_handoff_is_published() -> Result<()> {
+    let publisher =
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
+            .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+            BroadcasterBackend::Native,
+            10,
+            1,
+        )?))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        None
+    );
+    let handoff_id = publisher.begin_startup_handoff().await?;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+            BroadcasterBackend::Native,
+            11,
+            2,
+        )?))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        None
+    );
+    let handoff = publisher.freeze_startup_handoff(handoff_id).await?;
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test")
+        .await?;
+    publisher
+        .install_published_snapshot_heads(BTreeMap::from([(
+            BroadcasterBackend::Native,
+            snapshot_protocol_heads(BroadcasterBackend::Native, 10, 1)?,
+        )]))
+        .await;
+    publisher.drain_startup_handoff(handoff).await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(11, 2))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_recovery_heads_wait_for_commit_and_follow_buffer_order() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = Arc::new(
+        BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+            .with_required_protocols(vec!["uniswap_v2".into()], vec!["vm:balancer_v2".into()]),
+    );
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native, BroadcasterBackend::Vm]),
+            "test",
+        )
+        .await?;
+    publisher
+        .install_published_snapshot_heads(BTreeMap::from([
+            (
+                BroadcasterBackend::Native,
+                snapshot_protocol_heads(BroadcasterBackend::Native, 10, 1)?,
+            ),
+            (
+                BroadcasterBackend::Vm,
+                snapshot_protocol_heads(BroadcasterBackend::Vm, 10, 1)?,
+            ),
+        ]))
+        .await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let recovery_id = publisher
+        .begin_recovery(&[BroadcasterBackend::Native], Arc::clone(&cancelled))
+        .await;
+    publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
+            BroadcasterBackend::Vm,
+            12,
+            4,
+        )?))
+        .await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Vm],
+        Some(block_identity(10, 1))
+    );
+    // Start, one chunk, two catch-up updates, then commit at sequence 6.
+    writer.block_message_seq(6).await;
+    let publish = tokio::spawn({
+        let publisher = Arc::clone(&publisher);
+        async move {
+            publisher
+                .publish_recovery(
+                    super::BroadcasterRecoveryTransaction {
+                        recovery_id,
+                        backends: vec![BroadcasterBackend::Native],
+                        replacement_json: "replacement".into(),
+                        replacement_heads: BTreeMap::from([(
+                            BroadcasterBackend::Native,
+                            snapshot_protocol_heads(BroadcasterBackend::Native, 11, 2)?,
+                        )]),
+                        buffer_a: vec![
+                            complete_head_update(BroadcasterBackend::Native, 12, 3)?,
+                            complete_head_update(BroadcasterBackend::Native, 11, 4)?,
+                        ],
+                    },
+                    &cancelled,
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(1), writer.wait_for_blocked_append()).await?;
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(10, 1))
+    );
+    writer.release_blocked_append();
+    publish.await??;
+    let heads = publisher.published_backend_heads();
+    assert_eq!(
+        heads[&BroadcasterBackend::Native],
+        Some(block_identity(11, 4))
+    );
+    assert_eq!(heads[&BroadcasterBackend::Vm], Some(block_identity(12, 4)));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_recovery_commit_preserves_previously_published_heads() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
+        .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+    publisher
+        .promote(base_heads([BroadcasterBackend::Native]), "test")
+        .await?;
+    publisher
+        .install_published_snapshot_heads(BTreeMap::from([(
+            BroadcasterBackend::Native,
+            snapshot_protocol_heads(BroadcasterBackend::Native, 10, 1)?,
+        )]))
+        .await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let recovery_id = publisher
+        .begin_recovery(&[BroadcasterBackend::Native], Arc::clone(&cancelled))
+        .await;
+    writer.fail_message_seq(4).await;
+    let result = publisher
+        .publish_recovery(
+            super::BroadcasterRecoveryTransaction {
+                recovery_id,
+                backends: vec![BroadcasterBackend::Native],
+                replacement_json: "replacement".into(),
+                replacement_heads: BTreeMap::from([(
+                    BroadcasterBackend::Native,
+                    snapshot_protocol_heads(BroadcasterBackend::Native, 11, 2)?,
+                )]),
+                buffer_a: Vec::new(),
+            },
+            &cancelled,
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        publisher.published_backend_heads()[&BroadcasterBackend::Native],
+        Some(block_identity(10, 1))
+    );
+    assert!(!writer
+        .appends()
+        .await
+        .iter()
+        .any(|append| append.entry.kind == BroadcasterMessageKind::RecoveryCommit));
+    Ok(())
+}
+
+fn block_identity(number: u64, hash_seed: u8) -> BlockIdentity {
+    BlockIdentity {
+        number,
+        hash: Bytes::from(vec![hash_seed; 32]),
+    }
+}
+
+fn complete_head_update(
+    backend: BroadcasterBackend,
+    number: u64,
+    hash_seed: u8,
+) -> Result<BroadcasterUpdateMessage> {
+    let protocol = match backend {
+        BroadcasterBackend::Native => "uniswap_v2",
+        BroadcasterBackend::Vm => "vm:balancer_v2",
+        BroadcasterBackend::Rfq => unreachable!("RFQ has no chain head"),
+    };
+    let message = raw_head_message(protocol, number, hash_seed);
+    let status = BroadcasterProtocolSyncStatus::from_synchronizer_state(&message.sync_state);
+    BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::with_messages(
+        backend,
+        number,
+        vec![message],
+        BTreeMap::from([(protocol.into(), status)]),
+    )])
+    .map_err(Into::into)
+}
+
+fn raw_head_message(protocol: &str, number: u64, hash_seed: u8) -> BroadcasterProtocolMessage {
+    let header = BlockHeader {
+        hash: block_identity(number, hash_seed).hash,
+        number,
+        parent_hash: Bytes::from(vec![0; 32]),
+        revert: false,
+        timestamp: number,
+        partial_block_index: None,
+    };
+    BroadcasterProtocolMessage::new(
+        protocol,
+        SynchronizerState::Ready(header.clone()),
+        StateSyncMessage {
+            header,
+            snapshots: Snapshot {
+                states: HashMap::new(),
+                vm_storage: HashMap::new(),
+            },
+            deltas: None,
+            removed_components: HashMap::new(),
+        },
+    )
+}
+
+fn snapshot_protocol_heads(
+    backend: BroadcasterBackend,
+    number: u64,
+    hash_seed: u8,
+) -> Result<ProtocolStateHeads> {
+    let update = complete_head_update(backend, number, hash_seed)?;
+    let message = &update.partitions[0].messages[0];
+    Ok(ProtocolStateHeads::from_snapshot(
+        vec![message.protocol.clone()],
+        std::slice::from_ref(message),
+    ))
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DummySim(u8);
@@ -759,6 +1202,7 @@ async fn stale_writer_cannot_append_or_commit_recovery_transaction() -> Result<(
         recovery_id,
         backends: vec![BroadcasterBackend::Native],
         replacement_json: "replacement".to_string(),
+        replacement_heads: BTreeMap::new(),
         buffer_a: Vec::new(),
     };
     let Err(error) = old.publish_recovery(transaction, cancelled.as_ref()).await else {
@@ -957,6 +1401,7 @@ async fn recovery_transaction_appends_start_chunks_buffer_a_and_commit_contiguou
         recovery_id,
         backends: vec![BroadcasterBackend::Native],
         replacement_json: "x".repeat(3_600_000),
+        replacement_heads: BTreeMap::new(),
         buffer_a: vec![BroadcasterUpdateMessage::from_tycho_update(
             &update(BroadcasterBackend::Native, 11, "native-buffer-a"),
             &HashMap::new(),
@@ -1013,6 +1458,7 @@ async fn recovery_versions_advance_past_intervening_live_traffic() -> Result<()>
                 recovery_id: first_recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "first replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             first_cancelled.as_ref(),
@@ -1037,6 +1483,7 @@ async fn recovery_versions_advance_past_intervening_live_traffic() -> Result<()>
                 recovery_id: second_recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "second replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             second_cancelled.as_ref(),
@@ -1097,6 +1544,7 @@ async fn partial_recovery_queues_sibling_until_superseding_commit() -> Result<()
                 recovery_id: first_recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "first replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             first_cancelled.as_ref(),
@@ -1118,6 +1566,7 @@ async fn partial_recovery_queues_sibling_until_superseding_commit() -> Result<()
                 recovery_id: second_recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "second replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             second_cancelled.as_ref(),
@@ -1176,6 +1625,7 @@ async fn superseding_recovery_waits_for_commit_and_drain_without_deadlock() -> R
                         recovery_id: first_recovery_id,
                         backends: vec![BroadcasterBackend::Native],
                         replacement_json: "first replacement".to_string(),
+                        replacement_heads: BTreeMap::new(),
                         buffer_a: Vec::new(),
                     },
                     first_cancelled.as_ref(),
@@ -1219,6 +1669,7 @@ async fn superseding_recovery_waits_for_commit_and_drain_without_deadlock() -> R
                 recovery_id: second_recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "second replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             second_cancelled.as_ref(),
@@ -1378,6 +1829,7 @@ async fn identical_recovery_duplicate_is_accepted_after_lost_append_reply() -> R
                 recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             cancelled.as_ref(),
@@ -1420,6 +1872,7 @@ async fn conflicting_recovery_duplicate_is_rejected() -> Result<()> {
                 recovery_id,
                 backends: vec![BroadcasterBackend::Native],
                 replacement_json: "replacement".to_string(),
+                replacement_heads: BTreeMap::new(),
                 buffer_a: Vec::new(),
             },
             cancelled.as_ref(),

@@ -34,7 +34,7 @@ use tycho_simulation::{
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
     BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterTokenDto,
-    BroadcasterUpdateMessage,
+    BroadcasterUpdateMessage, ProtocolHeadUpdate,
 };
 
 use crate::payload::{live_partition_update, snapshot_partition_update};
@@ -256,6 +256,7 @@ impl ReplayDecoder {
         let mut raw_messages = BTreeMap::<ReplayBackend, RawSnapshotReassembly>::new();
         let mut seen_backends = HashSet::new();
         let mut combined = None;
+        let mut protocol_head_updates = Vec::new();
         let mut block_number = 0;
         for chunk in chunks.into_values() {
             if chunk.snapshot_id != snapshot_id {
@@ -272,6 +273,7 @@ impl ReplayDecoder {
                 block_number = block_number.max(partition.block_number);
                 if partition.messages.is_empty() {
                     let decoded = self.decode_snapshot_partition(partition).await?;
+                    protocol_head_updates.extend(decoded.protocol_head_updates);
                     merge_update(&mut combined, decoded.update);
                     continue;
                 }
@@ -284,9 +286,10 @@ impl ReplayDecoder {
             }
         }
         for (backend, mut reassembly) in raw_messages {
-            let update = self
-                .decode_snapshot_messages(backend, reassembly.take_messages())
+            let (update, head_updates) = self
+                .decode_protocol_messages(backend, reassembly.take_messages())
                 .await?;
+            protocol_head_updates.extend(head_updates);
             merge_update(&mut combined, update);
         }
         if let Some(missing) = selected
@@ -304,6 +307,7 @@ impl ReplayDecoder {
             had_applicable_partition: true,
             block_number,
             complete_native_block: None,
+            protocol_head_updates,
             update: combined,
         })
     }
@@ -315,17 +319,34 @@ impl ReplayDecoder {
         let backend = ReplayBackend::from(partition.backend);
         self.ensure_backend_configured(backend)?;
         let block_number = partition.block_number;
-        let update = if partition.messages.is_empty() {
-            Some(snapshot_partition_update(partition))
+        let (update, protocol_head_updates) = if partition.messages.is_empty() {
+            let head_updates = if backend != ReplayBackend::Rfq && !partition.states.is_empty() {
+                self.config
+                    .protocols(backend)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|protocol| ProtocolHeadUpdate {
+                        protocol: protocol.clone(),
+                        head: None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (Some(snapshot_partition_update(partition)), head_updates)
         } else {
             self.ensure_raw_messages_supported(backend)?;
             self.decode_protocol_messages(backend, partition.messages)
                 .await?
         };
+        let block_number = update
+            .as_ref()
+            .map_or(block_number, |update| update.block_number_or_timestamp);
         Ok(DecodedReplay {
             had_applicable_partition: true,
             block_number,
             complete_native_block: None,
+            protocol_head_updates,
             update,
         })
     }
@@ -340,7 +361,9 @@ impl ReplayDecoder {
             return Ok(None);
         }
         self.ensure_raw_messages_supported(backend)?;
-        self.decode_protocol_messages(backend, messages).await
+        self.decode_protocol_messages(backend, messages)
+            .await
+            .map(|(update, _)| update)
     }
 
     pub async fn decode_delta(
@@ -386,16 +409,17 @@ impl ReplayDecoder {
         }
 
         let mut combined: Option<Update> = None;
-        let mut block_number: Option<u64> = None;
+        let mut block_number = 0;
         let mut complete_native_block: Option<u64> = None;
         let mut had_applicable_partition = false;
+        let mut protocol_head_updates = Vec::new();
         for partition in update
             .partitions
             .into_iter()
             .filter(|partition| applicable.contains(&ReplayBackend::from(partition.backend)))
         {
-            had_applicable_partition = true;
             let backend = ReplayBackend::from(partition.backend);
+            had_applicable_partition = true;
             if let Some(complete_block) = partition.complete_native_block() {
                 complete_native_block = Some(
                     complete_native_block
@@ -403,18 +427,37 @@ impl ReplayDecoder {
                         .max(complete_block),
                 );
             }
-            block_number = Some(block_number.unwrap_or_default().max(partition.block_number));
             let decoded = if partition.messages.is_empty() {
-                Some(live_partition_update(partition))
+                let has_state_payload = !partition.new_pairs.is_empty()
+                    || !partition.updated_states.is_empty()
+                    || !partition.removed_pairs.is_empty();
+                if backend != ReplayBackend::Rfq && has_state_payload {
+                    protocol_head_updates.extend(
+                        self.config
+                            .protocols(backend)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|protocol| ProtocolHeadUpdate {
+                                protocol: protocol.clone(),
+                                head: None,
+                            }),
+                    );
+                }
+                (backend == ReplayBackend::Rfq || has_state_payload)
+                    .then(|| live_partition_update(partition))
             } else {
                 self.ensure_raw_messages_supported(backend)?;
-                self.decode_protocol_messages(backend, partition.messages)
-                    .await?
+                let (decoded, head_updates) = self
+                    .decode_protocol_messages(backend, partition.messages)
+                    .await?;
+                protocol_head_updates.extend(head_updates);
+                decoded
             };
+            if let Some(update) = &decoded {
+                block_number = block_number.max(update.block_number_or_timestamp);
+            }
             merge_update(&mut combined, decoded);
         }
-
-        let block_number = block_number.unwrap_or_default();
         if let Some(update) = combined.as_mut() {
             update.block_number_or_timestamp = block_number;
         }
@@ -422,6 +465,7 @@ impl ReplayDecoder {
             had_applicable_partition,
             block_number,
             complete_native_block,
+            protocol_head_updates,
             update: combined,
         })
     }
@@ -430,12 +474,14 @@ impl ReplayDecoder {
         &self,
         backend: ReplayBackend,
         messages: Vec<BroadcasterProtocolMessage>,
-    ) -> Result<Option<Update>, ReplayDecodeError> {
+    ) -> Result<(Option<Update>, Vec<ProtocolHeadUpdate>), ReplayDecodeError> {
         let mut combined: Option<Update> = None;
+        let mut head_updates = Vec::new();
         for raw in messages {
             if !self.config.contains_protocol(backend, &raw.protocol) {
                 continue;
             }
+            let head_update = ProtocolHeadUpdate::from_message(&raw);
             let mut state_msgs = HashMap::new();
             state_msgs.insert(raw.protocol.clone(), raw.message);
             let mut sync_states = HashMap::new();
@@ -450,8 +496,9 @@ impl ReplayDecoder {
                 .await
                 .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
             merge_update(&mut combined, Some(update));
+            head_updates.push(head_update);
         }
-        Ok(combined)
+        Ok((combined, head_updates))
     }
 
     fn ensure_backend_configured(&self, backend: ReplayBackend) -> Result<(), ReplayDecodeError> {

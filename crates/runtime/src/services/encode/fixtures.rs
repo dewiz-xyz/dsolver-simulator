@@ -10,6 +10,7 @@ use tycho_simulation::tycho_common::models::token::Token;
 use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::Bytes;
 
+use crate::chain_head::ChainHeadObserver;
 use crate::config::SlippageConfig;
 use crate::models::erc4626::Erc4626PairPolicy;
 use crate::models::messages::PoolRef;
@@ -154,6 +155,7 @@ pub(super) fn test_app_state(
 ) -> AppState {
     AppState {
         chain: Chain::Ethereum,
+        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,
@@ -173,7 +175,6 @@ pub(super) fn test_app_state(
         },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: config.request_timeout,
         vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),

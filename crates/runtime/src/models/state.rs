@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+use simulator_core::broadcaster::{
+    BlockIdentity, BroadcasterRedisReplayBoundary, ProtocolHeadUpdate, ProtocolStateHeads,
+};
 use simulator_replay::{ApplyReport, PoolEntry, ReplayWorld, StatePoint};
 use tokio::sync::{watch, Mutex, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
@@ -14,6 +16,7 @@ use tycho_simulation::{
     },
 };
 
+use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
 use crate::config::SlippageConfig;
 
 use super::{
@@ -33,6 +36,7 @@ fn native_token_address() -> Bytes {
 #[derive(Clone)]
 pub struct AppState {
     pub chain: Chain,
+    pub chain_head_observer: Arc<ChainHeadObserver>,
     pub rfq_client_config: Arc<RfqClientConfig>,
     pub native_token_protocol_allowlist: Arc<Vec<String>>,
     pub tokens: Arc<TokenStore>,
@@ -49,7 +53,6 @@ pub struct AppState {
     pub configured_backends: ConfiguredBackends,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
-    pub native_progress_lease: Duration,
     pub optional_backend_stale: Duration,
     pub request_timeout: Duration,
     pub vm_simulation_rebuild_gate: Arc<RwLock<()>>,
@@ -151,6 +154,11 @@ pub struct BroadcasterSubscriptionSnapshot {
 }
 
 impl BroadcasterSubscriptionStatus {
+    #[cfg(test)]
+    pub(crate) async fn hold_readiness_for_test(&self) -> impl Drop + Send {
+        Arc::clone(&self.inner).write_owned().await
+    }
+
     pub async fn mark_connected(&self) {
         let mut guard = self.inner.write().await;
         guard.connected = true;
@@ -480,6 +488,9 @@ pub struct SimulatorBackendStatusSnapshot {
     pub readiness: SimulatorBackendReadiness,
     pub reason: Option<SimulatorReadinessReason>,
     pub block_number: Option<u64>,
+    pub applied_head: Option<BlockIdentity>,
+    pub observed_chain_head: Option<BlockIdentity>,
+    pub chain_head_agreement: Option<ChainHeadAgreement>,
     pub update_timestamp: Option<u64>,
     pub pool_count: usize,
     pub restart_count: u64,
@@ -567,7 +578,146 @@ impl EncodeAvailability {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BackendFreshnessFence {
+    backend: SimulatorBackendKind,
+    observer_revision: u64,
+    head_revision: u64,
+}
+
+struct BackendAssessment {
+    readiness: SimulatorBackendReadiness,
+    observed_chain_head: Option<BlockIdentity>,
+    chain_head_agreement: ChainHeadAgreement,
+}
+
 impl AppState {
+    fn backend_store(&self, backend: SimulatorBackendKind) -> &StateStore {
+        match backend {
+            SimulatorBackendKind::Native => &self.native_state_store,
+            SimulatorBackendKind::Vm => &self.vm_state_store,
+            SimulatorBackendKind::Rfq => &self.rfq_state_store,
+        }
+    }
+
+    async fn backend_assessment_for_pin(
+        &self,
+        backend: SimulatorBackendKind,
+        pinned: &PublishedStatePin,
+    ) -> BackendAssessment {
+        let state_ready = pinned.state.ready && pinned.state.requests_allowed;
+        let readiness = match backend {
+            SimulatorBackendKind::Native => {
+                if state_ready && self.native_broadcaster_bootstrap_ready().await {
+                    SimulatorBackendReadiness::Ready
+                } else {
+                    SimulatorBackendReadiness::WarmingUp
+                }
+            }
+            SimulatorBackendKind::Vm => {
+                if !self.enable_vm_pools {
+                    SimulatorBackendReadiness::Disabled
+                } else if self.vm_rebuilding().await {
+                    SimulatorBackendReadiness::Rebuilding
+                } else if state_ready && self.vm_broadcaster_bootstrap_ready().await {
+                    SimulatorBackendReadiness::Ready
+                } else {
+                    SimulatorBackendReadiness::WarmingUp
+                }
+            }
+            SimulatorBackendKind::Rfq => SimulatorBackendReadiness::Disabled,
+        };
+        let observation = self.chain_head_observer.snapshot();
+        let chain_head_agreement = observation.agreement(pinned.applied_head());
+        let readiness = if readiness == SimulatorBackendReadiness::Ready
+            && chain_head_agreement != ChainHeadAgreement::Matches
+        {
+            SimulatorBackendReadiness::Stale
+        } else {
+            readiness
+        };
+        BackendAssessment {
+            readiness,
+            observed_chain_head: observation.observed_head,
+            chain_head_agreement,
+        }
+    }
+
+    pub(crate) async fn backend_freshness_fence(
+        &self,
+        backend: SimulatorBackendKind,
+        pinned: &PublishedStatePin,
+    ) -> Option<BackendFreshnessFence> {
+        let revision = self.chain_head_observer.snapshot().revision;
+        if self
+            .backend_assessment_for_pin(backend, pinned)
+            .await
+            .readiness
+            != SimulatorBackendReadiness::Ready
+        {
+            return None;
+        }
+        let current = self.backend_store(backend).published.try_read().ok()?;
+        let observation = self.chain_head_observer.snapshot();
+        if current.head_revision != pinned.head_revision()
+            || !current.ready
+            || !current.requests_allowed
+            || observation.revision != revision
+            || observation.agreement(current.applied_head.as_ref()) != ChainHeadAgreement::Matches
+        {
+            return None;
+        }
+        Some(BackendFreshnessFence {
+            backend,
+            observer_revision: observation.revision,
+            head_revision: current.head_revision,
+        })
+    }
+
+    pub(crate) async fn backend_freshness_fences_valid(
+        &self,
+        fences: &[&BackendFreshnessFence],
+    ) -> Vec<bool> {
+        let mut eligible = Vec::with_capacity(fences.len());
+        for fence in fences {
+            let pinned = self.backend_store(fence.backend).pin().await;
+            eligible.push(
+                self.backend_assessment_for_pin(fence.backend, &pinned)
+                    .await
+                    .readiness
+                    == SimulatorBackendReadiness::Ready,
+            );
+        }
+        // Hold all participating publications through the final observation. No backend can
+        // close and reopen while another backend's final check is still waiting.
+        let publications = fences
+            .iter()
+            .map(|fence| self.backend_store(fence.backend).published.try_read().ok())
+            .collect::<Vec<_>>();
+        let observation = self.chain_head_observer.snapshot();
+        fences
+            .iter()
+            .zip(publications.iter())
+            .zip(eligible)
+            .map(|((fence, current), eligible)| {
+                eligible
+                    && current.as_ref().is_some_and(|current| {
+                        current.ready
+                            && current.requests_allowed
+                            && current.head_revision == fence.head_revision
+                            && observation.revision == fence.observer_revision
+                            && observation.agreement(current.applied_head.as_ref())
+                                == ChainHeadAgreement::Matches
+                    })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    async fn backend_freshness_fence_valid(&self, fence: &BackendFreshnessFence) -> bool {
+        self.backend_freshness_fences_valid(&[fence]).await[0]
+    }
+
     async fn native_broadcaster_bootstrap_ready(&self) -> bool {
         let subscription = self.native_broadcaster_subscription.snapshot().await;
         subscription_readiness_reason(&subscription).is_none()
@@ -608,14 +758,11 @@ impl AppState {
         let last_update_age_ms = self.native_update_age_ms().await;
         let stream_restart_count = self.native_stream_health.restart_count().await;
         let stream_last_error = self.native_stream_health.last_error().await;
-        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
-        let readiness = if subscription_reason.is_some() || !state_ready || !requests_allowed {
-            SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.native_progress_lease_ms()) {
-            SimulatorBackendReadiness::Stale
-        } else {
-            SimulatorBackendReadiness::Ready
-        };
+        let pinned = self.native_state_store.pin().await;
+        let assessment = self
+            .backend_assessment_for_pin(SimulatorBackendKind::Native, &pinned)
+            .await;
+        let readiness = assessment.readiness;
         let reason = match readiness {
             SimulatorBackendReadiness::WarmingUp => {
                 subscription_reason.or(Some(SimulatorReadinessReason::StateWarmingUp))
@@ -631,7 +778,10 @@ impl AppState {
             enabled: true,
             readiness,
             reason,
-            block_number: Some(self.current_block().await),
+            block_number: Some(pinned.current_block()),
+            applied_head: pinned.applied_head().cloned(),
+            observed_chain_head: assessment.observed_chain_head,
+            chain_head_agreement: Some(assessment.chain_head_agreement),
             update_timestamp: None,
             pool_count: self.native_state_store.total_states().await,
             restart_count: stream_restart_count,
@@ -648,17 +798,11 @@ impl AppState {
         let subscription_reason = subscription_readiness_reason(&subscription);
         let stream_status = self.vm_stream.read().await.clone();
         let last_update_age_ms = self.vm_update_age_ms().await;
-        let readiness = if !self.enable_vm_pools {
-            SimulatorBackendReadiness::Disabled
-        } else if stream_status.rebuilding {
-            SimulatorBackendReadiness::Rebuilding
-        } else if subscription_reason.is_some() || !self.vm_state_store.is_ready() {
-            SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.optional_backend_stale_ms()) {
-            SimulatorBackendReadiness::Stale
-        } else {
-            SimulatorBackendReadiness::Ready
-        };
+        let pinned = self.vm_state_store.pin().await;
+        let assessment = self
+            .backend_assessment_for_pin(SimulatorBackendKind::Vm, &pinned)
+            .await;
+        let readiness = assessment.readiness;
         let reason = match readiness {
             SimulatorBackendReadiness::Disabled => Some(SimulatorReadinessReason::DisabledByConfig),
             SimulatorBackendReadiness::Rebuilding => Some(SimulatorReadinessReason::Rebuilding),
@@ -674,7 +818,10 @@ impl AppState {
             enabled: self.enable_vm_pools,
             readiness,
             reason,
-            block_number: self.enable_vm_pools.then_some(self.vm_block().await),
+            block_number: self.enable_vm_pools.then_some(pinned.current_block()),
+            applied_head: pinned.applied_head().cloned(),
+            observed_chain_head: assessment.observed_chain_head,
+            chain_head_agreement: Some(assessment.chain_head_agreement),
             update_timestamp: None,
             pool_count: self.vm_pools().await,
             restart_count: stream_status.restart_count,
@@ -728,6 +875,9 @@ impl AppState {
             readiness,
             reason,
             block_number: None,
+            applied_head: None,
+            observed_chain_head: None,
+            chain_head_agreement: None,
             update_timestamp,
             pool_count: self.rfq_pools().await,
             restart_count: subscription.restart_count,
@@ -772,10 +922,6 @@ impl AppState {
         self.optional_backend_stale.as_millis() as u64
     }
 
-    pub fn native_progress_lease_ms(&self) -> u64 {
-        self.native_progress_lease.as_millis() as u64
-    }
-
     pub async fn native_update_age_ms(&self) -> Option<u64> {
         self.native_stream_health.last_update_age_ms().await
     }
@@ -789,22 +935,15 @@ impl AppState {
     }
 
     pub async fn native_readiness(&self) -> NativeReadiness {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return NativeReadiness::WarmingUp;
-        }
-
-        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
-        if !state_ready || !requests_allowed {
-            return NativeReadiness::WarmingUp;
-        }
-
-        if is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        ) {
-            NativeReadiness::Stale
-        } else {
-            NativeReadiness::Ready
+        let pinned = self.native_state_store.pin().await;
+        match self
+            .backend_assessment_for_pin(SimulatorBackendKind::Native, &pinned)
+            .await
+            .readiness
+        {
+            SimulatorBackendReadiness::Ready => NativeReadiness::Ready,
+            SimulatorBackendReadiness::Stale => NativeReadiness::Stale,
+            _ => NativeReadiness::WarmingUp,
         }
     }
 
@@ -830,68 +969,35 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn native_request_availability(&self) -> (bool, u64) {
-        let bootstrap_ready = self.native_broadcaster_bootstrap_ready().await;
-        let update_is_stale = is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        );
-        let (state_ready, requests_allowed, current_generation) =
-            self.native_state_store.request_snapshot().await;
-        (
-            bootstrap_ready && !update_is_stale && state_ready && requests_allowed,
-            current_generation,
-        )
-    }
-
     pub(crate) async fn native_pool_fence_status(
         &self,
         pinned: &PublishedStatePin,
         current: &PublishedStatePin,
         pool_ids: &HashSet<String>,
     ) -> NativePoolFenceStatus {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return NativePoolFenceStatus::Unavailable;
-        }
-        if is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        ) {
-            return NativePoolFenceStatus::Unavailable;
-        }
-        // The request flags must come from the same publication as the identity compare.
-        // fence_requests only flips requests_allowed and keeps every pool Arc, so a fence
-        // landing between a separate availability read and the pin would pass as Current.
-        if !current.state.ready || !current.state.requests_allowed {
+        if self
+            .backend_assessment_for_pin(SimulatorBackendKind::Native, current)
+            .await
+            .readiness
+            != SimulatorBackendReadiness::Ready
+        {
             return NativePoolFenceStatus::Unavailable;
         }
         NativePoolFenceStatus::Available(pinned.changed_pool_ids(current, pool_ids))
     }
 
     pub async fn vm_readiness(&self) -> VmReadiness {
-        if !self.enable_vm_pools {
-            return VmReadiness::Disabled;
-        }
-
-        if self.vm_rebuilding().await {
-            return VmReadiness::Rebuilding;
-        }
-
-        if !self.vm_broadcaster_bootstrap_ready().await {
-            return VmReadiness::WarmingUp;
-        }
-
-        if !self.vm_state_store.is_ready() {
-            return VmReadiness::WarmingUp;
-        }
-
-        if is_update_stale(
-            self.vm_update_age_ms().await,
-            self.optional_backend_stale_ms(),
-        ) {
-            VmReadiness::Stale
-        } else {
-            VmReadiness::Ready
+        let pinned = self.vm_state_store.pin().await;
+        match self
+            .backend_assessment_for_pin(SimulatorBackendKind::Vm, &pinned)
+            .await
+            .readiness
+        {
+            SimulatorBackendReadiness::Ready => VmReadiness::Ready,
+            SimulatorBackendReadiness::Stale => VmReadiness::Stale,
+            SimulatorBackendReadiness::Rebuilding => VmReadiness::Rebuilding,
+            SimulatorBackendReadiness::Disabled => VmReadiness::Disabled,
+            _ => VmReadiness::WarmingUp,
         }
     }
 
@@ -1175,6 +1281,9 @@ pub struct VmStreamStatus {
 #[derive(Clone)]
 struct PublishedStateStore {
     version: u64,
+    applied_head: Option<BlockIdentity>,
+    protocol_heads: ProtocolStateHeads,
+    head_revision: u64,
     request_generation: u64,
     requests_allowed: bool,
     point: StatePoint,
@@ -1182,14 +1291,29 @@ struct PublishedStateStore {
 }
 
 impl PublishedStateStore {
-    fn empty(tokens: HashMap<Bytes, Token>, wrapped_native_token: Option<Bytes>) -> Self {
+    fn empty(
+        tokens: HashMap<Bytes, Token>,
+        wrapped_native_token: Option<Bytes>,
+        required_protocols: Vec<String>,
+    ) -> Self {
         Self {
             version: 0,
+            applied_head: None,
+            protocol_heads: ProtocolStateHeads::new(required_protocols),
+            head_revision: 0,
             request_generation: 0,
             requests_allowed: false,
             point: ReplayWorld::new(tokens, wrapped_native_token).pin(),
             ready: false,
         }
+    }
+}
+
+fn align_published_block(publication: &mut PublishedStateStore) {
+    if let Some(head) = &publication.applied_head {
+        let mut world = ReplayWorld::from_point(&publication.point);
+        world.set_current_block(head.number);
+        publication.point = world.pin();
     }
 }
 
@@ -1199,6 +1323,14 @@ pub(crate) struct PublishedStatePin {
 }
 
 impl PublishedStatePin {
+    pub(crate) fn applied_head(&self) -> Option<&BlockIdentity> {
+        self.state.applied_head.as_ref()
+    }
+
+    pub(crate) fn head_revision(&self) -> u64 {
+        self.state.head_revision
+    }
+
     #[cfg(test)]
     pub(crate) fn version(&self) -> u64 {
         self.state.version
@@ -1262,26 +1394,33 @@ pub struct StateStore {
 impl StateStore {
     pub fn new(tokens: Arc<TokenStore>) -> Self {
         let initial_tokens = tokens.initial_snapshot();
-        Self::new_with_token_publication(tokens, initial_tokens, true)
+        Self::new_with_token_publication(tokens, initial_tokens, true, Vec::new())
+    }
+
+    pub fn new_with_protocols(tokens: Arc<TokenStore>, required_protocols: Vec<String>) -> Self {
+        let initial_tokens = tokens.initial_snapshot();
+        Self::new_with_token_publication(tokens, initial_tokens, true, required_protocols)
     }
 
     #[cfg(test)]
     pub(crate) fn new_private(tokens: Arc<TokenStore>) -> Self {
         let initial_tokens = tokens.initial_snapshot();
-        Self::new_with_token_publication(tokens, initial_tokens, false)
+        Self::new_with_token_publication(tokens, initial_tokens, false, Vec::new())
     }
 
     pub(crate) fn new_private_with_snapshot(
         tokens: Arc<TokenStore>,
         initial_tokens: HashMap<Bytes, Token>,
+        required_protocols: Vec<String>,
     ) -> Self {
-        Self::new_with_token_publication(tokens, initial_tokens, false)
+        Self::new_with_token_publication(tokens, initial_tokens, false, required_protocols)
     }
 
     fn new_with_token_publication(
         tokens: Arc<TokenStore>,
         initial_tokens: HashMap<Bytes, Token>,
         publish_tokens_to_store: bool,
+        required_protocols: Vec<String>,
     ) -> Self {
         let wrapped_native_token = tokens.wrapped_native_token();
         let (ready_tx, _) = watch::channel(false);
@@ -1291,6 +1430,7 @@ impl StateStore {
             published: RwLock::new(Arc::new(PublishedStateStore::empty(
                 initial_tokens,
                 wrapped_native_token,
+                required_protocols,
             ))),
             update_guard: Mutex::new(()),
             ready_tx,
@@ -1317,16 +1457,8 @@ impl StateStore {
         let current = Arc::clone(&*self.published.read().await);
         let mut replacement = (*current).clone();
         replacement.requests_allowed = false;
+        replacement.head_revision = replacement.head_revision.saturating_add(1);
         self.publish(replacement).await;
-    }
-
-    async fn request_snapshot(&self) -> (bool, bool, u64) {
-        let current = self.published.read().await;
-        (
-            current.ready,
-            current.requests_allowed,
-            current.request_generation,
-        )
     }
 
     pub(crate) async fn align_bootstrap_state_version(&self, state_version: u64) {
@@ -1345,6 +1477,8 @@ impl StateStore {
         world.clear();
         let mut replacement = (*current).clone();
         replacement.point = world.pin();
+        replacement.applied_head = None;
+        replacement.protocol_heads.clear();
         replacement.version = current.version.saturating_add(1);
         replacement.ready = false;
         replacement.requests_allowed = false;
@@ -1369,52 +1503,106 @@ impl StateStore {
         }
         let mut replacement = (*current).clone();
         replacement.point = world.pin();
+        replacement.applied_head = None;
+        replacement.protocol_heads.clear();
         replacement.version = current.version.saturating_add(1);
         replacement.ready = replacement.point.total_states() > 0;
         replacement.requests_allowed = replacement.ready;
         self.publish(replacement).await;
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn apply_update(&self, update: Update) -> UpdateMetrics {
+        self.apply_update_with_head(update, None).await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn apply_update_with_head(
+        &self,
+        update: Update,
+        applied_head: Option<BlockIdentity>,
+    ) -> UpdateMetrics {
         let _guard = self.update_guard.lock().await;
-        let current = Arc::clone(&*self.published.read().await);
-        let state_version = current.version.saturating_add(1);
-        self.apply_update_locked(update, current, state_version)
+        let mut replacement = (**self.published.read().await).clone();
+        let state_version = replacement.version.saturating_add(1);
+        replacement.protocol_heads.clear();
+        replacement.applied_head = applied_head;
+        self.apply_update_locked(update, replacement, state_version)
             .await
     }
 
-    pub(crate) async fn apply_update_at_version(
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn set_applied_head(&self, applied_head: Option<BlockIdentity>) {
+        let _guard = self.update_guard.lock().await;
+        let mut replacement = (**self.published.read().await).clone();
+        replacement.protocol_heads.clear();
+        replacement.applied_head = applied_head;
+        align_published_block(&mut replacement);
+        self.publish(replacement).await;
+    }
+
+    pub(crate) async fn apply_update_with_protocol_heads(
         &self,
         update: Update,
+        head_updates: &[ProtocolHeadUpdate],
+    ) -> UpdateMetrics {
+        let _guard = self.update_guard.lock().await;
+        let mut replacement = (**self.published.read().await).clone();
+        let state_version = replacement.version.saturating_add(1);
+        replacement.protocol_heads.apply_updates(head_updates);
+        replacement.applied_head = replacement.protocol_heads.complete_head();
+        self.apply_update_locked(update, replacement, state_version)
+            .await
+    }
+
+    pub(crate) async fn apply_update_at_version_with_protocol_heads(
+        &self,
+        update: Update,
+        head_updates: &[ProtocolHeadUpdate],
         state_version: u64,
     ) -> anyhow::Result<UpdateMetrics> {
         let _guard = self.update_guard.lock().await;
-        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = (**self.published.read().await).clone();
         anyhow::ensure!(
-            state_version > current.version,
+            state_version > replacement.version,
             "state version {state_version} must be newer than published version {}",
-            current.version
+            replacement.version
         );
+        replacement.protocol_heads.apply_updates(head_updates);
+        replacement.applied_head = replacement.protocol_heads.complete_head();
         Ok(self
-            .apply_update_locked(update, current, state_version)
+            .apply_update_locked(update, replacement, state_version)
             .await)
+    }
+
+    pub(crate) async fn apply_protocol_heads(&self, head_updates: &[ProtocolHeadUpdate]) {
+        if head_updates.is_empty() {
+            return;
+        }
+        let _guard = self.update_guard.lock().await;
+        let mut replacement = (**self.published.read().await).clone();
+        replacement.protocol_heads.apply_updates(head_updates);
+        replacement.applied_head = replacement.protocol_heads.complete_head();
+        align_published_block(&mut replacement);
+        self.publish(replacement).await;
     }
 
     async fn apply_update_locked(
         &self,
-        update: Update,
-        current: Arc<PublishedStateStore>,
+        mut update: Update,
+        mut replacement: PublishedStateStore,
         state_version: u64,
     ) -> UpdateMetrics {
-        let mut world = ReplayWorld::from_point(&current.point);
+        if let Some(head) = &replacement.applied_head {
+            update.block_number_or_timestamp = head.number;
+        }
+        let mut world = ReplayWorld::from_point(&replacement.point);
         let report = world.apply(update);
         if self.publish_tokens_to_store && !report.tokens_to_cache().is_empty() {
             self.tokens
                 .insert_batch(report.tokens_to_cache().iter().cloned())
                 .await;
         }
-
-        let mut replacement = (*current).clone();
         replacement.version = state_version;
         replacement.point = world.pin();
         replacement.ready = report.total_pairs > 0;
@@ -1425,6 +1613,11 @@ impl StateStore {
 
     async fn publish(&self, mut replacement: PublishedStateStore) {
         let current = Arc::clone(&*self.published.read().await);
+        if replacement.applied_head != current.applied_head {
+            replacement.head_revision = current.head_revision.saturating_add(1);
+        } else {
+            replacement.head_revision = replacement.head_revision.max(current.head_revision);
+        }
         replacement.request_generation = current.request_generation.saturating_add(1);
         let ready = replacement.ready;
         let previous_ready = current.ready;
@@ -1722,6 +1915,7 @@ mod tests {
 
     fn build_test_app_state(stores: TestAppStateStores, flags: PoolFlags) -> AppState {
         AppState {
+            chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -1742,7 +1936,6 @@ mod tests {
             },
             enable_vm_pools: flags.enable_vm_pools,
             enable_rfq_pools: flags.enable_rfq_pools,
-            native_progress_lease: Duration::from_secs(120),
             optional_backend_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
@@ -1869,6 +2062,128 @@ mod tests {
         );
     }
 
+    fn test_block_head(number: u64, hash: u8) -> BlockIdentity {
+        BlockIdentity {
+            number,
+            hash: Bytes::from(vec![hash; 32]),
+        }
+    }
+
+    async fn expire_chain_observation(state: &mut AppState) {
+        let head = test_block_head(1, 1);
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        state
+            .native_state_store
+            .set_applied_head(Some(head.clone()))
+            .await;
+        state.vm_state_store.set_applied_head(Some(head)).await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+    }
+
+    async fn observed_ready_state() -> AppState {
+        let mut state = build_ready_state_with_vm_and_rfq().await;
+        let head = test_block_head(1, 1);
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        state
+            .native_state_store
+            .set_applied_head(Some(head.clone()))
+            .await;
+        state.vm_state_store.set_applied_head(Some(head)).await;
+        state
+    }
+
+    #[tokio::test]
+    async fn chain_agreement_gates_native_and_vm_independently() {
+        let mut state = observed_ready_state().await;
+        state.optional_backend_stale = Duration::ZERO;
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+
+        state
+            .vm_state_store
+            .set_applied_head(Some(test_block_head(1, 2)))
+            .await;
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+        assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+        assert_eq!(
+            state.encode_availability(true, false, false).await,
+            EncodeAvailability::Ready
+        );
+        assert_eq!(
+            state.encode_availability(true, true, false).await,
+            EncodeAvailability::VmStale
+        );
+
+        state
+            .vm_state_store
+            .set_applied_head(Some(test_block_head(1, 1)))
+            .await;
+        state.native_state_store.set_applied_head(None).await;
+        assert_eq!(state.native_readiness().await, NativeReadiness::Stale);
+        assert_eq!(
+            state.encode_availability(false, true, false).await,
+            EncodeAvailability::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_fences_remember_observation_and_application_discontinuities(
+    ) -> Result<(), &'static str> {
+        let state = observed_ready_state().await;
+        let native_pin = state.native_state_store.pin().await;
+        let native_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Native, &native_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        state
+            .chain_head_observer
+            .observe_for_test(test_block_head(2, 2));
+        state
+            .chain_head_observer
+            .observe_for_test(test_block_head(1, 1));
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+        assert!(!state.backend_freshness_fence_valid(&native_fence).await);
+
+        let vm_pin = state.vm_state_store.pin().await;
+        let vm_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Vm, &vm_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        state.vm_state_store.set_applied_head(None).await;
+        state
+            .vm_state_store
+            .set_applied_head(Some(test_block_head(1, 1)))
+            .await;
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+        assert!(!state.backend_freshness_fence_valid(&vm_fence).await);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_freshness_batch_rechecks_expiry_after_waiting_for_another_backend(
+    ) -> Result<(), &'static str> {
+        let state = observed_ready_state().await;
+        let native_pin = state.native_state_store.pin().await;
+        let vm_pin = state.vm_state_store.pin().await;
+        let native_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Native, &native_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        let vm_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Vm, &vm_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        let fences = [&native_fence, &vm_fence];
+        let vm_status = state.vm_stream.write().await;
+        let validation = state.backend_freshness_fences_valid(&fences);
+        tokio::pin!(validation);
+        assert!(futures::poll!(validation.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(121)).await;
+        drop(vm_status);
+        assert_eq!(validation.await, vec![false, false]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn simulation_rebuild_guard_holds_and_releases_vm_read_guard() {
         let state = build_readiness_test_state(true, true).await;
@@ -1979,7 +2294,7 @@ mod tests {
             .unwrap_or_else(|| unreachable!("status snapshot must include {kind:?} backend"))
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn native_readiness_distinguishes_ready_stale_and_warming_up() {
         let warming_up_state = {
             let token_store = Arc::new(TokenStore::new(
@@ -2014,7 +2329,7 @@ mod tests {
         ready_state.native_stream_health.record_update(1).await;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Ready);
 
-        ready_state.native_progress_lease = Duration::ZERO;
+        expire_chain_observation(&mut ready_state).await;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Stale);
     }
 
@@ -2224,7 +2539,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rfq_and_vm_readiness_distinguishes_disabled_warming_up_ready_and_stale() {
         let disabled_state = build_readiness_test_state(false, false).await;
         assert_eq!(disabled_state.vm_readiness().await, VmReadiness::Disabled);
@@ -2279,6 +2594,7 @@ mod tests {
             vm_status.rebuilding = false;
         }
         state.optional_backend_stale = Duration::ZERO;
+        expire_chain_observation(&mut state).await;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
     }
@@ -2507,7 +2823,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pool_by_id_only_exposes_encode_ready_vm_and_rfq_entries() {
         let mut state = build_readiness_test_state(true, true).await;
 
@@ -2568,6 +2884,7 @@ mod tests {
         assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
 
         state.optional_backend_stale = Duration::ZERO;
+        expire_chain_observation(&mut state).await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);

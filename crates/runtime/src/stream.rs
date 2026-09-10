@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{interval, sleep, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tycho_simulation::{
@@ -14,9 +15,11 @@ use tycho_simulation::{
 
 use crate::broadcaster::redis_publisher::current_time_ms;
 use crate::broadcaster::service::BroadcasterServiceState;
+use crate::chain_head::ChainHeadAgreement;
 use crate::config::MemoryConfig;
 use crate::memory::{maybe_log_memory_snapshot, maybe_purge_allocator};
 use crate::models::stream_health::StreamHealth;
+use simulator_core::broadcaster::BroadcasterBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -40,6 +43,8 @@ pub enum StreamRestartReason {
     Stale,
     Ended,
     Stopped,
+    InitialBootstrapTimeout,
+    HeadMismatchTimeout,
 }
 
 impl StreamRestartReason {
@@ -52,6 +57,8 @@ impl StreamRestartReason {
             StreamRestartReason::Stale => "stale",
             StreamRestartReason::Ended => "ended",
             StreamRestartReason::Stopped => "stopped",
+            StreamRestartReason::InitialBootstrapTimeout => "initial_bootstrap_timeout",
+            StreamRestartReason::HeadMismatchTimeout => "head_mismatch_timeout",
         }
     }
 }
@@ -64,7 +71,7 @@ pub struct StreamExit {
 
 #[derive(Debug, Clone)]
 pub struct StreamSupervisorConfig {
-    pub readiness_stale: Duration,
+    pub initialization_timeout: Duration,
     pub stream_stale: Duration,
     pub missing_block_burst: u64,
     pub missing_block_window: Duration,
@@ -75,6 +82,12 @@ pub struct StreamSupervisorConfig {
     pub restart_backoff_max: Duration,
     pub restart_backoff_jitter_pct: f64,
     pub memory: MemoryConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcasterRecoveryConfig {
+    pub initial_bootstrap_timeout: Duration,
+    pub head_mismatch_recovery_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -272,21 +285,21 @@ pub async fn process_broadcaster_raw_stream(
             () = service.wait_for_shared_publisher_pause_after(pause_epoch) => {
                 return stream_exit(StreamRestartReason::SharedPublisherPaused, None);
             }
-            message = next_broadcaster_raw_stream_message(&mut stream, &health, &cfg) => {
+            message = stream.next() => {
                 message
             }
         };
         match message {
-            StreamMessage::Stale => return stream_exit(StreamRestartReason::Stale, None),
-            StreamMessage::Ended => return stream_exit(StreamRestartReason::Ended, None),
-            StreamMessage::Error(err_msg) => {
+            None => return stream_exit(StreamRestartReason::Ended, None),
+            Some(Err(error)) => {
                 if let Some(exit) =
-                    handle_stream_error(StreamKind::Broadcaster, err_msg, &health, &cfg).await
+                    handle_stream_error(StreamKind::Broadcaster, error.to_string(), &health, &cfg)
+                        .await
                 {
                     return exit;
                 }
             }
-            StreamMessage::Update(update) => {
+            Some(Ok(update)) => {
                 if let Some(exit) =
                     handle_broadcaster_raw_update(update, service, &health, &cfg, &mut ready_logged)
                         .await
@@ -310,7 +323,7 @@ async fn next_stream_message(
     let stream_timeout = if has_received_update {
         cfg.stream_stale
     } else {
-        cfg.readiness_stale
+        cfg.initialization_timeout
     };
 
     match timeout(stream_timeout, stream.next()).await {
@@ -330,52 +343,6 @@ async fn next_stream_message(
                 has_received_update,
                 "stream_ended",
                 "Stream ended unexpectedly",
-            )
-            .await;
-            StreamMessage::Ended
-        }
-        Ok(Some(Ok(update))) => StreamMessage::Update(update),
-        Ok(Some(Err(err))) => StreamMessage::Error(err.to_string()),
-    }
-}
-
-async fn next_broadcaster_raw_stream_message(
-    stream: &mut (impl futures::Stream<
-        Item = Result<FeedMessage<BlockHeader>, Box<dyn std::error::Error + Send + Sync + 'static>>,
-    > + Unpin
-              + Send),
-    health: &StreamHealth,
-    cfg: &StreamSupervisorConfig,
-) -> StreamMessage<FeedMessage<BlockHeader>> {
-    let last_progress_age = health.last_update_age_ms().await.map(Duration::from_millis);
-    let progress_age = if let Some(age) = last_progress_age {
-        age
-    } else {
-        Duration::from_millis(health.started_age_ms().await.unwrap_or_default())
-    };
-    if progress_age >= cfg.readiness_stale {
-        return StreamMessage::Stale;
-    }
-    let stream_timeout = cfg.readiness_stale.saturating_sub(progress_age);
-    let has_received_update = health.has_received_update().await;
-
-    match timeout(stream_timeout, stream.next()).await {
-        Err(_) => {
-            log_stream_termination(
-                health,
-                has_received_update,
-                "stream_stale",
-                "Raw broadcaster stream stale; triggering restart",
-            )
-            .await;
-            StreamMessage::Stale
-        }
-        Ok(None) => {
-            log_stream_termination(
-                health,
-                has_received_update,
-                "stream_ended",
-                "Raw broadcaster stream ended unexpectedly",
             )
             .await;
             StreamMessage::Ended
@@ -527,15 +494,6 @@ async fn handle_broadcaster_raw_update(
 ) -> Option<StreamExit> {
     let now = Instant::now();
     let received_at_ms = current_time_ms();
-    let has_advanced = update
-        .sync_states
-        .values()
-        .any(|state| matches!(state, SynchronizerState::Advanced(_)));
-
-    if let Some(exit) = check_advanced_state(has_advanced, now, health, cfg.resync_grace).await {
-        return Some(exit);
-    }
-
     let block_number = broadcaster_raw_block_number(&update);
     let new_pairs = update
         .state_msgs
@@ -551,7 +509,7 @@ async fn handle_broadcaster_raw_update(
         }
     };
 
-    if !applied.published {
+    if !applied.update_available {
         return None;
     }
 
@@ -782,6 +740,7 @@ pub async fn run_broadcaster_raw_stream_once<F, Fut, S>(
     build_stream: F,
     health: Arc<StreamHealth>,
     cfg: StreamSupervisorConfig,
+    recovery_config: BroadcasterRecoveryConfig,
     controls: BroadcasterStreamControls,
 ) -> anyhow::Result<()>
 where
@@ -799,9 +758,16 @@ where
         return Ok(());
     }
     let pause_epoch = controls.service.shared_publisher_pause_epoch();
+    let bootstrap_started_at = Instant::now();
+    let mut recovery = Box::pin(monitor_broadcaster_recovery(
+        &controls.service,
+        recovery_config,
+        bootstrap_started_at,
+    ));
     let built_stream = tokio::select! {
         biased;
         () = controls.stop.cancelled() => return Ok(()),
+        exit = &mut recovery => return RawStreamCompletion::Stream(exit).finish(&controls).await,
         result = build_stream() => result,
     };
     let (mut lifecycle_task, stream) = match built_stream {
@@ -834,9 +800,151 @@ where
         biased;
         exit = &mut processing => RawStreamCompletion::Stream(exit),
         result = &mut lifecycle_task => RawStreamCompletion::LifecycleTask(result),
+        exit = &mut recovery => RawStreamCompletion::Stream(exit),
     };
     drop(processing);
     completion.finish(&controls).await
+}
+
+async fn monitor_broadcaster_recovery(
+    service: &BroadcasterServiceState,
+    config: BroadcasterRecoveryConfig,
+    bootstrap_started_at: Instant,
+) -> StreamExit {
+    if let Err(exit) = wait_for_initial_bootstrap(
+        service,
+        config.initial_bootstrap_timeout,
+        bootstrap_started_at,
+    )
+    .await
+    {
+        return exit;
+    }
+    let mut checks = interval(Duration::from_millis(100));
+    checks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut mismatches = BroadcasterHeadMismatches::default();
+    loop {
+        checks.tick().await;
+        let Some(observation) = service.chain_head_snapshot() else {
+            continue;
+        };
+        let agreements = service.recovery_head_agreements(&observation).await;
+        if let Some(exit) = mismatches.observe(
+            Instant::now(),
+            &agreements,
+            config.head_mismatch_recovery_timeout,
+        ) {
+            return exit;
+        }
+    }
+}
+
+async fn wait_for_initial_bootstrap(
+    service: &BroadcasterServiceState,
+    bootstrap_timeout: Duration,
+    started_at: Instant,
+) -> Result<(), StreamExit> {
+    let mut checks = interval(Duration::from_millis(100));
+    checks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    info!(
+        event = "tycho_initial_bootstrap_started",
+        chain_id = service.chain_id(),
+        timeout_secs = bootstrap_timeout.as_secs(),
+        "Waiting for complete state from the configured Tycho backends"
+    );
+    loop {
+        checks.tick().await;
+        if service
+            .initial_bootstrap_completed_at()
+            .is_some_and(|completed_at| {
+                completed_at.saturating_duration_since(started_at) < bootstrap_timeout
+            })
+        {
+            info!(
+                event = "tycho_initial_bootstrap_completed",
+                chain_id = service.chain_id(),
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "Initial configured Tycho state is complete"
+            );
+            return Ok(());
+        }
+        if started_at.elapsed() >= bootstrap_timeout {
+            error!(
+                event = "tycho_initial_bootstrap_expired",
+                chain_id = service.chain_id(),
+                timeout_secs = bootstrap_timeout.as_secs(),
+                "Initial Tycho bootstrap deadline expired"
+            );
+            return Err(stream_exit(
+                StreamRestartReason::InitialBootstrapTimeout,
+                Some("first complete configured Tycho state did not arrive before the bootstrap deadline".to_string()),
+            ));
+        }
+    }
+}
+
+#[derive(Default)]
+struct BroadcasterHeadMismatches {
+    started_at: BTreeMap<BroadcasterBackend, Instant>,
+}
+
+impl BroadcasterHeadMismatches {
+    fn observe(
+        &mut self,
+        now: Instant,
+        agreements: &BTreeMap<BroadcasterBackend, ChainHeadAgreement>,
+        recovery_timeout: Duration,
+    ) -> Option<StreamExit> {
+        for (backend, agreement) in agreements {
+            match agreement {
+                ChainHeadAgreement::Matches => {
+                    if let Some(started_at) = self.started_at.remove(backend) {
+                        info!(
+                            event = "tycho_head_mismatch_recovered",
+                            backend = backend.as_str(),
+                            duration_ms = now.duration_since(started_at).as_millis() as u64,
+                            "Existing Tycho lifecycle caught up to the observed chain head"
+                        );
+                    }
+                }
+                ChainHeadAgreement::AppliedStateIncomplete
+                | ChainHeadAgreement::ChainAhead
+                | ChainHeadAgreement::HashMismatch => {
+                    let started_at = self.started_at.entry(*backend).or_insert_with(|| {
+                        warn!(
+                            event = "tycho_head_mismatch_started",
+                            backend = backend.as_str(),
+                            reason = agreement.as_str(),
+                            recovery_timeout_secs = recovery_timeout.as_secs(),
+                            "Readiness closed while the existing Tycho lifecycle recovers"
+                        );
+                        now
+                    });
+                    if now.duration_since(*started_at) >= recovery_timeout {
+                        error!(
+                            event = "tycho_head_mismatch_expired",
+                            backend = backend.as_str(),
+                            reason = agreement.as_str(),
+                            duration_ms = now.duration_since(*started_at).as_millis() as u64,
+                            "Existing Tycho lifecycle did not recover within the allowed window"
+                        );
+                        return Some(stream_exit(
+                            StreamRestartReason::HeadMismatchTimeout,
+                            Some(format!(
+                                "{} {} remained after the recovery window",
+                                backend.as_str(),
+                                agreement.as_str()
+                            )),
+                        ));
+                    }
+                }
+                // Keep the incident's start, but only an available reference can justify exit.
+                ChainHeadAgreement::ObserverBehind | ChainHeadAgreement::ObservationUnavailable => {
+                }
+            }
+        }
+        None
+    }
 }
 
 fn is_missing_block_error(message: &str) -> bool {
@@ -870,7 +978,7 @@ fn jittered_backoff_ms(base: Duration, jitter_pct: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::error::Error;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -893,29 +1001,357 @@ mod tests {
     };
 
     use super::{
-        classify_stream_error, handle_broadcaster_update, process_broadcaster_raw_stream,
-        process_broadcaster_stream, run_broadcaster_raw_stream_once, BroadcasterStreamControls,
-        StreamMessage, StreamRestartReason, StreamSupervisorConfig,
+        classify_stream_error, handle_broadcaster_update, monitor_broadcaster_recovery,
+        process_broadcaster_raw_stream, process_broadcaster_stream,
+        run_broadcaster_raw_stream_once, BroadcasterHeadMismatches, BroadcasterRecoveryConfig,
+        BroadcasterStreamControls, StreamMessage, StreamRestartReason, StreamSupervisorConfig,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisAppendCommand,
         RedisPromotionCommand, RedisPromotionResult, RedisRenewCommand, RedisStreamWriter,
     };
     use crate::broadcaster::service::BroadcasterServiceState;
-    use crate::broadcaster::state::{BroadcasterSnapshotCache, BroadcasterUpstreamState};
+    use crate::broadcaster::state::{
+        BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterUpstreamState,
+    };
     use crate::broadcaster::state_history::test_state_history_runtime;
+    use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
     use crate::config::MemoryConfig;
     use crate::models::stream_health::StreamHealth;
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
+    use simulator_core::broadcaster::{BlockIdentity, BroadcasterBackend, BroadcasterBackendHead};
     use tycho_simulation::tycho_common::Bytes;
 
     type RawTestItem = Result<FeedMessage<BlockHeader>, Box<dyn Error + Send + Sync>>;
     type TestRawStream = BoxStream<'static, RawTestItem>;
 
+    #[test]
+    fn backend_recovery_windows_are_independent_and_require_matching_heads_to_reset(
+    ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let limit = Duration::from_secs(60);
+        let mut recovery = BroadcasterHeadMismatches::default();
+        let agreements = |native, vm| {
+            BTreeMap::from([
+                (BroadcasterBackend::Native, native),
+                (BroadcasterBackend::Vm, vm),
+            ])
+        };
+        assert!(recovery
+            .observe(
+                started,
+                &agreements(ChainHeadAgreement::Matches, ChainHeadAgreement::ChainAhead),
+                limit
+            )
+            .is_none());
+        assert!(recovery
+            .observe(
+                started + Duration::from_secs(30),
+                &agreements(
+                    ChainHeadAgreement::HashMismatch,
+                    ChainHeadAgreement::Matches
+                ),
+                limit
+            )
+            .is_none());
+        assert!(recovery
+            .observe(
+                started + Duration::from_secs(60),
+                &agreements(
+                    ChainHeadAgreement::AppliedStateIncomplete,
+                    ChainHeadAgreement::Matches
+                ),
+                limit
+            )
+            .is_none());
+        let exit = recovery
+            .observe(
+                started + Duration::from_secs(90),
+                &agreements(
+                    ChainHeadAgreement::AppliedStateIncomplete,
+                    ChainHeadAgreement::Matches,
+                ),
+                limit,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!("native recovery must expire from its own first mismatch")
+            })?;
+        assert_eq!(exit.reason, StreamRestartReason::HeadMismatchTimeout);
+        assert!(exit
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("native")));
+        Ok(())
+    }
+
+    #[test]
+    fn expired_recovery_waits_for_positive_evidence_after_observer_uncertainty() {
+        let started = Instant::now();
+        let limit = Duration::from_secs(60);
+        let mut recovery = BroadcasterHeadMismatches::default();
+        let agreement = |value| BTreeMap::from([(BroadcasterBackend::Native, value)]);
+        assert!(recovery
+            .observe(started, &agreement(ChainHeadAgreement::ChainAhead), limit)
+            .is_none());
+        for unknown in [
+            ChainHeadAgreement::ObservationUnavailable,
+            ChainHeadAgreement::ObserverBehind,
+        ] {
+            assert!(recovery
+                .observe(
+                    started + Duration::from_secs(300),
+                    &agreement(unknown),
+                    limit
+                )
+                .is_none());
+        }
+        assert!(recovery
+            .observe(
+                started + Duration::from_secs(301),
+                &agreement(ChainHeadAgreement::ChainAhead),
+                limit
+            )
+            .is_some());
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn decoded_and_raw_streams_keep_distinct_stale_deadlines() {
+    async fn bootstrap_deadline_covers_builder_and_wait_for_complete_state() -> anyhow::Result<()> {
+        for build_duration in [Duration::from_secs(2), Duration::from_secs(10)] {
+            let service = test_service(8453, BroadcasterBackend::Native);
+            let lifecycle_stop = CancellationToken::new();
+            let task_lifecycle_stop = lifecycle_stop.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let build_calls = Arc::clone(&calls);
+            let started = Instant::now();
+            let result = run_broadcaster_raw_stream_once(
+                move || async move {
+                    build_calls.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(build_duration).await;
+                    Ok((
+                        tokio::spawn(task_lifecycle_stop.cancelled_owned()),
+                        futures::stream::pending::<RawTestItem>(),
+                    ))
+                },
+                Arc::new(StreamHealth::new()),
+                test_supervisor_config(),
+                BroadcasterRecoveryConfig {
+                    initial_bootstrap_timeout: Duration::from_secs(3),
+                    ..test_recovery_config()
+                },
+                BroadcasterStreamControls {
+                    service,
+                    stop: CancellationToken::new(),
+                },
+            )
+            .await;
+            lifecycle_stop.cancel();
+            let Err(error) = result else {
+                return Err(anyhow::anyhow!(
+                    "incomplete initial state must exhaust the bootstrap deadline"
+                ));
+            };
+            assert!(error.to_string().contains("initial_bootstrap_timeout"));
+            assert_eq!(started.elapsed(), Duration::from_secs(3));
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passive_bootstrap_waits_for_snapshot_before_monitoring_published_heads(
+    ) -> anyhow::Result<()> {
+        let (service, observer, publisher) = passive_recovery_service().await?;
+        let monitor =
+            monitor_broadcaster_recovery(&service, test_recovery_config(), Instant::now());
+        tokio::pin!(monitor);
+
+        assert!(timeout(Duration::from_secs(61), &mut monitor)
+            .await
+            .is_err());
+        let status = service.status_snapshot().await;
+        assert_ne!(status.readiness, BroadcasterReadiness::Ready);
+        assert_eq!(
+            status.backends[&BroadcasterBackend::Native].head_agreement,
+            Some(ChainHeadAgreement::AppliedStateIncomplete)
+        );
+
+        let boundary = BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "test_delayed_promotion",
+        )
+        .await?;
+        assert!(boundary.is_some(), "the warmed cache must still promote");
+        assert_eq!(
+            service.status_snapshot().await.readiness,
+            BroadcasterReadiness::Ready
+        );
+
+        observer.observe_for_test(BlockIdentity {
+            number: 10,
+            hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 10)],
+                "test_repromotion",
+            )
+            .await?;
+        let exit = timeout(Duration::from_secs(61), &mut monitor).await?;
+        assert_eq!(exit.reason, StreamRestartReason::HeadMismatchTimeout);
+        assert!(exit
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("applied_state_incomplete")));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passive_bootstrap_still_times_out_on_local_head_mismatch() -> anyhow::Result<()> {
+        let (service, observer, _publisher) = passive_recovery_service().await?;
+        observer.observe_for_test(BlockIdentity {
+            number: 11,
+            hash: native_feed(11).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        let exit = timeout(
+            Duration::from_secs(61),
+            monitor_broadcaster_recovery(&service, test_recovery_config(), Instant::now()),
+        )
+        .await?;
+        assert_eq!(exit.reason, StreamRestartReason::HeadMismatchTimeout);
+        assert!(exit
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("chain_ahead")));
+        Ok(())
+    }
+
+    async fn passive_recovery_service() -> anyhow::Result<(
+        BroadcasterServiceState,
+        ChainHeadObserver,
+        Arc<BroadcasterRedisPublisher>,
+    )> {
+        let protocols = vec!["uniswap_v2".to_string()];
+        let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
+            number: 10,
+            hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                test_publisher_config(8453),
+                Arc::new(RecordStreamAppendsRedisWriter {
+                    appends: Mutex::new(Vec::new()),
+                }),
+            )
+            .with_required_protocols(protocols.clone(), Vec::new()),
+        );
+        let service =
+            test_service_with_publisher(8453, BroadcasterBackend::Native, publisher.clone())
+                .with_chain_head_observer(observer.clone(), protocols, Vec::new());
+        service.mark_upstream_connected().await;
+        service.apply_feed_message(&native_feed(10)).await?;
+        assert!(service.initial_bootstrap_is_complete());
+        Ok((service, observer, publisher))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raw_feed_recovers_with_one_owned_lifecycle() -> anyhow::Result<()> {
+        let native_protocols = vec!["uniswap_v2".to_string()];
+        let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
+            number: 10,
+            hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                test_publisher_config(8453),
+                Arc::new(RecordStreamAppendsRedisWriter {
+                    appends: Mutex::new(Vec::new()),
+                }),
+            )
+            .with_required_protocols(native_protocols.clone(), Vec::new()),
+        );
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "test_active",
+            )
+            .await?;
+        let service = test_service_with_publisher(8453, BroadcasterBackend::Native, publisher)
+            .with_chain_head_observer(observer.clone(), native_protocols, Vec::new());
+        let status_service = service.clone();
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let lifecycle_stop = CancellationToken::new();
+        let task_lifecycle_stop = lifecycle_stop.clone();
+        let (sender, receiver) = mpsc::channel::<RawTestItem>(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::clone(&calls);
+        let task = tokio::spawn(run_broadcaster_raw_stream_once(
+            move || async move {
+                build_calls.fetch_add(1, Ordering::Relaxed);
+                Ok((
+                    tokio::spawn(task_lifecycle_stop.cancelled_owned()),
+                    tokio_stream::wrappers::ReceiverStream::new(receiver),
+                ))
+            },
+            Arc::new(StreamHealth::new()),
+            test_supervisor_config(),
+            BroadcasterRecoveryConfig {
+                initial_bootstrap_timeout: Duration::from_secs(3),
+                ..test_recovery_config()
+            },
+            BroadcasterStreamControls {
+                service,
+                stop: task_stop,
+            },
+        ));
+        sender.send(Ok(native_feed(10))).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(status_service.initial_bootstrap_is_complete());
+        observer.observe_for_test(BlockIdentity {
+            number: 11,
+            hash: native_feed(11).state_msgs["uniswap_v2"].header.hash.clone(),
+        });
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            !task.is_finished(),
+            "mismatch must allow the existing lifecycle to recover"
+        );
+        sender.send(Ok(native_feed(11))).await?;
+        let mut stalled = native_feed(11);
+        stalled.state_msgs.clear();
+        for status in stalled.sync_states.values_mut() {
+            if let SynchronizerState::Ready(header) = status {
+                *status = SynchronizerState::Stale(header.clone());
+            }
+        }
+        sender.send(Ok(stalled)).await?;
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(
+            !task.is_finished(),
+            "matching heads must clear the earlier recovery deadline"
+        );
+        assert_eq!(
+            status_service
+                .recovery_head_agreements(&observer.snapshot())
+                .await[&BroadcasterBackend::Native],
+            ChainHeadAgreement::Matches
+        );
+        observer.fail_for_test();
+        tokio::time::sleep(Duration::from_secs(301)).await;
+        assert!(
+            !task.is_finished(),
+            "RPC observation failure alone must not replace Tycho"
+        );
+        stop.cancel();
+        task.await??;
+        lifecycle_stop.cancel();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raw_stream_silence_does_not_use_the_decoded_stream_timeout() {
         let cfg = StreamSupervisorConfig {
-            readiness_stale: Duration::from_secs(10),
+            initialization_timeout: Duration::from_secs(10),
             stream_stale: Duration::from_secs(2),
             ..test_supervisor_config()
         };
@@ -929,12 +1365,25 @@ mod tests {
         assert!(matches!(message, StreamMessage::Stale));
         assert_eq!(started.elapsed(), Duration::from_secs(2));
 
-        // A repeated native block cannot extend the raw stream's progress deadline.
-        health.record_progress(42).await;
-        let mut raw = futures::stream::pending();
-        let message = super::next_broadcaster_raw_stream_message(&mut raw, &health, &cfg).await;
-        assert!(matches!(message, StreamMessage::Stale));
-        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        let service = test_service(8453, BroadcasterBackend::Native);
+        let stop = CancellationToken::new();
+        let raw = futures::stream::pending::<RawTestItem>();
+        let result = timeout(
+            Duration::from_secs(60),
+            process_broadcaster_raw_stream(
+                raw,
+                Arc::new(health),
+                cfg,
+                &service,
+                service.shared_publisher_pause_epoch(),
+                &stop,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "raw stream silence alone must leave its lifecycle running"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1237,6 +1686,7 @@ mod tests {
                 },
                 Arc::new(StreamHealth::new()),
                 test_supervisor_config(),
+                test_recovery_config(),
                 BroadcasterStreamControls { service, stop },
             ),
         )
@@ -1294,6 +1744,7 @@ mod tests {
                 },
                 Arc::new(StreamHealth::new()),
                 test_supervisor_config(),
+                test_recovery_config(),
                 BroadcasterStreamControls { service, stop },
             ),
         )
@@ -1336,6 +1787,7 @@ mod tests {
                 },
                 Arc::new(StreamHealth::new()),
                 test_supervisor_config(),
+                test_recovery_config(),
                 BroadcasterStreamControls { service, stop },
             ),
         )
@@ -1382,6 +1834,7 @@ mod tests {
             },
             Arc::new(StreamHealth::new()),
             test_supervisor_config(),
+            test_recovery_config(),
             BroadcasterStreamControls {
                 service,
                 stop: task_stop,
@@ -1651,9 +2104,16 @@ mod tests {
         ]))
     }
 
+    fn test_recovery_config() -> BroadcasterRecoveryConfig {
+        BroadcasterRecoveryConfig {
+            initial_bootstrap_timeout: Duration::from_secs(120),
+            head_mismatch_recovery_timeout: Duration::from_secs(60),
+        }
+    }
+
     fn test_supervisor_config() -> StreamSupervisorConfig {
         StreamSupervisorConfig {
-            readiness_stale: Duration::from_secs(120),
+            initialization_timeout: Duration::from_secs(120),
             stream_stale: Duration::from_secs(120),
             missing_block_burst: 3,
             missing_block_window: Duration::from_secs(60),

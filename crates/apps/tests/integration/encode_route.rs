@@ -1,3 +1,4 @@
+use runtime::chain_head::ChainHeadObserver;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -23,6 +24,7 @@ use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
 use runtime::services::EncodeService;
 use runtime::simulator_service::SimulatorRuntime;
+use simulator_core::broadcaster::BlockIdentity;
 use simulator_core::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
@@ -760,6 +762,7 @@ async fn build_app_state_and_request(
     };
 
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
         chain: config.chain,
         rfq_client_config: Arc::new(test_rfq_client_config()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -780,7 +783,6 @@ async fn build_app_state_and_request(
         },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -941,6 +943,7 @@ async fn setup_timeout_app(
     let rfq_stream_health = Arc::new(StreamHealth::new());
 
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
         chain: config.chain,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -961,7 +964,6 @@ async fn setup_timeout_app(
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1344,8 +1346,13 @@ async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.native_progress_lease = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
+    let head = BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    };
+    state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+    state.native_state_store.set_applied_head(Some(head)).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
@@ -1485,9 +1492,13 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.optional_backend_stale = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
-    state.native_stream_health.record_update(42).await;
+    let head = BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    };
+    state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+    state.vm_state_store.set_applied_head(Some(head)).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
@@ -1971,6 +1982,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let vm_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -1991,7 +2003,6 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),

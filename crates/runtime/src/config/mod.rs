@@ -27,8 +27,17 @@ pub struct ChainProfile {
     pub native_protocols: Vec<String>,
     pub vm_protocols: Vec<String>,
     pub rfq_protocols: Vec<String>,
-    /// Only a strictly newer complete native block renews this lease.
-    pub native_progress_lease_secs: u64,
+    /// Per-operation bound for replay snapshot requests, incomplete replay recovery,
+    /// and the first RFQ update. This is separate from overall Tycho bootstrap and serving freshness.
+    pub stream_initialization_timeout_secs: u64,
+    /// Interval between independent observations of the configured chain's latest block.
+    pub chain_head_poll_interval_ms: u64,
+    /// Maximum age of a successful observation that may still justify serving state.
+    pub chain_head_observation_max_age_secs: u64,
+    /// Time from starting Tycho construction until all configured chain state is complete.
+    pub tycho_initial_bootstrap_timeout_secs: u64,
+    /// Time an established feed may remain behind the observed chain before process exit.
+    pub tycho_head_mismatch_recovery_timeout_secs: u64,
     pub recovery_max_buffered_native_blocks: usize,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
     pub native_token_protocol_allowlist: Vec<String>,
@@ -1126,7 +1135,19 @@ mod tests {
             "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
         );
         assert_eq!(chain.hashflow_filename, "./hashflow_supported_tokens.csv");
-        assert_eq!(chain.chain_profile.native_progress_lease_secs, 25);
+        assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 25);
+        assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 1000);
+        assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 15);
+        assert_eq!(
+            chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
+            900
+        );
+        assert_eq!(
+            chain
+                .chain_profile
+                .tycho_head_mismatch_recovery_timeout_secs,
+            60
+        );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
         assert!(!chain
             .chain_profile
@@ -1168,7 +1189,19 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
-        assert_eq!(chain.chain_profile.native_progress_lease_secs, 10);
+        assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 10);
+        assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 500);
+        assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 5);
+        assert_eq!(
+            chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
+            300
+        );
+        assert_eq!(
+            chain
+                .chain_profile
+                .tycho_head_mismatch_recovery_timeout_secs,
+            60
+        );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 64);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
@@ -1222,7 +1255,11 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1241,7 +1278,7 @@ route_policy = "default"
     }
 
     #[test]
-    fn parse_manifest_requires_native_progress_lease() {
+    fn parse_manifest_requires_stream_initialization_timeout() {
         let manifest = r#"
 [[protocols]]
 id = "uniswap_v2"
@@ -1266,9 +1303,40 @@ route_policy = "default"
 
         let error = manifest::parse_manifest_registries(manifest)
             .err()
-            .unwrap_or_else(|| unreachable!("missing native progress lease must fail"));
+            .unwrap_or_else(|| unreachable!("missing stream initialization timeout must fail"));
 
-        assert!(format!("{error:#}").contains("native_progress_lease_secs"));
+        assert!(format!("{error:#}").contains("stream_initialization_timeout_secs"));
+    }
+
+    #[test]
+    fn parse_manifest_rejects_invalid_chain_observation_and_recovery_timing() {
+        let manifest = fs::read_to_string(manifest_path())
+            .unwrap_or_else(|_| unreachable!("expected checked-in manifest"));
+        for field in [
+            "chain_head_poll_interval_ms",
+            "chain_head_observation_max_age_secs",
+            "tycho_initial_bootstrap_timeout_secs",
+            "tycho_head_mismatch_recovery_timeout_secs",
+        ] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(field))
+                .unwrap_or_else(|| unreachable!("manifest contains timing field"));
+            let invalid = manifest.replacen(line, &format!("{field} = 0"), 1);
+            let error = manifest::parse_manifest_registries(&invalid)
+                .err()
+                .unwrap_or_else(|| unreachable!("zero timing must fail"));
+            assert!(format!("{error:#}").contains(field));
+        }
+        let invalid = manifest.replacen(
+            "chain_head_observation_max_age_secs = 15",
+            "chain_head_observation_max_age_secs = 1",
+            1,
+        );
+        let error = manifest::parse_manifest_registries(&invalid)
+            .err()
+            .unwrap_or_else(|| unreachable!("observation would expire before the next poll"));
+        assert!(format!("{error:#}").contains("observation maximum age"));
     }
 
     #[test]
@@ -1303,7 +1371,11 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1335,7 +1407,11 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1367,7 +1443,11 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 999999
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1409,7 +1489,11 @@ allow_share_to_asset = false
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1445,7 +1529,11 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = " tycho "
 bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "

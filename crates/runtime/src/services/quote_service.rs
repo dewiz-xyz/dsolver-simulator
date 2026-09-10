@@ -502,6 +502,7 @@ impl Drop for CancelOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_head::ChainHeadObserver;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -555,6 +556,7 @@ mod tests {
         let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         AppState {
+            chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(Vec::new()),
@@ -575,7 +577,6 @@ mod tests {
             },
             enable_vm_pools: false,
             enable_rfq_pools: false,
-            native_progress_lease: Duration::from_secs(120),
             optional_backend_stale: Duration::from_secs(120),
             request_timeout,
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),

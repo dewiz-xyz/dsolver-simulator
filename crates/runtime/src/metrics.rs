@@ -82,6 +82,29 @@ pub fn emit_simulate_result_quality(quality: QuoteResultQuality) {
     );
 }
 
+pub fn emit_chain_head_observation(chain_id: u64, rpc_outage_seconds: u64) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let event = json!({
+        "_aws": {
+            "Timestamp": timestamp_ms,
+            "CloudWatchMetrics": [{
+                "Namespace": METRIC_NAMESPACE,
+                "Dimensions": [["ChainId"]],
+                "Metrics": [{ "Name": "ChainHeadRpcOutageSeconds", "Unit": "Seconds" }],
+            }],
+        },
+        "event": "chain_head_observation",
+        "ChainId": chain_id.to_string(),
+        "ChainHeadRpcOutageSeconds": rpc_outage_seconds,
+    });
+    if let Value::Object(event) = event {
+        emit_emf_event(event, "chain_head_observation");
+    }
+}
+
 pub fn emit_broadcaster_redis_append_failure() {
     emit_count_metric(METRIC_BROADCASTER_REDIS_APPEND_FAILURE, &[]);
 }
