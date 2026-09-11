@@ -202,6 +202,11 @@ impl BroadcasterRecoverySource {
 }
 
 impl BroadcasterSnapshotSource {
+    pub(crate) fn relabel_generation(&mut self, chain_id: u64, generation: u64) {
+        self.stream_id = format_stream_id(chain_id, generation);
+        self.snapshot_id = format_snapshot_id(chain_id, generation);
+    }
+
     pub(crate) fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
         self.partitions
             .iter()
@@ -1140,6 +1145,10 @@ fn apply_raw_update_message(
     Ok(())
 }
 
+#[expect(
+    clippy::excessive_nesting,
+    reason = "Backend, protocol and account reconciliation retains the conflicting peer identity in errors"
+)]
 fn validate_raw_update_message(
     partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     update: &BroadcasterUpdateMessage,
@@ -1165,23 +1174,24 @@ fn validate_raw_update_message(
                             && message.message.header.number == incoming.message.header.number
                     })
                 {
-                    if let Some(existing_account) =
+                    let Some(existing_account) =
                         existing.message.snapshots.vm_storage.get(&address)
-                    {
-                        projected = merge_projected_vm_accounts(
-                            projected,
-                            ProjectedVmAccount::Materialized(Some(existing_account.clone())),
-                            &address,
-                            incoming.message.header.number,
+                    else {
+                        continue;
+                    };
+                    projected = merge_projected_vm_accounts(
+                        projected,
+                        ProjectedVmAccount::Materialized(Some(existing_account.clone())),
+                        &address,
+                        incoming.message.header.number,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "while reconciling VM protocols {} and {}: {error:#}",
+                            incoming.protocol,
+                            existing.protocol
                         )
-                        .map_err(|error| {
-                            anyhow!(
-                                "while reconciling VM protocols {} and {}: {error:#}",
-                                incoming.protocol,
-                                existing.protocol
-                            )
-                        })?;
-                    }
+                    })?;
                 }
                 let key = (incoming.message.header.number, address.clone());
                 if let Some((protocol, previous)) = projected_by_block_and_address.get_mut(&key) {
@@ -1318,7 +1328,7 @@ fn project_vm_account(
         };
     }
 
-    let mut account = incoming
+    let account = incoming
         .message
         .snapshots
         .vm_storage
@@ -1339,12 +1349,12 @@ fn project_vm_account(
                     })
             })
         });
-    if let Some(account) = account.as_mut() {
+    if let Some(mut account) = account {
         if let Some(update) = update.cloned() {
-            fold_account_update_into_snapshot(account, update);
+            fold_account_update_into_snapshot(&mut account, update);
         }
         account.token_balances.extend(balances);
-        ProjectedVmAccount::Materialized(Some(account.clone()))
+        ProjectedVmAccount::Materialized(Some(account))
     } else {
         ProjectedVmAccount::Residual {
             update: update.cloned(),
@@ -1816,10 +1826,6 @@ fn compact_raw_state_sync_message(
     stats
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the accumulator applies one BlockAggregatedChanges transaction in field order"
-)]
 fn fold_block_changes_into_snapshot(
     snapshots: &mut Snapshot,
     deltas: &mut BlockAggregatedChanges,
@@ -1829,20 +1835,14 @@ fn fold_block_changes_into_snapshot(
     // Tokens come from /tokens/snapshot before the consumer builds its decoder.
     deltas.new_tokens.clear();
 
-    let deleted_component_ids = deltas
-        .deleted_protocol_components
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    for component_id in &deleted_component_ids {
-        snapshots.states.remove(component_id);
-        deltas.state_deltas.remove(component_id);
-        deltas.component_balances.remove(component_id);
-        deltas.component_tvl.remove(component_id);
-        deltas.new_protocol_components.remove(component_id);
-        deltas.dci_update.new_entrypoints.remove(component_id);
+    for component_id in std::mem::take(&mut deltas.deleted_protocol_components).into_keys() {
+        snapshots.states.remove(&component_id);
+        deltas.state_deltas.remove(&component_id);
+        deltas.component_balances.remove(&component_id);
+        deltas.component_tvl.remove(&component_id);
+        deltas.new_protocol_components.remove(&component_id);
+        deltas.dci_update.new_entrypoints.remove(&component_id);
     }
-    deltas.deleted_protocol_components.clear();
     deltas
         .new_protocol_components
         .retain(|component_id, _| !snapshots.states.contains_key(component_id));
@@ -1878,19 +1878,10 @@ fn fold_block_changes_into_snapshot(
         false
     });
 
-    let deleted_accounts = deltas
-        .account_deltas
-        .iter()
-        .filter_map(|(address, update)| {
-            matches!(update.change_type(), ChangeType::Deletion).then_some(address.clone())
-        })
-        .collect::<Vec<_>>();
-    for address in &deleted_accounts {
-        snapshots.vm_storage.remove(address);
-        deltas.account_balances.remove(address);
-    }
     deltas.account_deltas.retain(|address, update| {
         if matches!(update.change_type(), ChangeType::Deletion) {
+            snapshots.vm_storage.remove(address);
+            deltas.account_balances.remove(address);
             stats.folded_account_updates += 1;
             return false;
         }
@@ -1920,11 +1911,7 @@ fn fold_block_changes_into_snapshot(
         .dci_update
         .new_entrypoints
         .values()
-        .flat_map(|entrypoints| {
-            entrypoints
-                .iter()
-                .map(|entrypoint| entrypoint.external_id.clone())
-        })
+        .flat_map(|entrypoints| entrypoints.iter().map(|entrypoint| &entrypoint.external_id))
         .collect::<HashSet<_>>();
     deltas
         .dci_update
@@ -2870,7 +2857,7 @@ fn format_snapshot_id(chain_id: u64, generation: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::{
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
@@ -2880,13 +2867,13 @@ mod tests {
     use num_bigint::BigUint;
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk,
-        BroadcasterSubscriptionEvent, BroadcasterSubscriptionTracker,
+        BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk, BroadcasterSubscriptionEvent,
+        BroadcasterSubscriptionTracker,
     };
     use tycho_common::{
         dto::{ProtocolStateDelta as SimulationProtocolStateDelta, ResponseToken},
         models::{
-            blockchain::BlockAggregatedChanges,
+            blockchain::{BlockAggregatedChanges, EntryPoint},
             contract::{Account, AccountBalance, AccountDelta},
             protocol::{
                 ComponentBalance, ProtocolComponent as DtoProtocolComponent,
@@ -3472,6 +3459,12 @@ mod tests {
             changes
                 .component_tvl
                 .insert(component_id.to_string(), block_number as f64);
+            let mut compacted = messages[0].message.clone();
+            compacted.deltas = Some(changes.clone());
+            let stats = super::compact_raw_state_sync_message(&mut compacted);
+            assert_eq!(stats.folded_state_updates, 1);
+            assert_eq!(stats.folded_component_balances, 1);
+            assert_eq!(stats.folded_component_tvl, 1);
             super::merge_raw_message(
                 &mut messages,
                 raw_protocol_message_with_changes(
@@ -3605,7 +3598,9 @@ mod tests {
         );
         message.message.deltas = Some(changes);
 
-        super::compact_raw_state_sync_message(&mut message.message);
+        let stats = super::compact_raw_state_sync_message(&mut message.message);
+        assert_eq!(stats.folded_account_updates, 1);
+        assert_eq!(stats.folded_account_balances, 1);
 
         let account = &message.message.snapshots.vm_storage[&address];
         assert_eq!(
@@ -3764,6 +3759,86 @@ mod tests {
             .snapshots
             .vm_storage
             .contains_key(&account_address));
+    }
+
+    #[test]
+    fn raw_cache_prunes_deleted_component_entrypoints() -> Result<()> {
+        let surviving_component = "surviving";
+        let surviving_entrypoint = "entrypoint-surviving";
+        let mut states = HashMap::new();
+        let mut changes = BlockAggregatedChanges::default();
+        for (component, entrypoint) in [
+            ("deleted", "entrypoint-deleted"),
+            (surviving_component, surviving_entrypoint),
+        ] {
+            states.insert(
+                component.to_string(),
+                raw_component_with_state(component, 1),
+            );
+            changes.dci_update.new_entrypoints.insert(
+                component.to_string(),
+                HashSet::from([EntryPoint::new(
+                    entrypoint.to_string(),
+                    DtoBytes::from([61u8; 20]),
+                    "balanceOf(address)".to_string(),
+                )]),
+            );
+            changes
+                .dci_update
+                .new_entrypoint_params
+                .insert(entrypoint.to_string(), HashSet::new());
+            changes
+                .dci_update
+                .trace_results
+                .insert(entrypoint.to_string(), Default::default());
+        }
+        changes.deleted_protocol_components.insert(
+            "deleted".to_string(),
+            raw_component("deleted", "uniswap_v2", 2),
+        );
+        let surviving_entrypoints = changes.dci_update.new_entrypoints[surviving_component].clone();
+        let mut message = raw_protocol_message_with_changes(
+            "uniswap_v2",
+            2,
+            Snapshot {
+                states,
+                vm_storage: HashMap::new(),
+            },
+            Some(changes),
+            HashMap::new(),
+        );
+
+        super::compact_raw_state_sync_message(&mut message.message);
+
+        assert_eq!(
+            message
+                .message
+                .snapshots
+                .states
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            HashSet::from([surviving_component])
+        );
+        let deltas = message
+            .message
+            .deltas
+            .as_ref()
+            .ok_or_else(|| anyhow!("surviving entrypoints must remain"))?;
+        assert!(deltas.deleted_protocol_components.is_empty());
+        assert_eq!(
+            deltas.dci_update.new_entrypoints,
+            HashMap::from([(surviving_component.to_string(), surviving_entrypoints)])
+        );
+        assert_eq!(
+            deltas.dci_update.new_entrypoint_params,
+            HashMap::from([(surviving_entrypoint.to_string(), HashSet::new())])
+        );
+        assert_eq!(
+            deltas.dci_update.trace_results,
+            HashMap::from([(surviving_entrypoint.to_string(), Default::default())])
+        );
+        Ok(())
     }
 
     #[test]
@@ -5645,15 +5720,5 @@ mod tests {
                 Some("build_failed")
             );
         });
-    }
-
-    #[test]
-    fn sync_status_clone_keeps_repo_owned_shape() {
-        let status = BroadcasterProtocolSyncStatus {
-            kind: BroadcasterProtocolSyncStatusKind::Ready,
-            block: None,
-            reason: None,
-        };
-        assert_eq!(status.kind, BroadcasterProtocolSyncStatusKind::Ready);
     }
 }

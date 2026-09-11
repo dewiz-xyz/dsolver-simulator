@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shared DSolver simulator core types and protocol metadata."
 
 [dependencies]
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tycho-simulation.workspace = true

@@ -218,9 +218,7 @@ impl ReplayWorld {
     }
 
     pub fn restore(&mut self, update: Update) -> ApplyReport {
-        let tokens = self.state.tokens.clone();
-        let wrapped_native_token = self.state.wrapped_native_token.clone();
-        self.state = Arc::new(ReplayState::empty(tokens, wrapped_native_token));
+        self.clear();
         self.apply(update)
     }
 
@@ -570,41 +568,36 @@ fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
 }
 
-fn ids_for_token(state: &ReplayState, token: &Bytes) -> Option<HashSet<String>> {
+fn ids_for_token<'a>(state: &'a ReplayState, token: &Bytes) -> Option<HashSet<&'a String>> {
     let native_address = native_token_address();
     let needs_native = state.wrapped_native_token.as_ref() == Some(token);
     let needs_wrapped = *token == native_address;
-    let mut ids = state.token_index.get(token).cloned().unwrap_or_default();
+    let mut ids = state
+        .token_index
+        .get(token)
+        .into_iter()
+        .flatten()
+        .collect::<HashSet<_>>();
     if needs_native {
         if let Some(native_ids) = state.token_index.get(&native_address) {
-            ids.extend(native_ids.iter().cloned());
+            ids.extend(native_ids);
         }
     }
     if needs_wrapped {
         if let Some(wrapped_address) = state.wrapped_native_token.as_ref() {
             if let Some(wrapped_ids) = state.token_index.get(wrapped_address) {
-                ids.extend(wrapped_ids.iter().cloned());
+                ids.extend(wrapped_ids);
             }
         }
     }
     (!ids.is_empty()).then_some(ids)
 }
 
-fn intersect_pool_ids(left: HashSet<String>, right: HashSet<String>) -> Vec<String> {
-    let (smaller, larger) = if left.len() <= right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-    smaller
-        .into_iter()
-        .filter(|id| larger.contains(id))
-        .collect()
-}
-
-fn pool_entries_for_ids(state: &ReplayState, ids: Vec<String>) -> Vec<(String, PoolEntry)> {
-    ids.into_iter()
-        .filter_map(|id| pool_by_id_from_state(state, &id).map(|entry| (id, entry)))
+fn pool_entries_for_ids<'a>(
+    state: &ReplayState,
+    ids: impl Iterator<Item = &'a String>,
+) -> Vec<(String, PoolEntry)> {
+    ids.filter_map(|id| pool_by_id_from_state(state, id).map(|entry| (id.clone(), entry)))
         .collect()
 }
 
@@ -614,10 +607,10 @@ fn matching_pools_from_state(
     token_out: &Bytes,
 ) -> Vec<(String, PoolEntry)> {
     if let (Some(token_in_ids), Some(token_out_ids)) = (
-        state.token_index.get(token_in).cloned(),
-        state.token_index.get(token_out).cloned(),
+        state.token_index.get(token_in),
+        state.token_index.get(token_out),
     ) {
-        let exact = pool_entries_for_ids(state, intersect_pool_ids(token_in_ids, token_out_ids));
+        let exact = pool_entries_for_ids(state, token_in_ids.intersection(token_out_ids));
         if !exact.is_empty() {
             return exact;
         }
@@ -628,7 +621,7 @@ fn matching_pools_from_state(
         ids_for_token(state, token_out),
     ) {
         (Some(token_in_ids), Some(token_out_ids)) => {
-            pool_entries_for_ids(state, intersect_pool_ids(token_in_ids, token_out_ids))
+            pool_entries_for_ids(state, token_in_ids.intersection(&token_out_ids).copied())
         }
         _ => Vec::new(),
     }
@@ -643,6 +636,7 @@ fn pool_by_id_from_state(state: &ReplayState, id: &str) -> Option<PoolEntry> {
 #[cfg(test)]
 mod tests {
     use std::any::Any;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use alloy_primitives::U256;
     use num_bigint::BigUint;
@@ -996,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_pools_falls_back_to_alias_when_exact_ids_are_stale() {
+    fn matching_pools_falls_back_to_alias_when_exact_ids_are_stale() -> anyhow::Result<()> {
         let wrapped_address = address(50);
         let native_address = native_token_address();
         let token_out = token(51, "TKNX");
@@ -1021,14 +1015,51 @@ mod tests {
             ),
         ]);
 
-        let ids = world
-            .pin()
-            .matching_pools_by_addresses(&wrapped_address, &token_out.address)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<HashSet<_>>();
+        let point = world.pin();
+        let matches = point.matching_pools_by_addresses(&wrapped_address, &token_out.address);
+        assert_eq!(matches.len(), 1);
+        let (id, (state, component)) = &matches[0];
+        assert_eq!(id, "pool-native");
+        let (expected_state, expected_component) = point
+            .pool_by_id("pool-native")
+            .ok_or_else(|| anyhow::anyhow!("native pool is missing"))?;
+        assert!(Arc::ptr_eq(state, &expected_state));
+        assert!(Arc::ptr_eq(component, &expected_component));
+        Ok(())
+    }
 
-        assert_eq!(ids, HashSet::from(["pool-native".to_string()]));
+    #[test]
+    fn exact_quote_preserves_custom_chain_failure_and_missing_token_priority(
+    ) -> Result<(), serde_json::Error> {
+        let custom_chain: Chain = serde_json::from_str(r#"{"custom":"quote-unregistered-chain"}"#)?;
+        let mut token_in = token(56, "CUSTOM");
+        token_in.chain = custom_chain;
+        let token_out = token(57, "OTHER");
+        let pool = component(
+            58,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        world.apply(pair_update("pool-custom", pool));
+        let point = world.pin();
+        let mut request = ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "pool-custom".to_owned(),
+            token_in: token_in.address,
+            token_out: address(59),
+            amount_in: U256::from(10_u64),
+        };
+        assert_eq!(
+            point.quote(&request),
+            Err(ReplayQuoteError::TokenMissing(request.token_out.clone()))
+        );
+
+        request.token_out = token_out.address;
+        assert!(catch_unwind(AssertUnwindSafe(|| point.quote(&request))).is_err());
+        Ok(())
     }
 
     #[test]

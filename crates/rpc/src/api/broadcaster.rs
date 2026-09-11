@@ -171,19 +171,27 @@ mod tests {
     #[tokio::test]
     async fn status_reports_snapshot_warming_up() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["upstream"]["connected"], true);
         assert_eq!(body["snapshot"]["ready"], false);
+
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn status_reports_ready_once_snapshot_is_bootstrapped() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
@@ -195,24 +203,8 @@ mod tests {
         assert_eq!(body["snapshot"]["ready"], true);
         assert_eq!(body["backends"]["native"]["block_number"], 10);
         assert_eq!(body["backends"]["native"]["pool_count"], 1);
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn ready_fails_closed_until_snapshot_is_bootstrapped() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
         let (status, body) = get_json(app, "/ready").await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "snapshot_warming_up");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ready_succeeds_for_active_exportable_publisher() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
-        let (status, body) = get_json(app, "/ready").await?;
-
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         Ok(())
@@ -237,7 +229,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn status_reports_passive_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_passive_ready_state().await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_passive");
@@ -245,6 +237,11 @@ mod tests {
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");
         assert!(body["redis_publisher"]["replay_boundary"].is_null());
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_passive");
+        assert_eq!(body["redis_publisher"]["mode"], "passive");
         Ok(())
     }
 
@@ -368,7 +365,7 @@ mod tests {
     async fn status_reports_unhealthy_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
 
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_unhealthy");
@@ -376,6 +373,11 @@ mod tests {
         assert_eq!(body["redis_publisher"]["mode"], "unhealthy");
         assert_eq!(body["deployment_admission"]["admitted"], true);
         assert_eq!(body["deployment_admission"]["phase"], "admitted");
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_unhealthy");
+        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 
@@ -389,39 +391,6 @@ mod tests {
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_session_create_rejects_when_publisher_is_passive() -> Result<()> {
-        let app = create_broadcaster_router(build_passive_ready_state().await?);
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "redis_publisher_passive");
-        assert_eq!(body["redis_publisher"]["mode"], "passive");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_session_create_rejects_until_ready() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "snapshot_warming_up");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_session_create_rejects_when_redis_boundary_is_unavailable() -> Result<()> {
-        let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
-
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "redis_publisher_unhealthy");
-        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 
@@ -467,6 +436,8 @@ mod tests {
             serde_json::json!(["native", "rfq"])
         );
         assert!(body["backends"]["rfq"].is_object());
+        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
+        assert!(body["snapshot"]["ready"].as_bool().unwrap_or(false));
 
         let (status, body) =
             post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
@@ -478,24 +449,6 @@ mod tests {
             get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["backends"], serde_json::json!(["native"]));
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn root_status_reports_rfq_backend_readiness() -> Result<()> {
-        let app = create_broadcaster_router(
-            build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
-        );
-
-        let (status, body) = get_json(app, "/status").await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "ready");
-        assert_eq!(
-            body["snapshot"]["configured_backends"],
-            serde_json::json!(["native", "rfq"])
-        );
-        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
-        assert!(body["snapshot"]["ready"].as_bool().unwrap_or(false));
         Ok(())
     }
 
@@ -816,16 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_lookup_rejects_mismatched_chain_id() -> Result<()> {
-        let (tycho_url, _request_count, server_task) =
-            spawn_tycho_token_server(None, Duration::ZERO).await?;
-        let app = create_broadcaster_router(
-            build_state_with_tokens(
-                SeedMode::Disconnected,
-                token_store(vec![], tycho_url, Chain::Ethereum),
-                Chain::Ethereum,
-            )
-            .await?,
-        );
+        let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
 
         let (status, body) = post_json(
             app,
@@ -836,7 +780,6 @@ mod tests {
             }),
         )
         .await?;
-        server_task.abort();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let Some(error) = body["error"].as_str() else {
@@ -848,16 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_lookup_rejects_malformed_addresses() -> Result<()> {
-        let (tycho_url, _request_count, server_task) =
-            spawn_tycho_token_server(None, Duration::ZERO).await?;
-        let app = create_broadcaster_router(
-            build_state_with_tokens(
-                SeedMode::Disconnected,
-                token_store(vec![], tycho_url, Chain::Ethereum),
-                Chain::Ethereum,
-            )
-            .await?,
-        );
+        let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
 
         let (status, body) = post_json(
             app,
@@ -868,7 +802,6 @@ mod tests {
             }),
         )
         .await?;
-        server_task.abort();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let Some(error) = body["error"].as_str() else {
@@ -1328,12 +1261,11 @@ mod tests {
         > {
             Box::pin(async move {
                 let mut state = self.state.lock().await;
-                if let Some(expected_token) = command.expected_writer_token {
-                    if state.active_token.as_deref() != Some(expected_token)
+                if command.expected_writer_token.is_some_and(|expected_token| {
+                    state.active_token.as_deref() != Some(expected_token)
                         || Some(state.active_generation) != command.expected_generation
-                    {
-                        bail!("stale Redis broadcaster writer token");
-                    }
+                }) {
+                    bail!("stale Redis broadcaster writer token");
                 }
                 state.active_generation = state.active_generation.saturating_add(1);
                 state.active_token = Some(command.writer_token.to_string());

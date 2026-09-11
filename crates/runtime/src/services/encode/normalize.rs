@@ -49,7 +49,9 @@ pub(super) fn normalize_route(
     let segment_amounts =
         allocate_amounts_by_bps(total_amount_in, &segment_shares, "segment", "shareBps")?;
 
-    for (segment_index, segment) in request.segments.iter().enumerate() {
+    for (segment_index, (segment, segment_amount_in)) in
+        request.segments.iter().zip(segment_amounts).enumerate()
+    {
         validate_segment_shape(segment, segment_index)?;
         validate_hop_continuity(segment, request_token_in, request_token_out)?;
 
@@ -66,17 +68,6 @@ pub(super) fn normalize_route(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-
-        let segment_amount_in = segment_amounts
-            .get(segment_index)
-            .cloned()
-            .ok_or_else(|| EncodeError::internal("Missing segment amount allocation"))?;
-        if segment_amount_in.is_zero() {
-            return Err(EncodeError::invalid(format!(
-                "segment[{}] amountIn must be > 0",
-                segment_index
-            )));
-        }
 
         normalized_segments.push(NormalizedSegmentInternal {
             share_bps: segment.share_bps,

@@ -2188,6 +2188,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simulator-core",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -6850,6 +6851,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tycho-simulation",
  "typetag",
 ]

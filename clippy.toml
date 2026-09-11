@@ -1,0 +1,6 @@
+# Structural guardrails; test coverage and design still need review.
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+excessive-nesting-threshold = 5
+type-complexity-threshold = 250
+too-many-arguments-threshold = 7

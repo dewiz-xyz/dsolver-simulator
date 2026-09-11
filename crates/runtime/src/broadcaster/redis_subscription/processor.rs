@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use simulator_replay::{ReplayBackend, ReplayDecoder};
+use simulator_replay::{RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -13,14 +13,13 @@ use simulator_replay::DecoderConfig;
 use tycho_simulation::{evm::decoder::TychoStreamDecoder, tycho_client::feed::BlockHeader};
 
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotPartition,
-    BroadcasterSnapshotStart, BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
+    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
+    BroadcasterRedisStreamEntry, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+    BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
 };
 
 use crate::broadcaster::redis_publisher::current_time_ms;
 
-use super::snapshot::RawSnapshotReassembly;
 use super::{
     BroadcasterSubscriptionControls, RfqBroadcasterSubscriptionControls,
     VmBroadcasterSubscriptionControls,
@@ -48,7 +47,6 @@ pub(super) struct BroadcasterSubscriptionProcessor {
     decoder: Arc<ReplayDecoder>,
     tracker: BroadcasterSubscriptionTracker,
     raw_snapshot: RawSnapshotReassembly,
-    bootstrap_block: Option<u64>,
     bootstrap_redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
     pub(super) rebuild: Option<SubscriptionRebuildState>,
 }
@@ -86,7 +84,6 @@ impl BroadcasterSubscriptionProcessor {
             decoder,
             tracker: BroadcasterSubscriptionTracker::new(),
             raw_snapshot: RawSnapshotReassembly::default(),
-            bootstrap_block: None,
             bootstrap_redis_replay_boundary: None,
             rebuild,
         }
@@ -109,7 +106,6 @@ impl BroadcasterSubscriptionProcessor {
             decoder: Arc::clone(&self.decoder),
             tracker: BroadcasterSubscriptionTracker::new(),
             raw_snapshot: RawSnapshotReassembly::default(),
-            bootstrap_block: None,
             bootstrap_redis_replay_boundary: Some(replay_boundary),
             rebuild: None,
         }
@@ -151,7 +147,6 @@ impl BroadcasterSubscriptionProcessor {
 
         match envelope.payload {
             BroadcasterPayload::SnapshotStart(start) => {
-                self.bootstrap_block = None;
                 self.raw_snapshot.reset();
                 self.controls
                     .broadcaster_subscription()
@@ -161,7 +156,6 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::SnapshotChunk(chunk) => {
                 for partition in chunk.partitions {
                     if partition.backend == self.controls.backend() {
-                        self.bootstrap_block = Some(partition.block_number);
                         self.buffer_snapshot_partition(partition).await?;
                     }
                 }
@@ -187,14 +181,7 @@ impl BroadcasterSubscriptionProcessor {
             BroadcasterPayload::Update(update) => {
                 self.apply_live_update(update, state_version).await?;
             }
-            BroadcasterPayload::Heartbeat(heartbeat) => {
-                for head in heartbeat.backend_heads {
-                    if head.backend == self.controls.backend() {
-                        self.apply_heartbeat(head);
-                    }
-                }
-            }
-            BroadcasterPayload::Progress(_progress) => {}
+            BroadcasterPayload::Heartbeat(_) | BroadcasterPayload::Progress(_) => {}
             BroadcasterPayload::RecoveryStart(_)
             | BroadcasterPayload::RecoveryChunk(_)
             | BroadcasterPayload::RecoveryCatchUp(_)
@@ -300,29 +287,16 @@ impl BroadcasterSubscriptionProcessor {
         }
     }
 
-    async fn apply_snapshot_partition(
-        &self,
-        partition: BroadcasterSnapshotPartition,
-    ) -> Result<()> {
-        if !partition.messages.is_empty() {
-            return Err(anyhow!(
-                "raw broadcaster snapshot messages cannot be applied without reassembly"
-            ));
-        }
-
-        let decoded = self.decoder.decode_snapshot_partition(partition).await?;
-        if let Some(update) = decoded.update {
-            self.controls.state_store().apply_update(update).await;
-        }
-        Ok(())
-    }
-
     async fn buffer_snapshot_partition(
         &mut self,
         partition: BroadcasterSnapshotPartition,
     ) -> Result<()> {
         if partition.messages.is_empty() {
-            return self.apply_snapshot_partition(partition).await;
+            let decoded = self.decoder.decode_snapshot_partition(partition).await?;
+            if let Some(update) = decoded.update {
+                self.controls.state_store().apply_update(update).await;
+            }
+            return Ok(());
         }
         self.ensure_raw_messages_supported()?;
 
@@ -398,8 +372,6 @@ impl BroadcasterSubscriptionProcessor {
         }
         Ok(())
     }
-
-    fn apply_heartbeat(&self, _head: BroadcasterBackendHead) {}
 
     fn ensure_raw_messages_supported(&self) -> Result<()> {
         if self.controls.backend() == BroadcasterBackend::Rfq {

@@ -1,6 +1,5 @@
 use std::{cmp::Ordering, collections::BTreeSet, fmt, str::FromStr};
 
-use num_bigint::BigUint;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::openapi::{
     schema::{ArrayBuilder, ObjectBuilder, Schema, SchemaFormat, Type},
@@ -206,8 +205,10 @@ impl FromStr for UnsignedAmount {
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(UnsignedAmountError);
         }
-        let amount = BigUint::from_str(value).map_err(|_| UnsignedAmountError)?;
-        Ok(Self(amount.to_str_radix(10)))
+        let amount = value.trim_start_matches('0');
+        Ok(Self(
+            if amount.is_empty() { "0" } else { amount }.to_owned(),
+        ))
     }
 }
 

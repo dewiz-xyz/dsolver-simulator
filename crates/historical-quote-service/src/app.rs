@@ -195,39 +195,35 @@ where
 {
     fn probe(&self) -> ServiceFuture<'_, StatusDependencies> {
         Box::pin(async move {
-            match self
+            let (visible_through_block, database) = match self
                 .reader
                 .visible_through_block(self.chain_id, &self.backends)
                 .await
             {
-                Ok(cutoff) => Ok(StatusDependencies {
-                    visible_through_block: Some(cutoff),
-                    database: healthy_dependency(),
-                    object_store: DependencyHealth {
-                        state: DependencyState::Degraded,
-                        message: Some("object reads are checked during jobs".to_owned()),
+                Ok(cutoff) => (
+                    Some(cutoff),
+                    DependencyHealth {
+                        state: DependencyState::Healthy,
+                        message: None,
                     },
-                }),
-                Err(_) => Ok(StatusDependencies {
-                    visible_through_block: None,
-                    database: DependencyHealth {
+                ),
+                Err(_) => (
+                    None,
+                    DependencyHealth {
                         state: DependencyState::Unavailable,
                         message: Some("read replica cutoff is unavailable".to_owned()),
                     },
-                    object_store: DependencyHealth {
-                        state: DependencyState::Degraded,
-                        message: Some("object reads are checked during jobs".to_owned()),
-                    },
-                }),
-            }
+                ),
+            };
+            Ok(StatusDependencies {
+                visible_through_block,
+                database,
+                object_store: DependencyHealth {
+                    state: DependencyState::Degraded,
+                    message: Some("object reads are checked during jobs".to_owned()),
+                },
+            })
         })
-    }
-}
-
-fn healthy_dependency() -> DependencyHealth {
-    DependencyHealth {
-        state: DependencyState::Healthy,
-        message: None,
     }
 }
 
@@ -240,40 +236,103 @@ fn history_backend(backend: Backend) -> state_history::Backend {
 }
 
 fn map_engine_error(error: HistoricalError) -> JobExecutionError {
-    let failure = match error {
+    let retryable = matches!(&error, HistoricalError::HistoryRead { .. });
+    let (code, message) = match error {
         HistoricalError::Cancelled => return JobExecutionError::Cancelled,
-        HistoricalError::HistoryRead { .. } => JobFailure {
-            code: JobFailureCode::HistoryReadFailed,
-            message: "historical state could not be read".to_owned(),
-            retryable: true,
-            details: None,
-        },
-        HistoricalError::HistoricalDataInvalid(_) => JobFailure {
-            code: JobFailureCode::HistoricalDataInvalid,
-            message: "retained historical data is invalid".to_owned(),
-            retryable: false,
-            details: None,
-        },
+        HistoricalError::HistoryRead { .. } => (
+            JobFailureCode::HistoryReadFailed,
+            "historical state could not be read",
+        ),
+        HistoricalError::HistoricalDataInvalid(_) => (
+            JobFailureCode::HistoricalDataInvalid,
+            "retained historical data is invalid",
+        ),
         HistoricalError::StateReconstructionFailed(_) | HistoricalError::UnsupportedCanonicalVm => {
-            JobFailure {
-                code: JobFailureCode::StateReconstructionFailed,
-                message: "historical state could not be reconstructed".to_owned(),
-                retryable: false,
-                details: None,
-            }
+            (
+                JobFailureCode::StateReconstructionFailed,
+                "historical state could not be reconstructed",
+            )
         }
-        HistoricalError::CheckBudgetExceeded => JobFailure {
-            code: JobFailureCode::CheckBudgetExceeded,
-            message: "checkpoint pair limit was exceeded".to_owned(),
-            retryable: false,
-            details: None,
-        },
-        HistoricalError::InvalidSelector(_) => JobFailure {
-            code: JobFailureCode::InternalError,
-            message: "historical job could not be completed".to_owned(),
-            retryable: false,
-            details: None,
-        },
+        HistoricalError::CheckBudgetExceeded => (
+            JobFailureCode::CheckBudgetExceeded,
+            "checkpoint pair limit was exceeded",
+        ),
+        HistoricalError::InvalidSelector(_) => (
+            JobFailureCode::InternalError,
+            "historical job could not be completed",
+        ),
     };
-    JobExecutionError::Failed(failure)
+    JobExecutionError::Failed(JobFailure {
+        code,
+        message: message.to_owned(),
+        retryable,
+        details: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_engine_error, HistoricalError, JobExecutionError, JobFailureCode};
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "unexpected engine outcomes must fail the mapping test"
+    )]
+    fn engine_errors_preserve_public_codes_messages_and_retryability() {
+        assert!(matches!(
+            map_engine_error(HistoricalError::Cancelled),
+            JobExecutionError::Cancelled
+        ));
+        let private_detail = "private replica address and credentials";
+        for (error, code, message, retryable) in [
+            (
+                HistoricalError::HistoryRead {
+                    operation: private_detail,
+                    source: anyhow::anyhow!(private_detail),
+                },
+                JobFailureCode::HistoryReadFailed,
+                "historical state could not be read",
+                true,
+            ),
+            (
+                HistoricalError::HistoricalDataInvalid(private_detail.to_owned()),
+                JobFailureCode::HistoricalDataInvalid,
+                "retained historical data is invalid",
+                false,
+            ),
+            (
+                HistoricalError::StateReconstructionFailed(private_detail.to_owned()),
+                JobFailureCode::StateReconstructionFailed,
+                "historical state could not be reconstructed",
+                false,
+            ),
+            (
+                HistoricalError::UnsupportedCanonicalVm,
+                JobFailureCode::StateReconstructionFailed,
+                "historical state could not be reconstructed",
+                false,
+            ),
+            (
+                HistoricalError::CheckBudgetExceeded,
+                JobFailureCode::CheckBudgetExceeded,
+                "checkpoint pair limit was exceeded",
+                false,
+            ),
+            (
+                HistoricalError::InvalidSelector(private_detail.to_owned()),
+                JobFailureCode::InternalError,
+                "historical job could not be completed",
+                false,
+            ),
+        ] {
+            let JobExecutionError::Failed(failure) = map_engine_error(error) else {
+                panic!("engine failure must remain a failed job");
+            };
+            assert_eq!(failure.code, code);
+            assert_eq!(failure.message, message);
+            assert_eq!(failure.retryable, retryable);
+            assert!(failure.details.is_none());
+        }
+    }
 }

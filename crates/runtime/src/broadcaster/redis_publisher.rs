@@ -1081,21 +1081,21 @@ impl BroadcasterRedisPublisher {
         let append_failures_before = guard.append_failure_count;
         for payload in handoff.payloads {
             let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
-            if let Err(error) = self.append_live_payload_locked(&mut guard, payload).await {
-                let message = format!("{error:#}");
-                if is_stale_writer_error(&error) {
-                    guard.record_retired(message.clone());
-                    self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
-                } else {
-                    if guard.append_failure_count > append_failures_before {
-                        guard.retry_exhaustion_count =
-                            guard.retry_exhaustion_count.saturating_add(1);
-                    }
-                    guard.record_retired(message.clone());
-                    self.set_deployment_phase(BroadcasterDeploymentPhase::Fatal, Some(message));
+            let Err(error) = self.append_live_payload_locked(&mut guard, payload).await else {
+                continue;
+            };
+            let message = format!("{error:#}");
+            let phase = if is_stale_writer_error(&error) {
+                BroadcasterDeploymentPhase::Retired
+            } else {
+                if guard.append_failure_count > append_failures_before {
+                    guard.retry_exhaustion_count = guard.retry_exhaustion_count.saturating_add(1);
                 }
-                return Err(error);
-            }
+                BroadcasterDeploymentPhase::Fatal
+            };
+            guard.record_retired(message.clone());
+            self.set_deployment_phase(phase, Some(message));
+            return Err(error);
         }
         guard.startup_handoff = None;
         Ok(())
@@ -1147,14 +1147,16 @@ impl BroadcasterRedisPublisher {
                 // this later would publish stale backend heads.
                 return Ok(());
             }
-            if let Some(block_number) = complete_native_block(&payload) {
+            let complete_block = complete_native_block(&payload);
+            if let Some(block_number) = complete_block {
                 recovery_gate.complete_native_blocks.insert(block_number);
-                if recovery_gate.complete_native_blocks.len()
+            }
+            if complete_block.is_some()
+                && recovery_gate.complete_native_blocks.len()
                     >= self.config.recovery_max_buffered_native_blocks
-                {
-                    if let Some(cancelled) = &recovery_gate.cancelled {
-                        cancelled.store(true, Ordering::Release);
-                    }
+            {
+                if let Some(cancelled) = &recovery_gate.cancelled {
+                    cancelled.store(true, Ordering::Release);
                 }
             }
             anyhow::ensure!(

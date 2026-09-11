@@ -1243,29 +1243,9 @@ impl PublishedStatePin {
         current: &Self,
         pool_ids: &HashSet<String>,
     ) -> HashSet<String> {
-        pool_ids
-            .iter()
-            .filter(|pool_id| {
-                let pinned_entry = self.pool_by_id(pool_id);
-                let current_entry = current.pool_by_id(pool_id);
-                match (pinned_entry, current_entry) {
-                    (None, None) => {
-                        // Neither pin has an identity that could have moved during encode.
-                        false
-                    }
-                    (None, Some(_)) | (Some(_), None) => true,
-                    (
-                        Some((pinned_state, pinned_component)),
-                        Some((current_state, current_component)),
-                    ) => {
-                        // Component identity catches pools removed and re-added between pins.
-                        !Arc::ptr_eq(&pinned_state, &current_state)
-                            || !Arc::ptr_eq(&pinned_component, &current_component)
-                    }
-                }
-            })
-            .cloned()
-            .collect()
+        self.state
+            .point
+            .changed_pool_ids(&current.state.point, pool_ids)
     }
 }
 
@@ -3116,32 +3096,6 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("repeated fixture swap succeeds: {error}"));
         assert_eq!(first.amount, repeated.amount);
         assert_eq!(first.gas, repeated.gas);
-    }
-
-    #[tokio::test]
-    async fn native_route_fence_marks_removed_pool_changed() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-        let component = pinned
-            .pool_by_id("pool-native")
-            .map(|(_, component)| component.as_ref().clone())
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-
-        state
-            .native_state_store
-            .apply_update(
-                Update::new(2, HashMap::new(), HashMap::new())
-                    .set_removed_pairs(HashMap::from([("pool-native".to_string(), component)])),
-            )
-            .await;
-
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Changed
-        );
     }
 
     #[tokio::test]

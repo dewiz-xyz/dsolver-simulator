@@ -52,7 +52,7 @@ pub(super) fn build_route_swaps(
                 count: 0,
                 last_index: index,
             });
-        entry.total_amount += swap.amount_in.clone();
+        entry.total_amount += &swap.amount_in;
         entry.count += 1;
         entry.last_index = index;
     }
@@ -94,19 +94,16 @@ pub(super) fn build_route_swaps(
 fn ensure_token_in_single_depth(
     resimulated: &ResimulatedRouteInternal,
 ) -> Result<(), AttemptError> {
-    let mut token_depths: HashMap<Bytes, usize> = HashMap::new();
+    let mut token_depths: HashMap<&Bytes, usize> = HashMap::new();
     for segment in &resimulated.segments {
         for (hop_index, hop) in segment.hops.iter().enumerate() {
             for swap in &hop.swaps {
-                if let Some(existing_depth) = token_depths.get(&swap.token_in) {
-                    if *existing_depth != hop_index {
-                        return Err(AttemptError::deterministic(EncodeError::invalid(format!(
-                            "tokenIn {} appears at multiple hop depths",
-                            format_address(&swap.token_in)
-                        ))));
-                    }
-                } else {
-                    token_depths.insert(swap.token_in.clone(), hop_index);
+                let existing_depth = token_depths.entry(&swap.token_in).or_insert(hop_index);
+                if *existing_depth != hop_index {
+                    return Err(AttemptError::deterministic(EncodeError::invalid(format!(
+                        "tokenIn {} appears at multiple hop depths",
+                        format_address(&swap.token_in)
+                    ))));
                 }
             }
         }

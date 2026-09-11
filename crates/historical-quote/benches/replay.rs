@@ -339,32 +339,35 @@ fn benchmark_concurrent_jobs(
                 BenchmarkId::new(fixture.label, jobs),
                 &jobs,
                 |bencher, jobs| {
-                    bencher.to_async(runtime).iter(|| async {
-                        let mut tasks = Vec::with_capacity(*jobs);
-                        for _ in 0..*jobs {
-                            let fixture = Arc::clone(fixture);
-                            tasks.push(tokio::spawn(async move {
-                                replay_workload(fixture.as_ref(), 1_800, quote_shape(100, 10, 20))
-                                    .await
-                            }));
-                        }
-                        let mut observations = Vec::with_capacity(*jobs);
-                        for task in tasks {
-                            observations.push(task.await.expect("benchmark task must finish"));
-                        }
-                        black_box(
-                            observations
-                                .iter()
-                                .map(WorkloadObservation::measurements)
-                                .collect::<Vec<_>>(),
-                        );
-                        black_box(observations);
-                    });
+                    bencher
+                        .to_async(runtime)
+                        .iter(|| replay_concurrent_jobs(fixture, *jobs));
                 },
             );
         }
     }
     group.finish();
+}
+
+async fn replay_concurrent_jobs(fixture: &Arc<PreparedFixture>, jobs: usize) {
+    let mut tasks = Vec::with_capacity(jobs);
+    for _ in 0..jobs {
+        let fixture = Arc::clone(fixture);
+        tasks.push(tokio::spawn(async move {
+            replay_workload(fixture.as_ref(), 1_800, quote_shape(100, 10, 20)).await
+        }));
+    }
+    let mut observations = Vec::with_capacity(jobs);
+    for task in tasks {
+        observations.push(task.await.expect("benchmark task must finish"));
+    }
+    black_box(
+        observations
+            .iter()
+            .map(WorkloadObservation::measurements)
+            .collect::<Vec<_>>(),
+    );
+    black_box(observations);
 }
 
 fn peak_rss_bytes() -> Option<u64> {

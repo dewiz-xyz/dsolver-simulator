@@ -141,14 +141,12 @@ impl<S: HistorySource> HistoricalReconstructor<S> {
             states.entry(*block).or_insert_with(|| {
                 let gap_refs = matching_gap_refs(&plan.gaps, *block);
                 Err(UnavailableState {
-                    reason: if gap_refs.is_empty() {
-                        if request.backends.contains(&Backend::Rfq) {
-                            UnavailableReason::RfqObservationMissing
-                        } else {
-                            UnavailableReason::StateApplicationInvalid
-                        }
-                    } else {
+                    reason: if !gap_refs.is_empty() {
                         UnavailableReason::Gap
+                    } else if request.backends.contains(&Backend::Rfq) {
+                        UnavailableReason::RfqObservationMissing
+                    } else {
+                        UnavailableReason::StateApplicationInvalid
                     },
                     gap_refs,
                 })
@@ -205,10 +203,9 @@ impl<S: HistorySource> HistoricalReconstructor<S> {
         };
         let mut applied = BTreeSet::new();
         let mut application_invalid = restored.checkpoint_application_invalid;
-        let mut blocks = blocks.to_vec();
-        blocks.sort_unstable();
         let mut states = Vec::with_capacity(blocks.len());
-        for block in blocks {
+        // Assigned blocks retain the order of request.required_blocks.
+        for &block in blocks {
             check_cancelled(cancellation)?;
             let next_block_timestamp = block
                 .checked_add(1)
@@ -674,7 +671,7 @@ fn public_gap(index: usize, gap: &RangeGap) -> Result<GapReference, HistoricalEr
     })
 }
 
-fn gap_cause(reason: &str) -> Result<GapCause, HistoricalError> {
+pub(crate) fn gap_cause(reason: &str) -> Result<GapCause, HistoricalError> {
     match reason {
         "queue_overflow" => Ok(GapCause::QueueOverflow),
         "write_failed" => Ok(GapCause::WriteFailed),

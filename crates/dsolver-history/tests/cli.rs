@@ -530,6 +530,57 @@ async fn verify_job_not_found_recomputes_once_with_the_exact_request_body() {
 }
 
 #[tokio::test]
+async fn second_missing_result_stops_without_a_third_submission() {
+    for (command, request_id, job_type, fixture_name, route) in [
+        (
+            "quotes",
+            QUOTE_REQUEST_ID,
+            "historicalQuote",
+            "quote_request.json",
+            "/jobs/quote",
+        ),
+        (
+            "verify",
+            VERIFY_REQUEST_ID,
+            "historicalStateConsistencyCheck",
+            "verify_request.json",
+            "/jobs/consistency-check",
+        ),
+    ] {
+        let api = MockApi::start(vec![
+            Spec::json(
+                StatusCode::ACCEPTED,
+                submission(JOB_ONE, request_id, job_type),
+            ),
+            Spec::json(StatusCode::NOT_FOUND, api_error("job_not_found")),
+            Spec::json(
+                StatusCode::ACCEPTED,
+                submission(JOB_TWO, request_id, job_type),
+            ),
+            Spec::json(StatusCode::NOT_FOUND, api_error("job_not_found")),
+        ])
+        .await;
+        let output = run_cli(
+            &api,
+            [command, "--request"],
+            Some(fixture(fixture_name)),
+            None,
+        )
+        .await;
+
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+        let records = api.records();
+        assert_eq!(records.len(), 4, "{command}");
+        assert_eq!(records[0].path, route);
+        assert_eq!(records[2].path, route);
+        assert_eq!(records[0].body, records[2].body);
+        assert_eq!(records[1].path, format!("/jobs/{JOB_ONE}"));
+        assert_eq!(records[3].path, format!("/jobs/{JOB_TWO}"));
+    }
+}
+
+#[tokio::test]
 async fn terminal_failed_job_is_not_resubmitted() {
     let api = MockApi::start(vec![
         Spec::json(
@@ -649,12 +700,66 @@ async fn ctrl_c_requests_cancellation_and_exits_130() {
     let mut command = async_command(&api);
     command.args(["quotes", "--request"]);
     command.arg(fixture("quote_request.json"));
+    assert_interrupt_cancels_job(command, &api, 2, JOB_ONE).await;
+}
+
+#[tokio::test]
+async fn verification_ctrl_c_cancels_the_recomputed_job() {
+    let mut running = running_job(JOB_TWO);
+    running["requestId"] = json!(VERIFY_REQUEST_ID);
+    running["jobType"] = json!("historicalStateConsistencyCheck");
+    running["progress"] = progress("historicalStateConsistencyCheck", 50);
+    let api = MockApi::start(vec![
+        Spec::json(
+            StatusCode::ACCEPTED,
+            submission(
+                JOB_ONE,
+                VERIFY_REQUEST_ID,
+                "historicalStateConsistencyCheck",
+            ),
+        ),
+        Spec::json(StatusCode::NOT_FOUND, api_error("job_not_found")),
+        Spec::json(
+            StatusCode::ACCEPTED,
+            submission(
+                JOB_TWO,
+                VERIFY_REQUEST_ID,
+                "historicalStateConsistencyCheck",
+            ),
+        ),
+        Spec::json(StatusCode::OK, running).header("retry-after", "1"),
+        Spec::json(StatusCode::OK, cancelled_job(JOB_TWO)),
+    ])
+    .await;
+    let mut command = async_command(&api);
+    command.args(["verify", "--request"]);
+    command.arg(fixture("verify_request.json"));
+    assert_interrupt_cancels_job(command, &api, 4, JOB_TWO).await;
+}
+
+#[tokio::test]
+async fn job_wait_ctrl_c_requests_cancellation_and_exits_130() {
+    let api = MockApi::start(vec![
+        Spec::json(StatusCode::OK, running_job(JOB_ONE)).header("retry-after", "1"),
+        Spec::json(StatusCode::OK, cancelled_job(JOB_ONE)),
+    ])
+    .await;
+    let mut command = async_command(&api);
+    command.args(["job", "wait", JOB_ONE]);
+    assert_interrupt_cancels_job(command, &api, 1, JOB_ONE).await;
+}
+
+async fn assert_interrupt_cancels_job(
+    mut command: tokio::process::Command,
+    api: &MockApi,
+    requests_before_interrupt: usize,
+    expected_job_id: &str,
+) {
     let child = command.spawn().expect("CLI process must start");
     let child_id = child.id().expect("child PID must exist");
-    let child = child;
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        while api.records().len() < 2 {
+        while api.records().len() < requests_before_interrupt {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -678,7 +783,7 @@ async fn ctrl_c_requests_cancellation_and_exits_130() {
     );
     assert_eq!(
         api.records().last().unwrap().path,
-        format!("/jobs/{JOB_ONE}/cancel")
+        format!("/jobs/{expected_job_id}/cancel")
     );
 }
 

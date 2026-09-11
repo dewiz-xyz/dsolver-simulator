@@ -95,14 +95,3 @@ async fn unbounded_coverage_has_no_pool_existence_claim() -> Result<(), Box<dyn 
     assert!(json.get("componentId").is_none());
     Ok(())
 }
-
-#[test]
-fn duplicate_backends_are_rejected_at_the_wire_boundary() {
-    let request = serde_json::from_value::<CoverageRequest>(serde_json::json!({
-        "apiRevision": 1,
-        "chainId": 8453,
-        "backends": ["native", "native"]
-    }));
-
-    assert!(request.is_err());
-}

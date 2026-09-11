@@ -16,7 +16,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91.0"
+rust-version = "1.95.0"
 license = "MIT"
 repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 
@@ -67,6 +67,10 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 zstd = "0.13"
 
+[workspace.lints.rust]
+unused = { level = "deny", priority = -1 }
+unfulfilled_lint_expectations = "deny"
+
 [workspace.lints.clippy]
 dbg_macro = "deny"
 unimplemented = "deny"
@@ -74,6 +78,12 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+cognitive_complexity = "deny"
+excessive_nesting = "deny"
+too_many_lines = "deny"
+type_complexity = "deny"
+too_many_arguments = "deny"
 unused_async = "warn"
 manual_let_else = "warn"
 match_same_arms = "warn"
@@ -82,4 +92,3 @@ unnecessary_wraps = "warn"
 trivially_copy_pass_by_ref = "warn"
 struct_excessive_bools = "warn"
 fn_params_excessive_bools = "warn"
-too_many_lines = "warn"

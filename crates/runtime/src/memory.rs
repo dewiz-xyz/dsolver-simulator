@@ -28,10 +28,8 @@ pub fn maybe_log_memory_snapshot(
         return;
     }
 
-    if let Some(count) = new_pairs {
-        if count < cfg.snapshots_min_new_pairs {
-            return;
-        }
+    if new_pairs.is_some_and(|count| count < cfg.snapshots_min_new_pairs) {
+        return;
     }
 
     let now_secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -47,24 +45,8 @@ pub fn maybe_log_memory_snapshot(
         return;
     }
 
-    if let Err(err) = epoch::advance() {
-        warn!(error = %err, "Failed advancing jemalloc epoch");
+    let Some((allocated, resident)) = read_jemalloc_snapshot() else {
         return;
-    }
-
-    let allocated = match stats::allocated::read() {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(error = %err, "Failed reading jemalloc allocated bytes");
-            return;
-        }
-    };
-    let resident = match stats::resident::read() {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(error = %err, "Failed reading jemalloc resident bytes");
-            return;
-        }
     };
 
     info!(
@@ -80,6 +62,19 @@ pub fn maybe_log_memory_snapshot(
     if cfg.snapshots_emit_emf {
         emit_jemalloc_snapshot(label, allocated, resident);
     }
+}
+
+fn read_jemalloc_snapshot() -> Option<(usize, usize)> {
+    epoch::advance()
+        .inspect_err(|err| warn!(error = %err, "Failed advancing jemalloc epoch"))
+        .ok()?;
+    let allocated = stats::allocated::read()
+        .inspect_err(|err| warn!(error = %err, "Failed reading jemalloc allocated bytes"))
+        .ok()?;
+    let resident = stats::resident::read()
+        .inspect_err(|err| warn!(error = %err, "Failed reading jemalloc resident bytes"))
+        .ok()?;
+    Some((allocated, resident))
 }
 
 fn purge_jemalloc(context: &'static str) {

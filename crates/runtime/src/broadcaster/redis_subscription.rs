@@ -35,7 +35,6 @@ use crate::stream::StreamSupervisorConfig;
 #[cfg(test)]
 mod live_vm_wire_e2e;
 mod processor;
-mod snapshot;
 #[cfg(test)]
 mod tests;
 
@@ -190,6 +189,10 @@ impl BroadcasterSubscriptionControls {
 #[expect(
     clippy::too_many_lines,
     reason = "subscription ownership and restart decisions stay in one supervisor loop"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Connection, bootstrap and replay failures have distinct rebuild ownership and retry rules"
 )]
 pub(crate) async fn supervise_broadcaster_redis_subscription(
     broadcaster_url: String,
@@ -589,8 +592,8 @@ fn pending_processor_bootstrap_error(
 }
 
 #[expect(
-    clippy::too_many_lines,
-    reason = "tail polling, recovery timeout, and transport retry share one ordered replay loop"
+    clippy::cognitive_complexity,
+    reason = "Tail polling preserves separate transport retry, recovery application and catch-up outcomes"
 )]
 async fn process_broadcaster_redis_subscription(
     replay_client: &impl ReplayPollSource,
@@ -656,33 +659,13 @@ async fn process_broadcaster_redis_subscription(
             }
         };
 
-        match poll {
-            ReplayPoll::Pending => {
-                if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
-                    return (
-                        SubscriptionExit::error(message),
-                        redis_processor_rebuilds(prepared.processors),
-                        caught_up_once,
-                    );
-                }
-            }
+        let caught_up = match poll {
+            ReplayPoll::Pending => false,
             ReplayPoll::CaughtUp {
                 checkpoint: caught_up_checkpoint,
             } => {
-                caught_up_once = true;
-                mark_redis_catch_up_checkpoints(
-                    &prepared.processors,
-                    caught_up_checkpoint.entry_id(),
-                )
-                .await;
                 checkpoint = caught_up_checkpoint;
-                if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
-                    return (
-                        SubscriptionExit::error(message),
-                        redis_processor_rebuilds(prepared.processors),
-                        caught_up_once,
-                    );
-                }
+                true
             }
             ReplayPoll::Batch(batch) => {
                 let caught_up_after_batch = batch.caught_up_after_batch;
@@ -695,19 +678,22 @@ async fn process_broadcaster_redis_subscription(
                         caught_up_once,
                     );
                 }
-                if caught_up_after_batch {
-                    caught_up_once = true;
-                    mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id())
-                        .await;
-                    if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
-                        return (
-                            SubscriptionExit::error(message),
-                            redis_processor_rebuilds(prepared.processors),
-                            caught_up_once,
-                        );
-                    }
+                if !caught_up_after_batch {
+                    continue;
                 }
+                true
             }
+        };
+        if caught_up {
+            caught_up_once = true;
+            mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id()).await;
+        }
+        if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
+            return (
+                SubscriptionExit::error(message),
+                redis_processor_rebuilds(prepared.processors),
+                caught_up_once,
+            );
         }
     }
 }

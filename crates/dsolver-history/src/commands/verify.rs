@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use historical_quote::api::{
     ConsistencyCheckReport, ConsistencyCheckRequest, JobState, PairStatus, API_REVISION,
 };
@@ -10,15 +7,12 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::args::{DirectVerifyArgs, VerifyArgs};
-use crate::client::{ClientError, HistoryClient};
+use crate::client::HistoryClient;
 use crate::exit::{EXIT_OPERATION_FAILED, EXIT_SUCCESS};
 use crate::output::OutputOptions;
-use crate::retry::sleep_before;
 
-use super::job::{cancel_after_interrupt, consistency_result, print_progress, terminal};
-use super::{read_request, required, CliError};
-
-const DEFAULT_POLL_DELAY: Duration = Duration::from_secs(2);
+use super::job::{cancel_after_interrupt, consistency_result, wait_for_result};
+use super::{read_request, request_deadline, required, CliError};
 
 pub async fn execute(
     client: &HistoryClient,
@@ -27,17 +21,15 @@ pub async fn execute(
 ) -> Result<u8, CliError> {
     let request = verify_request(args.request.as_deref(), args.direct)?;
     let deadline = request_deadline(request.timeout_ms)?;
-    let active_job = Arc::new(Mutex::new(None));
-    let flow_client = client.clone();
-    let flow_active_job = Arc::clone(&active_job);
+    let active_job = Mutex::new(None);
     tokio::select! {
         result = verify_flow(
-            &flow_client,
+            client,
             request,
             args.job_envelope,
             output,
             deadline,
-            flow_active_job,
+            &active_job,
         ) => result,
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| CliError::operation(format!("failed to listen for Ctrl-C: {error}")))?;
@@ -55,7 +47,7 @@ async fn verify_flow(
     job_envelope: bool,
     output: &OutputOptions,
     deadline: Instant,
-    active_job: Arc<Mutex<Option<Uuid>>>,
+    active_job: &Mutex<Option<Uuid>>,
 ) -> Result<u8, CliError> {
     let mut recomputed = false;
     loop {
@@ -65,7 +57,7 @@ async fn verify_flow(
             .map_err(CliError::from_client)?;
         *active_job.lock().await = Some(submission.job_id);
         eprintln!("job {}", submission.job_id);
-        match wait_for_verify(client, submission.job_id, deadline).await {
+        match wait_for_result(client, submission.job_id, deadline).await {
             Ok(envelope) => {
                 if envelope.state != JobState::Completed {
                     output.write(&envelope).map_err(CliError::from_output)?;
@@ -98,24 +90,6 @@ async fn verify_flow(
                 );
             }
             Err(error) => return Err(CliError::from_client(error)),
-        }
-    }
-}
-
-async fn wait_for_verify(
-    client: &HistoryClient,
-    job_id: Uuid,
-    deadline: Instant,
-) -> Result<historical_quote::api::JobEnvelope, ClientError> {
-    loop {
-        let response = client.poll(job_id, deadline).await?;
-        print_progress(&response.envelope);
-        if terminal(response.envelope.state) {
-            return Ok(response.envelope);
-        }
-        let delay = response.retry_after.unwrap_or(DEFAULT_POLL_DELAY);
-        if !sleep_before(deadline, delay).await {
-            return Err(ClientError::DeadlineExpired);
         }
     }
 }
@@ -215,10 +189,4 @@ fn verify_exit(report: &ConsistencyCheckReport) -> u8 {
     } else {
         EXIT_SUCCESS
     }
-}
-
-fn request_deadline(timeout_ms: u64) -> Result<Instant, CliError> {
-    Instant::now()
-        .checked_add(Duration::from_millis(timeout_ms))
-        .ok_or_else(|| CliError::usage("timeoutMs is too large"))
 }

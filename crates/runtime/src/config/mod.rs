@@ -70,23 +70,7 @@ pub fn load_config() -> AppConfig {
     let timeouts = load_timeout_config();
     let stream = load_stream_config();
     let slippage = load_slippage_config();
-    // Keep the rest of the runtime on the same AppConfig shape. The manifest is just the new
-    // source of truth for the chain-specific slice.
-    let chain_profile = ChainProfile {
-        chain: resolved_chain.chain_profile.chain,
-        native_protocols: resolved_chain.chain_profile.native_protocols,
-        vm_protocols: resolved_chain.chain_profile.vm_protocols,
-        rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
-        native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
-        recovery_max_buffered_native_blocks: resolved_chain
-            .chain_profile
-            .recovery_max_buffered_native_blocks,
-        native_token_protocol_allowlist: resolved_chain
-            .chain_profile
-            .native_token_protocol_allowlist,
-        reset_allowance_tokens: resolved_chain.chain_profile.reset_allowance_tokens,
-        erc4626_pair_policies: resolved_chain.chain_profile.erc4626_pair_policies,
-    };
+    let chain_profile = resolved_chain.chain_profile;
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
@@ -165,21 +149,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     let stream = load_stream_config();
     let memory = MemoryConfig::from_env();
     let tuning = load_broadcaster_tuning();
-    let chain_profile = ChainProfile {
-        chain: resolved_chain.chain_profile.chain,
-        native_protocols: resolved_chain.chain_profile.native_protocols,
-        vm_protocols: resolved_chain.chain_profile.vm_protocols,
-        rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
-        native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
-        recovery_max_buffered_native_blocks: resolved_chain
-            .chain_profile
-            .recovery_max_buffered_native_blocks,
-        native_token_protocol_allowlist: resolved_chain
-            .chain_profile
-            .native_token_protocol_allowlist,
-        reset_allowance_tokens: resolved_chain.chain_profile.reset_allowance_tokens,
-        erc4626_pair_policies: resolved_chain.chain_profile.erc4626_pair_policies,
-    };
+    let chain_profile = resolved_chain.chain_profile;
     let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
     let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
         load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
@@ -578,7 +548,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS,
     );
-    let maxlen = Some(parse_env_or_default("BROADCASTER_REDIS_MAXLEN", "5000"));
+    let maxlen = parse_env_or_default("BROADCASTER_REDIS_MAXLEN", "5000");
 
     assert_valid_redis_url(&redis_url);
     assert!(block_ms > 0, "BROADCASTER_REDIS_BLOCK_MS must be > 0");
@@ -587,9 +557,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         append_retry_window_ms > 0,
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS must be > 0"
     );
-    if let Some(maxlen) = maxlen {
-        assert!(maxlen > 0, "BROADCASTER_REDIS_MAXLEN must be > 0");
-    }
+    assert!(maxlen > 0, "BROADCASTER_REDIS_MAXLEN must be > 0");
 
     BroadcasterRedisConfig {
         redis_url,
@@ -597,7 +565,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         block_ms,
         read_count,
         append_retry_window_ms,
-        maxlen,
+        maxlen: Some(maxlen),
     }
 }
 
@@ -1519,28 +1487,6 @@ route_policy = " default "
         let base = resolve_chain_config(&registries, 8453, None)
             .unwrap_or_else(|_| unreachable!("expected base manifest entry"))
             .chain_profile;
-        let ethereum = ChainProfile {
-            chain: ethereum.chain,
-            native_protocols: ethereum.native_protocols,
-            vm_protocols: ethereum.vm_protocols,
-            rfq_protocols: ethereum.rfq_protocols,
-            native_progress_lease_secs: ethereum.native_progress_lease_secs,
-            recovery_max_buffered_native_blocks: ethereum.recovery_max_buffered_native_blocks,
-            native_token_protocol_allowlist: ethereum.native_token_protocol_allowlist,
-            reset_allowance_tokens: ethereum.reset_allowance_tokens,
-            erc4626_pair_policies: ethereum.erc4626_pair_policies,
-        };
-        let base = ChainProfile {
-            chain: base.chain,
-            native_protocols: base.native_protocols,
-            vm_protocols: base.vm_protocols,
-            rfq_protocols: base.rfq_protocols,
-            native_progress_lease_secs: base.native_progress_lease_secs,
-            recovery_max_buffered_native_blocks: base.recovery_max_buffered_native_blocks,
-            native_token_protocol_allowlist: base.native_token_protocol_allowlist,
-            reset_allowance_tokens: base.reset_allowance_tokens,
-            erc4626_pair_policies: base.erc4626_pair_policies,
-        };
 
         assert!(rfq_effectively_enabled(true, &ethereum));
         assert!(!rfq_effectively_enabled(false, &ethereum));

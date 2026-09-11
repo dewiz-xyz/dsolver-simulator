@@ -60,7 +60,7 @@ redis_port="${redis_address##*:}"
 (
   cd "$repo"
   BROADCASTER_REDIS_HANDOFF_TEST_URL="redis://127.0.0.1:${redis_port}/0" \
-    cargo test -p runtime \
+    cargo test --locked -p runtime \
       broadcaster::redis_publisher::tests::two_broadcasters_handoff_without_loss_or_duplication_on_real_redis \
       -- --ignored --exact --nocapture
 )

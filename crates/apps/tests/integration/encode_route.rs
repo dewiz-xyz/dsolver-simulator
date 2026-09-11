@@ -21,6 +21,7 @@ use runtime::models::state::{
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
+use runtime::services::EncodeService;
 use runtime::simulator_service::SimulatorRuntime;
 use simulator_core::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
@@ -45,11 +46,6 @@ struct EchoAmountSim;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct SlowAmountSim {
-    sleep_for: Duration,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-struct SleepAmountSim {
     sleep_for: Duration,
 }
 
@@ -248,64 +244,6 @@ impl TychoEncoder for PublishUpdateWithWrongRouterEncoder {
 
     fn validate_solution(&self, _solution: &Solution) -> Result<(), EncodingError> {
         Ok(())
-    }
-}
-
-#[typetag::serde]
-impl ProtocolSim for SleepAmountSim {
-    fn fee(&self) -> f64 {
-        0.0
-    }
-
-    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
-        Ok(0.0)
-    }
-
-    fn get_amount_out(
-        &self,
-        amount_in: BigUint,
-        _token_in: &Token,
-        _token_out: &Token,
-    ) -> Result<GetAmountOutResult, SimulationError> {
-        std::thread::sleep(self.sleep_for);
-        Ok(GetAmountOutResult::new(
-            amount_in,
-            BigUint::zero(),
-            self.clone_box(),
-        ))
-    }
-
-    fn get_limits(
-        &self,
-        _sell_token: Bytes,
-        _buy_token: Bytes,
-    ) -> Result<(BigUint, BigUint), SimulationError> {
-        Ok((BigUint::zero(), BigUint::zero()))
-    }
-
-    fn delta_transition(
-        &mut self,
-        _delta: ProtocolStateDelta,
-        _tokens: &HashMap<Bytes, Token>,
-        _balances: &Balances,
-    ) -> Result<(), TransitionError> {
-        Ok(())
-    }
-
-    fn clone_box(&self) -> Box<dyn ProtocolSim> {
-        Box::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn eq(&self, other: &dyn ProtocolSim) -> bool {
-        other.as_any().downcast_ref::<SleepAmountSim>() == Some(self)
     }
 }
 
@@ -2383,5 +2321,26 @@ async fn encode_route_calldata_matches_committed_fixtures() -> Result<()> {
             "{name} calldata receiver"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_service_reports_single_attempt_amounts() -> Result<()> {
+    let (_, config) = base_calldata_fixture_configs()
+        .into_iter()
+        .find(|(name, _)| *name == "base_uniswap_v2")
+        .ok_or_else(|| anyhow!("missing Base Uniswap v2 fixture configuration"))?;
+    let (state, request) = build_app_state_and_request(config).await?;
+    let expected_amount_out = request.amount_in.clone();
+    let computation = EncodeService::new(state)
+        .encode(request)
+        .await
+        .map_err(|error| anyhow!("encode failed: {error:?}"))?
+        .computation;
+
+    assert_eq!(computation.attempts, 1);
+    assert_eq!(computation.expected_amount_out, expected_amount_out);
+    assert_eq!(computation.amount_out_delta, "2");
+    assert!(!computation.reset_approval);
     Ok(())
 }

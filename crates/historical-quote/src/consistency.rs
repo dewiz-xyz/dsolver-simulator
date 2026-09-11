@@ -104,17 +104,14 @@ impl<S: HistorySource> ConsistencyChecker<S> {
                     self.read_limits,
                 )
                 .await?;
+            validate_pair_storage(&plan, &request.backends)?;
             let report = if plan.gaps.is_empty() {
-                let comparison = self
-                    .compare_pair(request, plan, cancellation, remaining_differences)
-                    .await?;
-                storage.merge(comparison.storage);
-                comparison.report
+                self.compare_pair(request, &plan, cancellation, remaining_differences)
+                    .await?
             } else {
-                validate_pair_storage(&plan, &request.backends)?;
-                storage.record_plan(&plan, false);
                 gap_report(request, &plan.pair)
             };
+            storage.record_plan(&plan, plan.gaps.is_empty());
             remaining_differences = remaining_differences.saturating_sub(report.differences.len());
             reports.push(report);
             progress.checkpoint_pair_completed();
@@ -137,13 +134,12 @@ impl<S: HistorySource> ConsistencyChecker<S> {
     async fn compare_pair(
         &self,
         request: &ConsistencyCheckRequest,
-        plan: state_history::CheckpointPairReplayPlan,
+        plan: &state_history::CheckpointPairReplayPlan,
         cancellation: &CancellationToken,
         difference_limit: usize,
-    ) -> Result<PairComparison, HistoricalError> {
-        validate_pair_storage(&plan, &request.backends)?;
+    ) -> Result<ConsistencyPairReport, HistoricalError> {
         let backends = request.backends.iter().copied().collect::<BTreeSet<_>>();
-        self.validate_rfq_token_objects(&plan, &backends, cancellation)
+        self.validate_rfq_token_objects(plan, &backends, cancellation)
             .await?;
         let direct = restore_checkpoint_with_token_anchor(
             self.source.as_ref(),
@@ -218,7 +214,7 @@ impl<S: HistorySource> ConsistencyChecker<S> {
                 affected_component_ids.insert(comparison.pool.component_id.clone());
             }
         }
-        let report = ConsistencyPairReport {
+        Ok(ConsistencyPairReport {
             earlier_position: public_position(plan.pair.earlier.position),
             target_position: public_position(plan.pair.target.position),
             status,
@@ -229,10 +225,7 @@ impl<S: HistorySource> ConsistencyChecker<S> {
             quote_comparisons,
             total_difference_count: difference_set.total_count,
             differences: difference_set.differences,
-        };
-        let mut storage = StorageEvidence::default();
-        storage.record_plan(&plan, true);
-        Ok(PairComparison { report, storage })
+        })
     }
 
     async fn validate_rfq_token_objects(
@@ -271,11 +264,6 @@ impl<S: HistorySource> ConsistencyChecker<S> {
     }
 }
 
-struct PairComparison {
-    report: ConsistencyPairReport,
-    storage: StorageEvidence,
-}
-
 #[derive(Default)]
 struct StorageEvidence {
     replay_plans_verified: u64,
@@ -304,15 +292,6 @@ impl StorageEvidence {
         }
     }
 
-    fn merge(&mut self, other: Self) {
-        self.replay_plans_verified = self
-            .replay_plans_verified
-            .saturating_add(other.replay_plans_verified);
-        self.checkpoint_positions.extend(other.checkpoint_positions);
-        self.token_digests.extend(other.token_digests);
-        self.delta_positions.extend(other.delta_positions);
-    }
-
     fn summary(&self) -> StorageVerificationSummary {
         StorageVerificationSummary {
             range_plan_valid: true,
@@ -336,6 +315,11 @@ fn validate_pair_storage(
     if earlier >= target || plan.pair.earlier.chain_id != plan.pair.target.chain_id {
         return Err(invalid_storage("checkpoint pair range is invalid"));
     }
+    let requested = requested_backends
+        .iter()
+        .copied()
+        .map(history_backend)
+        .collect();
     let mut previous = earlier;
     for delta in &plan.deltas {
         if delta.position <= previous || delta.position > target {
@@ -343,7 +327,7 @@ fn validate_pair_storage(
                 "checkpoint pair deltas are not strictly ordered",
             ));
         }
-        validate_applicable_backends(delta, requested_backends)?;
+        validate_applicable_backends(delta, &requested)?;
         previous = delta.position;
     }
     Ok(())
@@ -351,18 +335,13 @@ fn validate_pair_storage(
 
 fn validate_applicable_backends(
     delta: &state_history::StoredDelta,
-    requested_backends: &[Backend],
+    requested: &BTreeSet<state_history::Backend>,
 ) -> Result<(), HistoricalError> {
     if delta.applicable_backends.is_empty() {
         return Err(invalid_storage(
             "checkpoint pair delta has no applicable backend",
         ));
     }
-    let requested = requested_backends
-        .iter()
-        .copied()
-        .map(history_backend)
-        .collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
     for cursor in &delta.applicable_backends {
         let cursor_is_valid = requested.contains(&cursor.backend)
@@ -732,7 +711,7 @@ fn collect_component_differences(
             (
                 (
                     public_replay_backend(component.backend),
-                    component.component_id.clone(),
+                    component.component_id.as_str(),
                 ),
                 component,
             )
@@ -745,7 +724,7 @@ fn collect_component_differences(
             (
                 (
                     public_replay_backend(component.backend),
-                    component.component_id.clone(),
+                    component.component_id.as_str(),
                 ),
                 component,
             )
@@ -754,18 +733,18 @@ fn collect_component_differences(
     let component_keys = direct_components
         .keys()
         .chain(replayed_components.keys())
-        .cloned()
+        .copied()
         .collect::<BTreeSet<_>>();
     for (backend, component_id) in component_keys {
         let component_difference_start = candidates.len();
-        let direct = direct_components.get(&(backend, component_id.clone()));
-        let replayed = replayed_components.get(&(backend, component_id.clone()));
+        let direct = direct_components.get(&(backend, component_id));
+        let replayed = replayed_components.get(&(backend, component_id));
         if direct.map(|value| value.component_bytes())
             != replayed.map(|value| value.component_bytes())
         {
             candidates.push(difference(
                 backend,
-                Some(component_id.clone()),
+                Some(component_id.to_owned()),
                 "component",
                 direct.map(|value| value.component_bytes()),
                 replayed.map(|value| value.component_bytes()),
@@ -774,7 +753,7 @@ fn collect_component_differences(
         if direct.map(|value| value.state_bytes()) != replayed.map(|value| value.state_bytes()) {
             candidates.push(difference(
                 backend,
-                Some(component_id.clone()),
+                Some(component_id.to_owned()),
                 "state",
                 direct.map(|value| value.state_bytes()),
                 replayed.map(|value| value.state_bytes()),
@@ -782,7 +761,7 @@ fn collect_component_differences(
         }
         if candidates.len() != component_difference_start {
             affected_backends.insert(backend);
-            affected_component_ids.insert(component_id);
+            affected_component_ids.insert(component_id.to_owned());
         }
     }
 }
@@ -797,17 +776,17 @@ fn collect_token_differences(
     let direct_tokens = direct
         .tokens()
         .iter()
-        .map(|token| (token.address.clone(), token.token_bytes()))
+        .map(|token| (token.address.as_str(), token.token_bytes()))
         .collect::<BTreeMap<_, _>>();
     let replayed_tokens = replayed
         .tokens()
         .iter()
-        .map(|token| (token.address.clone(), token.token_bytes()))
+        .map(|token| (token.address.as_str(), token.token_bytes()))
         .collect::<BTreeMap<_, _>>();
     let token_keys = direct_tokens
         .keys()
         .chain(replayed_tokens.keys())
-        .cloned()
+        .copied()
         .collect::<BTreeSet<_>>();
     for address in token_keys {
         let direct = direct_tokens.get(&address).copied();

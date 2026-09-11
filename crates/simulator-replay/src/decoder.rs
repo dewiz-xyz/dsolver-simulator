@@ -100,29 +100,20 @@ impl DecoderConfig {
         Self {
             min_token_quality: RETAINED_TOKEN_QUALITY_V1,
             protocols: [
-                (
-                    ReplayBackend::Native,
-                    RETAINED_NATIVE_PROTOCOLS_V1
-                        .iter()
-                        .map(|protocol| (*protocol).to_owned())
-                        .collect(),
-                ),
-                (
-                    ReplayBackend::Vm,
-                    RETAINED_VM_PROTOCOLS_V1
-                        .iter()
-                        .map(|protocol| (*protocol).to_owned())
-                        .collect(),
-                ),
-                (
-                    ReplayBackend::Rfq,
-                    RETAINED_RFQ_PROTOCOLS_V1
-                        .iter()
-                        .map(|protocol| (*protocol).to_owned())
-                        .collect(),
-                ),
+                (ReplayBackend::Native, RETAINED_NATIVE_PROTOCOLS_V1),
+                (ReplayBackend::Vm, RETAINED_VM_PROTOCOLS_V1),
+                (ReplayBackend::Rfq, RETAINED_RFQ_PROTOCOLS_V1),
             ]
             .into_iter()
+            .map(|(backend, protocols)| {
+                (
+                    backend,
+                    protocols
+                        .iter()
+                        .map(|protocol| (*protocol).to_owned())
+                        .collect(),
+                )
+            })
             .collect(),
             profile: DecoderProfile::RetainedV1,
         }
@@ -282,13 +273,13 @@ impl ReplayDecoder {
                 if partition.messages.is_empty() {
                     let decoded = self.decode_snapshot_partition(partition).await?;
                     merge_update(&mut combined, decoded.update);
-                } else {
-                    let reassembly = raw_messages.entry(backend).or_default();
-                    for message in partition.messages {
-                        reassembly.push(message).map_err(|error| {
-                            ReplayDecodeError::InvalidCheckpoint(error.to_string())
-                        })?;
-                    }
+                    continue;
+                }
+                let reassembly = raw_messages.entry(backend).or_default();
+                for message in partition.messages {
+                    reassembly
+                        .push(message)
+                        .map_err(|error| ReplayDecodeError::InvalidCheckpoint(error.to_string()))?;
                 }
             }
         }
@@ -420,12 +411,7 @@ impl ReplayDecoder {
                 self.decode_protocol_messages(backend, partition.messages)
                     .await?
             };
-            if let Some(decoded) = decoded {
-                combined = Some(match combined {
-                    Some(current) => current.merge(decoded),
-                    None => decoded,
-                });
-            }
+            merge_update(&mut combined, decoded);
         }
 
         let block_number = block_number.unwrap_or_default();
@@ -463,10 +449,7 @@ impl ReplayDecoder {
                 .decode(&feed)
                 .await
                 .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
-            combined = Some(match combined {
-                Some(current) => current.merge(update),
-                None => update,
-            });
+            merge_update(&mut combined, Some(update));
         }
         Ok(combined)
     }

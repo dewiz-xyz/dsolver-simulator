@@ -1,13 +1,13 @@
 use std::io::Read;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use simulator_core::broadcaster::BroadcasterTokenDto;
 
 use super::{ReadConnectionProvider, StateHistoryReader};
 use crate::{
     archive::decode_archive_with_info_and_limit,
-    tokens::decode_token_snapshot_raw_with_info_and_limit, CheckpointArchive, CheckpointManifest,
-    CheckpointStatus, RawTokenSnapshot, TokenSnapshotRef,
+    tokens::{decode_token_snapshot_raw_with_info_and_limit, DecodedRawTokenSnapshot},
+    CheckpointArchive, CheckpointManifest, CheckpointStatus, RawTokenSnapshot, TokenSnapshotRef,
 };
 
 macro_rules! read_ensure {
@@ -295,13 +295,20 @@ fn validate_token_snapshot_bytes(
         &reference.sha256,
         limits.max_decoded_bytes,
     )?;
-    read_ensure!(
+    validate_decoded_token_snapshot(reference, decoded).map_err(ReadLimitError::Read)
+}
+
+pub(super) fn validate_decoded_token_snapshot(
+    reference: &TokenSnapshotRef,
+    decoded: DecodedRawTokenSnapshot,
+) -> anyhow::Result<RawTokenSnapshot> {
+    ensure!(
         decoded.token_bytes == reference.token_bytes,
         "token snapshot byte length mismatch: expected {}, got {}",
         reference.token_bytes,
         decoded.token_bytes
     );
-    read_ensure!(
+    ensure!(
         decoded.snapshot.token_count == reference.token_count,
         "token snapshot count mismatch: expected {}, got {}",
         reference.token_count,
@@ -311,18 +318,18 @@ fn validate_token_snapshot_bytes(
         .context("failed to parse token snapshot token array")?;
     let actual_token_count =
         u64::try_from(tokens.len()).context("token snapshot token count exceeds u64")?;
-    read_ensure!(
+    ensure!(
         actual_token_count == decoded.snapshot.token_count,
         "token snapshot envelope count mismatch: expected {}, got {actual_token_count}",
         decoded.snapshot.token_count
     );
-    read_ensure!(
+    ensure!(
         tokens
             .iter()
             .all(|token| token.chain_id == decoded.snapshot.chain_id),
         "token snapshot contains a token from a different chain"
     );
-    read_ensure!(
+    ensure!(
         tokens
             .windows(2)
             .all(|pair| pair[0].address < pair[1].address),

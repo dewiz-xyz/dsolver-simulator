@@ -118,28 +118,17 @@ mod tests {
     }
 
     #[test]
-    fn to_tycho_token_selects_ethereum_chain_info() -> Result<(), Box<dyn std::error::Error>> {
-        let token = sample_token()
-            .to_tycho_token(Chain::Ethereum)?
-            .ok_or_else(|| io::Error::other("expected Ethereum token"))?;
+    fn to_tycho_token_selects_requested_chain_info() -> Result<(), Box<dyn std::error::Error>> {
+        for (chain, address) in [(Chain::Ethereum, ETH_ADDRESS), (Chain::Base, BASE_ADDRESS)] {
+            let token = sample_token()
+                .to_tycho_token(chain)?
+                .ok_or_else(|| io::Error::other(format!("expected {chain} token")))?;
 
-        assert_eq!(token.address, Bytes::from_str(ETH_ADDRESS)?);
-        assert_eq!(token.symbol, "WETH");
-        assert_eq!(token.decimals, 18);
-        assert_eq!(token.chain, Chain::Ethereum);
-        Ok(())
-    }
-
-    #[test]
-    fn to_tycho_token_selects_base_chain_info() -> Result<(), Box<dyn std::error::Error>> {
-        let token = sample_token()
-            .to_tycho_token(Chain::Base)?
-            .ok_or_else(|| io::Error::other("expected Base token"))?;
-
-        assert_eq!(token.address, Bytes::from_str(BASE_ADDRESS)?);
-        assert_eq!(token.symbol, "WETH");
-        assert_eq!(token.decimals, 18);
-        assert_eq!(token.chain, Chain::Base);
+            assert_eq!(token.address, Bytes::from_str(address)?, "{chain}");
+            assert_eq!(token.symbol, "WETH", "{chain}");
+            assert_eq!(token.decimals, 18, "{chain}");
+            assert_eq!(token.chain, chain, "{chain}");
+        }
         Ok(())
     }
 }

@@ -153,40 +153,35 @@ impl BearerKeySetReloader {
     /// refresh state. The active verifier is unchanged on failure.
     pub async fn refresh_once(&mut self) -> Result<(), BearerKeySetError> {
         let current = Arc::clone(&self.sender.borrow());
-        match self.read_next(&current).await {
-            Ok(next) => {
-                if current.version_id != next.version_id {
-                    tracing::info!(
-                        auth_version = %next.version_id,
-                        "historical quote API keys updated"
-                    );
-                }
-                if current.metadata().degraded {
-                    tracing::info!(
-                        auth_version = %next.version_id,
-                        "historical quote API key refresh recovered"
-                    );
-                }
-                self.sender.send_replace(Arc::new(next));
-                Ok(())
+        let next = self.read_next(&current).await.inspect_err(|error| {
+            if !current.last_refresh_failed {
+                tracing::warn!(
+                    auth_version = %current.version_id,
+                    reason = %error,
+                    "historical quote API key refresh degraded"
+                );
             }
-            Err(error) => {
-                if !current.last_refresh_failed {
-                    tracing::warn!(
-                        auth_version = %current.version_id,
-                        reason = %error,
-                        "historical quote API key refresh degraded"
-                    );
-                }
-                self.sender.send_replace(Arc::new(BearerKeySetSnapshot {
-                    verifier: Arc::clone(&current.verifier),
-                    version_id: current.version_id.clone(),
-                    last_success: current.last_success,
-                    last_refresh_failed: true,
-                }));
-                Err(error)
-            }
+            self.sender.send_replace(Arc::new(BearerKeySetSnapshot {
+                verifier: Arc::clone(&current.verifier),
+                version_id: current.version_id.clone(),
+                last_success: current.last_success,
+                last_refresh_failed: true,
+            }));
+        })?;
+        if current.version_id != next.version_id {
+            tracing::info!(
+                auth_version = %next.version_id,
+                "historical quote API keys updated"
+            );
         }
+        if current.metadata().degraded {
+            tracing::info!(
+                auth_version = %next.version_id,
+                "historical quote API key refresh recovered"
+            );
+        }
+        self.sender.send_replace(Arc::new(next));
+        Ok(())
     }
 
     /// Refreshes on a delayed interval until cancellation, including during reads.

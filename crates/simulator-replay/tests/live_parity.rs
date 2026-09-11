@@ -117,6 +117,58 @@ async fn delta_applies_only_listed_backends() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn mixed_delta_preserves_every_partition_state() -> Result<()> {
+    let native: LiveParityDelta = serde_json::from_str(NATIVE_DELTA_V1)?;
+    let rfq: LiveParityDelta = serde_json::from_str(RFQ_DELTA_V1)?;
+    let partitions = native
+        .update
+        .partitions
+        .into_iter()
+        .chain(rfq.update.partitions)
+        .collect::<Vec<_>>();
+    let expected = partitions
+        .iter()
+        .flat_map(|partition| &partition.updated_states)
+        .map(|entry| {
+            Ok((
+                entry.component_id.clone(),
+                serde_json::to_value(entry.state.as_ref())?,
+            ))
+        })
+        .collect::<serde_json::Result<HashMap<_, _>>>()?;
+    let decoder = ReplayDecoder::new(
+        DecoderConfig::new(
+            0,
+            [
+                (ReplayBackend::Native, vec!["uniswap_v2".to_owned()]),
+                (ReplayBackend::Rfq, vec!["rfq:bebop".to_owned()]),
+            ],
+        ),
+        HashMap::new(),
+    )
+    .await?;
+    let decoded = decoder
+        .decode_live_delta(
+            BroadcasterUpdateMessage::new(partitions)?,
+            &[ReplayBackend::Native, ReplayBackend::Rfq],
+        )
+        .await?;
+    assert!(decoded.had_applicable_partition);
+    assert_eq!(decoded.block_number, 1_710_000_005);
+    let update = decoded
+        .update
+        .ok_or_else(|| anyhow!("delta did not decode"))?;
+    assert_eq!(update.block_number_or_timestamp, decoded.block_number);
+    let actual = update
+        .states
+        .into_iter()
+        .map(|(id, state)| serde_json::to_value(state.as_ref()).map(|state| (id, state)))
+        .collect::<serde_json::Result<HashMap<_, _>>>()?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[test]
 fn apply_report_preserves_live_anomaly_shape() {
     let token_a = test_token(0x51, "TOKEN_A");

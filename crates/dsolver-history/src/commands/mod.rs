@@ -5,8 +5,10 @@ mod service;
 mod verify;
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
+use tokio::time::Instant;
 
 use crate::args::{Args, Command};
 use crate::client::{ClientError, HistoryClient};
@@ -94,4 +96,10 @@ fn read_request<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
 
 fn required<T>(value: Option<T>, flag: &str) -> Result<T, CliError> {
     value.ok_or_else(|| CliError::usage(format!("{flag} is required with direct request flags")))
+}
+
+fn request_deadline(timeout_ms: u64) -> Result<Instant, CliError> {
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| CliError::usage("timeoutMs is too large"))
 }

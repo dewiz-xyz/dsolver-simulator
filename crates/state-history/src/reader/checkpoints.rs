@@ -5,7 +5,7 @@ use sqlx::Row;
 use super::{
     begin_range_transaction, database_backends, database_i64, database_u64,
     decode_delta_row_with_limit, encoded_delta_from_row, fetch_delta_backends, gap_from_row,
-    manifest_from_row, BlockInterval, RangeGap, RangeGapKind, ReadConnectionProvider, ReadLimits,
+    manifest_from_row, BlockInterval, RangeGap, ReadConnectionProvider, ReadLimits,
     StateHistoryReader, StoredDelta,
 };
 use crate::{Backend, CheckpointKind, CheckpointManifest, CheckpointStatus, StreamPosition};
@@ -323,7 +323,7 @@ fn declared_pair_checkpoint_bytes(
         if let Some(reference) = checkpoint
             .token_reference
             .as_ref()
-            .filter(|reference| token_digests.insert(reference.sha256.clone()))
+            .filter(|reference| token_digests.insert(reference.sha256.as_str()))
         {
             decoded_bytes = decoded_bytes
                 .checked_add(reference.token_bytes)
@@ -450,28 +450,7 @@ async fn fetch_pair_gaps(
     .await
     .context("failed to select checkpoint pair gaps")?;
     rows.iter()
-        .map(|row| {
-            let gap = gap_from_row(row)?;
-            Ok(RangeGap {
-                kind: RangeGapKind::Recorded,
-                generation: Some(gap.generation),
-                from_message_seq: Some(gap.from_message_seq),
-                to_message_seq: Some(gap.to_message_seq),
-                from_position: Some(StreamPosition {
-                    generation: gap.generation,
-                    message_seq: gap.from_message_seq,
-                }),
-                to_position: Some(StreamPosition {
-                    generation: gap.generation,
-                    message_seq: gap.to_message_seq,
-                }),
-                from_block: gap.from_block_number,
-                to_block_inclusive: gap.to_block_number,
-                from_observed_at_ms: gap.from_observed_at_ms,
-                to_observed_at_ms: gap.to_observed_at_ms,
-                reason: gap.reason,
-            })
-        })
+        .map(|row| gap_from_row(row).map(RangeGap::from))
         .collect()
 }
 

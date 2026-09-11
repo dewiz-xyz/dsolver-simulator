@@ -5,7 +5,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::args::{JobArgs, JobCommand, JobReadArgs};
-use crate::client::HistoryClient;
+use crate::client::{ClientError, HistoryClient};
 use crate::exit::{EXIT_OPERATION_FAILED, EXIT_SUCCESS};
 use crate::output::OutputOptions;
 use crate::retry::sleep_before;
@@ -54,10 +54,9 @@ async fn wait_interruptibly(
     output: &OutputOptions,
 ) -> Result<u8, CliError> {
     let deadline = Instant::now() + JOB_COMMAND_DEADLINE;
-    let wait_client = client.clone();
     let job_id = args.job_id;
     tokio::select! {
-        result = wait(&wait_client, args, output, deadline) => result,
+        result = wait(client, args, output, deadline) => result,
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| CliError::operation(format!("failed to listen for Ctrl-C: {error}")))?;
             cancel_after_interrupt(client, job_id).await;
@@ -84,6 +83,24 @@ async fn wait(
         let delay = response.retry_after.unwrap_or(DEFAULT_POLL_DELAY);
         if !sleep_before(deadline, delay).await {
             return Err(CliError::operation("job wait deadline expired"));
+        }
+    }
+}
+
+pub(super) async fn wait_for_result(
+    client: &HistoryClient,
+    job_id: Uuid,
+    deadline: Instant,
+) -> Result<JobEnvelope, ClientError> {
+    loop {
+        let response = client.poll(job_id, deadline).await?;
+        print_progress(&response.envelope);
+        if terminal(response.envelope.state) {
+            return Ok(response.envelope);
+        }
+        let delay = response.retry_after.unwrap_or(DEFAULT_POLL_DELAY);
+        if !sleep_before(deadline, delay).await {
+            return Err(ClientError::DeadlineExpired);
         }
     }
 }

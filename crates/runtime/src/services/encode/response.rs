@@ -67,7 +67,7 @@ struct EncodeRequestSummary {
 pub(super) fn compute_expected_total(resimulated: &ResimulatedRouteInternal) -> BigUint {
     let mut expected_total = BigUint::zero();
     for segment in &resimulated.segments {
-        expected_total += segment.expected_amount_out.clone();
+        expected_total += &segment.expected_amount_out;
     }
     expected_total
 }

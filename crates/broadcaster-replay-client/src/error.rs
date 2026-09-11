@@ -1,47 +1,58 @@
-use std::error::Error;
-use std::fmt;
+use thiserror::Error;
 
 /// Result type used by the broadcaster replay client.
 pub type Result<T> = std::result::Result<T, BroadcasterReplayClientError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Errors returned while bootstrapping snapshots or replaying Redis streams.
 pub enum BroadcasterReplayClientError {
     /// The configured broadcaster URL is not a usable HTTP(S) base URL.
+    #[error("invalid broadcaster URL: {message}")]
     InvalidBroadcasterUrl { message: String },
     /// Redis connection setup failed.
+    #[error("failed to connect to broadcaster Redis: {message}")]
     RedisConnect { message: String },
     /// Blocking Redis stream read failed.
+    #[error("Redis XREAD failed: {message}")]
     RedisRead { message: String },
     /// Blocking Redis stream read hit a transient transport failure.
+    #[error("Redis XREAD transport failed: {message}")]
     RedisReadTransport { message: String },
     /// Redis stream inspection failed.
+    #[error("Redis XINFO STREAM failed: {message}")]
     RedisInspect { message: String },
     /// Redis stream inspection hit a transient transport failure.
+    #[error("Redis XINFO STREAM transport failed: {message}")]
     RedisInspectTransport { message: String },
     /// Redis returned a stream entry that could not be decoded.
+    #[error("failed to decode Redis stream entry: {message}")]
     RedisDecode { message: String },
     /// Replay continuity checks failed and the caller should rebuild from a snapshot.
+    #[error("{message}")]
     RedisGap { message: String },
     /// Snapshot-session HTTP request failed before a response was received.
+    #[error("failed to {operation} at {url}: {message}")]
     HttpRequest {
         operation: &'static str,
         url: String,
         message: String,
     },
     /// Snapshot-session HTTP request returned a non-success status.
+    #[error("{operation} at {url} failed with HTTP {status}")]
     HttpStatus {
         operation: &'static str,
         url: String,
         status: u16,
     },
     /// Snapshot-session HTTP response body could not be read.
+    #[error("failed to read {operation} response from {url}: {message}")]
     HttpBody {
         operation: &'static str,
         url: String,
         message: String,
     },
     /// Snapshot-session HTTP response body could not be decoded.
+    #[error("failed to decode {operation} response from {url}: {message}")]
     JsonDecode {
         operation: &'static str,
         url: String,
@@ -146,61 +157,3 @@ impl BroadcasterReplayClientError {
         }
     }
 }
-
-impl fmt::Display for BroadcasterReplayClientError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidBroadcasterUrl { message } => {
-                write!(formatter, "invalid broadcaster URL: {message}")
-            }
-            Self::RedisConnect { message } => {
-                write!(
-                    formatter,
-                    "failed to connect to broadcaster Redis: {message}"
-                )
-            }
-            Self::RedisRead { message } => write!(formatter, "Redis XREAD failed: {message}"),
-            Self::RedisReadTransport { message } => {
-                write!(formatter, "Redis XREAD transport failed: {message}")
-            }
-            Self::RedisInspect { message } => {
-                write!(formatter, "Redis XINFO STREAM failed: {message}")
-            }
-            Self::RedisInspectTransport { message } => {
-                write!(formatter, "Redis XINFO STREAM transport failed: {message}")
-            }
-            Self::RedisDecode { message } => {
-                write!(formatter, "failed to decode Redis stream entry: {message}")
-            }
-            Self::RedisGap { message } => formatter.write_str(message),
-            Self::HttpRequest {
-                operation,
-                url,
-                message,
-            } => write!(formatter, "failed to {operation} at {url}: {message}"),
-            Self::HttpStatus {
-                operation,
-                url,
-                status,
-            } => write!(formatter, "{operation} at {url} failed with HTTP {status}"),
-            Self::HttpBody {
-                operation,
-                url,
-                message,
-            } => write!(
-                formatter,
-                "failed to read {operation} response from {url}: {message}"
-            ),
-            Self::JsonDecode {
-                operation,
-                url,
-                message,
-            } => write!(
-                formatter,
-                "failed to decode {operation} response from {url}: {message}"
-            ),
-        }
-    }
-}
-
-impl Error for BroadcasterReplayClientError {}

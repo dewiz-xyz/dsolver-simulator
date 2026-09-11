@@ -169,7 +169,7 @@ async fn encode_route(
                 return attempt.outcome.into_result().map(|mut computation| {
                     computation.attempts = attempt_number.value();
                     computation.first_attempt_expected_amount_out =
-                        first_attempt_expected_amount_out.clone();
+                        first_attempt_expected_amount_out;
                     computation
                 });
             }
@@ -371,9 +371,6 @@ async fn encode_attempt_with_pin(
         state,
         &prepared.normalized,
         prepared.chain,
-        &prepared.token_in,
-        &prepared.token_out,
-        &state.native_token_protocol_allowlist,
         rebuild_guard,
         native_pin,
     )

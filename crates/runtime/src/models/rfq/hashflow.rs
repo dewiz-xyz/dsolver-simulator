@@ -9,11 +9,17 @@ use tycho_simulation::tycho_common::{
 //evm,1,1INCH,1inch,0x111111111117dc0aa78b770fa6a738034120c302,18
 #[derive(Deserialize)]
 struct Record {
-    #[expect(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "CSV input still requires this column; chain selection uses chain_id"
+    )]
     chain_type: String,
     chain_id: u32,
     name: String,
-    #[expect(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "CSV input still requires this column; the token symbol uses name"
+    )]
     display_name: String,
     address: String,
     decimals: u32,
@@ -102,36 +108,21 @@ mod tests {
     }
 
     #[test]
-    fn read_hashflow_csv_filters_for_ethereum() -> Result<(), Box<dyn Error>> {
+    fn read_hashflow_csv_filters_for_requested_chain() -> Result<(), Box<dyn Error>> {
         let fixture = csv_fixture()?;
-        let tokens = read_hashflow_csv(fixture.path(), Chain::Ethereum)?;
-        let address = Bytes::from_str(ETH_ADDRESS)?;
-        let token = tokens
-            .get(&address)
-            .ok_or_else(|| io::Error::other("expected Ethereum token"))?;
+        for (chain, address) in [(Chain::Ethereum, ETH_ADDRESS), (Chain::Base, BASE_ADDRESS)] {
+            let tokens = read_hashflow_csv(fixture.path(), chain)?;
+            let address = Bytes::from_str(address)?;
+            let token = tokens
+                .get(&address)
+                .ok_or_else(|| io::Error::other(format!("expected {chain} token")))?;
 
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(token.address, address);
-        assert_eq!(token.symbol, "WETH");
-        assert_eq!(token.decimals, 18);
-        assert_eq!(token.chain, Chain::Ethereum);
-        Ok(())
-    }
-
-    #[test]
-    fn read_hashflow_csv_filters_for_base() -> Result<(), Box<dyn Error>> {
-        let fixture = csv_fixture()?;
-        let tokens = read_hashflow_csv(fixture.path(), Chain::Base)?;
-        let address = Bytes::from_str(BASE_ADDRESS)?;
-        let token = tokens
-            .get(&address)
-            .ok_or_else(|| io::Error::other("expected Base token"))?;
-
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(token.address, address);
-        assert_eq!(token.symbol, "WETH");
-        assert_eq!(token.decimals, 18);
-        assert_eq!(token.chain, Chain::Base);
+            assert_eq!(tokens.len(), 1, "{chain}");
+            assert_eq!(token.address, address, "{chain}");
+            assert_eq!(token.symbol, "WETH", "{chain}");
+            assert_eq!(token.decimals, 18, "{chain}");
+            assert_eq!(token.chain, chain, "{chain}");
+        }
         Ok(())
     }
 }

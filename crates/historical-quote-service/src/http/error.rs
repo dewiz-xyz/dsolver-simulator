@@ -102,9 +102,9 @@ impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         let mut response = (self.status, axum::Json(*self.body)).into_response();
         if let Some(seconds) = self.retry_after_seconds {
-            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
-                response.headers_mut().insert(RETRY_AFTER, value);
-            }
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
     }

@@ -5,8 +5,8 @@ use sqlx::Row;
 
 use super::{
     begin_range_transaction, database_backends, database_i64, database_u64, gap_from_row,
-    resolve_range_in_transaction, GapRow, RangeGap, RangeGapKind, RangeLeg, RangeRequest,
-    ReadConnectionProvider, ReadLimits, StateHistoryReader,
+    resolve_range_in_transaction, GapRow, RangeGap, RangeLeg, RangeRequest, ReadConnectionProvider,
+    ReadLimits, StateHistoryReader,
 };
 use crate::{Backend, BlockTimeObservation, ModelError, StreamPosition};
 
@@ -178,7 +178,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         .await?;
         let known_gaps = gap_projections
             .iter()
-            .map(|projection| range_gap(&gap_rows[projection.gap_index]))
+            .map(|projection| RangeGap::from(gap_rows[projection.gap_index].clone()))
             .collect::<Vec<_>>();
         let mut unsafe_intervals = gap_projections
             .into_iter()
@@ -492,28 +492,6 @@ async fn coverage_gap_rows(
     .fetch_all(connection)
     .await?;
     rows.iter().map(gap_from_row).collect()
-}
-
-fn range_gap(gap: &GapRow) -> RangeGap {
-    RangeGap {
-        kind: RangeGapKind::Recorded,
-        generation: Some(gap.generation),
-        from_message_seq: Some(gap.from_message_seq),
-        to_message_seq: Some(gap.to_message_seq),
-        from_position: Some(StreamPosition {
-            generation: gap.generation,
-            message_seq: gap.from_message_seq,
-        }),
-        to_position: Some(StreamPosition {
-            generation: gap.generation,
-            message_seq: gap.to_message_seq,
-        }),
-        from_block: gap.from_block_number,
-        to_block_inclusive: gap.to_block_number,
-        from_observed_at_ms: gap.from_observed_at_ms,
-        to_observed_at_ms: gap.to_observed_at_ms,
-        reason: gap.reason.clone(),
-    }
 }
 
 async fn project_gap_intervals(

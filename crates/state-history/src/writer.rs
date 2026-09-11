@@ -140,25 +140,7 @@ impl StateHistoryWriter {
         let (command_sender, command_receiver) = mpsc::channel(queue_capacity);
         let gaps = Arc::new(Mutex::new(GapAccumulator::default()));
         let (shutdown_deadline, shutdown_deadline_receiver) = watch::channel(None);
-        let (status_sender, _) = watch::channel(WriterStatus {
-            healthy: true,
-            queue_len: 0,
-            queue_capacity: u64::try_from(queue_capacity).unwrap_or(u64::MAX),
-            enqueued_deltas: 0,
-            persisted_deltas: 0,
-            dropped_deltas: 0,
-            failed_deltas: 0,
-            recorded_gaps: 0,
-            last_persisted: None,
-            last_persisted_at_ms: None,
-            last_error: None,
-            checkpoints_completed: 0,
-            checkpoints_failed: 0,
-            last_checkpoint_status: None,
-            last_successful_checkpoint_at_ms: None,
-            last_token_snapshot_sha: None,
-            token_persistence_failures: 0,
-        });
+        let (status_sender, _) = watch::channel(WriterStatus::new(queue_capacity));
         let task = WriterTask {
             config,
             store,
@@ -419,25 +401,7 @@ pub fn test_writer_handle(queue_capacity: usize) -> (WriterHandle, TestWriterPro
     let (command_sender, mut command_receiver) = mpsc::channel(queue_capacity);
     let gaps = Arc::new(Mutex::new(GapAccumulator::default()));
     let (shutdown_deadline, _) = watch::channel(None);
-    let (status, _) = watch::channel(WriterStatus {
-        healthy: true,
-        queue_len: 0,
-        queue_capacity: u64::try_from(queue_capacity).unwrap_or(u64::MAX),
-        enqueued_deltas: 0,
-        persisted_deltas: 0,
-        dropped_deltas: 0,
-        failed_deltas: 0,
-        recorded_gaps: 0,
-        last_persisted: None,
-        last_persisted_at_ms: None,
-        last_error: None,
-        checkpoints_completed: 0,
-        checkpoints_failed: 0,
-        last_checkpoint_status: None,
-        last_successful_checkpoint_at_ms: None,
-        last_token_snapshot_sha: None,
-        token_persistence_failures: 0,
-    });
+    let (status, _) = watch::channel(WriterStatus::new(queue_capacity));
     let checkpoints = Arc::new(Mutex::new(Vec::new()));
     let token_snapshots = Arc::new(Mutex::new(Vec::new()));
     let task_checkpoints = Arc::clone(&checkpoints);
@@ -508,6 +472,30 @@ pub struct WriterStatus {
     pub last_successful_checkpoint_at_ms: Option<u64>,
     pub last_token_snapshot_sha: Option<String>,
     pub token_persistence_failures: u64,
+}
+
+impl WriterStatus {
+    fn new(queue_capacity: usize) -> Self {
+        Self {
+            healthy: true,
+            queue_len: 0,
+            queue_capacity: u64::try_from(queue_capacity).unwrap_or(u64::MAX),
+            enqueued_deltas: 0,
+            persisted_deltas: 0,
+            dropped_deltas: 0,
+            failed_deltas: 0,
+            recorded_gaps: 0,
+            last_persisted: None,
+            last_persisted_at_ms: None,
+            last_error: None,
+            checkpoints_completed: 0,
+            checkpoints_failed: 0,
+            last_checkpoint_status: None,
+            last_successful_checkpoint_at_ms: None,
+            last_token_snapshot_sha: None,
+            token_persistence_failures: 0,
+        }
+    }
 }
 
 struct WriterHandleInner {
@@ -644,22 +632,22 @@ impl WriterTask {
                 };
                 let result =
                     run_before_deadline(retry_deadline, "delta persistence", attempt).await;
-                match result {
-                    Ok(()) => return Ok(()),
-                    Err(error) if is_permanent_persistence_error(&error) => return Err(error),
-                    Err(error) => {
-                        let Some(delay) = delays.next() else {
-                            return Err(error);
-                        };
-                        let Some(next_attempt_at) = Instant::now().checked_add(delay) else {
-                            return Err(error);
-                        };
-                        if next_attempt_at > retry_deadline {
-                            return Err(error);
-                        }
-                        tokio::time::sleep_until(next_attempt_at).await;
-                    }
+                let Err(error) = result else {
+                    return Ok(());
+                };
+                if is_permanent_persistence_error(&error) {
+                    return Err(error);
                 }
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                let Some(next_attempt_at) = Instant::now().checked_add(delay) else {
+                    return Err(error);
+                };
+                if next_attempt_at > retry_deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep_until(next_attempt_at).await;
             }
         };
         run_until_shutdown_deadline(shutdown_deadline, "delta persistence", persistence).await
@@ -1005,6 +993,10 @@ impl WriterTask {
         }
     }
 
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "The shutdown-bounded retry loop updates shared status inside each terminal outcome"
+    )]
     async fn persist_gap(&self, gap: GapRecord) {
         // A lost gap record turns a known hole into an invisible one, so normal operation retries forever.
         let persistence = async {
@@ -1021,59 +1013,55 @@ impl WriterTask {
                     StateHistoryStore::record_gap(&mut connection, &gap).await
                 }
                 .await;
-                match result {
-                    Ok(()) => {
-                        tracing::warn!(
-                            event = "state_history_gap_recorded",
-                            chain_id = gap.chain_id,
-                            generation = gap.generation,
-                            from_message_seq = gap.from_message_seq,
-                            to_message_seq = gap.to_message_seq,
-                            reason = gap.reason.as_str(),
-                            "state history gap recorded"
-                        );
-                        self.status.send_modify(|status| {
-                            status.healthy = true;
-                            status.recorded_gaps += 1;
-                            status.last_error = None;
-                        });
-                        return;
-                    }
-                    Err(error) if is_permanent_persistence_error(&error) => {
-                        tracing::error!(
-                            event = "state_history_gap_persistence_failed",
-                            chain_id = gap.chain_id,
-                            generation = gap.generation,
-                            from_message_seq = gap.from_message_seq,
-                            to_message_seq = gap.to_message_seq,
-                            reason = gap.reason.as_str(),
-                            %error,
-                            "permanent state history gap persistence failure"
-                        );
-                        self.status.send_modify(|status| {
-                            status.healthy = false;
-                            status.last_error = Some(error.to_string());
-                        });
-                        return;
-                    }
-                    Err(error) => {
-                        if !reported_retry {
-                            tracing::warn!(
-                                event = "state_history_gap_persistence_retrying",
-                                chain_id = gap.chain_id,
-                                generation = gap.generation,
-                                from_message_seq = gap.from_message_seq,
-                                to_message_seq = gap.to_message_seq,
-                                reason = gap.reason.as_str(),
-                                %error,
-                                "state history gap persistence will retry"
-                            );
-                            reported_retry = true;
-                        }
-                        tokio::time::sleep(delay).await;
-                        delay = cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
-                    }
+                let Err(error) = result else {
+                    tracing::warn!(
+                        event = "state_history_gap_recorded",
+                        chain_id = gap.chain_id,
+                        generation = gap.generation,
+                        from_message_seq = gap.from_message_seq,
+                        to_message_seq = gap.to_message_seq,
+                        reason = gap.reason.as_str(),
+                        "state history gap recorded"
+                    );
+                    self.status.send_modify(|status| {
+                        status.healthy = true;
+                        status.recorded_gaps += 1;
+                        status.last_error = None;
+                    });
+                    return;
+                };
+                if is_permanent_persistence_error(&error) {
+                    tracing::error!(
+                        event = "state_history_gap_persistence_failed",
+                        chain_id = gap.chain_id,
+                        generation = gap.generation,
+                        from_message_seq = gap.from_message_seq,
+                        to_message_seq = gap.to_message_seq,
+                        reason = gap.reason.as_str(),
+                        %error,
+                        "permanent state history gap persistence failure"
+                    );
+                    self.status.send_modify(|status| {
+                        status.healthy = false;
+                        status.last_error = Some(error.to_string());
+                    });
+                    return;
                 }
+                if !reported_retry {
+                    tracing::warn!(
+                        event = "state_history_gap_persistence_retrying",
+                        chain_id = gap.chain_id,
+                        generation = gap.generation,
+                        from_message_seq = gap.from_message_seq,
+                        to_message_seq = gap.to_message_seq,
+                        reason = gap.reason.as_str(),
+                        %error,
+                        "state history gap persistence will retry"
+                    );
+                    reported_retry = true;
+                }
+                tokio::time::sleep(delay).await;
+                delay = cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
             }
         };
         if run_until_shutdown_bound(
@@ -1451,7 +1439,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The valid RFQ fixture must construct before its provider-time gap bounds are asserted"
+    )]
     fn rfq_delta_gap_uses_provider_observation_time() {
         let publication_time = 2_000;
         let provider_observation_time = 1_000;
@@ -2044,7 +2035,10 @@ mod tests {
         }
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn test_delta(message_seq: u64) -> DeltaEntry {
         DeltaEntry::new(
             8453,
@@ -2076,7 +2070,10 @@ mod tests {
         test_capture_at(10, kind, test_token_snapshot(1))
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn test_capture_at(
         message_seq: u64,
         kind: CheckpointKind,
@@ -2100,7 +2097,10 @@ mod tests {
         CheckpointCapture::new(state, token_snapshot.tokens, "writer".to_owned())
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "The fixed token JSON must decode before checkpoint persistence is exercised"
+    )]
     fn test_token_snapshot(seed: u8) -> TokenSnapshot {
         let token = serde_json::from_value(serde_json::json!({
             "address": format!("0x{seed:040x}"),

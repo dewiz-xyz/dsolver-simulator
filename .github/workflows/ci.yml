@@ -53,7 +53,7 @@ jobs:
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test
@@ -69,9 +69,13 @@ jobs:
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+      - name: Check historical image lock guard
+        run: python3 scripts/test_check_pruned_lock.py
       - uses: taiki-e/install-action@nextest
       - name: Run tests
-        run: cargo nextest run --workspace
+        run: cargo nextest run --locked --workspace
+      - name: Run documentation tests
+        run: cargo test --locked --workspace --doc
 
   state-history-storage:
     name: state history storage
@@ -105,14 +109,14 @@ jobs:
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
       - name: Build simulator release binary
-        run: cargo build -p apps --bin dsolver-simulator-service --release
+        run: cargo build --locked -p apps --bin dsolver-simulator-service --release
       - name: Build broadcaster release binary
-        run: cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+        run: cargo build --locked -p apps --bin dsolver-tycho-broadcaster-service --release
       - name: Build state history migration binary
-        run: cargo build -p apps --bin state-history-migrate --release
+        run: cargo build --locked -p apps --bin state-history-migrate --release
       - name: Build historical quote service
-        run: cargo build -p historical-quote-service --release
+        run: cargo build --locked -p historical-quote-service --release
       - name: Build dsolver history CLI
-        run: cargo build -p dsolver-history --release
+        run: cargo build --locked -p dsolver-history --release
       - name: Check historical API contract
-        run: cargo test -p historical-quote --test contract checked_in_openapi_matches_rust_types
+        run: cargo test --locked -p historical-quote --test contract checked_in_openapi_matches_rust_types

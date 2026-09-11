@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use historical_quote::api::{
     Backend, ConsistencyPairReport, ConsistencyQuoteOutcome, PairStatus, PoolSelector,
-    QuoteFailureReason, StreamPosition,
+    QuoteFailureReason,
 };
 use historical_quote::{ConsistencyChecker, HistoricalError};
 use serde_json::{json, Value};
@@ -37,6 +37,19 @@ async fn direct_target_matches_earlier_checkpoint_plus_deltas(
     );
     assert_eq!(report.pairs[0].total_difference_count, 0);
     assert_eq!(report.pairs[0].direct_state, report.pairs[0].replayed_state);
+    assert_eq!(
+        report.pairs[0].earlier_position,
+        support::public_position(1)
+    );
+    assert_eq!(report.pairs[0].target_position, support::public_position(3));
+    assert!(report.storage.range_plan_valid);
+    assert!(report.storage.checkpoint_objects_valid);
+    assert!(report.storage.token_objects_valid);
+    assert!(report.storage.delta_order_valid);
+    assert_eq!(report.storage.replay_plans_verified, 1);
+    assert_eq!(report.storage.checkpoint_objects_verified, 2);
+    assert_eq!(report.storage.token_objects_verified, 2);
+    assert_eq!(report.storage.deltas_verified, 1);
     Ok(())
 }
 
@@ -140,28 +153,6 @@ async fn unknown_update_beside_absent_removal_still_rejects_consistency(
         result,
         Err(HistoricalError::StateReconstructionFailed(_))
     ));
-    Ok(())
-}
-
-#[tokio::test]
-async fn verification_report_covers_storage_object_integrity(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let report = checker(Arc::new(FixtureSource::native_consistency(true)?), 100)
-        .execute(
-            &consistency_request(native_pool()),
-            &CancellationToken::new(),
-            &(),
-        )
-        .await?;
-
-    assert!(report.storage.range_plan_valid);
-    assert!(report.storage.checkpoint_objects_valid);
-    assert!(report.storage.token_objects_valid);
-    assert!(report.storage.delta_order_valid);
-    assert_eq!(report.storage.replay_plans_verified, 1);
-    assert_eq!(report.storage.checkpoint_objects_verified, 2);
-    assert_eq!(report.storage.token_objects_verified, 2);
-    assert_eq!(report.storage.deltas_verified, 1);
     Ok(())
 }
 
@@ -608,6 +599,10 @@ async fn gap_has_precedence_over_state_and_quote_comparison(
     assert_eq!(report.summary.gap, 1);
     assert!(report.pairs[0].direct_state.is_none());
     assert!(report.pairs[0].quote_comparisons.is_empty());
+    assert_eq!(report.storage.replay_plans_verified, 1);
+    assert_eq!(report.storage.deltas_verified, 1);
+    assert_eq!(report.storage.checkpoint_objects_verified, 0);
+    assert_eq!(report.storage.token_objects_verified, 0);
     Ok(())
 }
 
@@ -694,24 +689,6 @@ async fn canonical_vm_comparison_is_rejected_and_cancellation_is_observed(
         return Err("cancelled check must stop".into());
     };
     assert!(matches!(cancellation_error, HistoricalError::Cancelled));
-    Ok(())
-}
-
-#[test]
-fn explicit_positions_remain_exact_and_ordered() -> Result<(), Box<dyn std::error::Error>> {
-    let request = consistency_request(native_pool());
-    let historical_quote::api::ConsistencySelection::CheckpointPairs { pairs } = request.selection
-    else {
-        return Err("fixture must use explicit pairs".into());
-    };
-    assert_eq!(
-        pairs[0].earlier_position,
-        StreamPosition {
-            generation: 1,
-            message_seq: 1,
-        }
-    );
-    assert_eq!(pairs[0].target_position.message_seq, 3);
     Ok(())
 }
 

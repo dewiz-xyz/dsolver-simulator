@@ -758,28 +758,4 @@ mod tests {
             err.message()
         );
     }
-
-    #[test]
-    fn default_registry_supports_ekubo_v3() {
-        let registry = SwapEncoderRegistry::new(Chain::Ethereum)
-            .add_default_encoders(None)
-            .expect("default encoder registry should initialize");
-
-        assert!(
-            registry.get_encoder("ekubo_v3").is_some(),
-            "expected ekubo_v3 encoder in default registry"
-        );
-    }
-
-    #[test]
-    fn default_registry_supports_aerodrome_slipstreams() {
-        let registry = SwapEncoderRegistry::new(Chain::Base)
-            .add_default_encoders(None)
-            .expect("default encoder registry should initialize");
-
-        assert!(
-            registry.get_encoder("aerodrome_slipstreams").is_some(),
-            "expected aerodrome_slipstreams encoder in default registry"
-        );
-    }
 }

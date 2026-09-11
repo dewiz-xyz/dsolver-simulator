@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use state_history::{BlockInterval, CoverageQuery, RangeGap, RangeGapKind};
 
-use crate::api::{BlockBounds, CoverageRequest, CoverageResponse, GapCause, GapKind, KnownGap};
-use crate::replay::{history_backend, public_position};
+use crate::api::{BlockBounds, CoverageRequest, CoverageResponse, GapKind, KnownGap};
+use crate::replay::{gap_cause, history_backend, public_position};
 use crate::{HistoricalError, HistorySource};
 
 pub struct CoverageService<S> {
@@ -74,17 +74,4 @@ fn known_gap(gap: &RangeGap) -> Result<KnownGap, HistoricalError> {
         from_observed_at_ms: gap.from_observed_at_ms,
         to_observed_at_ms: gap.to_observed_at_ms,
     })
-}
-
-fn gap_cause(reason: &str) -> Result<GapCause, HistoricalError> {
-    match reason {
-        "queue_overflow" => Ok(GapCause::QueueOverflow),
-        "write_failed" => Ok(GapCause::WriteFailed),
-        "writer_stopped" => Ok(GapCause::WriterStopped),
-        "checkpoint_failed" => Ok(GapCause::CheckpointFailed),
-        "boundary_slip" => Ok(GapCause::BoundarySlip),
-        other => Err(HistoricalError::HistoricalDataInvalid(format!(
-            "unknown recorded gap cause {other}"
-        ))),
-    }
 }

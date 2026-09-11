@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
+use simulator_replay::{SimulationExecutionError, SimulationExecutor};
 use tracing::debug;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
@@ -23,7 +24,6 @@ use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
 use crate::models::state::{AppState, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard};
-use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::services::stream_builder::{
     ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
 };
@@ -75,24 +75,12 @@ async fn resimulate_route(
     state: &AppState,
     normalized: &NormalizedRouteInternal,
     chain: Chain,
-    request_token_in: &Bytes,
-    request_token_out: &Bytes,
-    native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
 ) -> Result<ResimulatedRouteInternal, AttemptError> {
     let native_pin = state.native_state_store.pin().await;
-    resimulate_route_with_native_pin(
-        state,
-        normalized,
-        chain,
-        request_token_in,
-        request_token_out,
-        native_token_protocol_allowlist,
-        rebuild_guard,
-        native_pin,
-    )
-    .await
-    .result
+    resimulate_route_with_native_pin(state, normalized, chain, rebuild_guard, native_pin)
+        .await
+        .result
 }
 
 pub(super) struct ResimulationOutcome {
@@ -101,29 +89,16 @@ pub(super) struct ResimulationOutcome {
     pub(super) uses_rfq: bool,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "route, chain, token, guard, and pinned-state inputs remain explicit at the request boundary"
-)]
 pub(super) async fn resimulate_route_with_native_pin(
     state: &AppState,
     normalized: &NormalizedRouteInternal,
     chain: Chain,
-    request_token_in: &Bytes,
-    request_token_out: &Bytes,
-    native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
     native_pin: PublishedStatePin,
 ) -> ResimulationOutcome {
     let mut resimulator =
         RouteResimulator::new(state, normalized, chain, rebuild_guard, native_pin);
-    let result = resimulator
-        .run(
-            request_token_in,
-            request_token_out,
-            native_token_protocol_allowlist,
-        )
-        .await;
+    let result = resimulator.run().await;
     // The fence needs the component-resolved backends even when the route failed partway,
     // so the resolved view survives the result either way.
     let (native_pool_ids, uses_rfq) = resimulator.resolved_backends();
@@ -154,12 +129,7 @@ impl<'a> RouteResimulator<'a> {
         }
     }
 
-    async fn run(
-        &mut self,
-        request_token_in: &Bytes,
-        request_token_out: &Bytes,
-        native_token_protocol_allowlist: &[String],
-    ) -> Result<ResimulatedRouteInternal, AttemptError> {
+    async fn run(&mut self) -> Result<ResimulatedRouteInternal, AttemptError> {
         // Resimulate in hop-depth order to match build_route_swaps execution order.
         for hop_index in 0..self.max_hop_depth() {
             for segment_index in 0..self.normalized.segments.len() {
@@ -168,12 +138,6 @@ impl<'a> RouteResimulator<'a> {
             }
         }
 
-        validate_request_tokens(request_token_in, request_token_out)?;
-        validate_native_request_tokens(
-            self.normalized,
-            self.chain,
-            native_token_protocol_allowlist,
-        )?;
         let segments = self.build_resimulated_segments()?;
         Ok(ResimulatedRouteInternal { segments })
     }
@@ -255,7 +219,7 @@ impl<'a> RouteResimulator<'a> {
 
         for allocated in allocated_swaps {
             let swap = self.simulate_allocated_swap(allocated).await?;
-            hop_expected += swap.expected_amount_out.clone();
+            hop_expected += &swap.expected_amount_out;
             swap_results.push(swap);
         }
 
@@ -634,19 +598,6 @@ fn take_segment_hops(
     Ok(resim_hops)
 }
 
-fn validate_request_tokens(
-    request_token_in: &Bytes,
-    request_token_out: &Bytes,
-) -> Result<(), AttemptError> {
-    if request_token_in.is_empty() || request_token_out.is_empty() {
-        return Err(AttemptError::deterministic(EncodeError::internal(
-            "Request tokens missing after resimulation",
-        )));
-    }
-
-    Ok(())
-}
-
 fn ensure_native_swap_supported(
     chain: Chain,
     token_in: &Bytes,
@@ -669,40 +620,6 @@ fn ensure_native_swap_supported(
     }
 
     Ok(protocol_supports_native)
-}
-
-fn validate_native_request_tokens(
-    normalized: &NormalizedRouteInternal,
-    chain: Chain,
-    native_token_protocol_allowlist: &[String],
-) -> Result<(), AttemptError> {
-    let native_address = chain.native_token().address;
-
-    for segment in &normalized.segments {
-        for hop in &segment.hops {
-            let swap_uses_native =
-                hop.token_in == native_address || hop.token_out == native_address;
-            if !swap_uses_native {
-                continue;
-            }
-
-            for swap in &hop.swaps {
-                if !is_native_protocol_allowlisted(
-                    &swap.pool.protocol,
-                    native_token_protocol_allowlist,
-                ) {
-                    let supported =
-                        format_native_protocol_allowlist(native_token_protocol_allowlist);
-                    return Err(AttemptError::deterministic(EncodeError::invalid(format!(
-                        "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
-                        supported, swap.pool.protocol
-                    ))));
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn ensure_erc4626_swap_supported(
@@ -1162,9 +1079,6 @@ mod tests {
             &app_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &app_state.native_token_protocol_allowlist,
             test_rebuild_guard(&app_state).await,
         )
         .await
@@ -1239,9 +1153,6 @@ mod tests {
             &app_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &app_state.native_token_protocol_allowlist,
             rebuild_guard,
             native_pin,
         )
@@ -1295,8 +1206,6 @@ mod tests {
             },
         );
         let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
-        let token_in_address = token_in.address.clone();
-        let token_out_address = token_out.address.clone();
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
                 share_bps: 10_000,
@@ -1318,16 +1227,7 @@ mod tests {
             let guard = state_for_task
                 .acquire_simulation_rebuild_guard(true, false)
                 .await;
-            resimulate_route(
-                &state_for_task,
-                &normalized,
-                Chain::Ethereum,
-                &token_in_address,
-                &token_out_address,
-                &state_for_task.native_token_protocol_allowlist,
-                guard,
-            )
-            .await
+            resimulate_route(&state_for_task, &normalized, Chain::Ethereum, guard).await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1399,8 +1299,6 @@ mod tests {
             },
         );
         let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
-        let token_in_address = token_in.address.clone();
-        let token_out_address = token_out.address.clone();
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
                 share_bps: 10_000,
@@ -1422,16 +1320,7 @@ mod tests {
             let guard = state_for_task
                 .acquire_simulation_rebuild_guard(false, false)
                 .await;
-            resimulate_route(
-                &state_for_task,
-                &normalized,
-                Chain::Ethereum,
-                &token_in_address,
-                &token_out_address,
-                &state_for_task.native_token_protocol_allowlist,
-                guard,
-            )
-            .await
+            resimulate_route(&state_for_task, &normalized, Chain::Ethereum, guard).await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1520,9 +1409,6 @@ mod tests {
             &disabled_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &disabled_state.native_token_protocol_allowlist,
             test_rebuild_guard(&disabled_state).await,
         )
         .await
@@ -1550,9 +1436,6 @@ mod tests {
             &enabled_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &enabled_state.native_token_protocol_allowlist,
             test_rebuild_guard(&enabled_state).await,
         )
         .await
@@ -1661,9 +1544,6 @@ mod tests {
             &app_state,
             &normalized,
             Chain::Ethereum,
-            &token_a.address,
-            &token_c.address,
-            &app_state.native_token_protocol_allowlist,
             test_rebuild_guard(&app_state).await,
         )
         .await

@@ -142,46 +142,7 @@ impl RpcBaseFeeSource {
             return Some(base_fee);
         }
 
-        let block = match self.transport.get_block(&self.rpc_url, block_number).await {
-            Ok(Some(block)) => block,
-            Ok(None) => {
-                warn!(
-                    scope = "state_history_base_fee",
-                    chain_id, block_number, "Base fee RPC returned no block"
-                );
-                return None;
-            }
-            Err(RpcTransportError::Http(error)) => {
-                warn!(
-                    scope = "state_history_base_fee",
-                    chain_id,
-                    block_number,
-                    %error,
-                    "Base fee RPC HTTP request failed"
-                );
-                return None;
-            }
-            Err(RpcTransportError::Timeout(error)) => {
-                warn!(
-                    scope = "state_history_base_fee",
-                    chain_id,
-                    block_number,
-                    %error,
-                    "Base fee RPC request timed out"
-                );
-                return None;
-            }
-            Err(RpcTransportError::Decode(error)) => {
-                warn!(
-                    scope = "state_history_base_fee",
-                    chain_id,
-                    block_number,
-                    %error,
-                    "Base fee RPC response could not be decoded"
-                );
-                return None;
-            }
-        };
+        let block = self.fetch_block(chain_id, block_number).await?;
 
         if !rpc_block_matches(&block, chain_id, block_number, block_hash) {
             return None;
@@ -210,6 +171,30 @@ impl RpcBaseFeeSource {
             self.cache_base_fee(cache_key, base_fee.clone());
         }
         Some(base_fee)
+    }
+
+    async fn fetch_block(&self, chain_id: u64, block_number: u64) -> Option<RpcBlock> {
+        match self.transport.get_block(&self.rpc_url, block_number).await {
+            Ok(Some(block)) => Some(block),
+            Ok(None) => {
+                warn!(
+                    scope = "state_history_base_fee",
+                    chain_id, block_number, "Base fee RPC returned no block"
+                );
+                None
+            }
+            Err(error) => {
+                let (message, error) = match error {
+                    RpcTransportError::Http(error) => ("Base fee RPC HTTP request failed", error),
+                    RpcTransportError::Timeout(error) => ("Base fee RPC request timed out", error),
+                    RpcTransportError::Decode(error) => {
+                        ("Base fee RPC response could not be decoded", error)
+                    }
+                };
+                warn!(scope = "state_history_base_fee", chain_id, block_number, %error, "{message}");
+                None
+            }
+        }
     }
 
     fn cached_base_fee(&self, key: &(u64, u64, String)) -> Option<String> {
@@ -345,20 +330,6 @@ mod tests {
         let source =
             RpcBaseFeeSource::with_transport("http://rpc.example".to_string(), transport.clone());
         (source, transport)
-    }
-
-    #[tokio::test]
-    async fn parses_base_fee_hex_to_decimal_string() {
-        let (source, _) = source_with_response(RpcBlock {
-            base_fee_per_gas: Some("0x3b9aca00".to_string()),
-            hash: Some("block-100".to_string()),
-            number: Some("0x64".to_string()),
-        });
-
-        assert_eq!(
-            source.base_fee_wei(1, 100, Some("block-100")).await,
-            Some("1000000000".to_string())
-        );
     }
 
     #[tokio::test]

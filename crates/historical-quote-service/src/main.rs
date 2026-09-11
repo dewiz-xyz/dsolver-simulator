@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
     .await
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Keep the shared shutdown deadline and ordered abort/join steps together."
+)]
 async fn serve<E: JobExecutor>(
     listener: TcpListener,
     app: Router,
@@ -111,21 +115,17 @@ async fn serve<E: JobExecutor>(
         .checked_add(shutdown_timeout)
         .ok_or_else(|| anyhow::anyhow!("shutdown timeout is too large"))?;
     let refresh_stopped = matches!(stop_reason, StopReason::RefreshStopped);
-    let server_result = match stop_reason {
-        StopReason::ServerStopped(result) => Some(result),
-        StopReason::Signal | StopReason::RefreshStopped => {
-            let _ = stop_server.send(());
-            match timeout_at(deadline, &mut server_task).await {
-                Ok(result) => Some(result),
-                Err(_) => {
-                    tracing::warn!("HTTP shutdown exceeded the configured deadline");
-                    server_task.abort();
-                    let _ = server_task.await;
-                    None
-                }
-            }
-        }
+    let server_result = if let StopReason::ServerStopped(result) = stop_reason {
+        Some(result)
+    } else {
+        let _ = stop_server.send(());
+        timeout_at(deadline, &mut server_task).await.ok()
     };
+    if server_result.is_none() {
+        tracing::warn!("HTTP shutdown exceeded the configured deadline");
+        server_task.abort();
+        let _ = server_task.await;
+    }
     if !refresh_stopped && timeout_at(deadline, &mut refresh_task).await.is_err() {
         tracing::warn!("key refresh shutdown exceeded the configured deadline");
         refresh_task.abort();

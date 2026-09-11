@@ -84,38 +84,24 @@ This document describes the `/simulate` request and response shape.
 
 In this example, the smallest requested amount failed for that pool, so `amounts_out[0]` is `"0"`. The later requested amounts are still usable, and the row stays in `data[]` because the pool still produced positive outputs for later amount positions. If every entry were `"0"`, the row would be filtered out of `data[]` and reported only through `meta.failures` and `meta.pool_results`.
 
-## Notes
+## Client contract
 
 - `auction_id` is optional in the request. When present, it is echoed back as `meta.auction_id`.
 - `/simulate` uses `200 OK` for contract-valid complete, partial, no-result, and selected degraded outcomes. Clients must inspect `meta`, not just the HTTP status.
-- For partial results, `amounts_out` stays aligned with the request `amounts[]`. Failed or timed-out requested amounts are returned in place as `"0"`, and the matching `gas_used` entries are `0`.
-- `amounts_out[i] = "0"` means that requested amount did not produce a usable quote for that pool. It is not a real output amount.
+- Each row contains one pool's quotes in the same order as the request `amounts[]`. Use only positive values at the amount position you need. Failed or timed-out amounts remain in place as `"0"` with `gas_used = 0`; zero means no usable quote for that amount.
 - `data[]` contains only pools with at least one positive output across the requested amounts. Pools whose entire `amounts_out` row is `"0"` stay out of `data[]` and remain visible through `meta.failures` and `meta.pool_results`.
 - `data[]` row order is deterministic, but it is not a best-to-worst ranking. Consumers should rely on requested-amount alignment within each row and choose pools explicitly rather than inferring semantics from `data[0]`.
 - `block_number` is the native stream block. `vm_block_number` is present when VM pool support is enabled and VM state has a current block. `rfq_update_timestamp` is present when RFQ pool support is enabled and RFQ state is ready; it carries the current RFQ update timestamp/cursor, not a chain block.
 
-### How to consume `data[]`
-
-- treat each row as one pool's quotes across the requested amounts
-- match the amount position you care about to the same index in the request `amounts[]`
-- only treat positive values in that slot as usable quotes
-- treat `"0"` as "no usable quote for that requested amount," not a real output
-- treat rows whose whole `amounts_out` array is `"0"` as failed rows; they should not survive in `data[]`
-- do not infer pool quality from row position; `data[]` order is stable output, not ranking
-
-### Quick usability check
-
-- `meta.status = "ready"` and `meta.result_quality = "complete"` or `"partial"` means the response is usable for quoting
-- `meta.result_quality = "request_level_failure"` or `"no_results"` means it is not usable for quoting
-- a usable response can still contain degraded rows where some amount positions are `"0"`
-- a usable response should not contain a row whose entire `amounts_out` array is `"0"`
-
 ### Outcome interpretation
 
-- `status = "ready"` with `result_quality = "complete"` means usable quotes were returned without request-visible degradation.
-- `status = "ready"` with `result_quality = "partial"` means usable quotes were returned, but the result is degraded.
-- `status = "no_liquidity"` with `result_quality = "no_results"` means no usable quote survived because liquidity was absent or exhausted.
-- `result_quality = "request_level_failure"` means the request ended in a degraded state that should not be used as a quote source, even if the response shape is valid.
+| Status | Result quality | Use as a quote source |
+| --- | --- | --- |
+| `ready` | `complete` | Yes; no request-visible degradation. |
+| `ready` | `partial` | Yes, for positive amount positions; inspect the reported degradation. |
+| Any | `no_results` | No. With `no_liquidity`, liquidity was absent or exhausted. |
+| Any | `request_level_failure` | No, even though the response shape is valid. |
+
 - `partial_kind` appears only when `result_quality = "partial"`. It is `amount_ladders`, `pool_coverage`, or `mixed`.
 - `vm_unavailable = true` means VM pools were skipped because VM state was not ready. If native pools still produced usable quotes, the response can still be usable for quoting.
 

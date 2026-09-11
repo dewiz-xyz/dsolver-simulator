@@ -102,20 +102,20 @@ SQL
 echo "Running the state history migration task twice..."
 (
   cd "$repo"
-  cargo run -p apps --bin state-history-migrate
-  cargo run -p apps --bin state-history-migrate
+  cargo run --locked -p apps --bin state-history-migrate
+  cargo run --locked -p apps --bin state-history-migrate
 )
 
 echo "Running ignored state-history integration tests..."
 (
   cd "$repo"
-  cargo test -p state-history -- --ignored
+  cargo test --locked -p state-history -- --ignored
 )
 
 echo "Running state-history analysis harness..."
 (
   cd "$repo"
-  cargo run -p apps --bin state-history-analysis
+  cargo run --locked -p apps --bin state-history-analysis
 )
 
 echo "State history storage contract verification passed."

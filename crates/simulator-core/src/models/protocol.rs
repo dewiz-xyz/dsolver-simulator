@@ -310,26 +310,7 @@ mod tests {
 
     #[test]
     fn from_sync_state_key_rejects_protocol_type_names() {
-        let type_names = [
-            "uniswap_v2_pool",
-            "sushiswap_v2_pool",
-            "pancakeswap_v2_pool",
-            "uniswap_v3_pool",
-            "pancakeswap_v3_pool",
-            "uniswap_v4_pool",
-            "ekubo_v2_pool",
-            "ekubo_v3_pool",
-            "fluid_dex_pool",
-            "curve_pool",
-            "balancer_v2_pool",
-            "maverick_v2_pool",
-            "erc4626_pool",
-            "hashflow_pool",
-            "bebop_pool",
-            "liquorice_pool",
-        ];
-
-        for type_name in type_names {
+        for (type_name, _) in CANONICAL_PROTOCOL_TYPE_CASES {
             assert_eq!(ProtocolKind::from_sync_state_key(type_name), None);
         }
     }

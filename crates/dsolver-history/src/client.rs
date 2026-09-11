@@ -54,7 +54,6 @@ impl ClientError {
     }
 }
 
-#[derive(Clone)]
 pub struct HistoryClient {
     base_url: Url,
     token: String,

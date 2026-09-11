@@ -232,7 +232,10 @@ pub struct CapturedState {
 }
 
 impl CapturedState {
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The validated capture constructor preserves its public field-oriented API"
+    )]
     pub fn new(
         chain_id: u64,
         position: StreamPosition,
@@ -410,7 +413,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::unwrap_used)]
     fn backend_round_trips_db_values() {
         for (backend, s) in [
             (Backend::Native, "native"),
@@ -418,13 +420,12 @@ mod tests {
             (Backend::Rfq, "rfq"),
         ] {
             assert_eq!(backend.as_str(), s);
-            assert_eq!(s.parse::<Backend>().unwrap(), backend);
+            assert_eq!(s.parse::<Backend>(), Ok(backend));
         }
         assert!("stream_header".parse::<Backend>().is_err());
     }
 
     #[test]
-    #[expect(clippy::unwrap_used)]
     fn gap_reason_round_trips_db_values() {
         for (reason, value) in [
             (GapReason::QueueOverflow, "queue_overflow"),
@@ -434,7 +435,7 @@ mod tests {
             (GapReason::BoundarySlip, "boundary_slip"),
         ] {
             assert_eq!(reason.as_str(), value);
-            assert_eq!(value.parse::<GapReason>().unwrap(), reason);
+            assert_eq!(value.parse::<GapReason>(), Ok(reason));
         }
         assert!("unknown".parse::<GapReason>().is_err());
     }

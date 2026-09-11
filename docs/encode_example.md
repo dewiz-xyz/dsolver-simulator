@@ -19,8 +19,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - RFQ routes are supported when RFQ state is ready. The simulator adds its provider credentials to the request-scoped RFQ state and requests the firm signed quote while building calldata.
 - For server-side reporting, rely on the structured summary log emitted for each `/encode` request. Detailed resimulation traces are available at `debug`.
 
-The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for default routes on each supported chain, requires simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on a required hop.
-
 ## Request body (shape)
 
 `estimatedAmountIn` is an optional top-level request field. RFQ routes still derive the actual per-swap estimated input internally from the route `amountIn` and split allocation.
@@ -32,8 +30,8 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
   "amountIn": "1000000000000000000",
   "minAmountOut": "9980000",
-  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41", // Cowswap's settlement contract on Ethereum mainnet
-  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35", // Tycho router contract on Ethereum mainnet
+  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
   "swapKind": "MegaSwap",
   "segments": [
     {
@@ -121,6 +119,8 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
   "estimatedAmountIn": "1000000000000000000"
 }
 ```
+
+The example uses the CoW settlement contract and Tycho router on Ethereum mainnet.
 
 ## Response body (shape)
 

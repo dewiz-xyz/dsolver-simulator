@@ -55,13 +55,6 @@ fn merge_snapshot_protocol_message(
     existing: &mut BroadcasterProtocolMessage,
     incoming: BroadcasterProtocolMessage,
 ) -> Result<(), SnapshotReassemblyError> {
-    if existing.protocol != incoming.protocol {
-        return Err(SnapshotReassemblyError::new(format!(
-            "broadcaster snapshot protocol mismatch: expected {}, got {}",
-            existing.protocol, incoming.protocol
-        )));
-    }
-
     ensure_raw_snapshot_fragment_identity(existing, &incoming)?;
     ensure_raw_snapshot_fragment_conflicts(existing, &incoming)?;
 

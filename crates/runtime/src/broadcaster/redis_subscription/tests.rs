@@ -7,7 +7,7 @@ use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
-use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
+use simulator_replay::{DecoderConfig, RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
 use tokio::sync::RwLock;
 use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -36,7 +36,6 @@ use tycho_simulation::{
 use super::processor::{
     handle_subscription_reset, BroadcasterSubscriptionProcessor, PreparedRedisProcessor,
 };
-use super::snapshot::RawSnapshotReassembly;
 use super::{
     apply_recovery_message, apply_replay_batch, committed_recovery_complete_native_block,
     mark_redis_replay_checkpoints, mark_redis_transport_failed,
@@ -51,7 +50,6 @@ use crate::config::MemoryConfig;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::TokenStore;
-use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
 use crate::stream::StreamSupervisorConfig;
 use broadcaster_replay_client::{
     BroadcasterReplayClientError, ReplayBatch, ReplayCheckpoint, ReplayMessage, ReplayPoll,
@@ -414,22 +412,6 @@ async fn live_apply_anomaly_report_is_characterized() {
     assert!(report.has_anomalies());
 }
 
-#[tokio::test]
-#[expect(
-    clippy::panic,
-    reason = "the characterization test verifies current panic containment"
-)]
-async fn live_quote_worker_panic_is_contained() {
-    let result = SimulationExecutor::new()
-        .run(|| panic!("fixture quote panic"))
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(SimulationExecutionError::WorkerPanicked(_))
-    ));
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "the characterization keeps one complete runtime replay path visible"
@@ -711,6 +693,7 @@ enum FakeReplayPoll {
     TransportError,
     PermanentCommandError,
     Batch,
+    Pending,
     CaughtUp,
     DecodeError,
 }
@@ -793,6 +776,7 @@ impl ReplayPollSource for FakeReplayPollSource {
                     caught_up_after_batch: false,
                 }))
             }
+            FakeReplayPoll::Pending => Ok(ReplayPoll::Pending),
             FakeReplayPoll::CaughtUp => Ok(ReplayPoll::CaughtUp {
                 checkpoint: checkpoint.clone(),
             }),
@@ -1250,19 +1234,52 @@ async fn producer_crash_before_or_after_commit_is_replayed_on_consumer_restart()
 }
 
 #[tokio::test]
+async fn incomplete_recovery_times_out_only_when_polling_the_tail() -> Result<()> {
+    for (poll, expected_caught_up) in [
+        (FakeReplayPoll::Pending, false),
+        (FakeReplayPoll::CaughtUp, true),
+    ] {
+        let (controls, mut prepared) = prepared_native_replay_subscription().await?;
+        let (start, _, _) = recovery_messages(&prepared, "recovery-timeout", 104, 80, 104)?;
+        apply_recovery_message(&mut prepared, &start).await?;
+        let source = FakeReplayPollSource::new([poll]);
+        let mut cfg = redis_test_supervisor_config();
+        cfg.readiness_stale = Duration::ZERO;
+        let (exit, _, caught_up_once) = process_broadcaster_redis_subscription(
+            &source,
+            prepared,
+            &cfg,
+            &RecordingRetrySleeper::default(),
+        )
+        .await;
+        assert!(exit
+            .message
+            .contains("remained incomplete at the Redis tail"));
+        assert_eq!(caught_up_once, expected_caught_up);
+        assert_eq!(source.observed_checkpoints(), vec!["7-103"]);
+        assert_eq!(controls.native_state_store.current_block().await, 70);
+        assert!(
+            !controls
+                .native_subscription
+                .snapshot()
+                .await
+                .bootstrap_complete
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn trimmed_recovery_transaction_forces_http_fallback_without_exposure() -> Result<()> {
     let (controls, prepared) = prepared_native_replay_subscription().await?;
     let (start, _, _) = recovery_messages(&prepared, "recovery-trimmed", 104, 80, 104)?;
     let source = RecoveryThenGapPollSource::new(start);
     let sleeper = RecordingRetrySleeper::default();
+    let mut cfg = redis_test_supervisor_config();
+    cfg.readiness_stale = Duration::ZERO;
 
-    let (exit, mut rebuilds, caught_up_once) = process_broadcaster_redis_subscription(
-        &source,
-        prepared,
-        &redis_test_supervisor_config(),
-        &sleeper,
-    )
-    .await;
+    let (exit, mut rebuilds, caught_up_once) =
+        process_broadcaster_redis_subscription(&source, prepared, &cfg, &sleeper).await;
 
     assert_eq!(exit.reason, SubscriptionExitReason::RedisGap);
     assert!(subscription_exit_requires_rebuild(exit.reason));

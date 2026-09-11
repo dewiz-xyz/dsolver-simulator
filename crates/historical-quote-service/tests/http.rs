@@ -87,24 +87,6 @@ async fn only_ready_is_open_and_bodyless_routes_require_exact_revision() {
 }
 
 #[tokio::test]
-async fn each_configured_bearer_key_authenticates_independently() {
-    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
-
-    for token in [EDSON_TOKEN, PEDRO_TOKEN] {
-        let response = send(&app, request("GET", "/status", None, Some(token), true)).await;
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    let unknown = send(
-        &app,
-        request("GET", "/status", None, Some("unknown-token"), true),
-    )
-    .await;
-    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
-    registry.begin_shutdown().await;
-}
-
-#[tokio::test]
 async fn job_paths_require_uuid_version_four_before_lookup() {
     let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
     for job_id in [
@@ -143,6 +125,17 @@ async fn key_changes_take_effect_without_rebuilding_the_router() {
         keys,
         Arc::new(StaticStatus),
     );
+    for token in [EDSON_TOKEN, PEDRO_TOKEN] {
+        let response = send(&app, request("GET", "/status", None, Some(token), true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let unknown = send(
+        &app,
+        request("GET", "/status", None, Some("unknown-token"), true),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+
     let base = [("edson", EDSON_TOKEN), ("pedro", PEDRO_TOKEN)];
     for entries in [
         [base.to_vec(), vec![("analytics", "analytics-old")]].concat(),

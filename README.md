@@ -5,7 +5,7 @@
 <h1 align="center">DSolver Simulator</h1>
 
 <p align="center">
-  High-throughput DeFi swap simulation and route encoding on live Tycho-backed state.
+  DeFi swap simulation and route encoding using live Tycho state.
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.91%2B-000000?logo=rust" alt="Rust 1.91+">
+  <img src="https://img.shields.io/badge/Toolchain-1.95.0-000000?logo=rust" alt="Rust toolchain 1.95.0">
   <img src="https://img.shields.io/badge/Axum-0.7-111827" alt="Axum 0.7">
   <img src="https://img.shields.io/badge/Chains-Ethereum%20%7C%20Base-2563eb" alt="Supported chains: Ethereum and Base">
 </p>
@@ -39,20 +39,11 @@
   <a href="#docs-map">Docs</a>
 </p>
 
-DSolver Simulator is a Rust service for DeFi quote simulation and route encoding. It subscribes to the internal Tycho broadcaster for native and VM state, maintains an in-memory view of pool state, and exposes fast HTTP endpoints for quoting, route settlement encoding, and readiness checks.
-
-## What It Is
-
-- Live-state simulation service for swap and routing workloads.
-- Built on Axum and Tokio, with `tycho-simulation` and `tycho-execution` handling pricing and route execution details.
-- Designed for solver and routing integrations that need both quote coverage and deterministic route encoding behavior.
-
-## Why Teams Use It
-
-- Continuous ingestion of native and optional VM-backed pool state through the internal broadcaster service.
-- Structured `/simulate` responses that distinguish usable quotes, partial coverage, warmup states, and request-level failures.
-- `/encode` route resimulation before calldata generation, so settlement interactions are built from the same runtime view used for quoting.
-- Reporting-first local analysis tooling for readiness, latency, sampled evidence, and quick regression investigation.
+DSolver Simulator subscribes to the internal Tycho broadcaster, maintains pool state in memory,
+and exposes HTTP endpoints for quotes, route encoding, and readiness. It uses `tycho-simulation`
+for pricing and `tycho-execution` for calldata. `/simulate` reports usable quotes, partial
+coverage, warmup states, and request failures; `/encode` resimulates routes before generating
+settlement interactions. The local analyzer records readiness, latency, and request evidence.
 
 ## At A Glance
 
@@ -230,25 +221,43 @@ Production task definitions pin immutable git SHA image tags, so pushing an imag
 
 ## Verification
 
-CI-equivalent commands:
+The minimum supported Rust version is 1.95.0. Local development, CI, and container builders
+use that version with matching Clippy and rustfmt.
+Builds and tests use the committed `Cargo.lock`:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace
-cargo build -p apps --bin dsolver-simulator-service --release
-cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
-cargo build -p apps --bin state-history-migrate --release
-cargo build -p historical-quote-service --release
-cargo build -p dsolver-history --release
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace
+cargo build --locked -p apps --release \
+  --bin dsolver-simulator-service \
+  --bin dsolver-tycho-broadcaster-service \
+  --bin state-history-migrate
+cargo build --locked -p historical-quote-service --release
+cargo build --locked -p dsolver-history --release
 scripts/verify_state_history.sh --repo .
 ```
+
+Linux CI uses `cargo nextest run --locked --workspace` and runs doctests separately with
+`cargo test --locked --workspace --doc`. For local nextest parity, use `--test-threads 16`.
+Run the pinned amount/gas fixture with
+`cargo test --locked -p runtime --test simulation_baseline -- --ignored` and the disposable
+Redis handoff check with `scripts/verify_broadcaster_handoff_redis.sh --repo .`.
+Keep `UPDATE_SIM_BASELINE` and `UPDATE_WIRE_FIXTURES` unset during verification.
+
+The workspace compiler policy denies unused code and unfulfilled lint expectations. Clippy
+adds structural guardrails configured in `clippy.toml`: cognitive complexity 25, function
+length 100 lines, nesting depth 5, type complexity 250, and 7 arguments per function.
+These are review prompts, not a measure of overall code quality. Clippy's cognitive score
+is approximate and skips test functions; distinct behavioral assertions still need review.
+Exceptions must use a narrow `#[expect(..., reason = "...")]` with a concrete explanation.
+Ordinary builds enforce compiler lints; run Clippy to enforce the complexity limits.
 
 Local analysis harness:
 
 ```bash
-cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
-cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
+cargo run --locked -p apps --bin sim-analysis -- --chain-id 1 --stop
+cargo run --locked -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 When `TYCHO_BROADCASTER_URL` points at local loopback, the analyzer uses the repo lifecycle
@@ -266,12 +275,13 @@ broadcaster plus Redis and enable the explicit live-test gate:
 DSOLVER_LIVE_MAINNET_VM_E2E=1 \
 TYCHO_BROADCASTER_URL=http://127.0.0.1:3001 \
 BROADCASTER_REDIS_URL=redis://127.0.0.1:6379 \
-cargo test -p runtime mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire \
+cargo test --locked --release -p runtime mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire \
   -- --ignored --nocapture --test-threads=1
 ```
 
-The test expects Curve and Balancer VM deltas from live mainnet traffic. A normal
-run should usually finish in about 10 minutes, and it fails after 20 minutes.
+The test first decodes the snapshot and checks Curve and Balancer quotes. It then allows
+up to 20 minutes for live Redis deltas that produce non-zero quotes for both protocols.
+Snapshot initialization adds time before that deadline starts.
 
 Container builds:
 

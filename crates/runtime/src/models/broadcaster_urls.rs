@@ -34,8 +34,9 @@ pub fn derive_broadcaster_http_url(
             )))
         }
     };
-    let prefix = broadcaster_path_prefix(&url);
-    let http_path = prefixed_path(prefix, relative_path);
+    let prefix = url.path().trim_end_matches('/');
+    let relative_path = relative_path.trim_start_matches('/');
+    let http_path = format!("{prefix}/{relative_path}");
 
     url.set_path(&http_path);
     url.set_query(None);
@@ -45,19 +46,6 @@ pub fn derive_broadcaster_http_url(
 fn parse_broadcaster_url(base_url: &str) -> Result<reqwest::Url, BroadcasterUrlError> {
     reqwest::Url::parse(base_url)
         .map_err(|err| BroadcasterUrlError::new(format!("invalid TYCHO_BROADCASTER_URL: {err}")))
-}
-
-fn prefixed_path(prefix: &str, relative_path: &str) -> String {
-    let relative_path = relative_path.trim_start_matches('/');
-    if prefix.is_empty() {
-        format!("/{relative_path}")
-    } else {
-        format!("{prefix}/{relative_path}")
-    }
-}
-
-fn broadcaster_path_prefix(url: &reqwest::Url) -> &str {
-    url.path().trim_end_matches('/')
 }
 
 #[cfg(test)]

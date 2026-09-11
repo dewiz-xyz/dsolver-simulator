@@ -32,11 +32,11 @@ where
             }
             if let Some(deadline) = batch.next_deadline {
                 tokio::select! {
-                    () = self.registry.notified() => {}
+                    () = batch.notified => {}
                     () = tokio::time::sleep_until(deadline) => {}
                 }
             } else {
-                self.registry.notified().await;
+                batch.notified.await;
             }
         }
     }

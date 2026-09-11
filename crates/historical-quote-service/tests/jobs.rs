@@ -79,6 +79,16 @@ async fn byte_budget_preserves_fifo_head_blocking_and_one_based_positions() {
     assert_eq!(head_snapshot.queue_position, Some(1));
     assert_eq!(younger_snapshot.state, JobState::Queued);
     assert_eq!(younger_snapshot.queue_position, Some(2));
+    for (job_id, expected) in [(head, head_snapshot), (younger, younger_snapshot)] {
+        let PollOutcome::Pending(polled) = registry.poll(job_id).await else {
+            panic!("queued job must return a pending envelope");
+        };
+        assert_eq!(
+            serde_json::to_value(*polled).expect("pending envelope must serialize"),
+            serde_json::to_value(expected).expect("inspected envelope must serialize")
+        );
+    }
+    assert_eq!(registry.snapshot().await.counts.queued, 2);
     assert!(executor.try_next_started().is_none());
 
     first_started.complete_quote();
@@ -111,6 +121,34 @@ async fn job_one_byte_above_global_budget_is_rejected_before_execution() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn job_at_the_exact_decoded_budget_is_admitted_and_scheduled() {
+    let executor = Arc::new(ControlledExecutor::default());
+    let registry = JobRegistry::new(JobLimits {
+        decoded_byte_budget: 100,
+        ..JobLimits::default()
+    });
+    let job_id = registry
+        .submit(ScheduledJob::new(
+            JobRequest::HistoricalQuote(quote_request(Uuid::new_v4(), 60_000)),
+            100,
+        ))
+        .await
+        .accepted_job_id();
+    let runner = tokio::spawn(JobRunner::new(registry.clone(), executor.clone()).run());
+    let started = tokio::time::timeout(Duration::from_secs(1), executor.next_started())
+        .await
+        .expect("exact-budget job must start before its deadline");
+    assert_eq!(started.job_id, job_id);
+    let snapshot = registry.snapshot().await;
+    assert_eq!(snapshot.counts.running, 1);
+    assert_eq!(snapshot.counts.queued, 0);
+    assert_eq!(snapshot.reserved_decoded_bytes, 100);
+    registry.begin_shutdown().await;
+    runner.await.expect("runner must stop");
+    assert_eq!(registry.snapshot().await.reserved_decoded_bytes, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn retained_request_id_reuses_same_content_and_conflicts_on_change() {
     let registry = JobRegistry::new(JobLimits::default());
     let request_id = Uuid::new_v4();
@@ -118,11 +156,20 @@ async fn retained_request_id_reuses_same_content_and_conflicts_on_change() {
         JobRequest::HistoricalQuote(quote_request(request_id, 60_000)),
         1,
     );
-    let first = registry.submit(original.clone()).await.accepted_job_id();
+    let first_submission = registry.submit(original.clone()).await;
+    let first = first_submission.accepted_job_id();
+    let SubmitOutcome::Accepted(first_submission) = first_submission else {
+        panic!("first submission must be accepted");
+    };
+    assert_eq!(first_submission.queue_position, Some(1));
 
     let reused = registry.submit(original).await;
     assert!(matches!(reused, SubmitOutcome::Reused(_)));
     assert_eq!(reused.job_id(), Some(first));
+    let SubmitOutcome::Reused(reused) = reused else {
+        panic!("retained request must reuse the submission");
+    };
+    assert_eq!(reused.queue_position, Some(1));
 
     let conflict = registry
         .submit(ScheduledJob::new(

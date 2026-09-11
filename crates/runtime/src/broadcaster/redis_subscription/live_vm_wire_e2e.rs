@@ -17,7 +17,7 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
     BroadcasterSnapshotPartition, BroadcasterTokenSnapshotResponse, BroadcasterUpdatePartition,
 };
-use simulator_replay::{ReplayBackend, ReplayDecoder};
+use simulator_replay::{RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
 use tokio::{sync::RwLock, time::Instant};
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
@@ -29,7 +29,6 @@ use tycho_simulation::{
 };
 
 use super::processor::{BroadcasterSubscriptionProcessor, PreparedRedisProcessor};
-use super::snapshot::RawSnapshotReassembly;
 use super::{
     apply_replay_batch, mark_redis_catch_up_checkpoints, BroadcasterSubscriptionControls,
     PreparedBroadcasterRedisSubscription, VmBroadcasterSubscriptionControls,

@@ -61,24 +61,18 @@ mod tests {
     }
 
     #[test]
-    fn to_tycho_token_maps_mainnet_supported_token() -> Result<(), Box<dyn std::error::Error>> {
-        let token = sample_token(MAINNET_USDC_ADDRESS).to_tycho_token(Chain::Ethereum)?;
+    fn to_tycho_token_maps_supported_chains() -> Result<(), Box<dyn std::error::Error>> {
+        for (chain, address) in [
+            (Chain::Ethereum, MAINNET_USDC_ADDRESS),
+            (Chain::Arbitrum, ARBITRUM_USDC_ADDRESS),
+        ] {
+            let token = sample_token(address).to_tycho_token(chain)?;
 
-        assert_eq!(token.address, Bytes::from_str(MAINNET_USDC_ADDRESS)?);
-        assert_eq!(token.symbol, "USDC");
-        assert_eq!(token.decimals, 6);
-        assert_eq!(token.chain, Chain::Ethereum);
-        Ok(())
-    }
-
-    #[test]
-    fn to_tycho_token_maps_arbitrum_supported_token() -> Result<(), Box<dyn std::error::Error>> {
-        let token = sample_token(ARBITRUM_USDC_ADDRESS).to_tycho_token(Chain::Arbitrum)?;
-
-        assert_eq!(token.address, Bytes::from_str(ARBITRUM_USDC_ADDRESS)?);
-        assert_eq!(token.symbol, "USDC");
-        assert_eq!(token.decimals, 6);
-        assert_eq!(token.chain, Chain::Arbitrum);
+            assert_eq!(token.address, Bytes::from_str(address)?, "{chain}");
+            assert_eq!(token.symbol, "USDC", "{chain}");
+            assert_eq!(token.decimals, 6, "{chain}");
+            assert_eq!(token.chain, chain, "{chain}");
+        }
         Ok(())
     }
 

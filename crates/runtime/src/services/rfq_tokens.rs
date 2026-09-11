@@ -241,12 +241,7 @@ fn rfq_token_request_error(
     error: reqwest::Error,
 ) -> anyhow::Error {
     if error.is_timeout() {
-        anyhow::anyhow!(
-            "{} RFQ token request to {} timed out after {} ms",
-            provider,
-            url,
-            timeout.as_millis()
-        )
+        rfq_token_request_timeout(provider, url, timeout)
     } else {
         anyhow::anyhow!(
             "{} RFQ token request to {} failed: {}",

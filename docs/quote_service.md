@@ -37,6 +37,7 @@ The request-level metadata shape is `QuoteMeta`:
 - optional `auction_id`
 - optional `pool_results`
 - optional `vm_unavailable`
+- optional `rfq_unavailable`
 - optional `failures`
 
 Live enum values:
@@ -256,11 +257,10 @@ Operational guidance:
 `/encode` integration:
 
 - `/encode` does not expose `QuoteMeta`
-- `/encode` clients and smoke helpers depend on `/simulate` to find candidate pools
+- `/encode` clients and the local analyzer depend on `/simulate` to find candidate pools
 - `/encode` supports RFQ pools when RFQ state is ready; it rebuilds the selected request-scoped RFQ client with simulator credentials because broadcaster serialization omits them
 - pool selection should stay strict: `ready + complete|partial` is usable, `request_level_failure` and `no_results` are not
 - clients should filter returned rows explicitly for the amount position they need instead of relying on `data[0]`
-- repo encode smoke uses dedicated realistic amount presets per default route and requires every tested amount to stay usable across both simulated hops
 
 Repo analysis workflow:
 

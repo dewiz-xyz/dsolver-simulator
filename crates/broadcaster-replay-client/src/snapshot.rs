@@ -113,68 +113,28 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
     use std::time::Duration;
 
-    use anyhow::{anyhow, Result};
-    use futures::StreamExt;
+    use anyhow::{Error, Result};
+    use futures::TryStreamExt;
     use tokio::sync::Notify;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn ordered_payload_fetches_overlap_and_yield_in_order() -> Result<()> {
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let max_in_flight = Arc::new(AtomicUsize::new(0));
-        let first_pair_started = Arc::new(AtomicUsize::new(0));
-        let first_pair_ready = Arc::new(Notify::new());
-
-        let mut payloads = super::ordered_payload_fetches(2, {
-            let in_flight = Arc::clone(&in_flight);
-            let max_in_flight = Arc::clone(&max_in_flight);
-            let first_pair_started = Arc::clone(&first_pair_started);
-            let first_pair_ready = Arc::clone(&first_pair_ready);
-            move |index| {
-                let in_flight = Arc::clone(&in_flight);
-                let max_in_flight = Arc::clone(&max_in_flight);
-                let first_pair_started = Arc::clone(&first_pair_started);
-                let first_pair_ready = Arc::clone(&first_pair_ready);
-                async move {
-                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    max_in_flight.fetch_max(active, Ordering::SeqCst);
-                    if first_pair_started.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
-                        first_pair_ready.notify_waiters();
-                    } else {
-                        first_pair_ready.notified().await;
-                    }
-                    if index == 0 {
-                        sleep(Duration::from_millis(50)).await;
-                    }
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, anyhow::Error>(index)
-                }
+        let second_payload_ready = &Notify::new();
+        // Payload 0 waits for payload 1, so fetching sequentially cannot finish.
+        let payloads = super::ordered_payload_fetches(2, |index| async move {
+            if index == 0 {
+                second_payload_ready.notified().await;
+            } else {
+                second_payload_ready.notify_one();
             }
+            Ok::<_, Error>(index)
         });
+        let indices = timeout(Duration::from_secs(2), payloads.try_collect::<Vec<_>>()).await??;
 
-        let first = next_payload(&mut payloads).await?;
-        let second = next_payload(&mut payloads).await?;
-
-        assert_eq!([first, second], [0, 1]);
-        assert!(
-            max_in_flight.load(Ordering::SeqCst) >= 2,
-            "payload fetches should overlap"
-        );
+        assert_eq!(indices, vec![0, 1]);
         Ok(())
-    }
-
-    async fn next_payload<T>(
-        payloads: &mut (impl futures::Stream<Item = std::result::Result<T, anyhow::Error>> + Unpin),
-    ) -> Result<T> {
-        timeout(Duration::from_secs(2), payloads.next())
-            .await
-            .map_err(|_| anyhow!("timed out waiting for concurrent snapshot payload fetch"))?
-            .ok_or_else(|| anyhow!("snapshot payload stream ended early"))?
     }
 }

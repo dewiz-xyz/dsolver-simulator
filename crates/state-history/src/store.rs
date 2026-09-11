@@ -449,7 +449,10 @@ impl StateHistoryStore {
         Ok(id)
     }
 
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Checkpoint completion persists archive, token and block-time provenance in one transaction"
+    )]
     pub async fn complete_checkpoint(
         conn: &mut sqlx::PgConnection,
         id: i64,
@@ -1006,7 +1009,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore]
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Each unknown checkpoint ID must fail before its diagnostic is asserted"
+    )]
     async fn checkpoint_updates_reject_unknown_ids(pool: PgPool) -> anyhow::Result<()> {
         let archive = EncodedArchiveInfo {
             sha256: "archive-sha256".to_owned(),
@@ -1069,7 +1075,10 @@ mod tests {
         )
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn test_delta_with_payload_and_block_hash(
         chain_id: u64,
         generation: u64,
@@ -1124,7 +1133,10 @@ mod tests {
         }
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Fixed fixture inputs must satisfy the validated constructor before the replay scenario runs"
+    )]
     fn test_capture(
         chain_id: u64,
         generation: u64,

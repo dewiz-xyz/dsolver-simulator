@@ -143,9 +143,9 @@ pub struct ScenarioReport {
     pub latency_ms: LatencySummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub encode_inspections: Vec<EncodeInspectionReport>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_files: Vec<String>,
 }
 
@@ -187,7 +187,7 @@ pub struct LogSummary {
     pub matched_lines: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt_file: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub highlights: Vec<String>,
 }
 
@@ -196,7 +196,7 @@ pub struct LogSourceSummary {
     pub source: String,
     pub log_file: String,
     pub matched_lines: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub highlights: Vec<String>,
 }
 
@@ -222,7 +222,7 @@ pub struct ScenarioDiff {
     pub error_rate_delta: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p90_delta_pct: Option<f64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
 
@@ -717,13 +717,15 @@ impl ReadinessSubscriptionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_findings, render_summary, AnalysisReport, Finding, LatencySummary, LogSourceSummary,
-        LogSummary, ReadinessReport, EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
+        build_findings, render_summary, AnalysisReport, BaselineComparison, Finding,
+        LatencySummary, LogSourceSummary, LogSummary, ReadinessReport, ScenarioDiff,
+        EXPECTED_RFQ_PROTOCOL_VISIBILITY_NOTE,
     };
     use super::{
         EncodeInspectionReport, ReadinessBackendSnapshot, ReadinessSnapshot,
         ReadinessSubscriptionSnapshot, RunMetadata, ScenarioReport,
     };
+    use serde_json::Result;
     use std::collections::BTreeMap;
 
     fn scenario(label: &str, degraded_count: usize, error_count: usize) -> ScenarioReport {
@@ -816,6 +818,34 @@ mod tests {
             findings,
             baseline: None,
         }
+    }
+
+    #[test]
+    fn saved_report_preserves_baseline_data_when_empty_lists_are_omitted() -> Result<()> {
+        let mut analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
+        analysis.baseline = Some(BaselineComparison {
+            compared_report_dir: "previous-run".to_string(),
+            scenario_diffs: vec![ScenarioDiff {
+                label: "core simulate".to_string(),
+                degraded_rate_delta: Some(0.0),
+                error_rate_delta: Some(0.0),
+                p90_delta_pct: None,
+                notes: Vec::new(),
+            }],
+        });
+
+        let saved = serde_json::to_value(&analysis)?;
+        assert!(saved["scenarios"][0].get("notes").is_none());
+        assert!(saved["scenarios"][0].get("evidence_files").is_none());
+        assert!(saved["logs"].get("highlights").is_none());
+        assert!(saved["logs"]["sources"][0].get("highlights").is_none());
+        assert!(saved["baseline"]["scenario_diffs"][0]
+            .get("notes")
+            .is_none());
+
+        let baseline: AnalysisReport = serde_json::from_value(saved.clone())?;
+        assert_eq!(serde_json::to_value(baseline)?, saved);
+        Ok(())
     }
 
     #[test]
@@ -1059,13 +1089,6 @@ mod tests {
         assert!(
             summary.contains("broadcaster: {\"level\":\"ERROR\",\"message\":\"snapshot failed\"}")
         );
-    }
-
-    #[test]
-    fn report_helper_uses_schema_version_seven() {
-        let analysis = report(Vec::new(), vec![scenario("core simulate", 0, 0)]);
-
-        assert_eq!(analysis.schema_version, 7);
     }
 
     #[test]

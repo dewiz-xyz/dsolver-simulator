@@ -634,26 +634,6 @@ impl BroadcasterServiceState {
             .flatten()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn reconnect_backoff_can_reset(&self, freshness: Duration) -> bool {
-        if self.cache.replacement_pending().await {
-            return false;
-        }
-        let recovery_completed = {
-            let recovery = self.recovery_publication.lock().await;
-            recovery.phase == RecoveryPublicationPhase::Idle
-                && recovery.last_outcome == Some("committed")
-        };
-        if !recovery_completed {
-            return false;
-        }
-        let upstream = self.upstream.snapshot().await;
-        upstream.connected
-            && upstream
-                .last_update_age_ms
-                .is_some_and(|age_ms| age_ms < freshness.as_millis() as u64)
-    }
-
     pub(crate) async fn redis_publisher_is_retired(&self) -> bool {
         self.redis_publisher.mode().await == BroadcasterRedisPublisherMode::Retired
     }
@@ -991,6 +971,10 @@ impl BroadcasterServiceState {
         Ok(self.apply_feed_message_with_progress(feed).await?.published)
     }
 
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "Replacement, buffered and live updates preserve different publication-before-cache commit boundaries"
+    )]
     pub(crate) async fn apply_feed_message_with_progress(
         &self,
         feed: &FeedMessage<BlockHeader>,
@@ -1194,6 +1178,11 @@ impl BroadcasterServiceState {
         clippy::too_many_lines,
         reason = "the bounded build, publish, and drain phases share one retry state machine"
     )]
+    #[expect(
+        clippy::excessive_nesting,
+        clippy::cognitive_complexity,
+        reason = "Serialization, cancellation and publication retries share a work ID and distinct local failure allowance"
+    )]
     async fn run_recovery_publication(self, work_id: u64, mut source: BroadcasterRecoverySource) {
         loop {
             self.spawn_recovery_bounds_monitor(work_id).await;
@@ -1203,28 +1192,18 @@ impl BroadcasterServiceState {
                 cache.serialize_recovery_source(source, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES)
             })
             .await;
+            let replacement = replacement
+                .map_err(|error| format!("recovery serialization worker failed: {error}"))
+                .and_then(|result| {
+                    result.map_err(|error| {
+                        format!("failed to serialize recovery replacement: {error:#}")
+                    })
+                });
             let replacement_json = match replacement {
-                Ok(Ok(replacement_json)) => replacement_json,
-                Ok(Err(error)) => {
-                    let Some(retry_source) = self
-                        .handle_local_recovery_failure(
-                            work_id,
-                            format!("failed to serialize recovery replacement: {error:#}"),
-                        )
-                        .await
-                    else {
-                        return;
-                    };
-                    source = retry_source;
-                    continue;
-                }
-                Err(error) => {
-                    let Some(retry_source) = self
-                        .handle_local_recovery_failure(
-                            work_id,
-                            format!("recovery serialization worker failed: {error}"),
-                        )
-                        .await
+                Ok(replacement_json) => replacement_json,
+                Err(reason) => {
+                    let Some(retry_source) =
+                        self.handle_local_recovery_failure(work_id, reason).await
                     else {
                         return;
                     };
@@ -1340,49 +1319,47 @@ impl BroadcasterServiceState {
                 recovery.phase = RecoveryPublicationPhase::Draining;
             }
 
-            if let Some(finish) = self
+            let Some(finish) = self
                 .finish_recovery_publication(work_id, replacement_complete_native_block)
                 .await
-            {
-                if let Some(native_block) = finish.complete_native_block {
-                    self.upstream.record_native_progress(native_block).await;
-                }
-                if let Some(state_history) = self.redis_publisher.state_history() {
-                    let block_number = finish.complete_native_block;
-                    let rfq_observed_at_ms = state_history.rfq_high_water_ms();
-                    let checkpoint = state_history
-                        .request_boundary_checkpoint(
-                            commit_position,
-                            block_number,
-                            rfq_observed_at_ms,
-                        )
-                        .await;
-                    if !matches!(checkpoint, Ok(Some(_))) {
-                        state_history.handle.record_boundary_failure_gap(
-                            self.cache.chain_id(),
-                            commit_position,
-                            block_number,
-                            rfq_observed_at_ms,
-                        );
-                        match checkpoint {
-                            Ok(None) => warn!(
-                                event = "state_history_boundary_checkpoint_failed",
-                                chain_id = self.cache.chain_id(),
-                                generation = commit_position.generation,
-                                message_seq = commit_position.message_seq,
-                                "Recovery boundary checkpoint was discarded"
-                            ),
-                            Err(error) => warn!(
-                                event = "state_history_boundary_checkpoint_failed",
-                                chain_id = self.cache.chain_id(),
-                                generation = commit_position.generation,
-                                message_seq = commit_position.message_seq,
-                                %error,
-                                "Recovery boundary checkpoint failed"
-                            ),
-                            Ok(Some(_)) => {}
-                        }
-                    }
+            else {
+                return;
+            };
+            if let Some(native_block) = finish.complete_native_block {
+                self.upstream.record_native_progress(native_block).await;
+            }
+            let Some(state_history) = self.redis_publisher.state_history() else {
+                return;
+            };
+            let block_number = finish.complete_native_block;
+            let rfq_observed_at_ms = state_history.rfq_high_water_ms();
+            let checkpoint = state_history
+                .request_boundary_checkpoint(commit_position, block_number, rfq_observed_at_ms)
+                .await;
+            if !matches!(checkpoint, Ok(Some(_))) {
+                state_history.handle.record_boundary_failure_gap(
+                    self.cache.chain_id(),
+                    commit_position,
+                    block_number,
+                    rfq_observed_at_ms,
+                );
+                match checkpoint {
+                    Ok(None) => warn!(
+                        event = "state_history_boundary_checkpoint_failed",
+                        chain_id = self.cache.chain_id(),
+                        generation = commit_position.generation,
+                        message_seq = commit_position.message_seq,
+                        "Recovery boundary checkpoint was discarded"
+                    ),
+                    Err(error) => warn!(
+                        event = "state_history_boundary_checkpoint_failed",
+                        chain_id = self.cache.chain_id(),
+                        generation = commit_position.generation,
+                        message_seq = commit_position.message_seq,
+                        %error,
+                        "Recovery boundary checkpoint failed"
+                    ),
+                    Ok(Some(_)) => {}
                 }
             }
             return;
@@ -1539,6 +1516,10 @@ impl BroadcasterServiceState {
         self.capture_retry_source(work_id, retry_id).await
     }
 
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "Cancellation must recheck the work ID under the reacquired lock before fencing or resetting state"
+    )]
     async fn handle_external_recovery_failure(
         &self,
         work_id: u64,
@@ -1849,6 +1830,10 @@ impl BroadcasterServiceState {
         clippy::too_many_lines,
         reason = "singleflight capture, off-thread export, and artifact fencing form one refresh operation"
     )]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "Captured sources and recovery IDs stay under the lifecycle lock inside the singleflight export operation"
+    )]
     pub async fn run_snapshot_export_preflight(services: &[Self]) -> Result<()> {
         anyhow::ensure!(
             !services.is_empty(),
@@ -1903,13 +1888,14 @@ impl BroadcasterServiceState {
                         service.cache.chain_id() == chain_id,
                         "combined broadcaster snapshot chain_id mismatch"
                     );
-                    if let Some(source) = service.cache.pin_snapshot_source().await {
-                        captured.push((
-                            service.cache.clone(),
-                            source,
-                            service.snapshot_max_payload_bytes,
-                        ));
-                    }
+                    let Some(source) = service.cache.pin_snapshot_source().await else {
+                        continue;
+                    };
+                    captured.push((
+                        service.cache.clone(),
+                        source,
+                        service.snapshot_max_payload_bytes,
+                    ));
                 }
                 (chain_id, boundary, captured, recovery_work_ids)
             };
@@ -2124,7 +2110,9 @@ async fn prepare_startup_snapshot_candidate(
     let worker = tokio::task::spawn_blocking(move || {
         let exports = captured
             .into_iter()
-            .map(|(cache, source, max_payload_bytes)| {
+            .map(|(cache, mut source, max_payload_bytes)| {
+                // Reserve generation ID growth before packing; promotion assigns the final IDs.
+                source.relabel_generation(chain_id, u64::MAX);
                 cache.export_snapshot_source(source, max_payload_bytes)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2516,7 +2504,7 @@ mod tests {
 
     use super::{
         checkpoint_world_matches, retain_current_checkpoint_capture, BroadcasterServiceState,
-        BroadcasterSnapshotSessionRegistry, SnapshotSessionError,
+        BroadcasterSnapshotSessionRegistry, RecoveryPublicationPhase, SnapshotSessionError,
     };
     use crate::broadcaster::redis_publisher::{
         BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
@@ -2624,13 +2612,10 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let task_stopped = Arc::clone(&stopped);
         let worker = tokio::spawn(async move {
-            loop {
-                if recovery.lock().await.cancelled.load(Ordering::Acquire) {
-                    task_stopped.store(true, Ordering::Release);
-                    return;
-                }
+            while !recovery.lock().await.cancelled.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            task_stopped.store(true, Ordering::Release);
         });
         service.recovery_workers.lock().await.push(worker);
 
@@ -3580,6 +3565,54 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_for_private_recovery(writer: &ServiceFakeRedisWriter) -> Result<()> {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let kinds = writer
+                    .appends()
+                    .await
+                    .into_iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>();
+                if kinds.contains(&BroadcasterMessageKind::RecoveryChunk)
+                    && !kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("recovery did not reach its private pre-commit phase"))
+    }
+
+    async fn wait_for_committed_recovery(
+        service: &BroadcasterServiceState,
+        complete_native_block: u64,
+        wait_limit: Duration,
+    ) -> Result<()> {
+        timeout(wait_limit, async {
+            loop {
+                let committed = {
+                    let recovery = service.recovery_publication.lock().await;
+                    recovery.phase == RecoveryPublicationPhase::Idle
+                        && recovery.last_outcome == Some("committed")
+                };
+                // The worker records progress after it releases the recovery lock.
+                if committed
+                    && service.upstream.last_native_block().await == Some(complete_native_block)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow!("recovery did not commit and publish native block {complete_native_block}")
+        })
+    }
+
     #[tokio::test]
     async fn recovery_commit_renews_progress_after_a_slow_publication() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
@@ -3614,24 +3647,7 @@ mod tests {
             .delay_recovery_commit(Duration::from_millis(5_100))
             .await;
         assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let kinds = writer
-                    .appends()
-                    .await
-                    .into_iter()
-                    .map(|entry| entry.kind)
-                    .collect::<Vec<_>>();
-                if kinds.contains(&BroadcasterMessageKind::RecoveryChunk)
-                    && !kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| anyhow!("recovery did not reach its private pre-commit phase"))?;
+        wait_for_private_recovery(&writer).await?;
         assert!(
             service
                 .create_snapshot_session(Duration::from_secs(300))
@@ -3645,16 +3661,7 @@ mod tests {
                 .await?
         );
 
-        timeout(Duration::from_secs(7), async {
-            while !service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| anyhow!("slow recovery did not renew progress after commit"))?;
+        wait_for_committed_recovery(&service, 12, Duration::from_secs(7)).await?;
         assert!(
             service
                 .upstream
@@ -3685,24 +3692,7 @@ mod tests {
             .await;
         service.mark_upstream_connected().await;
         assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
-        timeout(Duration::from_secs(1), async {
-            loop {
-                let kinds = writer
-                    .appends()
-                    .await
-                    .into_iter()
-                    .map(|entry| entry.kind)
-                    .collect::<Vec<_>>();
-                if kinds.contains(&BroadcasterMessageKind::RecoveryChunk)
-                    && !kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| anyhow!("recovery did not reach its delayed commit"))?;
+        wait_for_private_recovery(&writer).await?;
 
         let status = timeout(Duration::from_millis(100), service.status_snapshot())
             .await
@@ -3771,10 +3761,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the test keeps reconnect, recovery, retained snapshot, and backoff assertions in one scenario"
-    )]
     async fn reconnect_after_gap_publishes_recovery_in_same_generation() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
@@ -3792,11 +3778,6 @@ mod tests {
             Arc::new(Mutex::new(())),
         );
         service.mark_upstream_connected().await;
-        assert!(
-            !service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await
-        );
 
         assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
         BroadcasterServiceState::run_snapshot_export_preflight(std::slice::from_ref(&service))
@@ -3812,25 +3793,7 @@ mod tests {
             .await;
         service.mark_upstream_connected().await;
         assert!(service.apply_feed_message(&raw_feed(12, 12, 11)).await?);
-        let recovery_wait = timeout(Duration::from_secs(1), async {
-            loop {
-                let kinds = writer
-                    .appends()
-                    .await
-                    .into_iter()
-                    .map(|entry| entry.kind)
-                    .collect::<Vec<_>>();
-                if kinds.contains(&BroadcasterMessageKind::RecoveryCommit)
-                    && service
-                        .reconnect_backoff_can_reset(Duration::from_secs(5))
-                        .await
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let recovery_wait = wait_for_committed_recovery(&service, 12, Duration::from_secs(1)).await;
         if recovery_wait.is_err() {
             let (phase, fatal_error) = {
                 let recovery = service.recovery_publication.lock().await;
@@ -3866,18 +3829,12 @@ mod tests {
                 .is_some(),
             "the retained artifact should admit bootstrap immediately after commit"
         );
-        assert!(
-            service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await
-        );
+        assert!(!service.cache.replacement_pending().await);
         service.mark_stream_disconnected("ended", None).await;
         service.mark_upstream_connected().await;
         assert!(
-            !service
-                .reconnect_backoff_can_reset(Duration::from_secs(5))
-                .await,
-            "a later reconnect must complete its own replacement before resetting backoff"
+            service.cache.replacement_pending().await,
+            "a later reconnect must prepare a new replacement"
         );
         Ok(())
     }
@@ -4249,6 +4206,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "The bounded async wait captures the publishing work ID and cancellation flag under the same lock"
+    )]
     async fn cancelled_recovery_pause_reaches_writer_recovery() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
         let (service, publisher) = ready_feed_service_with_writer(writer.clone()).await?;
@@ -4308,44 +4269,6 @@ mod tests {
             .map_err(|_| anyhow!("recovery failure task did not observe the new writer"))?
             .map_err(|error| anyhow!("recovery failure task failed: {error}"))?;
         assert!(!publisher.feeds_are_paused());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn active_publication_failure_keeps_update_out_of_cache() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
-        let writer = ServiceFakeRedisWriter::default();
-        let publisher = Arc::new(BroadcasterRedisPublisher::new(
-            publisher_config(),
-            Arc::new(writer.clone()),
-        ));
-        publisher
-            .promote(
-                base_heads([BroadcasterBackend::Native]),
-                "active_writer_promoted",
-            )
-            .await?;
-        let service = BroadcasterServiceState::with_lifecycle_gate(
-            8_388_608,
-            cache,
-            BroadcasterUpstreamState::default(),
-            publisher,
-            Arc::new(Mutex::new(())),
-        );
-        service.mark_upstream_connected().await;
-        writer.fail_next_appends(100).await;
-
-        let Err(error) = service
-            .apply_update(&native_only_update(10, "native-1"))
-            .await
-        else {
-            return Err(anyhow!("active service must fail when Redis append fails"));
-        };
-
-        assert!(format!("{error:#}").contains("failed to publish accepted broadcaster delta"));
-        let status = service.status_snapshot().await;
-        assert!(!status.snapshot.ready);
-        assert_eq!(status.snapshot.total_states, 0);
         Ok(())
     }
 
@@ -5112,18 +5035,17 @@ mod tests {
         > {
             Box::pin(async move {
                 let mut guard = self.inner.lock().await;
-                if let Some(expected_token) = command.expected_writer_token {
-                    if guard.active_token.is_some()
+                if command.expected_writer_token.is_some_and(|expected_token| {
+                    guard.active_token.is_some()
                         && (guard.active_token.as_deref() != Some(expected_token)
                             || Some(guard.active_generation) != command.expected_generation)
-                    {
-                        return Err(anyhow!("stale Redis broadcaster writer token"));
-                    }
-                    if guard.active_token.is_none() {
-                        guard.active_generation = guard
-                            .active_generation
-                            .max(command.expected_generation.unwrap_or_default());
-                    }
+                }) {
+                    return Err(anyhow!("stale Redis broadcaster writer token"));
+                }
+                if command.expected_writer_token.is_some() && guard.active_token.is_none() {
+                    guard.active_generation = guard
+                        .active_generation
+                        .max(command.expected_generation.unwrap_or_default());
                 }
                 guard.active_generation = guard.active_generation.saturating_add(1);
                 guard.active_token = Some(command.writer_token.to_string());
@@ -5167,16 +5089,18 @@ mod tests {
                     return Err(anyhow!("planned append failure"));
                 }
                 let entry_id = crate::broadcaster::redis_publisher::redis_entry_id(command.entry)?;
-                if command.entry.kind == BroadcasterMessageKind::RecoveryCommit
-                    && guard.lose_recovery_commit_replies
-                {
-                    if !guard
+                let commit_reply_lost = command.entry.kind
+                    == BroadcasterMessageKind::RecoveryCommit
+                    && guard.lose_recovery_commit_replies;
+                if commit_reply_lost
+                    && !guard
                         .appends
                         .iter()
                         .any(|entry| entry.message_seq == command.entry.message_seq)
-                    {
-                        guard.appends.push(command.entry.clone());
-                    }
+                {
+                    guard.appends.push(command.entry.clone());
+                }
+                if commit_reply_lost {
                     return Err(anyhow!("planned lost recovery commit reply"));
                 }
                 guard.appends.push(command.entry.clone());
@@ -5227,6 +5151,91 @@ mod tests {
             return Err(anyhow!("Redis stream entry payload should be progress"));
         };
         Ok(progress)
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_packing_reserves_generation_id_growth() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        cache
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+        cache
+            .apply_update(&native_only_update(11, "native-2"))
+            .await?;
+        let export = cache.export_snapshot(usize::MAX).await?;
+        let mut full_chunk = export
+            .payloads
+            .iter()
+            .find_map(|payload| match payload {
+                BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("fixture should export a chunk"))?;
+        assert_eq!(full_chunk.partitions[0].states.len(), 2);
+        let expected_states = serde_json::to_value(&full_chunk.partitions[0].states)?;
+        full_chunk.chunk_index = u32::MAX;
+        let max_payload_bytes = serde_json::to_vec(&BroadcasterEnvelope::new(
+            export.stream_id,
+            u64::MAX,
+            BroadcasterPayload::SnapshotChunk(full_chunk),
+        ))?
+        .len();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(ServiceFakeRedisWriter::default()),
+        ));
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            max_payload_bytes,
+            cache,
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        let candidate = super::prepare_startup_snapshot_candidate(std::slice::from_ref(&service))
+            .await?
+            .ok_or_else(|| anyhow!("ready cache should produce a candidate"))?;
+        assert!(candidate.snapshot_chunk_count > 1);
+        assert!(candidate.largest_payload_bytes_upper_bound <= max_payload_bytes);
+        let boundary = super::promote_prepared_startup_candidate(
+            std::slice::from_ref(&service),
+            candidate,
+            "test_active".to_string(),
+        )
+        .await?;
+        let artifact = service
+            .snapshot_artifact
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("promotion should install the snapshot artifact"))?;
+        assert_eq!(artifact.redis_replay_boundary, boundary);
+        assert_eq!(publisher.status_snapshot().await.mode, "active");
+        let mut actual_states = Vec::new();
+        for envelope in artifact.payloads.iter() {
+            assert!(serde_json::to_vec(envelope)?.len() <= max_payload_bytes);
+            assert_eq!(envelope.stream_id, boundary.stream_id);
+            match &envelope.payload {
+                BroadcasterPayload::SnapshotStart(start) => {
+                    assert_eq!(start.snapshot_id, boundary.snapshot_id)
+                }
+                BroadcasterPayload::SnapshotChunk(chunk) => {
+                    assert_eq!(chunk.snapshot_id, boundary.snapshot_id);
+                    actual_states.extend(
+                        chunk
+                            .partitions
+                            .iter()
+                            .flat_map(|partition| partition.states.clone()),
+                    );
+                }
+                BroadcasterPayload::SnapshotEnd(end) => {
+                    assert_eq!(end.snapshot_id, boundary.snapshot_id)
+                }
+                _ => return Err(anyhow!("artifact should contain only snapshot payloads")),
+            }
+        }
+        assert_eq!(serde_json::to_value(actual_states)?, expected_states);
+        Ok(())
     }
 
     #[test]

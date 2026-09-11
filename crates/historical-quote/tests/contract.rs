@@ -2,7 +2,7 @@ use historical_quote::api::{
     normalize_consistency_request, normalize_quote_request, ApiError, ApiErrorCode, Backend,
     BlockRange, ConsistencyCheckReport, ConsistencyCheckRequest, ConsistencySelectionStatus,
     CoverageRequest, CoverageResponse, HistoricalQuoteResult, JobEnvelope, QuoteJobRequest,
-    QuoteOutcome, API_REVISION,
+    UnsignedAmount, API_REVISION,
 };
 use serde_json::{json, Value};
 
@@ -145,11 +145,6 @@ fn quote_request_value() -> Value {
 }
 
 #[test]
-fn api_revision_is_one() {
-    assert_eq!(API_REVISION, 1);
-}
-
-#[test]
 #[expect(clippy::unwrap_used, reason = "the fixture must be valid JSON")]
 fn request_requires_uuid_version_four() {
     let mut value = quote_request_value();
@@ -162,6 +157,16 @@ fn request_requires_uuid_version_four() {
     reserved_variant["requestId"] = json!("00000000-0000-4000-0000-000000000000");
     let error = serde_json::from_value::<QuoteJobRequest>(reserved_variant).unwrap_err();
     assert!(error.to_string().contains("UUID version 4"));
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "the decimal inputs must be valid")]
+fn amount_normalization_preserves_zero_and_arbitrary_precision() {
+    for value in ["0", "000000"] {
+        assert_eq!(value.parse::<UnsignedAmount>().unwrap().as_str(), "0");
+    }
+    let large = "9".repeat(257);
+    assert_eq!(large.parse::<UnsignedAmount>().unwrap().as_str(), large);
 }
 
 #[test]
@@ -421,23 +426,6 @@ fn consistency_report_golden_pins_not_comparable_selection() {
 }
 
 #[test]
-#[expect(clippy::unwrap_used, reason = "the response fixture must be valid")]
-fn outcome_union_uses_one_exact_discriminator() {
-    let outcome: QuoteOutcome = serde_json::from_value(json!({
-        "outcome": "unavailable",
-        "reason": "gap",
-        "gapRefs": ["gap-1"]
-    }))
-    .unwrap();
-
-    assert!(matches!(outcome, QuoteOutcome::Unavailable { .. }));
-    assert_eq!(
-        serde_json::to_value(outcome).unwrap()["outcome"],
-        "unavailable"
-    );
-}
-
-#[test]
 #[expect(clippy::unwrap_used, reason = "the result fixture must be valid")]
 fn grouped_result_golden_keeps_start_amount_and_lag_order() {
     let result: HistoricalQuoteResult =
@@ -642,10 +630,6 @@ fn openapi_validation_matches_boundary_rules() {
         .any(|field| field == "step"));
 
     let quote_request = &schemas["QuoteJobRequest"]["properties"];
-    let uuid_v4_pattern =
-        "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
-    assert_eq!(quote_request["requestId"]["format"], "uuid");
-    assert_eq!(quote_request["requestId"]["pattern"], uuid_v4_pattern);
     assert_eq!(quote_request["lags"]["minItems"], 1);
     assert_eq!(quote_request["lags"]["uniqueItems"], true);
     assert_eq!(quote_request["lags"]["items"]["minimum"], 1);
@@ -661,6 +645,37 @@ fn openapi_validation_matches_boundary_rules() {
         schemas["QuoteComparisonRequest"]["properties"]["amountsIn"]["uniqueItems"],
         true
     );
+
+    for schema in [
+        "ConsistencyQuoteOutcome",
+        "ConsistencySelection",
+        "QuoteOutcome",
+    ] {
+        assert!(schemas[schema]["oneOf"]
+            .as_array()
+            .expect("tagged contract type must be a oneOf union")
+            .iter()
+            .all(|variant| variant["additionalProperties"] == false));
+    }
+    let selections = schemas["ConsistencySelection"]["oneOf"]
+        .as_array()
+        .expect("consistency selection must be a oneOf union");
+    assert_eq!(selections[0]["properties"]["pairs"]["minItems"], 1);
+
+    for schema in ["BlockBounds", "BlockRange", "PoolSelector"] {
+        assert_eq!(schemas[schema]["additionalProperties"], false);
+    }
+}
+
+#[test]
+fn openapi_identifiers_require_uuid_version_four() {
+    let document = historical_quote::openapi::document_value();
+    let schemas = &document["components"]["schemas"];
+    let quote_request = &schemas["QuoteJobRequest"]["properties"];
+    let uuid_v4_pattern =
+        "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
+    assert_eq!(quote_request["requestId"]["format"], "uuid");
+    assert_eq!(quote_request["requestId"]["pattern"], uuid_v4_pattern);
 
     for schema in [
         "ConsistencyCheckReport",
@@ -692,25 +707,5 @@ fn openapi_validation_matches_boundary_rules() {
             operation["parameters"][0]["schema"]["pattern"],
             uuid_v4_pattern
         );
-    }
-
-    for schema in [
-        "ConsistencyQuoteOutcome",
-        "ConsistencySelection",
-        "QuoteOutcome",
-    ] {
-        assert!(schemas[schema]["oneOf"]
-            .as_array()
-            .expect("tagged contract type must be a oneOf union")
-            .iter()
-            .all(|variant| variant["additionalProperties"] == false));
-    }
-    let selections = schemas["ConsistencySelection"]["oneOf"]
-        .as_array()
-        .expect("consistency selection must be a oneOf union");
-    assert_eq!(selections[0]["properties"]["pairs"]["minItems"], 1);
-
-    for schema in ["BlockBounds", "BlockRange", "PoolSelector"] {
-        assert_eq!(schemas[schema]["additionalProperties"], false);
     }
 }

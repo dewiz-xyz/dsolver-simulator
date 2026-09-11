@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, str::FromStr};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryConfig {
@@ -11,7 +11,7 @@ pub struct MemoryConfig {
 
 impl MemoryConfig {
     pub fn from_env() -> Self {
-        let snapshots_min_interval_secs = parse_env_u64("STREAM_MEM_LOG_MIN_INTERVAL_SECS", 60);
+        let snapshots_min_interval_secs = parse_env("STREAM_MEM_LOG_MIN_INTERVAL_SECS", 60);
         assert!(
             snapshots_min_interval_secs > 0,
             "STREAM_MEM_LOG_MIN_INTERVAL_SECS must be > 0"
@@ -21,21 +21,13 @@ impl MemoryConfig {
             purge_enabled: parse_env_bool_strict("STREAM_MEM_PURGE", true),
             snapshots_enabled: parse_env_bool_strict("STREAM_MEM_LOG", true),
             snapshots_min_interval_secs,
-            snapshots_min_new_pairs: parse_env_usize("STREAM_MEM_LOG_MIN_NEW_PAIRS", 1000),
+            snapshots_min_new_pairs: parse_env("STREAM_MEM_LOG_MIN_NEW_PAIRS", 1000),
             snapshots_emit_emf: parse_env_bool_strict("STREAM_MEM_LOG_EMF", true),
         }
     }
 }
 
-fn parse_env_u64(key: &str, default: u64) -> u64 {
-    match env::var(key) {
-        Ok(value) => parse_or_panic(key, &value),
-        Err(env::VarError::NotPresent) => default,
-        Err(err) => read_env_or_panic(key, err),
-    }
-}
-
-fn parse_env_usize(key: &str, default: usize) -> usize {
+fn parse_env<T: FromStr>(key: &str, default: T) -> T {
     match env::var(key) {
         Ok(value) => parse_or_panic(key, &value),
         Err(env::VarError::NotPresent) => default,
@@ -69,7 +61,7 @@ fn parse_env_bool_strict(key: &str, default: bool) -> bool {
 )]
 fn parse_or_panic<T>(key: &str, value: &str) -> T
 where
-    T: std::str::FromStr,
+    T: FromStr,
 {
     match value.parse() {
         Ok(parsed) => parsed,

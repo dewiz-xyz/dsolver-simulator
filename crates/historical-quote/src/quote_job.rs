@@ -66,60 +66,59 @@ impl<S: HistorySource> HistoricalQuoteExecutor<S> {
             .await?;
         let mut quote_cache = BTreeMap::new();
         let mut results = Vec::with_capacity(start_blocks.len() * normalized.amounts_in.len());
-        for start_block in start_blocks {
-            for amount_in in &normalized.amounts_in {
+        let quote_inputs = start_blocks.iter().flat_map(|&start_block| {
+            normalized
+                .amounts_in
+                .iter()
+                .map(move |amount_in| (start_block, amount_in))
+        });
+        for (start_block, amount_in) in quote_inputs {
+            check_cancelled(cancellation)?;
+            let start_outcome = quote_at(
+                &timeline,
+                start_block,
+                amount_in,
+                &normalized.pool,
+                &self.service_revision,
+                &mut quote_cache,
+            );
+            let mut targets = Vec::with_capacity(normalized.lags.len());
+            for lag in &normalized.lags {
                 check_cancelled(cancellation)?;
-                let start_outcome = quote_at(
-                    &timeline,
-                    start_block,
-                    amount_in,
-                    &normalized.pool,
-                    &self.service_revision,
-                    &mut quote_cache,
-                );
-                let start_state_available =
-                    timeline.states.get(&start_block).is_some_and(Result::is_ok);
-                let mut targets = Vec::with_capacity(normalized.lags.len());
-                for lag in &normalized.lags {
-                    check_cancelled(cancellation)?;
-                    let target_block = start_block.checked_add(*lag).ok_or_else(|| {
-                        HistoricalError::InvalidSelector(
-                            "start block plus lag exceeds the block number range".to_owned(),
-                        )
-                    })?;
-                    let outcome = if !start_state_available {
-                        unavailable_from_start(&timeline, start_block)
-                    } else if let Some(gap_refs) =
-                        relative_gap_refs(&timeline, start_block, target_block)
-                    {
-                        QuoteOutcome::Unavailable {
-                            reason: UnavailableReason::Gap,
-                            gap_refs,
-                        }
-                    } else {
-                        quote_at(
-                            &timeline,
-                            target_block,
-                            amount_in,
-                            &normalized.pool,
-                            &self.service_revision,
-                            &mut quote_cache,
-                        )
-                    };
-                    targets.push(HistoricalQuoteTarget {
-                        lag: *lag,
+                // Every start/lag sum was checked before reconstruction.
+                let target_block = start_block + *lag;
+                let outcome = if matches!(&start_outcome, QuoteOutcome::Unavailable { .. }) {
+                    start_outcome.clone()
+                } else if let Some(gap_refs) =
+                    relative_gap_refs(&timeline, start_block, target_block)
+                {
+                    QuoteOutcome::Unavailable {
+                        reason: UnavailableReason::Gap,
+                        gap_refs,
+                    }
+                } else {
+                    quote_at(
+                        &timeline,
                         target_block,
-                        outcome,
-                    });
-                    progress.quote_comparison_completed();
-                }
-                results.push(HistoricalQuoteEntry {
-                    start_block,
-                    amount_in: amount_in.clone(),
-                    start_outcome,
-                    targets,
+                        amount_in,
+                        &normalized.pool,
+                        &self.service_revision,
+                        &mut quote_cache,
+                    )
+                };
+                targets.push(HistoricalQuoteTarget {
+                    lag: *lag,
+                    target_block,
+                    outcome,
                 });
+                progress.quote_comparison_completed();
             }
+            results.push(HistoricalQuoteEntry {
+                start_block,
+                amount_in: amount_in.clone(),
+                start_outcome,
+                targets,
+            });
         }
         Ok(HistoricalQuoteResult {
             request_id: request.request_id,
@@ -132,15 +131,15 @@ impl<S: HistorySource> HistoricalQuoteExecutor<S> {
     }
 }
 
-fn quote_at(
+fn quote_at<'a>(
     timeline: &ReconstructedTimeline,
     block: u64,
-    amount_in: &UnsignedAmount,
+    amount_in: &'a UnsignedAmount,
     pool: &PoolSelector,
     service_revision: &str,
-    cache: &mut BTreeMap<(u64, UnsignedAmount), QuoteOutcome>,
+    cache: &mut BTreeMap<(u64, &'a UnsignedAmount), QuoteOutcome>,
 ) -> QuoteOutcome {
-    let key = (block, amount_in.clone());
+    let key = (block, amount_in);
     if let Some(outcome) = cache.get(&key) {
         return outcome.clone();
     }
@@ -230,19 +229,6 @@ pub(crate) fn quote_failure_reason(error: &ReplayQuoteError) -> QuoteFailureReas
         ReplayQuoteError::SimulationFailed(_)
         | ReplayQuoteError::SimulationPanicked(_)
         | ReplayQuoteError::AmountOverflow => QuoteFailureReason::SimulationFailed,
-    }
-}
-
-fn unavailable_from_start(timeline: &ReconstructedTimeline, start_block: u64) -> QuoteOutcome {
-    match timeline.states.get(&start_block) {
-        Some(Err(unavailable)) => QuoteOutcome::Unavailable {
-            reason: unavailable.reason,
-            gap_refs: unavailable.gap_refs.clone(),
-        },
-        _ => QuoteOutcome::Unavailable {
-            reason: UnavailableReason::StateApplicationInvalid,
-            gap_refs: Vec::new(),
-        },
     }
 }
 

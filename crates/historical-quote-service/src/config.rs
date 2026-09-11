@@ -294,7 +294,7 @@ fn object_store_config() -> Result<ObjectStoreConfig, ConfigError> {
         prefix: required("DSOLVER_HISTORY_S3_PREFIX")?,
         region: required("AWS_REGION")?,
         endpoint_url: env::var("DSOLVER_HISTORY_S3_ENDPOINT_URL").ok(),
-        force_path_style: parse_bool_optional("DSOLVER_HISTORY_S3_FORCE_PATH_STYLE", false)?,
+        force_path_style: parse_optional("DSOLVER_HISTORY_S3_FORCE_PATH_STYLE", false)?,
     })
 }
 
@@ -330,10 +330,6 @@ where
     value.parse().map_err(|_| ConfigError::Malformed(name))
 }
 
-fn parse_bool_optional(name: &'static str, default: bool) -> Result<bool, ConfigError> {
-    parse_optional(name, default)
-}
-
 fn parse_backends(value: &str) -> Result<Vec<Backend>, ConfigError> {
     let mut backends = Vec::new();
     let mut distinct = BTreeSet::new();
@@ -350,11 +346,6 @@ fn parse_backends(value: &str) -> Result<Vec<Backend>, ConfigError> {
             ));
         }
         backends.push(backend);
-    }
-    if backends.is_empty() {
-        return Err(ConfigError::Invalid(
-            "at least one backend must be enabled".to_owned(),
-        ));
     }
     Ok(backends)
 }

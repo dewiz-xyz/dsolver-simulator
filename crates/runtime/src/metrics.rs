@@ -6,7 +6,8 @@ use tracing::warn;
 use crate::broadcaster::state::{BroadcasterReadiness, BroadcasterStatusSnapshot};
 use crate::models::messages::{QuoteResultQuality, QuoteStatus};
 use crate::models::state::{
-    SimulatorBackendKind, SimulatorBackendReadiness, SimulatorStatusSnapshot,
+    SimulatorBackendKind, SimulatorBackendReadiness, SimulatorBackendStatusSnapshot,
+    SimulatorStatusSnapshot,
 };
 use simulator_core::broadcaster::BroadcasterBackend;
 
@@ -145,14 +146,7 @@ pub fn emit_broadcaster_recovery_outcome(
         json!(buffer_b_count as u64),
     );
 
-    match serde_json::to_string(&Value::Object(event)) {
-        Ok(line) => println!("{line}"),
-        Err(error) => warn!(
-            error = %error,
-            metric = "broadcaster_recovery_outcome",
-            "Failed to serialize EMF metric"
-        ),
-    }
+    emit_emf_event(event, "broadcaster_recovery_outcome");
 }
 
 pub fn emit_broadcaster_redis_transport_failure(operation: &'static str) {
@@ -384,7 +378,7 @@ pub fn emit_simulator_health_snapshot(snapshot: &SimulatorStatusSnapshot) {
     let native = backend(SimulatorBackendKind::Native);
     let vm = backend(SimulatorBackendKind::Vm);
     let rfq = backend(SimulatorBackendKind::Rfq);
-    let is_available = |backend: Option<&crate::models::state::SimulatorBackendStatusSnapshot>| {
+    let is_available = |backend: Option<&SimulatorBackendStatusSnapshot>| {
         backend.is_some_and(|status| status.readiness == SimulatorBackendReadiness::Ready)
     };
     let mut metrics = vec![
@@ -476,19 +470,10 @@ fn emit_gauge_snapshot(
         event.insert((*name).to_string(), json!(value));
     }
 
-    match serde_json::to_string(&Value::Object(event)) {
-        Ok(line) => println!("{line}"),
-        Err(error) => warn!(
-            error = %error,
-            metric = event_name,
-            "Failed to serialize EMF metric"
-        ),
-    }
+    emit_emf_event(event, event_name);
 }
 
 pub fn emit_jemalloc_snapshot(label: &str, allocated_bytes: usize, resident_bytes: usize) {
-    // Emit CloudWatch Embedded Metric Format as a raw JSON log line.
-    // Tracing's JSON wrapper would prevent EMF extraction, so we write directly to stdout.
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -518,19 +503,10 @@ pub fn emit_jemalloc_snapshot(label: &str, allocated_bytes: usize, resident_byte
         json!(resident_bytes as u64),
     );
 
-    match serde_json::to_string(&Value::Object(event)) {
-        Ok(line) => println!("{line}"),
-        Err(err) => warn!(
-            error = %err,
-            metric = "jemalloc_snapshot",
-            "Failed to serialize EMF metric"
-        ),
-    }
+    emit_emf_event(event, "jemalloc_snapshot");
 }
 
 fn emit_count_metric(metric_name: &str, dimensions: &[(&str, Value)]) {
-    // Emit CloudWatch Embedded Metric Format as a raw JSON log line.
-    // Tracing's JSON wrapper would prevent EMF extraction, so we write directly to stdout.
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -556,9 +532,14 @@ fn emit_count_metric(metric_name: &str, dimensions: &[(&str, Value)]) {
         event.insert((*name).to_string(), value.clone());
     }
 
+    emit_emf_event(event, metric_name);
+}
+
+fn emit_emf_event(event: Map<String, Value>, metric_name: &str) {
+    // Tracing's JSON wrapper prevents CloudWatch from extracting these metrics.
     match serde_json::to_string(&Value::Object(event)) {
         Ok(line) => println!("{line}"),
-        Err(err) => warn!(error = %err, metric = metric_name, "Failed to serialize EMF metric"),
+        Err(error) => warn!(error = %error, metric = metric_name, "Failed to serialize EMF metric"),
     }
 }
 

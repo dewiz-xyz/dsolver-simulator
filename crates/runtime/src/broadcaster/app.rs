@@ -366,9 +366,6 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let rfq_cache = rfq_backends
         .as_ref()
         .map(|backends| BroadcasterSnapshotCache::new(chain.id(), backends.clone()));
-    let rfq_upstream_state = rfq_cache
-        .as_ref()
-        .map(|_| BroadcasterUpstreamState::default());
     let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
     let recovery_retry_backoff = Duration::from_millis(config.stream_restart_backoff_min_ms);
     let native_progress_lease =
@@ -386,13 +383,11 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     let supervisor_cfg = build_supervisor_config(&config);
     let mut supervisors = Vec::new();
 
-    let rfq_service = if let (Some(rfq_cache), Some(rfq_upstream_state)) =
-        (rfq_cache, rfq_upstream_state)
-    {
+    let rfq_service = if let Some(rfq_cache) = rfq_cache {
         let service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
             config.tuning.snapshot_max_payload_bytes,
             rfq_cache,
-            rfq_upstream_state,
+            BroadcasterUpstreamState::default(),
             Arc::clone(&redis_publisher),
             Arc::clone(&publication_gate),
             recovery_retry_backoff,
@@ -807,82 +802,83 @@ fn spawn_promotion_task(
                     .await
                 }
                 BroadcasterRedisPublisherMode::Active => {
-                    if refreshing_recovered_snapshot {
-                        if let Err(error) =
-                            BroadcasterServiceState::run_snapshot_export_preflight(&services).await
-                        {
-                            info!(
-                                error = %error,
-                                "Recovered broadcaster snapshot refresh is not ready"
-                            );
-                        }
-                        if services[0].has_current_snapshot_artifact().await {
-                            refreshing_recovered_snapshot = false;
-                            info!("Recovered broadcaster snapshot artifact is ready");
-                        }
+                    if !refreshing_recovered_snapshot {
+                        continue;
+                    }
+                    if let Err(error) =
+                        BroadcasterServiceState::run_snapshot_export_preflight(&services).await
+                    {
+                        info!(
+                            error = %error,
+                            "Recovered broadcaster snapshot refresh is not ready"
+                        );
+                    }
+                    if services[0].has_current_snapshot_artifact().await {
+                        refreshing_recovered_snapshot = false;
+                        info!("Recovered broadcaster snapshot artifact is ready");
                     }
                     continue;
                 }
                 BroadcasterRedisPublisherMode::Retired => return,
             };
-            match result {
-                Ok(Some(boundary)) => {
-                    info!(
-                        stream_id = boundary.stream_id.as_str(),
-                        snapshot_id = boundary.snapshot_id.as_str(),
-                        generation = boundary.generation,
-                        "Broadcaster active writer promoted"
-                    );
-                    if let Some(state_history) = &state_history {
-                        let requested_block_number =
-                            BroadcasterServiceState::state_history_aligned_head(&services).await;
-                        let requested_rfq_observed_at_ms = state_history.rfq_high_water_ms();
-                        let position = StreamPosition {
-                            generation: boundary.generation,
-                            message_seq: boundary.exclusive_message_seq,
-                        };
-                        let checkpoint = BroadcasterServiceState::capture_state_history_checkpoint(
-                            &services,
-                            CheckpointKind::Boundary,
-                            Some(position),
-                            requested_block_number,
-                            requested_rfq_observed_at_ms,
-                        )
-                        .await;
-                        // Mirrors the recovery commit path: a promotion boundary that never
-                        // lands must leave a durable gap, not just a log line.
-                        if !matches!(checkpoint, Ok(Some(_))) {
-                            state_history.handle.record_boundary_failure_gap(
-                                services[0].chain_id(),
-                                position,
-                                requested_block_number,
-                                requested_rfq_observed_at_ms,
-                            );
-                        }
-                        match checkpoint {
-                            Ok(Some(_)) => {}
-                            Ok(None) => warn!(
-                                event = "state_history_boundary_checkpoint_failed",
-                                generation = boundary.generation,
-                                message_seq = boundary.exclusive_message_seq,
-                                "Broadcaster promotion state history checkpoint was discarded"
-                            ),
-                            Err(error) => warn!(
-                                event = "state_history_boundary_checkpoint_failed",
-                                generation = boundary.generation,
-                                message_seq = boundary.exclusive_message_seq,
-                                error = %error,
-                                "Broadcaster promotion state history checkpoint failed"
-                            ),
-                        }
-                    }
-                    refreshing_recovered_snapshot =
-                        mode == BroadcasterRedisPublisherMode::Unhealthy;
-                }
-                Ok(None) => {}
+            let boundary = match result {
+                Ok(Some(boundary)) => boundary,
+                Ok(None) => continue,
                 Err(error) => {
                     info!(error = %error, "Broadcaster active writer promotion skipped");
+                    continue;
                 }
+            };
+            info!(
+                stream_id = boundary.stream_id.as_str(),
+                snapshot_id = boundary.snapshot_id.as_str(),
+                generation = boundary.generation,
+                "Broadcaster active writer promoted"
+            );
+            refreshing_recovered_snapshot = mode == BroadcasterRedisPublisherMode::Unhealthy;
+            let Some(state_history) = &state_history else {
+                continue;
+            };
+            let requested_block_number =
+                BroadcasterServiceState::state_history_aligned_head(&services).await;
+            let requested_rfq_observed_at_ms = state_history.rfq_high_water_ms();
+            let position = StreamPosition {
+                generation: boundary.generation,
+                message_seq: boundary.exclusive_message_seq,
+            };
+            let checkpoint = BroadcasterServiceState::capture_state_history_checkpoint(
+                &services,
+                CheckpointKind::Boundary,
+                Some(position),
+                requested_block_number,
+                requested_rfq_observed_at_ms,
+            )
+            .await;
+            // Mirrors the recovery commit path: a promotion boundary that never
+            // lands must leave a durable gap, not just a log line.
+            if !matches!(checkpoint, Ok(Some(_))) {
+                state_history.handle.record_boundary_failure_gap(
+                    services[0].chain_id(),
+                    position,
+                    requested_block_number,
+                    requested_rfq_observed_at_ms,
+                );
+            }
+            match checkpoint {
+                Ok(Some(_)) => {}
+                Ok(None) => warn!(
+                    event = "state_history_boundary_checkpoint_failed",
+                    generation = boundary.generation,
+                    message_seq = boundary.exclusive_message_seq,
+                    "Broadcaster promotion state history checkpoint was discarded"
+                ),
+                Err(error) => warn!(
+                    event = "state_history_boundary_checkpoint_failed",
+                    generation = boundary.generation,
+                    message_seq = boundary.exclusive_message_seq,
+                    error = %error,
+                    "Broadcaster promotion state history checkpoint failed"
+                ),
             }
         }
     })

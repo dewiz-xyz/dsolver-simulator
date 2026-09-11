@@ -7,6 +7,7 @@ use serde::Deserialize;
 use simulator_core::models::protocol::ProtocolKind;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
+use super::ChainProfile;
 use crate::models::erc4626::Erc4626PairPolicy;
 
 pub(crate) const MANIFEST_PATH: &str = "simulator-manifest.toml";
@@ -36,24 +37,11 @@ pub(crate) struct ManifestRegistries {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedChainConfig {
-    pub(crate) chain_profile: ResolvedChainProfile,
+    pub(crate) chain_profile: ChainProfile,
     pub(crate) tycho_url: String,
     pub(crate) bebop_url: String,
     pub(crate) hashflow_filename: String,
     pub(crate) liquorice_url: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedChainProfile {
-    pub(crate) chain: Chain,
-    pub(crate) native_protocols: Vec<String>,
-    pub(crate) vm_protocols: Vec<String>,
-    pub(crate) rfq_protocols: Vec<String>,
-    pub(crate) native_progress_lease_secs: u64,
-    pub(crate) recovery_max_buffered_native_blocks: usize,
-    pub(crate) native_token_protocol_allowlist: Vec<String>,
-    pub(crate) reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
-    pub(crate) erc4626_pair_policies: Vec<Erc4626PairPolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,7 +167,7 @@ pub(crate) fn resolve_chain_config(
     }
 
     Ok(ResolvedChainConfig {
-        chain_profile: ResolvedChainProfile {
+        chain_profile: ChainProfile {
             chain: chain_from_id(chain.chain_id)?,
             native_protocols: chain.native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),

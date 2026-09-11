@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use historical_quote::api::{
     JobCounts, JobEnvelope, JobFailure, JobFailureCode, JobResult, JobState, JobSubmission, JobType,
 };
+use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -27,17 +28,13 @@ struct RegistryInner {
 #[derive(Default)]
 struct RegistryState {
     records: HashMap<Uuid, JobRecord>,
-    request_ids: HashMap<Uuid, RequestMapping>,
+    request_ids: HashMap<Uuid, Uuid>,
     queue: VecDeque<Uuid>,
     running: usize,
     reserved_decoded_bytes: u64,
     admission_open: bool,
     draining: bool,
     next_terminal_order: u64,
-}
-
-struct RequestMapping {
-    job_id: Uuid,
 }
 
 struct JobRecord {
@@ -145,10 +142,11 @@ pub(crate) struct RunnableJob {
     pub progress: ProgressReporter,
 }
 
-pub(crate) struct ScheduleBatch {
+pub(crate) struct ScheduleBatch<'a> {
     pub jobs: Vec<RunnableJob>,
     pub next_deadline: Option<Instant>,
     pub stopped: bool,
+    pub notified: Notified<'a>,
 }
 
 pub(crate) enum FinishedJob {
@@ -180,8 +178,8 @@ impl JobRegistry {
         let mut state = self.inner.state.lock().await;
         prune_expired(&mut state, &self.inner.limits, Instant::now());
         let request_id = job.request.request_id();
-        if let Some(mapping) = state.request_ids.get(&request_id) {
-            let Some(record) = state.records.get(&mapping.job_id) else {
+        if let Some(job_id) = state.request_ids.get(&request_id) {
+            let Some(record) = state.records.get(job_id) else {
                 return SubmitOutcome::InternalError;
             };
             if record.fingerprint != fingerprint {
@@ -235,18 +233,10 @@ impl JobRegistry {
             terminal_body: None,
             terminal_delivery_in_progress: false,
         };
-        state
-            .request_ids
-            .insert(request_id, RequestMapping { job_id });
+        state.request_ids.insert(request_id, job_id);
         state.queue.push_back(job_id);
+        let submission = record.submission(false, &state.queue);
         state.records.insert(job_id, record);
-        let Some(submission) = state
-            .records
-            .get(&job_id)
-            .map(|record| record.submission(false, &state.queue))
-        else {
-            return SubmitOutcome::InternalError;
-        };
         drop(state);
         self.inner.notify.notify_one();
         SubmitOutcome::Accepted(submission)
@@ -264,12 +254,12 @@ impl JobRegistry {
     pub async fn poll(&self, job_id: Uuid) -> PollOutcome {
         let mut state = self.inner.state.lock().await;
         prune_expired(&mut state, &self.inner.limits, Instant::now());
-        let queue = state.queue.clone();
-        let Some(record) = state.records.get_mut(&job_id) else {
+        let RegistryState { records, queue, .. } = &mut *state;
+        let Some(record) = records.get_mut(&job_id) else {
             return PollOutcome::NotFound;
         };
         if !is_terminal(record.state) {
-            return PollOutcome::Pending(Box::new(record.envelope(false, &queue)));
+            return PollOutcome::Pending(Box::new(record.envelope(false, queue)));
         }
         if record.terminal_delivery_in_progress {
             return PollOutcome::NotFound;
@@ -351,7 +341,9 @@ impl JobRegistry {
         state.admission_open && !state.draining
     }
 
-    pub(crate) async fn schedule(&self) -> ScheduleBatch {
+    pub(crate) async fn schedule(&self) -> ScheduleBatch<'_> {
+        // Capture broadcasts before checking state so shutdown cannot fall between the check and wait.
+        let notified = self.inner.notify.notified();
         let mut state = self.inner.state.lock().await;
         let now = Instant::now();
         expire_queued_deadlines(&mut state, &self.inner.limits, now);
@@ -412,6 +404,7 @@ impl JobRegistry {
             jobs,
             next_deadline,
             stopped,
+            notified,
         }
     }
 
@@ -420,10 +413,6 @@ impl JobRegistry {
         finish_locked(&mut state, &self.inner.limits, job_id, outcome);
         drop(state);
         self.inner.notify.notify_one();
-    }
-
-    pub(crate) async fn notified(&self) {
-        self.inner.notify.notified().await;
     }
 
     pub(crate) async fn consume(&self, job_id: Uuid) {
@@ -647,5 +636,93 @@ fn internal_failure() -> JobFailure {
         message: "job result could not be prepared".to_owned(),
         retryable: false,
         details: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use anyhow::{Context, Result};
+    use tokio::time::timeout;
+
+    use super::{
+        FinishedJob, JobLimits, JobRegistry, JobRequest, JobState, ScheduledJob, SubmitOutcome,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_an_empty_schedule_wakes_every_waiter() -> Result<()> {
+        let registry = JobRegistry::new(JobLimits::default());
+        let first = registry.schedule().await;
+        let second = registry.schedule().await;
+        assert!(first.jobs.is_empty() && second.jobs.is_empty());
+        assert!(!first.stopped && !second.stopped);
+        assert!(first.next_deadline.is_none() && second.next_deadline.is_none());
+        let first_notification = first.notified;
+        let second_notification = second.notified;
+
+        // Shutdown lands after state inspection, before either scheduler polls its wait.
+        registry.begin_shutdown().await;
+        assert!(registry.snapshot().await.draining);
+        timeout(Duration::from_secs(1), async {
+            first_notification.await;
+            second_notification.await;
+        })
+        .await
+        .context("shutdown must wake every scheduler that already checked its state")?;
+        assert!(registry.schedule().await.stopped);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submission_and_completion_wake_a_scheduler_before_it_polls() -> Result<()> {
+        let registry = JobRegistry::new(JobLimits::default());
+        let empty = registry.schedule().await;
+        assert!(empty.jobs.is_empty());
+        let admission_notification = empty.notified;
+        let request = serde_json::from_value(serde_json::json!({
+            "requestId": "00000000-0000-4000-8000-000000000001",
+            "apiRevision": 1,
+            "timeoutMs": 60000,
+            "chainId": 8453,
+            "pool": {
+                "backend": "native",
+                "protocol": "uniswap_v3",
+                "componentId": "pool-1",
+                "tokenIn": "0x01",
+                "tokenOut": "0x02"
+            },
+            "blocks": {"start": 100, "endInclusive": 100, "step": 1},
+            "lags": [1],
+            "amountsIn": ["1"]
+        }))?;
+        let submitted = registry
+            .submit(ScheduledJob::new(JobRequest::HistoricalQuote(request), 1))
+            .await;
+        assert!(matches!(submitted, SubmitOutcome::Accepted(_)));
+        timeout(Duration::from_secs(1), admission_notification)
+            .await
+            .context("submission must wake the scheduler")?;
+
+        let running = registry.schedule().await;
+        assert_eq!(running.jobs.len(), 1);
+        let job_id = running.jobs[0].job_id;
+        let completion_notification = running.notified;
+        assert_eq!(registry.snapshot().await.reserved_decoded_bytes, 1);
+        registry.finish(job_id, FinishedJob::Cancelled).await;
+        timeout(Duration::from_secs(1), completion_notification)
+            .await
+            .context("completion must wake the scheduler")?;
+        assert_eq!(registry.snapshot().await.reserved_decoded_bytes, 0);
+        assert_eq!(
+            registry
+                .inspect(job_id)
+                .await
+                .context("job must remain retained")?
+                .state,
+            JobState::Cancelled
+        );
+        assert!(registry.schedule().await.jobs.is_empty());
+        Ok(())
     }
 }

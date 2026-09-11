@@ -401,7 +401,7 @@ start_broadcaster_if_local() {
 
   (
     cd "$repo"
-    HOST="$bind_host" PORT="$bind_port" nohup cargo run -p apps --bin dsolver-tycho-broadcaster-service --release > "$broadcaster_log_file" 2>&1 &
+    HOST="$bind_host" PORT="$bind_port" nohup cargo run --locked -p apps --bin dsolver-tycho-broadcaster-service --release > "$broadcaster_log_file" 2>&1 &
     echo $! > "$broadcaster_pid_file"
   )
   write_broadcaster_metadata "$broadcaster_metadata_file" "$TYCHO_BROADCASTER_URL" "$bind_host" "$bind_port" "$status_url"
@@ -687,7 +687,7 @@ fi
 
 (
   cd "$repo"
-  nohup cargo run -p apps --bin dsolver-simulator-service --release > "$log_file" 2>&1 &
+  nohup cargo run --locked -p apps --bin dsolver-simulator-service --release > "$log_file" 2>&1 &
   echo $! > "$pid_file"
 )
 

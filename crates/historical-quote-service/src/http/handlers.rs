@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use historical_quote::api::{
@@ -30,9 +30,8 @@ pub async fn submit_quote(
     let request = request
         .map_err(|_| HttpError::invalid("request body is invalid", None))?
         .0;
-    validate_quote(&state, &request)?;
+    let dimensions = validate_quote(&state, &request)?;
     let request_id = request.request_id;
-    let dimensions = quote_dimensions(&request)?;
     let outcome = state
         .registry
         .submit(ScheduledJob::new(
@@ -183,7 +182,10 @@ pub async fn status(
     Ok(response)
 }
 
-fn validate_quote(state: &AppState, request: &QuoteJobRequest) -> Result<(), HttpError> {
+fn validate_quote(
+    state: &AppState,
+    request: &QuoteJobRequest,
+) -> Result<QuoteDimensions, HttpError> {
     validate_timeout(state, request.timeout_ms)?;
     validate_backends(state, &[request.pool.backend])?;
     let max_lag = request
@@ -222,7 +224,7 @@ fn validate_quote(state: &AppState, request: &QuoteJobRequest) -> Result<(), Htt
             serde_json::to_value(details).unwrap_or(serde_json::Value::Null),
         ));
     }
-    Ok(())
+    Ok(dimensions)
 }
 
 fn validate_consistency(
@@ -356,26 +358,21 @@ fn require_revision_header(headers: &HeaderMap) -> Result<(), HttpError> {
 }
 
 fn parse_job_id(value: &str) -> Result<Uuid, HttpError> {
-    let job_id = Uuid::parse_str(value).map_err(|_| {
-        HttpError::invalid(
-            "jobId must be a UUID version 4",
-            Some(serde_json::json!({"field": "jobId"})),
-        )
-    })?;
-    if is_uuid_v4(job_id) {
-        Ok(job_id)
-    } else {
-        Err(HttpError::invalid(
-            "jobId must be a UUID version 4",
-            Some(serde_json::json!({"field": "jobId"})),
-        ))
-    }
+    Uuid::parse_str(value)
+        .ok()
+        .filter(|job_id| is_uuid_v4(*job_id))
+        .ok_or_else(|| {
+            HttpError::invalid(
+                "jobId must be a UUID version 4",
+                Some(serde_json::json!({"field": "jobId"})),
+            )
+        })
 }
 
-fn insert_integer_header(response: &mut Response, name: axum::http::HeaderName, value: u64) {
-    if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
-        response.headers_mut().insert(name, value);
-    }
+fn insert_integer_header(response: &mut Response, name: HeaderName, value: u64) {
+    response
+        .headers_mut()
+        .insert(name, HeaderValue::from(value));
 }
 
 fn unavailable_dependencies() -> StatusDependencies {

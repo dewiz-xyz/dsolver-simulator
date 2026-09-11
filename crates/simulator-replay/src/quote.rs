@@ -7,7 +7,7 @@ use thiserror::Error;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     tycho_common::{
-        models::token::Token,
+        models::{token::Token, Chain},
         simulation::{
             errors::SimulationError,
             protocol_sim::{GetAmountOutResult, ProtocolSim},
@@ -88,11 +88,8 @@ impl StatePoint {
         let requested_token_out = self
             .token(&request.token_out)
             .ok_or_else(|| ReplayQuoteError::TokenMissing(request.token_out.clone()))?;
-        let (token_in, token_out) = simulation_tokens_for_component(
-            &requested_token_in,
-            &requested_token_out,
-            component.as_ref(),
-        );
+        let token_in = remap_native_token_for_component(requested_token_in, component.as_ref());
+        let token_out = remap_native_token_for_component(requested_token_out, component.as_ref());
         if !component_supports_direction(component.as_ref(), &token_in.address, &token_out.address)
         {
             return Err(ReplayQuoteError::DirectionUnsupported(
@@ -119,22 +116,21 @@ impl StatePoint {
     }
 }
 
-fn simulation_tokens_for_component(
-    token_in: &Token,
-    token_out: &Token,
-    component: &ProtocolComponent,
-) -> (Token, Token) {
-    (
-        remap_native_token_for_component(token_in, component),
-        remap_native_token_for_component(token_out, component),
-    )
-}
+fn remap_native_token_for_component(requested: Token, component: &ProtocolComponent) -> Token {
+    // Custom chains still need the registry lookup, which can fail after direct deserialization.
+    if !matches!(requested.chain, Chain::Custom(_))
+        && component
+            .tokens
+            .iter()
+            .any(|token| token.address == requested.address)
+    {
+        return requested;
+    }
 
-fn remap_native_token_for_component(requested: &Token, component: &ProtocolComponent) -> Token {
     let native = requested.chain.native_token();
     let wrapped = requested.chain.wrapped_native_token();
     if native.address == wrapped.address {
-        return requested.clone();
+        return requested;
     }
 
     let has_native = component
@@ -150,7 +146,7 @@ fn remap_native_token_for_component(requested: &Token, component: &ProtocolCompo
     } else if requested.address == native.address && has_wrapped && !has_native {
         wrapped
     } else {
-        requested.clone()
+        requested
     }
 }
 
@@ -210,4 +206,101 @@ fn panic_payload_message(payload: &(dyn Any + Send + 'static)) -> String {
         return message.clone();
     }
     "unknown panic payload".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::NaiveDateTime;
+    use tycho_simulation::tycho_common::models::Chain;
+
+    use super::*;
+
+    fn component(tokens: Vec<Token>) -> ProtocolComponent {
+        ProtocolComponent::new(
+            Bytes::from([1; 20]),
+            "uniswap_v2".to_owned(),
+            "uniswap_v2_pool".to_owned(),
+            Chain::Ethereum,
+            tokens,
+            Vec::new(),
+            HashMap::new(),
+            Bytes::new(),
+            NaiveDateTime::default(),
+        )
+    }
+
+    fn distinctive_metadata(mut token: Token) -> Token {
+        token.symbol = "REQUESTED".to_owned();
+        token.decimals = 7;
+        token.tax = 13;
+        token.gas = vec![None, Some(31), Some(47)];
+        token.quality = 59;
+        token
+    }
+
+    #[test]
+    fn remapping_preserves_metadata_without_alias_substitution() -> Result<(), serde_json::Error> {
+        let native = Chain::Ethereum.native_token();
+        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let ordinary = Token::new(&Bytes::from([2; 20]), "OTHER", 18, 0, &[], Chain::Base, 100);
+        let starknet_native = Chain::Starknet.native_token();
+        let cases = [
+            ("ordinary present", ordinary.clone(), vec![ordinary.clone()]),
+            ("ordinary absent", ordinary, Vec::new()),
+            ("native present", native.clone(), vec![native.clone()]),
+            ("wrapped present", wrapped.clone(), vec![wrapped.clone()]),
+            (
+                "both aliases native",
+                native.clone(),
+                vec![native.clone(), wrapped.clone()],
+            ),
+            (
+                "both aliases wrapped",
+                wrapped.clone(),
+                vec![native.clone(), wrapped.clone()],
+            ),
+            (
+                "duplicate native",
+                native.clone(),
+                vec![native.clone(), native],
+            ),
+            (
+                "duplicate wrapped",
+                wrapped.clone(),
+                vec![wrapped.clone(), wrapped],
+            ),
+            (
+                "equal alias present",
+                starknet_native.clone(),
+                vec![starknet_native.clone()],
+            ),
+            ("equal alias absent", starknet_native, Vec::new()),
+        ];
+
+        for (name, requested, component_tokens) in cases {
+            let requested = distinctive_metadata(requested);
+            let expected = serde_json::to_value(&requested)?;
+            let actual = remap_native_token_for_component(requested, &component(component_tokens));
+            assert_eq!(serde_json::to_value(actual)?, expected, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alias_substitution_uses_canonical_chain_metadata() -> Result<(), serde_json::Error> {
+        let native = Chain::Ethereum.native_token();
+        let wrapped = Chain::Ethereum.wrapped_native_token();
+        for (requested, expected) in [(wrapped.clone(), native.clone()), (native, wrapped)] {
+            let requested = distinctive_metadata(requested);
+            let component = component(vec![distinctive_metadata(expected.clone())]);
+            let actual = remap_native_token_for_component(requested, &component);
+            assert_eq!(
+                serde_json::to_value(actual)?,
+                serde_json::to_value(expected)?
+            );
+        }
+        Ok(())
+    }
 }

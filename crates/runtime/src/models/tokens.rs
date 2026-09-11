@@ -138,25 +138,23 @@ impl TokenStore {
 
     async fn fetch_token(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
         // Coalesce concurrent fetches for the same address using a watch channel.
-        {
-            let mut inflight = self.inflight.lock().await;
-            if let Some(rx) = inflight.get(address) {
-                let mut rx = rx.clone();
-                drop(inflight);
-                while rx.changed().await.is_ok() {
-                    if let Some(res) = rx.borrow().clone() {
-                        return res;
-                    }
+        let mut inflight = self.inflight.lock().await;
+        if let Some(rx) = inflight.get(address) {
+            let mut rx = rx.clone();
+            drop(inflight);
+            while rx.changed().await.is_ok() {
+                if let Some(res) = rx.borrow().clone() {
+                    return res;
                 }
-            } else {
-                let (tx, rx) = watch::channel(None);
-                inflight.insert(address.clone(), rx);
-                drop(inflight);
-                let res = self.fetch_token_inner(address, tx).await;
-                let mut inflight = self.inflight.lock().await;
-                inflight.remove(address);
-                return res;
             }
+        } else {
+            let (tx, rx) = watch::channel(None);
+            inflight.insert(address.clone(), rx);
+            drop(inflight);
+            let res = self.fetch_token_inner(address, tx).await;
+            let mut inflight = self.inflight.lock().await;
+            inflight.remove(address);
+            return res;
         }
 
         // If the watch channel closed unexpectedly, this caller becomes the new fetch owner.

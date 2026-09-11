@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shared broadcaster snapshot and Redis replay client."
 
 [dependencies]
+thiserror.workspace = true
 futures.workspace = true
 redis.workspace = true
 reqwest.workspace = true

@@ -57,3 +57,36 @@ impl SimulationExecutor {
             .map_err(|_| SimulationExecutionError::ResultDropped)?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::{SimulationExecutionError, SimulationExecutor};
+
+    #[tokio::test]
+    async fn run_returns_result_from_worker_thread() {
+        let caller_thread = thread::current().id();
+        let result = SimulationExecutor::new()
+            .run(move || (7, thread::current().id() != caller_thread))
+            .await;
+
+        assert!(matches!(result, Ok((7, true))));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        reason = "The test verifies that worker panics retain their distinct error variant"
+    )]
+    async fn run_reports_worker_panic() {
+        let result = SimulationExecutor::new()
+            .run(|| panic!("simulation worker panic"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SimulationExecutionError::WorkerPanicked(_))
+        ));
+    }
+}

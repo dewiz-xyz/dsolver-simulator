@@ -325,21 +325,22 @@ pub fn captured_state_from_export(
             }
             BroadcasterPayload::SnapshotChunk(chunk) => {
                 for partition in &chunk.partitions {
-                    if matches!(
+                    if !matches!(
                         partition.backend,
                         BroadcasterBackend::Native | BroadcasterBackend::Vm
                     ) {
-                        if let Some(previous) =
-                            backend_heads.insert(partition.backend, partition.block_number)
-                        {
-                            anyhow::ensure!(
-                                previous == partition.block_number,
-                                "checkpoint backend {} has inconsistent heads",
-                                partition.backend
-                            );
-                        }
-                        collect_message_block_times(&partition.messages, &mut block_times)?;
+                        continue;
                     }
+                    if let Some(previous) =
+                        backend_heads.insert(partition.backend, partition.block_number)
+                    {
+                        anyhow::ensure!(
+                            previous == partition.block_number,
+                            "checkpoint backend {} has inconsistent heads",
+                            partition.backend
+                        );
+                    }
+                    collect_message_block_times(&partition.messages, &mut block_times)?;
                 }
             }
             BroadcasterPayload::SnapshotEnd(_) => {}

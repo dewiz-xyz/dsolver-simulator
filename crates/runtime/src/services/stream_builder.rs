@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -117,6 +113,10 @@ pub struct BroadcasterProtocols {
     pub vm: Vec<String>,
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "keep the three ordered provider setups together so credentials, polling, and quote timeouts stay visible"
+)]
 pub async fn build_rfq_stream(
     tvl_add_threshold: f64,
     token_stores: RFQTokenStores,
@@ -136,11 +136,8 @@ pub async fn build_rfq_stream(
 
     if rfq_protocol_enabled(protocols, "rfq:bebop") {
         info!("Setting up Bebop RFQ client...\n");
-        let mut rfq_tokens_bebop = HashSet::new();
-        for bebop_token_addr in token_stores.bebop.snapshot().await.keys().clone() {
-            rfq_tokens_bebop.insert(bebop_token_addr.clone());
-        }
-        let bebop_client = BebopClientBuilder::new(chain, rfq_config.bebop_key.clone())
+        let rfq_tokens_bebop = token_stores.bebop.snapshot().await.into_keys().collect();
+        let bebop_client = BebopClientBuilder::new(chain, rfq_config.bebop_key)
             .tokens(rfq_tokens_bebop)
             .tvl_threshold(tvl_add_threshold)
             .quote_timeout(RFQ_QUOTE_TIMEOUT)
@@ -151,14 +148,8 @@ pub async fn build_rfq_stream(
 
     if rfq_protocol_enabled(protocols, "rfq:hashflow") {
         info!("Setting up Hashflow RFQ client...\n");
-        let (user, key) = (
-            rfq_config.hashflow_user.clone(),
-            rfq_config.hashflow_key.clone(),
-        );
-        let mut rfq_tokens_hashflow = HashSet::new();
-        for hashflow_token_addr in token_stores.hashflow.snapshot().await.keys() {
-            rfq_tokens_hashflow.insert(hashflow_token_addr.clone());
-        }
+        let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
+        let rfq_tokens_hashflow = token_stores.hashflow.snapshot().await.into_keys().collect();
         let hashflow_client = HashflowClientBuilder::new(chain, user, key)
             .tokens(rfq_tokens_hashflow)
             .tvl_threshold(tvl_add_threshold)
@@ -172,14 +163,13 @@ pub async fn build_rfq_stream(
 
     if rfq_protocol_enabled(protocols, "rfq:liquorice") {
         info!("Setting up Liquorice RFQ client...\n");
-        let (user, key) = (
-            rfq_config.liquorice_user.clone(),
-            rfq_config.liquorice_key.clone(),
-        );
-        let mut rfq_tokens_liquorice = HashSet::new();
-        for liquorice_token_addr in token_stores.liquorice.snapshot().await.keys() {
-            rfq_tokens_liquorice.insert(liquorice_token_addr.clone());
-        }
+        let (user, key) = (rfq_config.liquorice_user, rfq_config.liquorice_key);
+        let rfq_tokens_liquorice = token_stores
+            .liquorice
+            .snapshot()
+            .await
+            .into_keys()
+            .collect();
         let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
             .tokens(rfq_tokens_liquorice)
             .tvl_threshold(tvl_add_threshold)
@@ -193,7 +183,7 @@ pub async fn build_rfq_stream(
     }
 
     info!("Building RFQ Stream...\n");
-    let (tx, /* mut */ rx) = mpsc::channel::<Update>(100);
+    let (tx, rx) = mpsc::channel::<Update>(100);
 
     let decoder_tokens = rfq_decoder_tokens(
         &token_stores.tokens,
@@ -205,8 +195,6 @@ pub async fn build_rfq_stream(
     rfq_builder = rfq_builder.set_tokens(decoder_tokens).await;
     tokio::spawn(rfq_builder.build(tx));
     info!("Connected to RFQs! Streaming live price levels...\n");
-
-    // todo consider implementing register_rfq_protocol...
 
     Ok(ReceiverStream::new(rx).map(Ok).boxed())
 }

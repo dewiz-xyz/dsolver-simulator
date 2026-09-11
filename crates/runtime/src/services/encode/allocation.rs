@@ -11,9 +11,6 @@ use super::EncodeError;
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
 
 fn mul_bps(amount: &BigUint, bps: u32) -> BigUint {
-    if bps == 0 {
-        return BigUint::zero();
-    }
     (amount * BigUint::from(bps)) / BigUint::from(BPS_DENOMINATOR)
 }
 
@@ -58,13 +55,13 @@ pub(super) fn allocate_amounts_by_bps(
                 )));
             }
             let amount = mul_bps(total, *share);
-            if last_index > 0 && amount.is_zero() {
+            if amount.is_zero() {
                 return Err(EncodeError::invalid(format!(
                     "{} {} rounds down to zero for this amountIn; increase amountIn or adjust {}",
                     label, field_name, field_name
                 )));
             }
-            allocated += amount.clone();
+            allocated += &amount;
             amounts.push(amount);
         } else {
             if *share != 0 {
@@ -123,16 +120,12 @@ pub(super) fn allocate_swaps_by_bps(
     )
     .map_err(AttemptError::deterministic)?;
 
-    for (index, swap) in swaps.iter().enumerate() {
-        let split = swap.split_bps;
-        let amount_in = amounts.get(index).cloned().ok_or_else(|| {
-            AttemptError::deterministic(EncodeError::internal("Missing swap amount allocation"))
-        })?;
+    for (swap, amount_in) in swaps.iter().zip(amounts) {
         allocations.push(AllocatedSwap {
             pool: swap.pool.clone(),
             token_in: swap.token_in.clone(),
             token_out: swap.token_out.clone(),
-            split_bps: split,
+            split_bps: swap.split_bps,
             amount_in,
         });
     }
