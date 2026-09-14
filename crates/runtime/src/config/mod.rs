@@ -32,6 +32,8 @@ pub struct ChainProfile {
     pub stream_initialization_timeout_secs: u64,
     /// Interval between independent observations of the configured chain's latest block.
     pub chain_head_poll_interval_ms: u64,
+    /// Timeout for each JSON-RPC request used to observe the chain head.
+    pub chain_head_rpc_request_timeout_ms: u64,
     /// Maximum age of a successful observation that may still justify serving state.
     pub chain_head_observation_max_age_secs: u64,
     /// Time from starting Tycho construction until all configured chain state is complete.
@@ -1137,6 +1139,7 @@ mod tests {
         assert_eq!(chain.hashflow_filename, "./hashflow_supported_tokens.csv");
         assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 25);
         assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 1000);
+        assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
         assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 15);
         assert_eq!(
             chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
@@ -1191,6 +1194,7 @@ mod tests {
         assert_eq!(chain.chain_profile.chain, Chain::Base);
         assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 10);
         assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 500);
+        assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
         assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 5);
         assert_eq!(
             chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
@@ -1257,6 +1261,7 @@ reset_allowance_tokens = []
 chain_id = 1
 stream_initialization_timeout_secs = 25
 chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
@@ -1309,11 +1314,13 @@ route_policy = "default"
     }
 
     #[test]
-    fn parse_manifest_rejects_invalid_chain_observation_and_recovery_timing() {
+    fn parse_manifest_rejects_missing_or_invalid_chain_timing() {
         let manifest = fs::read_to_string(manifest_path())
             .unwrap_or_else(|_| unreachable!("expected checked-in manifest"));
         for field in [
+            "stream_initialization_timeout_secs",
             "chain_head_poll_interval_ms",
+            "chain_head_rpc_request_timeout_ms",
             "chain_head_observation_max_age_secs",
             "tycho_initial_bootstrap_timeout_secs",
             "tycho_head_mismatch_recovery_timeout_secs",
@@ -1326,6 +1333,12 @@ route_policy = "default"
             let error = manifest::parse_manifest_registries(&invalid)
                 .err()
                 .unwrap_or_else(|| unreachable!("zero timing must fail"));
+            assert!(format!("{error:#}").contains(field));
+
+            let missing = manifest.replacen(line, "", 1);
+            let error = manifest::parse_manifest_registries(&missing)
+                .err()
+                .unwrap_or_else(|| unreachable!("missing timing must fail"));
             assert!(format!("{error:#}").contains(field));
         }
         let invalid = manifest.replacen(
@@ -1373,6 +1386,7 @@ reset_allowance_tokens = []
 chain_id = 1
 stream_initialization_timeout_secs = 25
 chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
@@ -1409,6 +1423,7 @@ reset_allowance_tokens = []
 chain_id = 1
 stream_initialization_timeout_secs = 25
 chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
@@ -1445,6 +1460,7 @@ reset_allowance_tokens = []
 chain_id = 999999
 stream_initialization_timeout_secs = 25
 chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
@@ -1491,6 +1507,7 @@ allow_share_to_asset = false
 chain_id = 1
 stream_initialization_timeout_secs = 25
 chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
@@ -1531,6 +1548,7 @@ reset_allowance_tokens = []
 chain_id = 1
 stream_initialization_timeout_secs = 25
 chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60

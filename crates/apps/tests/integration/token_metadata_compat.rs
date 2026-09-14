@@ -1,4 +1,5 @@
 use runtime::chain_head::ChainHeadObserver;
+use simulator_core::broadcaster::BlockIdentity;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,6 +204,13 @@ async fn handle_token_authority_request(
     Ok(())
 }
 
+fn fixture_head() -> BlockIdentity {
+    BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    }
+}
+
 fn parse_address(value: &str) -> Result<Bytes> {
     Ok(Bytes::from_str(value)?)
 }
@@ -242,7 +250,9 @@ async fn install_pool(
             make_component(component_address, tokens)?,
         )]),
     );
-    store.apply_update(update).await;
+    store
+        .apply_update_with_head(update, Some(fixture_head()))
+        .await;
     Ok(())
 }
 
@@ -264,7 +274,7 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
     native_stream_health.record_update(42).await;
 
     Ok(AppState {
-        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),

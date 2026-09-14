@@ -2,13 +2,14 @@ use std::cmp::Ordering;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use alloy_primitives::hex;
-use reqwest::Client;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use alloy_eips::BlockNumberOrTag;
+use alloy_provider::{Provider, RootProvider};
+use alloy_transport::{TransportError, TransportErrorKind};
 use simulator_core::broadcaster::BlockIdentity;
-use tokio::time::{interval, Instant, MissedTickBehavior};
+use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
+use tracing::subscriber::NoSubscriber;
 use tracing::{info, warn};
 use tycho_common::Bytes;
 
@@ -25,8 +26,6 @@ pub struct ChainHeadConfig {
 pub struct ChainHeadObserver {
     config: ChainHeadConfig,
     state: Arc<RwLock<ObserverState>>,
-    #[cfg(any(test, feature = "test-util"))]
-    unmonitored_for_test: bool,
 }
 
 #[derive(Default, Debug)]
@@ -53,15 +52,13 @@ pub struct ChainHeadSnapshot {
     pub last_error: Option<&'static str>,
     request_started_at: Option<Instant>,
     observation_max_age: Duration,
-    #[cfg(any(test, feature = "test-util"))]
-    unmonitored_for_test: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainHeadAgreement {
     Matches,
     AppliedStateIncomplete,
-    ChainAhead,
+    ObserverAhead,
     HashMismatch,
     ObserverBehind,
     ObservationUnavailable,
@@ -72,7 +69,7 @@ impl ChainHeadAgreement {
         match self {
             Self::Matches => "matches",
             Self::AppliedStateIncomplete => "applied_state_incomplete",
-            Self::ChainAhead => "chain_ahead",
+            Self::ObserverAhead => "observer_ahead",
             Self::HashMismatch => "hash_mismatch",
             Self::ObserverBehind => "observer_behind",
             Self::ObservationUnavailable => "observation_unavailable",
@@ -87,10 +84,6 @@ impl ChainHeadSnapshot {
     }
 
     pub fn agreement(&self, applied_head: Option<&BlockIdentity>) -> ChainHeadAgreement {
-        #[cfg(any(test, feature = "test-util"))]
-        if self.unmonitored_for_test {
-            return ChainHeadAgreement::Matches;
-        }
         if !self.is_observation_available() {
             return ChainHeadAgreement::ObservationUnavailable;
         }
@@ -101,18 +94,13 @@ impl ChainHeadSnapshot {
             return ChainHeadAgreement::AppliedStateIncomplete;
         };
         match observed_head.number.cmp(&applied_head.number) {
-            Ordering::Greater => ChainHeadAgreement::ChainAhead,
+            Ordering::Greater => ChainHeadAgreement::ObserverAhead,
             Ordering::Less => ChainHeadAgreement::ObserverBehind,
             Ordering::Equal if observed_head.hash != applied_head.hash => {
                 ChainHeadAgreement::HashMismatch
             }
             Ordering::Equal => ChainHeadAgreement::Matches,
         }
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn is_unmonitored_for_test(&self) -> bool {
-        self.unmonitored_for_test
     }
 }
 
@@ -121,8 +109,6 @@ impl ChainHeadObserver {
         Self {
             config,
             state: Arc::new(RwLock::new(ObserverState::default())),
-            #[cfg(any(test, feature = "test-util"))]
-            unmonitored_for_test: false,
         }
     }
 
@@ -145,13 +131,14 @@ impl ChainHeadObserver {
                 .as_ref()
                 .map(|value| value.request_started_at),
             observation_max_age: self.config.observation_max_age,
-            #[cfg(any(test, feature = "test-util"))]
-            unmonitored_for_test: self.unmonitored_for_test,
         }
     }
 
     pub async fn run(&self, rpc_url: &str, chain_id: u64, stop: CancellationToken) {
-        let client = Client::new();
+        let provider = rpc_url
+            .parse()
+            .map(RootProvider::new_http)
+            .map_err(|_| RpcFailure::Transport);
         let mut polling = interval(self.config.poll_interval);
         polling.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut chain_verified = false;
@@ -166,7 +153,13 @@ impl ChainHeadObserver {
             let observation = tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                result = self.poll(&client, rpc_url, chain_id, &mut chain_verified) => result,
+                // Alloy's HTTP spans include the RPC URL, which can contain credentials.
+                result = async {
+                    match &provider {
+                        Ok(provider) => self.poll(provider, chain_id, &mut chain_verified).await,
+                        Err(error) => Err(*error),
+                    }
+                }.with_subscriber(NoSubscriber::default()) => result,
             };
             let outage_transition =
                 self.record_observation_outcome(observation, request_started_at, chain_id);
@@ -218,52 +211,33 @@ impl ChainHeadObserver {
 
     async fn poll(
         &self,
-        client: &Client,
-        rpc_url: &str,
+        provider: &RootProvider,
         chain_id: u64,
         chain_verified: &mut bool,
     ) -> Result<BlockIdentity, RpcFailure> {
         if !*chain_verified {
-            let result = self
-                .request(client, rpc_url, "eth_chainId", json!([]))
-                .await?;
-            if parse_quantity(&result)? != chain_id {
+            let observed_chain_id =
+                timeout(self.config.rpc_request_timeout, provider.get_chain_id())
+                    .await
+                    .map_err(|_| RpcFailure::Timeout)?
+                    .map_err(RpcFailure::from_transport_error)?;
+            if observed_chain_id != chain_id {
                 return Err(RpcFailure::WrongChain);
             }
             *chain_verified = true;
         }
-        let result = self
-            .request(
-                client,
-                rpc_url,
-                "eth_getBlockByNumber",
-                json!(["latest", false]),
-            )
-            .await?;
-        parse_head(&result)
-    }
-
-    async fn request(
-        &self,
-        client: &Client,
-        rpc_url: &str,
-        method: &'static str,
-        params: Value,
-    ) -> Result<Value, RpcFailure> {
-        let response = client
-            .post(rpc_url)
-            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
-            .timeout(self.config.rpc_request_timeout)
-            .send()
-            .await
-            .map_err(RpcFailure::from_request_error)?
-            .error_for_status()
-            .map_err(|_| RpcFailure::HttpStatus)?;
-        let response = response
-            .json::<RpcResponse>()
-            .await
-            .map_err(RpcFailure::from_request_error)?;
-        response.result()
+        let block = timeout(
+            self.config.rpc_request_timeout,
+            provider.get_block_by_number(BlockNumberOrTag::Latest),
+        )
+        .await
+        .map_err(|_| RpcFailure::Timeout)?
+        .map_err(RpcFailure::from_transport_error)?
+        .ok_or(RpcFailure::InvalidResponse)?;
+        Ok(BlockIdentity {
+            number: block.header.number,
+            hash: Bytes::from(block.header.hash.as_slice()),
+        })
     }
 
     fn record_success(&self, head: BlockIdentity, request_started_at: Instant) -> bool {
@@ -313,37 +287,6 @@ impl ChainHeadObserver {
         observer.observe_for_test(head);
         observer
     }
-
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn unmonitored_for_test() -> Self {
-        let mut observer = Self::new(ChainHeadConfig {
-            poll_interval: Duration::from_secs(1),
-            rpc_request_timeout: Duration::from_secs(2),
-            observation_max_age: Duration::from_secs(120),
-        });
-        observer.unmonitored_for_test = true;
-        observer
-    }
-}
-
-#[derive(Deserialize)]
-struct RpcResponse {
-    jsonrpc: String,
-    id: u64,
-    result: Option<Value>,
-    error: Option<Value>,
-}
-
-impl RpcResponse {
-    fn result(self) -> Result<Value, RpcFailure> {
-        if self.jsonrpc != "2.0" || self.id != 1 {
-            return Err(RpcFailure::InvalidResponse);
-        }
-        if self.error.is_some() {
-            return Err(RpcFailure::JsonRpcError);
-        }
-        self.result.ok_or(RpcFailure::InvalidResponse)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,13 +300,12 @@ enum RpcFailure {
 }
 
 impl RpcFailure {
-    fn from_request_error(error: reqwest::Error) -> Self {
-        if error.is_timeout() {
-            Self::Timeout
-        } else if error.is_decode() {
-            Self::InvalidResponse
-        } else {
-            Self::Transport
+    fn from_transport_error(error: TransportError) -> Self {
+        match error {
+            TransportError::ErrorResp(_) => Self::JsonRpcError,
+            TransportError::NullResp | TransportError::DeserError { .. } => Self::InvalidResponse,
+            TransportError::Transport(TransportErrorKind::HttpError(_)) => Self::HttpStatus,
+            _ => Self::Transport,
         }
     }
 
@@ -379,37 +321,16 @@ impl RpcFailure {
     }
 }
 
-fn parse_quantity(value: &Value) -> Result<u64, RpcFailure> {
-    let digits = value
-        .as_str()
-        .and_then(|value| value.strip_prefix("0x"))
-        .filter(|digits| !digits.is_empty() && (digits.len() == 1 || !digits.starts_with('0')))
-        .filter(|digits| digits.bytes().all(|digit| digit.is_ascii_hexdigit()))
-        .ok_or(RpcFailure::InvalidResponse)?;
-    u64::from_str_radix(digits, 16).map_err(|_| RpcFailure::InvalidResponse)
-}
-
-fn parse_head(value: &Value) -> Result<BlockIdentity, RpcFailure> {
-    let number = parse_quantity(&value["number"])?;
-    let hash = value["hash"]
-        .as_str()
-        .and_then(|value| value.strip_prefix("0x"))
-        .filter(|value| value.len() == 64)
-        .ok_or(RpcFailure::InvalidResponse)?;
-    let hash = hex::decode(hash).map_err(|_| RpcFailure::InvalidResponse)?;
-    Ok(BlockIdentity {
-        number,
-        hash: Bytes::from(hash),
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use anyhow::{bail, Context, Result};
+    use alloy_primitives::B256;
+    use alloy_provider::network::{Ethereum, Network};
+    use anyhow::{bail, Context, Error, Result};
+    use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
-    use tokio::time::advance;
+    use tokio::time::{advance, pause, resume};
 
     use super::*;
 
@@ -460,12 +381,16 @@ mod tests {
     ) -> Result<(String, JoinHandle<Result<()>>)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = tokio::spawn(async move {
+        let serve = async move {
             for (method, result) in exchanges {
                 let (mut socket, _) = listener.accept().await?;
                 let request = read_http_request(&mut socket).await?;
                 assert_eq!(request["method"], method);
-                let response = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+                if method == "eth_getBlockByNumber" {
+                    assert_eq!(request["params"], json!(["latest", false]));
+                }
+                let response =
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result}).to_string();
                 socket
                     .write_all(
                         format!(
@@ -478,13 +403,17 @@ mod tests {
                 socket.shutdown().await?;
             }
             Ok(())
-        });
+        };
+        let server = tokio::spawn(async move { timeout(Duration::from_secs(5), serve).await? });
         Ok((format!("http://{address}"), server))
     }
 
     #[tokio::test]
     async fn polling_requires_the_configured_chain_before_reading_its_head() -> Result<()> {
-        let rpc_head = json!({"number": "0xa", "hash": format!("0x{}", "ab".repeat(32))});
+        let mut rpc_block = <Ethereum as Network>::BlockResponse::default();
+        rpc_block.header.number = 10;
+        rpc_block.header.hash = B256::repeat_byte(0xab);
+        let rpc_head = serde_json::to_value(rpc_block)?;
         let (url, server) = serve_rpc_responses(vec![
             ("eth_chainId", json!("0x1")),
             ("eth_chainId", json!("0x2105")),
@@ -493,20 +422,20 @@ mod tests {
         ])
         .await?;
         let observer = observer();
-        let client = Client::new();
+        let provider = RootProvider::new_http(url.parse()?);
         let mut verified = false;
         assert_eq!(
-            observer.poll(&client, &url, 8453, &mut verified).await,
+            observer.poll(&provider, 8453, &mut verified).await,
             Err(RpcFailure::WrongChain)
         );
         assert!(!verified);
         assert_eq!(
-            observer.poll(&client, &url, 8453, &mut verified).await,
+            observer.poll(&provider, 8453, &mut verified).await,
             Ok(head(10, 0xab))
         );
         assert!(verified);
         assert_eq!(
-            observer.poll(&client, &url, 8453, &mut verified).await,
+            observer.poll(&provider, 8453, &mut verified).await,
             Ok(head(10, 0xab))
         );
         server.await??;
@@ -598,7 +527,7 @@ mod tests {
         observer.observe_for_test(head(11, 4));
         assert_eq!(
             observer.snapshot().agreement(Some(&applied)),
-            ChainHeadAgreement::ChainAhead
+            ChainHeadAgreement::ObserverAhead
         );
         assert_eq!(
             observer.snapshot().agreement(None),
@@ -637,49 +566,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rpc_envelope_rejects_errors_null_results_and_unrelated_replies() -> Result<()> {
-        for response in [
-            json!({"jsonrpc": "2.0", "id": 1, "result": null}),
-            json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "secret RPC URL"}}),
-            json!({"jsonrpc": "2.0", "id": 1, "result": "0x1", "error": {"code": -1}}),
-            json!({"jsonrpc": "2.0", "id": 2, "result": "0x1"}),
-            json!({"jsonrpc": "1.0", "id": 1, "result": "0x1"}),
-        ] {
-            assert!(serde_json::from_value::<RpcResponse>(response)?
-                .result()
-                .is_err());
+    #[tokio::test]
+    async fn polling_bounds_each_rpc_request() -> Result<()> {
+        for (mut chain_verified, method) in [(false, "eth_chainId"), (true, "eth_getBlockByNumber")]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let provider =
+                RootProvider::new_http(format!("http://{}", listener.local_addr()?).parse()?);
+            let observer = observer();
+            let request_timeout = observer.config.rpc_request_timeout;
+            let polling =
+                tokio::spawn(
+                    async move { observer.poll(&provider, 8453, &mut chain_verified).await },
+                );
+            let (socket, request) = timeout(Duration::from_secs(5), async {
+                let (mut socket, _) = listener.accept().await?;
+                let request = read_http_request(&mut socket).await?;
+                Ok::<_, Error>((socket, request))
+            })
+            .await??;
+            assert_eq!(request["method"], method);
+            // Finish socket setup before advancing the clock manually.
+            pause();
+            advance(request_timeout).await;
+            assert_eq!(
+                timeout(Duration::from_secs(1), polling).await??,
+                Err(RpcFailure::Timeout)
+            );
+            drop(socket);
+            resume();
         }
-        let response: RpcResponse =
-            serde_json::from_value(json!({"jsonrpc": "2.0", "id": 1, "result": "0x1"}))?;
-        assert_eq!(response.result(), Ok(json!("0x1")));
         Ok(())
     }
 
-    #[test]
-    fn rpc_block_parser_requires_complete_block_identity_and_canonical_quantities() {
-        let valid_hash = format!("0x{}", "ab".repeat(32));
+    #[tokio::test]
+    async fn polling_rejects_a_missing_latest_block() -> Result<()> {
+        let (url, server) = serve_rpc_responses(vec![
+            ("eth_chainId", json!("0x2105")),
+            ("eth_getBlockByNumber", Value::Null),
+        ])
+        .await?;
+        let provider = RootProvider::new_http(url.parse()?);
+        let mut verified = false;
         assert_eq!(
-            parse_head(&json!({"number": "0xa", "hash": valid_hash})),
-            Ok(head(10, 0xab))
+            observer().poll(&provider, 8453, &mut verified).await,
+            Err(RpcFailure::InvalidResponse)
         );
-        for number in [
-            json!(10),
-            json!("10"),
-            json!("0x"),
-            json!("0x01"),
-            json!("0x+1"),
-            json!("0x10000000000000000"),
-        ] {
-            assert!(parse_head(&json!({"number": number, "hash": valid_hash})).is_err());
-        }
-        for hash in [
-            json!(null),
-            json!("0xab"),
-            json!("zz".repeat(32)),
-            json!(format!("0x{}", "gg".repeat(32))),
-        ] {
-            assert!(parse_head(&json!({"number": "0xa", "hash": hash})).is_err());
-        }
+        assert!(verified);
+        server.await??;
+        Ok(())
     }
 }

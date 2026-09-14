@@ -201,7 +201,10 @@ mod tests {
         });
         let (status, body) = get_json(app.clone(), "/ready").await?;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["backends"]["native"]["head_agreement"], "chain_ahead");
+        assert_eq!(
+            body["backends"]["native"]["head_agreement"],
+            "observer_ahead"
+        );
         assert_eq!(body["backends"]["native"]["published_head"]["number"], 10);
         assert_eq!(
             get_json(app.clone(), "/deployment-ready").await?.0,

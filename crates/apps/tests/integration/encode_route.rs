@@ -43,6 +43,13 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
 };
 use tycho_simulation::tycho_common::Bytes;
 
+fn fixture_head() -> BlockIdentity {
+    BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct EchoAmountSim;
 
@@ -110,9 +117,14 @@ impl PublishingEncoderState {
             Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
         )]);
         let new_pairs: HashMap<String, ProtocolComponent> = HashMap::new();
-        let update = Update::new(43, states, new_pairs);
+        // Change the pool publication without moving the chain head, so this exercises
+        // the touched-pool fence independently of the chain freshness fence.
+        let update = Update::new(42, states, new_pairs);
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.state_store.apply_update(update));
+            tokio::runtime::Handle::current().block_on(
+                self.state_store
+                    .apply_update_with_head(update, Some(fixture_head())),
+            );
         });
     }
 
@@ -597,11 +609,15 @@ async fn build_fixture_stores(
     let new_pairs = HashMap::from([(pool_id.to_string(), component)]);
     let update = Update::new(42, states, new_pairs);
     if config.vm_pool {
-        vm_state_store.apply_update(update).await;
+        vm_state_store
+            .apply_update_with_head(update, Some(fixture_head()))
+            .await;
     } else if config.rfq_pool {
         rfq_state_store.apply_update(update).await;
     } else {
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head()))
+            .await;
     }
     Ok((native_state_store, vm_state_store, rfq_state_store))
 }
@@ -668,7 +684,7 @@ async fn ensure_native_store_ready(
     )]);
     let new_pairs = HashMap::from([("native-ready".to_string(), component)]);
     native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
+        .apply_update_with_head(Update::new(42, states, new_pairs), Some(fixture_head()))
         .await;
     Ok(())
 }
@@ -762,7 +778,7 @@ async fn build_app_state_and_request(
     };
 
     let state = AppState {
-        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(test_rfq_client_config()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -840,14 +856,17 @@ async fn add_native_echo_pool(
     );
     state
         .native_state_store
-        .apply_update(Update::new(
-            43,
-            HashMap::from([(
-                pool_id.to_string(),
-                Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
-            )]),
-            HashMap::from([(pool_id.to_string(), component)]),
-        ))
+        .apply_update_with_head(
+            Update::new(
+                42,
+                HashMap::from([(
+                    pool_id.to_string(),
+                    Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(pool_id.to_string(), component)]),
+            ),
+            Some(fixture_head()),
+        )
         .await;
     Ok(())
 }
@@ -875,14 +894,17 @@ async fn add_vm_echo_pool(
     );
     state
         .vm_state_store
-        .apply_update(Update::new(
-            43,
-            HashMap::from([(
-                pool_id.to_string(),
-                Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
-            )]),
-            HashMap::from([(pool_id.to_string(), component)]),
-        ))
+        .apply_update_with_head(
+            Update::new(
+                42,
+                HashMap::from([(
+                    pool_id.to_string(),
+                    Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(pool_id.to_string(), component)]),
+            ),
+            Some(fixture_head()),
+        )
         .await;
     Ok(())
 }
@@ -934,7 +956,7 @@ async fn setup_timeout_app(
     let states = HashMap::from([(pool_id.clone(), sim)]);
     let new_pairs = HashMap::from([(pool_id.clone(), component)]);
     native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
+        .apply_update_with_head(Update::new(42, states, new_pairs), Some(fixture_head()))
         .await;
 
     let native_stream_health = Arc::new(StreamHealth::new());
@@ -943,7 +965,7 @@ async fn setup_timeout_app(
     let rfq_stream_health = Arc::new(StreamHealth::new());
 
     let state = AppState {
-        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -1982,7 +2004,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let vm_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
-        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),

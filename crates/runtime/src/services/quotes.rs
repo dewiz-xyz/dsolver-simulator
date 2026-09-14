@@ -3324,6 +3324,13 @@ mod tests {
         ]
     }
 
+    fn test_head(number: u8) -> BlockIdentity {
+        BlockIdentity {
+            number: u64::from(number),
+            hash: Bytes::from(vec![number; 32]),
+        }
+    }
+
     struct TestAppStateConfig {
         enable_vm_pools: bool,
         enable_rfq_pools: bool,
@@ -3351,7 +3358,7 @@ mod tests {
     ) -> AppState {
         AppState {
             chain: Chain::Ethereum,
-            chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+            chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head(1))),
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
             tokens: token_store,
@@ -3566,7 +3573,10 @@ mod tests {
             }),
         );
         state_store
-            .apply_update(Update::new(1, ready_states, ready_pairs))
+            .apply_update_with_head(
+                Update::new(1, ready_states, ready_pairs),
+                Some(test_head(1)),
+            )
             .await;
     }
 
@@ -3596,7 +3606,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         (limit_calls, quote_calls)
@@ -3985,7 +3995,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig {
@@ -4035,7 +4045,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -4083,7 +4093,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -4131,7 +4141,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -4194,7 +4204,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -4250,7 +4260,7 @@ mod tests {
         );
 
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = make_test_app_state(
@@ -4335,7 +4345,7 @@ mod tests {
         );
 
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = make_test_app_state(
@@ -4423,7 +4433,7 @@ mod tests {
         );
 
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = make_test_app_state(
@@ -4493,7 +4503,7 @@ mod tests {
         );
 
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = make_test_app_state(
@@ -4562,7 +4572,10 @@ mod tests {
             }),
         );
         native_state_store
-            .apply_update(Update::new(1, native_states, native_pairs))
+            .apply_update_with_head(
+                Update::new(1, native_states, native_pairs),
+                Some(test_head(1)),
+            )
             .await;
 
         let vm_limit_calls = Arc::new(AtomicUsize::new(0));
@@ -4585,7 +4598,7 @@ mod tests {
             }),
         );
         vm_state_store
-            .apply_update(Update::new(2, vm_states, vm_pairs))
+            .apply_update_with_head(Update::new(1, vm_states, vm_pairs), Some(test_head(1)))
             .await;
 
         let app_state = make_test_app_state(
@@ -4635,13 +4648,14 @@ mod tests {
         );
         fixture
             .vm_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
         let app_state = fixture.app_state(TestAppStateConfig {
             enable_vm_pools: true,
             ..TestAppStateConfig::default()
         });
         let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
+        let chain_head_observer = Arc::clone(&app_state.chain_head_observer);
         let request = fixture.request("req-vm-rebuild-guard", &["10"]);
         let quote_task = tokio::spawn(get_amounts_out(app_state, request, None));
 
@@ -4658,8 +4672,12 @@ mod tests {
         );
         fixture
             .vm_state_store
-            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .apply_update_with_head(
+                Update::new(2, replacement_states, HashMap::new()),
+                Some(test_head(2)),
+            )
             .await;
+        chain_head_observer.observe_for_test(test_head(2));
 
         drop(request_guard);
         let computation = tokio::time::timeout(Duration::from_millis(500), quote_task)
@@ -4692,7 +4710,7 @@ mod tests {
         );
         fixture
             .vm_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
         let app_state = fixture.app_state(TestAppStateConfig {
             enable_vm_pools: true,
@@ -4867,7 +4885,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
         let app_state = fixture.app_state(TestAppStateConfig::default());
         let request = fixture.request("req-native-subset-update", &["10"]);
@@ -4885,9 +4903,13 @@ mod tests {
             "native-pool-changed".to_string(),
             Box::new(LinearAmountSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
+        // Keep the chain identity unchanged so this only exercises pool state publication.
         fixture
             .native_state_store
-            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .apply_update_with_head(
+                Update::new(1, replacement_states, HashMap::new()),
+                Some(test_head(1)),
+            )
             .await;
 
         let computation = quote_task.await.expect("quote task should not panic");
@@ -4932,7 +4954,7 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
         let app_state = fixture.app_state(TestAppStateConfig::default());
         let request = fixture.request("req-native-fence-unavailable", &["10"]);
@@ -5346,7 +5368,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -5946,7 +5968,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -5995,7 +6017,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6035,7 +6057,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6075,7 +6097,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6117,7 +6139,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6167,7 +6189,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6362,7 +6384,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6429,7 +6451,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6504,7 +6526,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6552,7 +6574,7 @@ mod tests {
 
         fixture
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head(1)))
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
@@ -6653,10 +6675,14 @@ mod tests {
         );
         fixture
             .native_state_store
-            .apply_update(Update::new(2, newer_states, newer_pairs))
+            .apply_update_with_head(
+                Update::new(2, newer_states, newer_pairs),
+                Some(test_head(2)),
+            )
             .await;
 
         let app_state = fixture.app_state(TestAppStateConfig::default());
+        app_state.chain_head_observer.observe_for_test(test_head(2));
         let request = fixture.request("req-pinned-meta", &["1"]);
         let mut runner = QuoteRequestRunner::new(app_state, request, None).await;
         runner.native_pin = Some(pinned);

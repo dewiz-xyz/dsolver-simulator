@@ -908,7 +908,7 @@ impl BroadcasterHeadMismatches {
                     }
                 }
                 ChainHeadAgreement::AppliedStateIncomplete
-                | ChainHeadAgreement::ChainAhead
+                | ChainHeadAgreement::ObserverAhead
                 | ChainHeadAgreement::HashMismatch => {
                     let started_at = self.started_at.entry(*backend).or_insert_with(|| {
                         warn!(
@@ -1039,7 +1039,10 @@ mod tests {
         assert!(recovery
             .observe(
                 started,
-                &agreements(ChainHeadAgreement::Matches, ChainHeadAgreement::ChainAhead),
+                &agreements(
+                    ChainHeadAgreement::Matches,
+                    ChainHeadAgreement::ObserverAhead
+                ),
                 limit
             )
             .is_none());
@@ -1090,7 +1093,11 @@ mod tests {
         let mut recovery = BroadcasterHeadMismatches::default();
         let agreement = |value| BTreeMap::from([(BroadcasterBackend::Native, value)]);
         assert!(recovery
-            .observe(started, &agreement(ChainHeadAgreement::ChainAhead), limit)
+            .observe(
+                started,
+                &agreement(ChainHeadAgreement::ObserverAhead),
+                limit
+            )
             .is_none());
         for unknown in [
             ChainHeadAgreement::ObservationUnavailable,
@@ -1107,7 +1114,7 @@ mod tests {
         assert!(recovery
             .observe(
                 started + Duration::from_secs(301),
-                &agreement(ChainHeadAgreement::ChainAhead),
+                &agreement(ChainHeadAgreement::ObserverAhead),
                 limit
             )
             .is_some());
@@ -1220,7 +1227,7 @@ mod tests {
         assert!(exit
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("chain_ahead")));
+            .is_some_and(|error| error.contains("observer_ahead")));
         Ok(())
     }
 

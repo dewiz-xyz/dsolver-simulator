@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::NaiveDateTime;
+use simulator_core::broadcaster::BlockIdentity;
 use tokio::sync::RwLock;
 use tycho_simulation::protocol::models::ProtocolComponent;
 use tycho_simulation::tycho_common::models::token::Token;
@@ -128,7 +129,15 @@ fn erc4626_pair_policies() -> Vec<Erc4626PairPolicy> {
     ]
 }
 
+pub(super) fn fixture_head(number: u64) -> BlockIdentity {
+    BlockIdentity {
+        number,
+        hash: Bytes::from(vec![1; 32]),
+    }
+}
+
 pub(super) struct TestAppStateConfig {
+    pub(super) observed_head: BlockIdentity,
     pub(super) enable_vm_pools: bool,
     pub(super) enable_rfq_pools: bool,
     pub(super) erc4626_deposits_enabled: bool,
@@ -138,6 +147,7 @@ pub(super) struct TestAppStateConfig {
 impl Default for TestAppStateConfig {
     fn default() -> Self {
         Self {
+            observed_head: fixture_head(1),
             enable_vm_pools: false,
             enable_rfq_pools: false,
             erc4626_deposits_enabled: false,
@@ -155,7 +165,7 @@ pub(super) fn test_app_state(
 ) -> AppState {
     AppState {
         chain: Chain::Ethereum,
-        chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(config.observed_head)),
         rfq_client_config: Arc::new(RfqClientConfig::default()),
         native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
         tokens: token_store,

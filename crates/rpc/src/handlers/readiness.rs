@@ -254,6 +254,13 @@ mod tests {
         Token::new(&address(seed), symbol, 18, 0, &[], Chain::Ethereum, 100)
     }
 
+    fn test_head() -> BlockIdentity {
+        BlockIdentity {
+            number: 1,
+            hash: Bytes::from(vec![1; 32]),
+        }
+    }
+
     async fn seed_native_ready_store(state: &AppState) {
         let component = ProtocolComponent::new(
             address(3),
@@ -273,7 +280,7 @@ mod tests {
         let new_pairs = HashMap::from([("pool-native".to_string(), component)]);
         state
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head()))
             .await;
     }
 
@@ -286,7 +293,7 @@ mod tests {
             Duration::from_millis(10),
         ));
         AppState {
-            chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+            chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head())),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -395,14 +402,17 @@ mod tests {
         );
         state
             .vm_state_store
-            .apply_update(Update::new(
-                1,
-                HashMap::from([(
-                    "pool-vm".to_string(),
-                    Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
-                )]),
-                HashMap::from([("pool-vm".to_string(), vm_component)]),
-            ))
+            .apply_update_with_head(
+                Update::new(
+                    1,
+                    HashMap::from([(
+                        "pool-vm".to_string(),
+                        Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
+                    )]),
+                    HashMap::from([("pool-vm".to_string(), vm_component)]),
+                ),
+                Some(test_head()),
+            )
             .await;
         state.vm_stream_health.record_update(1).await;
         {

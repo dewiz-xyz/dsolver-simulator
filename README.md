@@ -222,6 +222,7 @@ The per-chain manifest keeps the clocks separate:
 | Setting | Base | Ethereum | What it bounds |
 | --- | ---: | ---: | --- |
 | `chain_head_poll_interval_ms` | 500 ms | 1,000 ms | Time between independent RPC observations |
+| `chain_head_rpc_request_timeout_ms` | 2,000 ms | 2,000 ms | Maximum duration of each chain head JSON-RPC request |
 | `chain_head_observation_max_age_secs` | 5 s | 15 s | How long a successful observation may justify serving |
 | `tycho_initial_bootstrap_timeout_secs` | 300 s | 900 s | Tycho construction through the first complete state for all configured chain backends |
 | `tycho_head_mismatch_recovery_timeout_secs` | 60 s | 60 s | Recovery of an established feed after confirmed divergence or incomplete state |
@@ -234,8 +235,8 @@ recovery incident. An expired recovery window with fresh divergence evidence, a 
 or a terminal feed failure follows the existing bounded process shutdown. `/deployment-ready`
 remains separate from serving readiness so ordinary recovery does not revoke deployment admission.
 
-Custom manifests must supply these timing settings. `stream_initialization_timeout_secs` replaces
-the old `native_progress_lease_secs` name; it no longer defines serving freshness or raw-feed lifetime.
+Custom manifests must supply these timing settings, including `chain_head_rpc_request_timeout_ms`.
+`stream_initialization_timeout_secs` replaces the old `native_progress_lease_secs` name; it no longer defines serving freshness or raw-feed lifetime.
 Production V2 `solve-base` uses its own Tycho path and is outside this behavior.
 
 Timeout behavior differs by endpoint:

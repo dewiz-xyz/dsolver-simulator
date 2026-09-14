@@ -2110,14 +2110,14 @@ fn backend_head_agreement(
         }
         (
             ChainHeadAgreement::AppliedStateIncomplete
-            | ChainHeadAgreement::ChainAhead
+            | ChainHeadAgreement::ObserverAhead
             | ChainHeadAgreement::HashMismatch,
             _,
         ) => local_agreement,
         (
             _,
             ChainHeadAgreement::AppliedStateIncomplete
-            | ChainHeadAgreement::ChainAhead
+            | ChainHeadAgreement::ObserverAhead
             | ChainHeadAgreement::HashMismatch,
         ) => published_agreement,
         (ChainHeadAgreement::ObserverBehind, _) | (_, ChainHeadAgreement::ObserverBehind) => {
@@ -2696,7 +2696,7 @@ mod tests {
         };
         for (published, expected) in [
             (None, ChainHeadAgreement::AppliedStateIncomplete),
-            (Some(&behind), ChainHeadAgreement::ChainAhead),
+            (Some(&behind), ChainHeadAgreement::ObserverAhead),
             (Some(&conflicting), ChainHeadAgreement::HashMismatch),
             (Some(&reference), ChainHeadAgreement::ObserverBehind),
         ] {

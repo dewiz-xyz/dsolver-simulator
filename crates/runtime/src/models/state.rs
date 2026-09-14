@@ -1915,7 +1915,7 @@ mod tests {
 
     fn build_test_app_state(stores: TestAppStateStores, flags: PoolFlags) -> AppState {
         AppState {
-            chain_head_observer: Arc::new(ChainHeadObserver::unmonitored_for_test()),
+            chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_block_head(1, 1))),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
@@ -1965,11 +1965,14 @@ mod tests {
             vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
         );
         native_state_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                native_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    native_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         build_test_app_state(
@@ -1991,16 +1994,19 @@ mod tests {
         state.native_stream_health.record_update(1).await;
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    38,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(39, "TKNA"), mk_token(40, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        38,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(39, "TKNA"), mk_token(40, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
             .rfq_state_store
@@ -2563,11 +2569,14 @@ mod tests {
         );
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                vm_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    vm_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
             .rfq_state_store
@@ -2613,16 +2622,19 @@ mod tests {
 
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    41,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(42, "TKNA"), mk_token(43, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        41,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(42, "TKNA"), mk_token(43, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
@@ -2787,16 +2799,19 @@ mod tests {
             },
         );
         vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    31,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        31,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         native_warming_vm_ready
             .vm_stream_health
@@ -2829,16 +2844,19 @@ mod tests {
 
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    36,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        36,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
             .rfq_state_store
@@ -3008,18 +3026,24 @@ mod tests {
         let vm_component = mk_component(21, "vm:curve", "curve_pool", vec![token_a, token_b]);
 
         native_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                native_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    native_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         vm_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                vm_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    vm_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         let app_state = build_test_app_state(
@@ -3053,28 +3077,34 @@ mod tests {
         let rfq_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         native_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                mk_component(
-                    34,
-                    "uniswap_v2",
-                    "uniswap_v2_pool",
-                    vec![mk_token(19, "TKNA"), mk_token(20, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    mk_component(
+                        34,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![mk_token(19, "TKNA"), mk_token(20, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         vm_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    35,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(21, "TKNA"), mk_token(22, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        35,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(21, "TKNA"), mk_token(22, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         let app_state = build_test_app_state(
@@ -3235,16 +3265,19 @@ mod tests {
         let state = build_readiness_test_state(false, false).await;
         state
             .native_state_store
-            .apply_update(mk_update(vec![(
-                "pool-b".to_string(),
-                mk_component(
-                    31,
-                    "uniswap_v2",
-                    "uniswap_v2_pool",
-                    vec![mk_token(32, "TKNC"), mk_token(33, "TKND")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-b".to_string(),
+                    mk_component(
+                        31,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![mk_token(32, "TKNC"), mk_token(33, "TKND")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
     }
@@ -3262,14 +3295,17 @@ mod tests {
 
         state
             .native_state_store
-            .apply_update(Update::new(
-                2,
-                HashMap::from([(
-                    "pool-native".to_string(),
-                    Box::new(DummySim) as Box<dyn ProtocolSim>,
-                )]),
-                HashMap::new(),
-            ))
+            .apply_update_with_head(
+                Update::new(
+                    1,
+                    HashMap::from([(
+                        "pool-native".to_string(),
+                        Box::new(DummySim) as Box<dyn ProtocolSim>,
+                    )]),
+                    HashMap::new(),
+                ),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         let current = state.native_state_store.pin().await;
@@ -3432,7 +3468,7 @@ mod tests {
 
         state
             .native_state_store
-            .apply_update(
+            .apply_update_with_head(
                 mk_update(vec![(
                     "pool-added".to_string(),
                     added_component,
@@ -3442,6 +3478,7 @@ mod tests {
                     "pool-native".to_string(),
                     removed_component,
                 )])),
+                Some(test_block_head(1, 1)),
             )
             .await;
 
@@ -3524,16 +3561,19 @@ mod tests {
         let pinned = state.native_state_store.pin().await;
         let candidate_store = StateStore::new_private(Arc::clone(&state.tokens));
         candidate_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                mk_component(
-                    28,
-                    "uniswap_v2",
-                    "uniswap_v2_pool",
-                    vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    mk_component(
+                        28,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         let candidate = candidate_store.pin().await;
 

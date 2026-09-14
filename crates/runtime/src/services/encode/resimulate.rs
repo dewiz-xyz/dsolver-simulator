@@ -811,8 +811,8 @@ mod tests {
     use super::*;
     use crate::models::state::RfqClientConfig;
     use crate::services::encode::fixtures::{
-        component_with_protocol, component_with_tokens, dummy_token, fixture_bytes, pool_ref,
-        test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
+        component_with_protocol, component_with_tokens, dummy_token, fixture_bytes, fixture_head,
+        pool_ref, test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
     };
     use crate::services::encode::mocks::{step_multiplier, StepProtocolSim};
     use crate::services::encode::model::{
@@ -1110,7 +1110,9 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-1".to_string(), component);
         let update = Update::new(1, states, new_pairs);
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head(1)))
+            .await;
 
         let app_state = test_app_state(
             tokens_store,
@@ -1181,7 +1183,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-1".to_string(), component);
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let app_state = test_app_state(
@@ -1262,7 +1264,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-vm".to_string(), component);
         vm_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let app_state = test_app_state(
@@ -1312,8 +1314,14 @@ mod tests {
             Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
         vm_state_store
-            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .apply_update_with_head(
+                Update::new(2, replacement_states, HashMap::new()),
+                Some(fixture_head(2)),
+            )
             .await;
+        app_state
+            .chain_head_observer
+            .observe_for_test(fixture_head(2));
 
         drop(request_guard);
         let resimulated =
@@ -1355,7 +1363,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-vm".to_string(), component);
         vm_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let app_state = test_app_state(
@@ -1405,8 +1413,14 @@ mod tests {
             Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
         vm_state_store
-            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .apply_update_with_head(
+                Update::new(2, replacement_states, HashMap::new()),
+                Some(fixture_head(2)),
+            )
             .await;
+        app_state
+            .chain_head_observer
+            .observe_for_test(fixture_head(2));
 
         drop(request_guard);
         let resimulated =
@@ -1448,7 +1462,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-erc4626".to_string(), component);
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let normalized = NormalizedRouteInternal {
@@ -1555,7 +1569,9 @@ mod tests {
         new_pairs.insert("pool-a".to_string(), component_a);
         new_pairs.insert("pool-shared".to_string(), component_shared);
         let update = Update::new(1, states, new_pairs);
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head(1)))
+            .await;
 
         let app_state = test_app_state(
             tokens_store,
@@ -1702,7 +1718,7 @@ mod tests {
             ),
         );
         native_state_store
-            .apply_update(Update::new(1, states, pairs))
+            .apply_update_with_head(Update::new(1, states, pairs), Some(fixture_head(1)))
             .await;
         let native_pin = native_state_store.pin().await;
         let app_state = test_app_state(

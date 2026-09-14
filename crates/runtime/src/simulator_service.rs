@@ -447,7 +447,9 @@ fn build_app_state(
         chain,
         chain_head_observer: Arc::new(ChainHeadObserver::new(ChainHeadConfig {
             poll_interval: Duration::from_millis(config.chain_profile.chain_head_poll_interval_ms),
-            rpc_request_timeout: Duration::from_secs(2),
+            rpc_request_timeout: Duration::from_millis(
+                config.chain_profile.chain_head_rpc_request_timeout_ms,
+            ),
             observation_max_age: Duration::from_secs(
                 config.chain_profile.chain_head_observation_max_age_secs,
             ),
@@ -1053,6 +1055,7 @@ mod tests {
             rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
             stream_initialization_timeout_secs: 10,
             chain_head_poll_interval_ms: 500,
+            chain_head_rpc_request_timeout_ms: 2_000,
             chain_head_observation_max_age_secs: 5,
             tycho_initial_bootstrap_timeout_secs: 300,
             tycho_head_mismatch_recovery_timeout_secs: 60,
@@ -1078,6 +1081,7 @@ mod tests {
             rfq_protocols: vec!["rfq:hashflow".to_string(), "rfq:liquorice".to_string()],
             stream_initialization_timeout_secs: 25,
             chain_head_poll_interval_ms: 1000,
+            chain_head_rpc_request_timeout_ms: 2_000,
             chain_head_observation_max_age_secs: 15,
             tycho_initial_bootstrap_timeout_secs: 900,
             tycho_head_mismatch_recovery_timeout_secs: 60,
