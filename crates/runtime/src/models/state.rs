@@ -38,7 +38,7 @@ pub struct AppState {
     pub chain: Chain,
     pub chain_head_observer: Arc<ChainHeadObserver>,
     pub rfq_client_config: Arc<RfqClientConfig>,
-    pub native_token_protocol_allowlist: Arc<Vec<String>>,
+    pub native_token_protocol_allowlist: Arc<Vec<ProtocolKind>>,
     pub tokens: Arc<TokenStore>,
     pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
@@ -1294,7 +1294,7 @@ impl PublishedStateStore {
     fn empty(
         tokens: HashMap<Bytes, Token>,
         wrapped_native_token: Option<Bytes>,
-        required_protocols: Vec<String>,
+        required_protocols: Vec<ProtocolKind>,
     ) -> Self {
         Self {
             version: 0,
@@ -1397,7 +1397,10 @@ impl StateStore {
         Self::new_with_token_publication(tokens, initial_tokens, true, Vec::new())
     }
 
-    pub fn new_with_protocols(tokens: Arc<TokenStore>, required_protocols: Vec<String>) -> Self {
+    pub fn new_with_protocols(
+        tokens: Arc<TokenStore>,
+        required_protocols: Vec<ProtocolKind>,
+    ) -> Self {
         let initial_tokens = tokens.initial_snapshot();
         Self::new_with_token_publication(tokens, initial_tokens, true, required_protocols)
     }
@@ -1411,7 +1414,7 @@ impl StateStore {
     pub(crate) fn new_private_with_snapshot(
         tokens: Arc<TokenStore>,
         initial_tokens: HashMap<Bytes, Token>,
-        required_protocols: Vec<String>,
+        required_protocols: Vec<ProtocolKind>,
     ) -> Self {
         Self::new_with_token_publication(tokens, initial_tokens, false, required_protocols)
     }
@@ -1420,7 +1423,7 @@ impl StateStore {
         tokens: Arc<TokenStore>,
         initial_tokens: HashMap<Bytes, Token>,
         publish_tokens_to_store: bool,
-        required_protocols: Vec<String>,
+        required_protocols: Vec<ProtocolKind>,
     ) -> Self {
         let wrapped_native_token = tokens.wrapped_native_token();
         let (ready_tx, _) = watch::channel(false);
@@ -1918,7 +1921,7 @@ mod tests {
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_block_head(1, 1))),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: stores.token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

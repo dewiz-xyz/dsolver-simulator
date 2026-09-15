@@ -98,6 +98,22 @@ Common optional inputs:
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
 
+### Protocol identities
+
+Use canonical Tycho protocol names in `simulator-manifest.toml`, such as `uniswap_v3` or
+`vm:curve`. Validation trims surrounding whitespace and requires an exact match. For example,
+`Uniswap-V3` and the protocol type name `uniswap_v3_pool` fail validation. The resolved configuration
+uses `ProtocolKind`, as do decoder registration, applied state tracking, and routing policies.
+
+Tycho messages, JSON payloads, and retained snapshots keep their protocol strings. Snapshot
+reassembly preserves exact upstream keys so differently named streams stay distinct and recovery
+waits for all required streams. Historical pool selectors also match the stored component name
+exactly, including noncanonical names. External metadata and request hints retain their existing
+parsing rules.
+
+Base Uniswap V4 consumes the native wire partition and stores its state in the VM store with
+the shared database. Using `ProtocolKind` preserves that split.
+
 ## Runtime Continuity Contract
 
 The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.

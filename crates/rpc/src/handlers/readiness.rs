@@ -176,6 +176,7 @@ mod tests {
     use chrono::NaiveDateTime;
     use num_bigint::BigUint;
     use num_traits::Zero;
+    use runtime::models::protocol::ProtocolKind;
     use simulator_core::broadcaster::{BlockIdentity, BroadcasterRedisReplayBoundary};
     use tycho_simulation::protocol::models::{ProtocolComponent, Update};
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
@@ -296,7 +297,7 @@ mod tests {
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head())),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: Arc::clone(&token_store),
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

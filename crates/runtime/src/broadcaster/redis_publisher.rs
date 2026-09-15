@@ -29,6 +29,7 @@ use simulator_core::broadcaster::{
     BroadcasterRecoveryStart, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
     BroadcasterUpdateMessage, ProtocolStateHeads,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
@@ -900,7 +901,7 @@ impl BroadcasterRedisPublisher {
         Self::new_with_mode(config, writer, 1, BroadcasterRedisPublisherMode::Passive)
     }
 
-    pub fn with_required_protocols(self, native: Vec<String>, vm: Vec<String>) -> Self {
+    pub fn with_required_protocols(self, native: Vec<ProtocolKind>, vm: Vec<ProtocolKind>) -> Self {
         let heads = [
             (BroadcasterBackend::Native, native),
             (BroadcasterBackend::Vm, vm),

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 use crate::models::messages::{RouteEncodeRequest, SegmentDraft, SwapKind};
+use crate::models::protocol::ProtocolKind;
 
 use super::EncodeError;
 
@@ -17,22 +18,20 @@ pub(super) fn validate_chain(chain_id: u64, expected: Chain) -> Result<Chain, En
     Ok(expected)
 }
 
-pub(super) fn normalize_protocol_id(protocol_id: &str) -> String {
-    protocol_id
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', ' '], "_")
+pub(super) fn is_native_protocol_allowlisted(
+    protocol_id: &str,
+    allowlist: &[ProtocolKind],
+) -> bool {
+    ProtocolKind::from_sync_state_key(protocol_id.trim())
+        .is_some_and(|protocol| allowlist.contains(&protocol))
 }
 
-pub(super) fn is_native_protocol_allowlisted(protocol_id: &str, allowlist: &[String]) -> bool {
-    let normalized = normalize_protocol_id(protocol_id);
+pub(super) fn format_native_protocol_allowlist(allowlist: &[ProtocolKind]) -> String {
     allowlist
         .iter()
-        .any(|candidate| normalize_protocol_id(candidate) == normalized)
-}
-
-pub(super) fn format_native_protocol_allowlist(allowlist: &[String]) -> String {
-    allowlist.join(", ")
+        .map(ProtocolKind::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(super) fn should_reset_allowance(
@@ -158,22 +157,23 @@ mod tests {
     }
 
     #[test]
-    fn normalize_protocol_id_handles_whitespace_and_casing() {
-        assert_eq!(normalize_protocol_id(" RocketPool "), "rocketpool");
-        assert_eq!(normalize_protocol_id("ROCKET-POOL"), "rocket_pool");
-    }
-
-    #[test]
     fn native_protocol_allowlist_matches_rocketpool_only() {
-        let allowlist = vec!["rocketpool".to_string()];
+        let allowlist = vec![ProtocolKind::Rocketpool];
         assert!(is_native_protocol_allowlisted("rocketpool", &allowlist));
         assert!(is_native_protocol_allowlisted("ROCKETPOOL", &allowlist));
+        assert!(is_native_protocol_allowlisted(" RocketPool ", &allowlist));
+        assert!(!is_native_protocol_allowlisted(
+            "rocketpool_pool",
+            &allowlist
+        ));
+        assert!(!is_native_protocol_allowlisted("ROCKET-POOL", &allowlist));
+        assert!(!is_native_protocol_allowlisted("unknown", &allowlist));
         assert!(!is_native_protocol_allowlisted("uniswap_v2", &allowlist));
     }
 
     #[test]
     fn empty_allowlist_rejects_everything() {
-        let allowlist: Vec<String> = vec![];
+        let allowlist: Vec<ProtocolKind> = vec![];
         assert!(!is_native_protocol_allowlisted("rocketpool", &allowlist));
     }
 

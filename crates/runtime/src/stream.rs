@@ -1019,6 +1019,7 @@ mod tests {
     use crate::config::MemoryConfig;
     use crate::models::stream_health::StreamHealth;
     use simulator_core::broadcaster::{BlockIdentity, BroadcasterBackend, BroadcasterBackendHead};
+    use simulator_core::models::protocol::ProtocolKind;
     use tycho_simulation::tycho_common::Bytes;
 
     type RawTestItem = Result<FeedMessage<BlockHeader>, Box<dyn Error + Send + Sync>>;
@@ -1236,7 +1237,7 @@ mod tests {
         ChainHeadObserver,
         Arc<BroadcasterRedisPublisher>,
     )> {
-        let protocols = vec!["uniswap_v2".to_string()];
+        let protocols = vec![ProtocolKind::UniswapV2];
         let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
             number: 10,
             hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),
@@ -1261,7 +1262,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn raw_feed_recovers_with_one_owned_lifecycle() -> anyhow::Result<()> {
-        let native_protocols = vec!["uniswap_v2".to_string()];
+        let native_protocols = vec![ProtocolKind::UniswapV2];
         let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
             number: 10,
             hash: native_feed(10).state_msgs["uniswap_v2"].header.hash.clone(),

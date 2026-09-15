@@ -1463,11 +1463,11 @@ fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolCompo
 
 fn is_directional_rfq_component(component: &ProtocolComponent) -> bool {
     matches!(
-        (
-            component.protocol_system.as_str(),
-            component.protocol_type_name.as_str()
-        ),
-        ("rfq:hashflow", _) | (_, "hashflow_pool") | ("rfq:liquorice", _) | (_, "liquorice_pool")
+        ProtocolKind::from_canonical_protocol_system(&component.protocol_system),
+        Some(ProtocolKind::Hashflow | ProtocolKind::Liquorice)
+    ) || matches!(
+        component.protocol_type_name.as_str(),
+        "hashflow_pool" | "liquorice_pool"
     )
 }
 
@@ -3263,6 +3263,43 @@ mod tests {
     }
 
     #[test]
+    fn directional_rfq_detection_preserves_exact_system_or_type_matching() {
+        for (system, type_name, directional) in [
+            ("rfq:hashflow", "", true),
+            ("rfq:liquorice", "", true),
+            ("rfq:bebop", "hashflow_pool", true),
+            ("unknown", "liquorice_pool", true),
+            ("RFQ:HASHFLOW", "", false),
+            ("unknown", "Hashflow_Pool", false),
+            ("rfq:bebop", "bebop_pool", false),
+        ] {
+            let component = make_pair_component(
+                "0x0000000000000000000000000000000000000009",
+                system,
+                type_name,
+                Vec::new(),
+            );
+            assert_eq!(
+                is_directional_rfq_component(&component),
+                directional,
+                "{system} / {type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_descriptor_preserves_unknown_external_protocol() {
+        let component = make_pair_component(
+            "0x0000000000000000000000000000000000000009",
+            "External Protocol",
+            "external_pool",
+            Vec::new(),
+        );
+        let descriptor = pool_descriptor("pool-external".to_string(), &component);
+        assert_eq!(descriptor.protocol, "External Protocol");
+    }
+
+    #[test]
     fn pool_descriptor_uses_canonical_protocol_for_type_only_rfq_component() {
         let token_a = make_token(
             &Bytes::from_str("0x0000000000000000000000000000000000000001").expect("valid address"),
@@ -3360,7 +3397,7 @@ mod tests {
             chain: Chain::Ethereum,
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head(1))),
             rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

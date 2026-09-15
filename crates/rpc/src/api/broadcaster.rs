@@ -27,6 +27,7 @@ pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    use simulator_core::models::protocol::ProtocolKind;
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::{
@@ -155,7 +156,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn chain_head_readiness_recovers_without_closing_deployment_admission() -> Result<()> {
-        let protocols = vec!["uniswap_v2".to_string()];
+        let protocols = vec![ProtocolKind::UniswapV2];
         let head = BlockIdentity {
             number: 10,
             hash: Bytes::from([11; 32]),

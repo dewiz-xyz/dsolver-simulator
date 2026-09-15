@@ -23,6 +23,7 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
+use crate::models::protocol::ProtocolKind;
 use crate::models::state::{
     AppState, BackendFreshnessFence, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard,
     SimulatorBackendKind,
@@ -674,7 +675,7 @@ fn ensure_native_swap_supported(
     token_out: &Bytes,
     component: &ProtocolComponent,
     component_id: &str,
-    native_token_protocol_allowlist: &[String],
+    native_token_protocol_allowlist: &[ProtocolKind],
 ) -> Result<bool, AttemptError> {
     let native_address = chain.native_token().address;
     let swap_uses_native = *token_in == native_address || *token_out == native_address;
