@@ -76,6 +76,7 @@ Contract invariants:
 7. Pool tasks run until they complete or the request-level timeout guard ends the computation.
 8. Per-pool execution results are aggregated into `data`, `meta.failures`, and `meta.pool_results`.
 9. The runner classifies the final exit as `complete`, `partial`, `no_results`, or `request_level_failure`.
+10. Before returning, native and VM freshness are checked again. Results from a backend that lost freshness are removed, and the response classification is updated.
 
 The current classification logic is:
 
@@ -106,17 +107,28 @@ Service health and native readiness:
 
 - `/ready` returns HTTP `200` with `status="ready"` when native traffic can be served
 - `/ready` returns HTTP `503` while native state is warming, recovering, disconnected, or stale
-- `backends.native.status="ready"` means native state is ready and recent enough
+- `backends.native.status="ready"` means bootstrap is complete, the subscription is live, and the complete applied native head matches a fresh RPC observation
 - `backends.native.status="warming_up"` means the native subscriber, snapshot bootstrap, or state store is still loading
-- `backends.native.status="stale"` means native updates are past the readiness freshness window
+- `backends.native.status="stale"` means the complete applied native head cannot be confirmed against a fresh RPC observation
 
 VM readiness:
 
 - `backends.vm.status="disabled"` when VM pools are configured but turned off
 - `backends.vm.status="warming_up"` while VM subscriber bootstrap or VM state is still loading
 - `backends.vm.status="rebuilding"` during VM rebuilds
-- `backends.vm.status="stale"` when VM updates are past the readiness freshness window
-- `backends.vm.status="ready"` when VM state is usable
+- `backends.vm.status="stale"` when the complete applied VM head cannot be confirmed against a fresh RPC observation
+- `backends.vm.status="ready"` when VM bootstrap is complete, the subscription is live, and the complete applied VM head matches a fresh RPC observation
+
+Both endpoints expose `observation_age_ms` on native and VM backend entries after the first
+successful RPC observation. The age starts when that observation's request began, includes request
+duration, and keeps increasing after failures or expiry. It comes from the same snapshot as
+`chain_head_agreement`. The field is omitted before any successful observation and for RFQ.
+
+The observation age limit is 5 seconds on Base and 15 seconds on Ethereum. It bounds how long the
+last successful observation may justify serving during RPC uncertainty. A fresh observation that
+disagrees with an applied block number or hash closes that backend's readiness immediately. The
+broadcaster's separate 60-second recovery window keeps the existing Tycho stream alive to catch up;
+it does not permit serving stale state. RPC uncertainty alone does not trigger a restart.
 
 RFQ readiness:
 
@@ -181,12 +193,15 @@ Important failure kinds include:
 - `internal`
 - `invalid_request`
 
-Native rows are never dropped just because native state changes while `/simulate` is running.
-`/encode` re-simulates the selected route, verifies its native pools against current state, and
-retries once when needed. Native rows are dropped only if native state is unavailable at the end of
-the request because bootstrap is incomplete, the update lease is stale, or recovery has fenced
-requests. In that case all native rows are dropped and reported through `stale_native_state`.
-VM/RFQ-only requests are never fenced.
+Before returning `/simulate` results, the service rechecks native and VM chain freshness
+separately. An expired observation, head change, or loss of backend readiness removes the affected
+backend's rows, even if state recovers before the request finishes. Removed native rows are reported
+through `stale_native_state`; removed VM rows set `vm_unavailable=true` and add a `simulator` failure.
+RFQ rows do not use this chain-head freshness check.
+
+The separate native pool identity check belongs to `/encode`: it compares the route's own pools
+against current published state and may retry once if those pools changed. Updating unrelated pools
+does not trigger that retry, but native and VM chain freshness must still hold for the encoded route.
 
 `meta.pool_results` is the per-pool anomaly layer.
 

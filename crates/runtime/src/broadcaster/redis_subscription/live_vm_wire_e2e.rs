@@ -17,6 +17,7 @@ use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
     BroadcasterSnapshotPartition, BroadcasterTokenSnapshotResponse, BroadcasterUpdatePartition,
 };
+use simulator_core::models::protocol::ProtocolKind;
 use simulator_replay::{RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
 use tokio::{sync::RwLock, time::Instant};
 use tycho_simulation::{
@@ -50,7 +51,11 @@ const REDIS_URL_ENV: &str = "BROADCASTER_REDIS_URL";
 const EXPECTED_CHAIN_ID: u64 = 1;
 const CURVE_PROTOCOL: &str = "vm:curve";
 const BALANCER_PROTOCOL: &str = "vm:balancer_v2";
-const VM_PROTOCOLS: [&str; 3] = [CURVE_PROTOCOL, BALANCER_PROTOCOL, "vm:maverick_v2"];
+const VM_PROTOCOLS: [ProtocolKind; 3] = [
+    ProtocolKind::Curve,
+    ProtocolKind::BalancerV2,
+    ProtocolKind::MaverickV2,
+];
 const REDIS_BLOCK_MS: u64 = 5_000;
 const REDIS_READ_COUNT: u64 = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,7 +176,7 @@ async fn build_vm_controls(
 ) -> Result<(
     BroadcasterSubscriptionControls,
     Arc<StateStore>,
-    Vec<String>,
+    Vec<ProtocolKind>,
 )> {
     let lookup_url = derive_broadcaster_token_lookup_url(broadcaster_url)
         .context("failed to derive broadcaster token lookup URL")?;
@@ -183,10 +188,7 @@ async fn build_vm_controls(
         REQUEST_TIMEOUT,
     ));
     let state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
-    let protocols = VM_PROTOCOLS
-        .iter()
-        .map(|protocol| (*protocol).to_string())
-        .collect::<Vec<_>>();
+    let protocols = VM_PROTOCOLS.to_vec();
     let controls = BroadcasterSubscriptionControls::Vm(VmBroadcasterSubscriptionControls {
         broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         state_store: Arc::clone(&state_store),

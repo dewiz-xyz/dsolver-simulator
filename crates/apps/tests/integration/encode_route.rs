@@ -1,3 +1,4 @@
+use runtime::chain_head::ChainHeadObserver;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -15,6 +16,7 @@ use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
+use runtime::models::protocol::ProtocolKind;
 use runtime::models::state::{
     AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
     VmStreamStatus,
@@ -23,6 +25,7 @@ use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
 use runtime::services::EncodeService;
 use runtime::simulator_service::SimulatorRuntime;
+use simulator_core::broadcaster::BlockIdentity;
 use simulator_core::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
@@ -40,6 +43,13 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
     Balances, GetAmountOutResult, ProtocolSim,
 };
 use tycho_simulation::tycho_common::Bytes;
+
+fn fixture_head() -> BlockIdentity {
+    BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct EchoAmountSim;
@@ -108,9 +118,14 @@ impl PublishingEncoderState {
             Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
         )]);
         let new_pairs: HashMap<String, ProtocolComponent> = HashMap::new();
-        let update = Update::new(43, states, new_pairs);
+        // Change the pool publication without moving the chain head, so this exercises
+        // the touched-pool fence independently of the chain freshness fence.
+        let update = Update::new(42, states, new_pairs);
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.state_store.apply_update(update));
+            tokio::runtime::Handle::current().block_on(
+                self.state_store
+                    .apply_update_with_head(update, Some(fixture_head())),
+            );
         });
     }
 
@@ -595,11 +610,15 @@ async fn build_fixture_stores(
     let new_pairs = HashMap::from([(pool_id.to_string(), component)]);
     let update = Update::new(42, states, new_pairs);
     if config.vm_pool {
-        vm_state_store.apply_update(update).await;
+        vm_state_store
+            .apply_update_with_head(update, Some(fixture_head()))
+            .await;
     } else if config.rfq_pool {
         rfq_state_store.apply_update(update).await;
     } else {
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head()))
+            .await;
     }
     Ok((native_state_store, vm_state_store, rfq_state_store))
 }
@@ -666,7 +685,7 @@ async fn ensure_native_store_ready(
     )]);
     let new_pairs = HashMap::from([("native-ready".to_string(), component)]);
     native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
+        .apply_update_with_head(Update::new(42, states, new_pairs), Some(fixture_head()))
         .await;
     Ok(())
 }
@@ -760,9 +779,10 @@ async fn build_app_state_and_request(
     };
 
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(test_rfq_client_config()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription,
@@ -780,7 +800,6 @@ async fn build_app_state_and_request(
         },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -838,14 +857,17 @@ async fn add_native_echo_pool(
     );
     state
         .native_state_store
-        .apply_update(Update::new(
-            43,
-            HashMap::from([(
-                pool_id.to_string(),
-                Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
-            )]),
-            HashMap::from([(pool_id.to_string(), component)]),
-        ))
+        .apply_update_with_head(
+            Update::new(
+                42,
+                HashMap::from([(
+                    pool_id.to_string(),
+                    Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(pool_id.to_string(), component)]),
+            ),
+            Some(fixture_head()),
+        )
         .await;
     Ok(())
 }
@@ -873,14 +895,17 @@ async fn add_vm_echo_pool(
     );
     state
         .vm_state_store
-        .apply_update(Update::new(
-            43,
-            HashMap::from([(
-                pool_id.to_string(),
-                Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
-            )]),
-            HashMap::from([(pool_id.to_string(), component)]),
-        ))
+        .apply_update_with_head(
+            Update::new(
+                42,
+                HashMap::from([(
+                    pool_id.to_string(),
+                    Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(pool_id.to_string(), component)]),
+            ),
+            Some(fixture_head()),
+        )
         .await;
     Ok(())
 }
@@ -932,7 +957,7 @@ async fn setup_timeout_app(
     let states = HashMap::from([(pool_id.clone(), sim)]);
     let new_pairs = HashMap::from([(pool_id.clone(), component)]);
     native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
+        .apply_update_with_head(Update::new(42, states, new_pairs), Some(fixture_head()))
         .await;
 
     let native_stream_health = Arc::new(StreamHealth::new());
@@ -941,9 +966,10 @@ async fn setup_timeout_app(
     let rfq_stream_health = Arc::new(StreamHealth::new());
 
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -961,7 +987,6 @@ async fn setup_timeout_app(
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1344,8 +1369,13 @@ async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.native_progress_lease = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
+    let head = BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    };
+    state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+    state.native_state_store.set_applied_head(Some(head)).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
@@ -1485,9 +1515,13 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.optional_backend_stale = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
-    state.native_stream_health.record_update(42).await;
+    let head = BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    };
+    state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+    state.vm_state_store.set_applied_head(Some(head)).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
@@ -1971,9 +2005,10 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let vm_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -1991,7 +2026,6 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),

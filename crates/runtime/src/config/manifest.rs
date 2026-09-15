@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::num::NonZeroU64;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -51,17 +52,22 @@ struct ChainRegistryEntry {
     bebop_url: String,
     hashflow_filename: String,
     liquorice_url: Option<String>,
-    native_protocols: Vec<String>,
-    vm_protocols: Vec<String>,
-    rfq_protocols: Vec<String>,
-    native_progress_lease_secs: u64,
+    native_protocols: Vec<ProtocolKind>,
+    vm_protocols: Vec<ProtocolKind>,
+    rfq_protocols: Vec<ProtocolKind>,
+    stream_initialization_timeout_secs: u64,
+    chain_head_poll_interval_ms: u64,
+    chain_head_rpc_request_timeout_ms: u64,
+    chain_head_observation_max_age_secs: u64,
+    tycho_initial_bootstrap_timeout_secs: u64,
+    tycho_head_mismatch_recovery_timeout_secs: u64,
     recovery_max_buffered_native_blocks: usize,
     route_policy_id: String,
 }
 
 #[derive(Clone, Debug)]
 struct RoutePolicyRegistryEntry {
-    native_token_protocol_allowlist: Vec<String>,
+    native_token_protocol_allowlist: Vec<ProtocolKind>,
     reset_allowance_tokens: HashSet<Bytes>,
     erc4626_pair_policies: Vec<Erc4626PairPolicy>,
 }
@@ -114,7 +120,12 @@ struct RawChain {
     native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
-    native_progress_lease_secs: u64,
+    stream_initialization_timeout_secs: NonZeroU64,
+    chain_head_poll_interval_ms: NonZeroU64,
+    chain_head_rpc_request_timeout_ms: NonZeroU64,
+    chain_head_observation_max_age_secs: NonZeroU64,
+    tycho_initial_bootstrap_timeout_secs: NonZeroU64,
+    tycho_head_mismatch_recovery_timeout_secs: NonZeroU64,
     recovery_max_buffered_native_blocks: usize,
     route_policy: String,
 }
@@ -172,7 +183,13 @@ pub(crate) fn resolve_chain_config(
             native_protocols: chain.native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
-            native_progress_lease_secs: chain.native_progress_lease_secs,
+            stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs,
+            chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms,
+            chain_head_rpc_request_timeout_ms: chain.chain_head_rpc_request_timeout_ms,
+            chain_head_observation_max_age_secs: chain.chain_head_observation_max_age_secs,
+            tycho_initial_bootstrap_timeout_secs: chain.tycho_initial_bootstrap_timeout_secs,
+            tycho_head_mismatch_recovery_timeout_secs: chain
+                .tycho_head_mismatch_recovery_timeout_secs,
             recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
             native_token_protocol_allowlist: route_policy.native_token_protocol_allowlist.clone(),
             reset_allowance_tokens,
@@ -205,16 +222,14 @@ fn supported_runtime_chains() -> [Chain; 7] {
     ]
 }
 
-fn validate_protocols(protocols: &[RawProtocol]) -> Result<HashMap<String, BackendKind>> {
+fn validate_protocols(protocols: &[RawProtocol]) -> Result<HashMap<ProtocolKind, BackendKind>> {
     let mut protocols_by_id = HashMap::new();
 
     for protocol in protocols {
         let protocol_id = required_string("protocol.id", &protocol.id)?;
-        if ProtocolKind::from_sync_state_key(protocol_id).is_none() {
-            bail!("unknown protocol id {protocol_id}");
-        }
+        let protocol_kind = parse_protocol_id(protocol_id)?;
         if protocols_by_id
-            .insert(protocol_id.to_string(), protocol.backend)
+            .insert(protocol_kind, protocol.backend)
             .is_some()
         {
             bail!("duplicate protocol id {protocol_id}");
@@ -226,7 +241,7 @@ fn validate_protocols(protocols: &[RawProtocol]) -> Result<HashMap<String, Backe
 
 fn validate_route_policies(
     route_policies: &[RawRoutePolicy],
-    protocols: &HashMap<String, BackendKind>,
+    protocols: &HashMap<ProtocolKind, BackendKind>,
 ) -> Result<HashMap<String, RoutePolicyRegistryEntry>> {
     let mut registry = HashMap::new();
 
@@ -243,13 +258,14 @@ fn validate_route_policies(
                 &format!("route_policies[{policy_id}].native_token_protocol_allowlist"),
                 protocol_id,
             )?;
-            let backend = protocols.get(protocol_id).ok_or_else(|| {
+            let protocol_kind = parse_protocol_id(protocol_id)?;
+            let backend = protocols.get(&protocol_kind).ok_or_else(|| {
                 anyhow!("route policy {policy_id} references unknown protocol {protocol_id}")
             })?;
             if *backend != BackendKind::Native {
                 bail!("route policy {policy_id} allowlists non-native protocol {protocol_id}");
             }
-            native_token_protocol_allowlist.push(protocol_id.to_string());
+            native_token_protocol_allowlist.push(protocol_kind);
         }
 
         let mut reset_allowance_tokens = HashSet::new();
@@ -315,9 +331,24 @@ fn validate_route_policies(
     Ok(registry)
 }
 
+fn validate_chain_timing(chain: &RawChain) -> Result<()> {
+    if chain
+        .chain_head_observation_max_age_secs
+        .get()
+        .saturating_mul(1000)
+        <= chain.chain_head_poll_interval_ms.get()
+    {
+        bail!(
+            "chain {} observation maximum age must exceed the chain head polling interval",
+            chain.chain_id
+        );
+    }
+    Ok(())
+}
+
 fn validate_chains(
     chains: &[RawChain],
-    protocols: &HashMap<String, BackendKind>,
+    protocols: &HashMap<ProtocolKind, BackendKind>,
     route_policies: &HashMap<String, RoutePolicyRegistryEntry>,
 ) -> Result<HashMap<u64, ChainRegistryEntry>> {
     let mut registry = HashMap::new();
@@ -351,12 +382,7 @@ fn validate_chains(
                 route_policy_id
             );
         }
-        if chain.native_progress_lease_secs == 0 {
-            bail!(
-                "chain {} native_progress_lease_secs must be greater than zero",
-                chain.chain_id
-            );
-        }
+        validate_chain_timing(chain)?;
         if chain.recovery_max_buffered_native_blocks == 0 {
             bail!(
                 "chain {} recovery_max_buffered_native_blocks must be greater than zero",
@@ -396,7 +422,18 @@ fn validate_chains(
                 native_protocols,
                 vm_protocols,
                 rfq_protocols,
-                native_progress_lease_secs: chain.native_progress_lease_secs,
+                stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs.get(),
+                chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms.get(),
+                chain_head_rpc_request_timeout_ms: chain.chain_head_rpc_request_timeout_ms.get(),
+                chain_head_observation_max_age_secs: chain
+                    .chain_head_observation_max_age_secs
+                    .get(),
+                tycho_initial_bootstrap_timeout_secs: chain
+                    .tycho_initial_bootstrap_timeout_secs
+                    .get(),
+                tycho_head_mismatch_recovery_timeout_secs: chain
+                    .tycho_head_mismatch_recovery_timeout_secs
+                    .get(),
                 recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
                 route_policy_id: route_policy_id.to_string(),
             },
@@ -410,8 +447,8 @@ fn validate_backend_protocol_refs(
     chain_id: u64,
     backend: BackendKind,
     protocol_ids: &[String],
-    protocols: &HashMap<String, BackendKind>,
-) -> Result<Vec<String>> {
+    protocols: &HashMap<ProtocolKind, BackendKind>,
+) -> Result<Vec<ProtocolKind>> {
     let mut seen = HashSet::new();
     let mut normalized_protocol_ids = Vec::with_capacity(protocol_ids.len());
     // Chains can only point at globally declared protocols for the matching backend. That keeps a
@@ -421,14 +458,15 @@ fn validate_backend_protocol_refs(
             &format!("chains[{chain_id}].{}_protocols", backend.label()),
             protocol_id,
         )?;
-        if !seen.insert(protocol_id) {
+        let protocol_kind = parse_protocol_id(protocol_id)?;
+        if !seen.insert(protocol_kind) {
             bail!(
                 "chain {chain_id} lists protocol {protocol_id} more than once for backend {}",
                 backend.label()
             );
         }
         let declared_backend = protocols
-            .get(protocol_id)
+            .get(&protocol_kind)
             .ok_or_else(|| anyhow!("chain {chain_id} references unknown protocol {protocol_id}"))?;
         if *declared_backend != backend {
             bail!(
@@ -437,19 +475,17 @@ fn validate_backend_protocol_refs(
                 declared_backend.label()
             );
         }
-        normalized_protocol_ids.push(protocol_id.to_string());
+        normalized_protocol_ids.push(protocol_kind);
     }
     Ok(normalized_protocol_ids)
 }
 
 fn validate_liquorice_url(
     chain_id: u64,
-    rfq_protocols: &[String],
+    rfq_protocols: &[ProtocolKind],
     raw_url: &Option<String>,
 ) -> Result<Option<String>> {
-    let liquorice_enabled = rfq_protocols
-        .iter()
-        .any(|protocol| protocol == "rfq:liquorice");
+    let liquorice_enabled = rfq_protocols.contains(&ProtocolKind::Liquorice);
     match raw_url {
         Some(url) => Ok(Some(
             required_string(&format!("chains[{chain_id}].liquorice_url"), url)?.to_string(),
@@ -459,6 +495,13 @@ fn validate_liquorice_url(
         }
         None => Ok(None),
     }
+}
+
+// Configuration uses the exact systems registered with Tycho. Normalizing here would
+// change which messages are selected or collapse distinct configured names.
+fn parse_protocol_id(protocol_id: &str) -> Result<ProtocolKind> {
+    ProtocolKind::from_canonical_protocol_system(protocol_id)
+        .ok_or_else(|| anyhow!("unknown or non-canonical protocol id {protocol_id}"))
 }
 
 fn required_string<'a>(field: &str, value: &'a str) -> Result<&'a str> {
@@ -492,6 +535,74 @@ impl<'de> Deserialize<'de> for BackendKind {
             other => Err(serde::de::Error::custom(format!(
                 "unknown backend kind {other}"
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_declarations_require_exact_system_names() {
+        for id in [
+            "Uniswap_V2",
+            "uniswap-v2",
+            "uniswap v2",
+            "uniswap_v2_pool",
+            "unknown",
+        ] {
+            let protocols = [RawProtocol {
+                id: id.to_string(),
+                backend: BackendKind::Native,
+            }];
+            assert!(validate_protocols(&protocols).is_err(), "accepted {id}");
+        }
+    }
+
+    #[test]
+    fn differently_spelled_declarations_cannot_collapse_into_one_protocol() {
+        let protocols = [
+            RawProtocol {
+                id: "uniswap_v2".to_string(),
+                backend: BackendKind::Native,
+            },
+            RawProtocol {
+                id: "UNISWAP_V2".to_string(),
+                backend: BackendKind::Native,
+            },
+        ];
+        assert!(validate_protocols(&protocols).is_err());
+    }
+
+    #[test]
+    fn protocol_references_preserve_order_and_reject_unknown_or_duplicate_entries() {
+        let declared = HashMap::from([
+            (ProtocolKind::UniswapV2, BackendKind::Native),
+            (ProtocolKind::UniswapV3, BackendKind::Native),
+            (ProtocolKind::Curve, BackendKind::Vm),
+        ]);
+        let references = [" uniswap_v3 ".to_string(), "uniswap_v2".to_string()];
+        assert_eq!(
+            validate_backend_protocol_refs(1, BackendKind::Native, &references, &declared)
+                .unwrap_or_else(|error| unreachable!("valid references: {error}")),
+            vec![ProtocolKind::UniswapV3, ProtocolKind::UniswapV2],
+        );
+        for references in [
+            vec!["uniswap_v2", " uniswap_v2 "],
+            vec!["UNISWAP_V2"],
+            vec!["rocketpool"],
+            vec!["unknown"],
+            vec!["vm:curve"],
+        ] {
+            let references = references
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(
+                validate_backend_protocol_refs(1, BackendKind::Native, &references, &declared)
+                    .is_err()
+            );
         }
     }
 }

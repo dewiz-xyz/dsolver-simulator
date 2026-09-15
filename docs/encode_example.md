@@ -218,20 +218,30 @@ The repo-local analyzer uses a SimpleSwap, MultiSwap, and MegaSwap route matrix 
 
 ## Staleness and retry
 
-Each encode attempt pins native state at the start and resimulates the route from that pin. Before
-returning, the service compares the route's own pools between the pinned and current published
-state by allocation identity. Updates that do not touch the route's pools never invalidate an
-encode. The pin always covers the whole native publication and the fence keys on the pools the
-attempt actually resolved as native, so a request protocol hint that mislabels a native pool as
-VM or RFQ does not bypass the fence.
+Each encode attempt pins native state at the start and resimulates its native pools from that pin.
+Before returning, the service compares the route's own native pools between the pinned and current
+published state by allocation identity. Updates that do not touch those pools do not trigger the
+identity check's retry. The pin always covers the whole native publication and the fence keys on
+the pools the attempt actually resolved as native, so a request protocol hint that mislabels a
+native pool as VM or RFQ does not bypass the fence.
 
 If the route's pools did change, the service re-pins and retries once internally, whether the first
 attempt produced a result or a state-dependent error. Both attempts share the request timeout, and
 the retry only starts when enough budget remains (an RFQ hop needs the firm quote window,
-native-only routes need a small floor). A second stale attempt returns 503 with "Native state
-changed while the route was being encoded". When native state is unavailable (bootstrap incomplete,
-stale update lease, or recovery fenced requests) the service returns 503 with "Native state is
-unavailable for encoding" without retrying.
+native-only routes need a small floor). A second pool identity change returns 503 with "Native state
+changed while the route was being encoded". Unavailable native state cannot trigger this retry.
+
+Chain freshness is checked separately for every native or VM backend the route actually uses,
+including VM-only routes. Each backend needs complete state matching a fresh independent RPC
+observation before resimulation and again before returning. An expired observation, head change,
+or loss of readiness prevents the attempt from returning calldata even if state recovers before
+encoding finishes. A failed final freshness check returns 503 without the pool identity retry.
+RFQ keeps its own readiness and firm-quote checks; it does not use chain-head freshness.
+
+The 5-second Base and 15-second Ethereum observation age limits bound trust in the last successful
+RPC observation. They do not delay closing readiness when a fresh observation disagrees with the
+applied head. The separate 60-second broadcaster recovery window lets the existing Tycho stream
+catch up while affected state remains unavailable. RPC uncertainty alone does not restart it.
 
 Operators can follow this behavior in logs through the `encode_fence` and `encode_retry` scopes,
 keyed by request id (`/simulate` logs the `quote_fence` scope). Both attempts' resimulated amounts
