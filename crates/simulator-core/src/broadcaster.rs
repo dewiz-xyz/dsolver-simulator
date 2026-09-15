@@ -52,6 +52,7 @@ impl ProtocolHeadUpdate {
         let header = &message.message.header;
         Some(Self {
             protocol: ProtocolKind::from_canonical_protocol_system(&message.protocol)?,
+            // A full Tycho revert names the restored block, so its header is already the applied head.
             head: header.partial_block_index.is_none().then(|| BlockIdentity {
                 number: header.number,
                 hash: header.hash.clone(),
