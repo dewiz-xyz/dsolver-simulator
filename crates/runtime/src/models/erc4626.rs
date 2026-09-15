@@ -50,18 +50,29 @@ impl Erc4626PairPolicy {
     }
 }
 
+fn normalize_protocol_id(protocol: &str) -> String {
+    protocol
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+}
+
+pub(crate) fn is_erc4626_protocol(protocol: &str) -> bool {
+    normalize_protocol_id(protocol) == "erc4626"
+}
+
 pub(crate) fn component_is_erc4626(component: &ProtocolComponent) -> bool {
     ProtocolKind::from_component(component) == Some(ProtocolKind::ERC4626)
 }
 
 pub(crate) fn request_direction_supported(
-    protocol: Option<ProtocolKind>,
+    protocol: &str,
     token_in: &Bytes,
     token_out: &Bytes,
     deposits_enabled: bool,
     pair_policies: &[Erc4626PairPolicy],
 ) -> bool {
-    protocol != Some(ProtocolKind::ERC4626)
+    !is_erc4626_protocol(protocol)
         || pair_policies
             .iter()
             .any(|pair| pair.supports_direction(token_in, token_out, deposits_enabled))
@@ -196,32 +207,32 @@ mod tests {
         let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
                 "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
                 "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
                 "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE",
                 "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8",
                 "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354",
                 "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8",
             ),
@@ -241,17 +252,17 @@ mod tests {
         let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
                 "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
                 "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8",
                 "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354",
             ),
@@ -271,17 +282,17 @@ mod tests {
         let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd",
                 "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE",
                 "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354",
                 "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8",
             ),
@@ -301,17 +312,17 @@ mod tests {
         let pair_policies = pair_policies();
         for (protocol, token_in, token_out) in [
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
                 "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",
                 "0x9d39a5de30e57443bff2a8307a4256c8797a3497",
             ),
             (
-                Some(ProtocolKind::ERC4626),
+                "erc4626",
                 "0xdC035D45d973E3EC169d2276DDab16f1e407384F",
                 "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354",
             ),

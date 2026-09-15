@@ -25,7 +25,6 @@ use simulator_core::models::messages::{
     PoolSwapDraft, QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
 };
-use simulator_core::models::protocol::ProtocolKind;
 
 use self::presets::{
     balanced_profile, chain_label, resolve_token, BalancedProfilePreset, EncodeRouteKind,
@@ -217,7 +216,7 @@ struct SelectedPool {
 #[derive(Clone, Copy)]
 enum PoolSelection<'a> {
     Best,
-    RequiredProtocol(ProtocolKind),
+    RequiredProtocol(&'a str),
     ExcludeProtocolPrefix(&'a str),
 }
 
@@ -832,7 +831,7 @@ async fn run_bebop_partial_fill_encode_route(
         &second_request,
         &format!("{}-hop-2", preset.label),
         &format!("{} prep hop 2 Bebop", preset.label),
-        PoolSelection::RequiredProtocol(ProtocolKind::Bebop),
+        PoolSelection::RequiredProtocol("rfq:bebop"),
     )
     .await?;
     prep_evidence_files.extend(second_hop.report.evidence_files.clone());
@@ -1166,7 +1165,7 @@ async fn run_encode_prep_hop(
                         selection.label()
                     ));
                     if let PoolSelection::RequiredProtocol(protocol) = selection {
-                        degrade_report_for_missing_required_pool(&mut report, protocol.as_str());
+                        degrade_report_for_missing_required_pool(&mut report, protocol);
                     }
                     None
                 }
@@ -2107,11 +2106,8 @@ fn select_best_pool(quote: &QuoteResult) -> Option<SelectedPool> {
     select_best_pool_matching(quote, |_| true)
 }
 
-fn select_best_pool_by_protocol(
-    quote: &QuoteResult,
-    protocol: ProtocolKind,
-) -> Option<SelectedPool> {
-    select_best_pool_matching(quote, |candidate| candidate == protocol.as_str())
+fn select_best_pool_by_protocol(quote: &QuoteResult, protocol: &str) -> Option<SelectedPool> {
+    select_best_pool_matching(quote, |candidate| candidate == protocol)
 }
 
 fn select_best_pool_excluding_prefix(quote: &QuoteResult, prefix: &str) -> Option<SelectedPool> {
@@ -2174,41 +2170,37 @@ fn protocols_from_quote(quote: &QuoteResult) -> Vec<String> {
     protocols.into_iter().collect()
 }
 
-fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<ProtocolKind> {
+fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<&'static str> {
     let protocol = pool_name
         .split_once("::")
         .map(|(protocol, _)| protocol)
         .unwrap_or(pool_name);
     match protocol {
-        "uniswap_v2" | "UniswapV2" => Some(ProtocolKind::UniswapV2),
-        "uniswap_v3" | "UniswapV3" => Some(ProtocolKind::UniswapV3),
-        "uniswap_v4" | "UniswapV4" => Some(ProtocolKind::UniswapV4),
-        "aerodrome_slipstreams" | "AerodromeSlipstreams" => {
-            Some(ProtocolKind::AerodromeSlipstreams)
-        }
-        "ekubo_v2" | "EkuboV2" => Some(ProtocolKind::EkuboV2),
-        "ekubo_v3" | "EkuboV3" => Some(ProtocolKind::EkuboV3),
-        "sushiswap_v2" | "SushiswapV2" => Some(ProtocolKind::SushiswapV2),
-        "pancakeswap_v2" | "PancakeswapV2" | "PancakeSwapV2" => Some(ProtocolKind::PancakeswapV2),
-        "pancakeswap_v3" | "PancakeswapV3" | "PancakeSwapV3" => Some(ProtocolKind::PancakeswapV3),
-        "fluid_v1" | "FluidV1" => Some(ProtocolKind::FluidV1),
-        "rocketpool" | "RocketPool" => Some(ProtocolKind::Rocketpool),
-        "erc4626" | "ERC4626" => Some(ProtocolKind::ERC4626),
-        "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some(ProtocolKind::Hashflow),
-        "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some(ProtocolKind::Bebop),
-        "rfq:liquorice" | "Liquorice" | "liquorice" | "liquorice_pool" => {
-            Some(ProtocolKind::Liquorice)
-        }
-        "vm:curve" | "Curve" => Some(ProtocolKind::Curve),
-        "vm:balancer_v2" | "BalancerV2" => Some(ProtocolKind::BalancerV2),
-        "vm:maverick_v2" | "MaverickV2" => Some(ProtocolKind::MaverickV2),
+        "uniswap_v2" | "UniswapV2" => Some("uniswap_v2"),
+        "uniswap_v3" | "UniswapV3" => Some("uniswap_v3"),
+        "uniswap_v4" | "UniswapV4" => Some("uniswap_v4"),
+        "aerodrome_slipstreams" | "AerodromeSlipstreams" => Some("aerodrome_slipstreams"),
+        "ekubo_v2" | "EkuboV2" => Some("ekubo_v2"),
+        "ekubo_v3" | "EkuboV3" => Some("ekubo_v3"),
+        "sushiswap_v2" | "SushiswapV2" => Some("sushiswap_v2"),
+        "pancakeswap_v2" | "PancakeswapV2" | "PancakeSwapV2" => Some("pancakeswap_v2"),
+        "pancakeswap_v3" | "PancakeswapV3" | "PancakeSwapV3" => Some("pancakeswap_v3"),
+        "fluid_v1" | "FluidV1" => Some("fluid_v1"),
+        "rocketpool" | "RocketPool" => Some("rocketpool"),
+        "erc4626" | "ERC4626" => Some("erc4626"),
+        "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some("rfq:hashflow"),
+        "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some("rfq:bebop"),
+        "rfq:liquorice" | "Liquorice" | "liquorice" | "liquorice_pool" => Some("rfq:liquorice"),
+        "vm:curve" | "Curve" => Some("vm:curve"),
+        "vm:balancer_v2" | "BalancerV2" => Some("vm:balancer_v2"),
+        "vm:maverick_v2" | "MaverickV2" => Some("vm:maverick_v2"),
         _ => None,
     }
 }
 
 fn protocol_from_pool_name(pool_name: &str) -> String {
     canonical_protocol_from_pool_name(pool_name)
-        .map(|protocol| protocol.to_string())
+        .map(str::to_string)
         .unwrap_or_else(|| {
             pool_name
                 .split_once("::")
@@ -2991,7 +2983,6 @@ mod tests {
         AmountOutResponse, Interaction, InteractionKind, PoolOutcomeKind, PoolSimulationOutcome,
         QuoteMeta, QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeResponse, SwapKind,
     };
-    use simulator_core::models::protocol::ProtocolKind;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3315,22 +3306,6 @@ mod tests {
     }
 
     #[test]
-    fn required_protocol_selection_preserves_exact_metadata_matching() {
-        let quote = quote_with_protocol_pools(&[
-            ("unknown-pool", "unknown", "500"),
-            ("uppercase-pool", "RFQ:BEBOP", "400"),
-            ("type-name-pool", "bebop_pool", "300"),
-            ("bebop-pool", "rfq:bebop", "100"),
-        ]);
-        let selected = select_best_pool_by_protocol(&quote, ProtocolKind::Bebop);
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
-            Some("bebop-pool")
-        );
-        assert!(select_best_pool_by_protocol(&quote, ProtocolKind::Hashflow).is_none());
-    }
-
-    #[test]
     fn select_best_pool_by_protocol_prefers_bebop_over_other_protocols() {
         let quote = quote_with_protocol_pools(&[
             ("hashflow-pool", "rfq:hashflow", "120"),
@@ -3338,7 +3313,7 @@ mod tests {
             ("bebop-pool", "rfq:bebop", "100"),
         ]);
 
-        let selected = select_best_pool_by_protocol(&quote, ProtocolKind::Bebop);
+        let selected = select_best_pool_by_protocol(&quote, "rfq:bebop");
 
         assert_eq!(
             selected.as_ref().map(|pool| pool.quote.pool.as_str()),

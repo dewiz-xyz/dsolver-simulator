@@ -6,7 +6,7 @@ pub const NATIVE: &str = "native";
 pub const VM: &str = "vm";
 pub const RFQ: &str = "rfq";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolKind {
     UniswapV2,
     UniswapV3,
@@ -71,12 +71,6 @@ impl ProtocolKind {
             ProtocolKind::Bebop => "rfq:bebop",
             ProtocolKind::Liquorice => "rfq:liquorice",
         }
-    }
-
-    /// Accepts an exact Tycho protocol system name without normalizing aliases.
-    /// Use this at selection boundaries so a different wire identity is not selected.
-    pub fn from_canonical_protocol_system(name: &str) -> Option<Self> {
-        Self::from_protocol_system(name)
     }
 
     pub fn from_component(component: &ProtocolComponent) -> Option<Self> {
@@ -266,26 +260,6 @@ mod tests {
                 .filter(|(_, listed_kind)| *listed_kind == kind)
                 .count();
             assert_eq!(count, 1, "missing or duplicate canonical system case");
-        }
-    }
-
-    #[test]
-    fn exact_protocol_system_parser_preserves_wire_identity() {
-        for (name, kind) in CANONICAL_PROTOCOL_SYSTEM_CASES {
-            assert_eq!(
-                ProtocolKind::from_canonical_protocol_system(name),
-                Some(kind)
-            );
-        }
-        for name in ["Uniswap_V2", "uniswap-v2", "uniswap v2", "VM:CURVE"] {
-            assert!(ProtocolKind::from_sync_state_key(name).is_some());
-            assert_eq!(ProtocolKind::from_canonical_protocol_system(name), None);
-        }
-        for name in NON_CANONICAL_ALIASES
-            .into_iter()
-            .chain(["future_protocol", "uniswap_v2_pool"])
-        {
-            assert_eq!(ProtocolKind::from_canonical_protocol_system(name), None);
         }
     }
 

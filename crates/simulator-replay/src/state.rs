@@ -83,7 +83,6 @@ impl StatePoint {
         pool_by_id_from_state(&self.state, id)
     }
 
-    /// Matches the exact component DTO identity, without normalizing retained names.
     pub fn pool_ids_by_protocol_system(&self, protocol_system: &str) -> Vec<String> {
         let mut ids = self
             .state

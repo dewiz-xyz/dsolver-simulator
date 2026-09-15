@@ -1,5 +1,4 @@
 pub mod broadcaster;
-pub mod chain_head;
 pub mod config;
 pub mod memory;
 pub mod metrics;

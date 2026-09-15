@@ -1,7 +1,6 @@
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use reqwest::Client;
-use simulator_core::models::protocol::ProtocolKind;
 use tracing::info;
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
@@ -18,7 +17,7 @@ pub struct RfqTokenStoreConfig<'a> {
     pub tokens: Arc<TokenStore>,
     pub chain: Chain,
     pub token_refresh_timeout: Duration,
-    pub protocols: &'a [ProtocolKind],
+    pub protocols: &'a [String],
     pub bebop_url: &'a str,
     pub hashflow_filename: &'a str,
     pub liquorice_url: Option<&'a str>,
@@ -29,12 +28,12 @@ pub struct RfqTokenStoreConfig<'a> {
 pub async fn load_rfq_token_stores(
     config: RfqTokenStoreConfig<'_>,
 ) -> anyhow::Result<RFQTokenStores> {
-    let bebop = if config.protocols.contains(&ProtocolKind::Bebop) {
+    let bebop = if rfq_protocol_enabled(config.protocols, "rfq:bebop") {
         load_bebop_token_store(config.bebop_url, config.chain, config.token_refresh_timeout).await?
     } else {
         new_local_token_store(HashMap::new(), config.chain, config.token_refresh_timeout)
     };
-    let hashflow = if config.protocols.contains(&ProtocolKind::Hashflow) {
+    let hashflow = if rfq_protocol_enabled(config.protocols, "rfq:hashflow") {
         load_hashflow_token_store(
             config.hashflow_filename,
             config.chain,
@@ -43,7 +42,7 @@ pub async fn load_rfq_token_stores(
     } else {
         new_local_token_store(HashMap::new(), config.chain, config.token_refresh_timeout)
     };
-    let liquorice = if config.protocols.contains(&ProtocolKind::Liquorice) {
+    let liquorice = if rfq_protocol_enabled(config.protocols, "rfq:liquorice") {
         let liquorice_url = config.liquorice_url.ok_or_else(|| {
             anyhow::anyhow!(
                 "Liquorice RFQ enabled for {} without liquorice_url",
@@ -251,6 +250,10 @@ fn rfq_token_request_error(
             error
         )
     }
+}
+
+fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
+    protocols.iter().any(|configured| configured == protocol)
 }
 
 fn new_local_token_store(

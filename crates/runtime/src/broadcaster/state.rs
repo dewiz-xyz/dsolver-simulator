@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use state_history::WriterStatus;
@@ -24,18 +25,15 @@ use tycho_simulation::{
     },
 };
 
-use crate::chain_head::{ChainHeadAgreement, ChainHeadSnapshot};
 use crate::models::tokens::TokenStore;
 
 use simulator_core::broadcaster::{
-    complete_broadcaster_partition_block, complete_broadcaster_snapshot_head, BlockIdentity,
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
-    BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
-    BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
-    BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
-    BroadcasterUpdateMessage, ProtocolStateHeads,
+    complete_broadcaster_partition_block, BroadcasterBackend, BroadcasterBackendHead,
+    BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
+    BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
+    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
+    BroadcasterStateEntry, BroadcasterUpdateMessage,
 };
-use simulator_core::models::protocol::ProtocolKind;
 
 use super::redis_publisher::{
     BroadcasterDeploymentAdmissionSnapshot, BroadcasterDeploymentPhase,
@@ -52,16 +50,14 @@ pub enum BroadcasterReadiness {
     UpstreamRecovering,
     SnapshotUnexportable,
     UpstreamDisconnected,
-    ChainHeadUnavailable,
-    ChainHeadMismatch,
+    NativeProgressStale,
 }
 
 impl BroadcasterReadiness {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
-            Self::ChainHeadUnavailable => "chain_head_unavailable",
-            Self::ChainHeadMismatch => "chain_head_mismatch",
+            Self::NativeProgressStale => "native_progress_stale",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
             Self::UpstreamRecovering | Self::SnapshotUnexportable => "degraded",
             Self::RedisPublisherPassive => "redis_publisher_passive",
@@ -84,7 +80,6 @@ pub struct BroadcasterStatusSnapshot {
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
     pub deployment_admission: BroadcasterDeploymentAdmissionSnapshot,
     pub state_history: Option<WriterStatus>,
-    pub chain_head: Option<ChainHeadSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,9 +158,6 @@ pub struct BroadcasterBackendStatus {
     pub block_number: Option<u64>,
     pub pool_count: usize,
     pub sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
-    pub complete_head: Option<BlockIdentity>,
-    pub published_head: Option<BlockIdentity>,
-    pub head_agreement: Option<ChainHeadAgreement>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,13 +191,6 @@ pub(crate) struct BroadcasterRecoverySource {
 }
 
 impl BroadcasterRecoverySource {
-    pub(crate) fn protocol_state_heads(
-        &self,
-        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
-    ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
-        partition_protocol_heads(&self.partitions, required_protocols)
-    }
-
     pub(crate) fn complete_native_block(&self) -> Option<u64> {
         let partition = self.partitions.get(&BroadcasterBackend::Native)?;
         complete_broadcaster_partition_block(
@@ -217,13 +202,6 @@ impl BroadcasterRecoverySource {
 }
 
 impl BroadcasterSnapshotSource {
-    pub(crate) fn protocol_state_heads(
-        &self,
-        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
-    ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
-        partition_protocol_heads(&self.partitions, required_protocols)
-    }
-
     pub(crate) fn relabel_generation(&mut self, chain_id: u64, generation: u64) {
         self.stream_id = format_stream_id(chain_id, generation);
         self.snapshot_id = format_snapshot_id(chain_id, generation);
@@ -387,8 +365,6 @@ struct BroadcasterSnapshotCacheData {
     snapshot_id: String,
     partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     known_backends: HashMap<String, BroadcasterBackend>,
-    // Keep exact upstream feed keys: aliases can name separate synchronization streams.
-    // Recovery must wait for every stream rather than merge keys through normalization.
     expected_protocols: BTreeSet<String>,
     replacement: Option<UpstreamReplacementState>,
     next_recovery_id: u64,
@@ -884,20 +860,6 @@ impl BroadcasterSnapshotCache {
         self.backend_heads_locked(&guard)
     }
 
-    pub(crate) async fn complete_backend_heads(
-        &self,
-        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
-    ) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
-        let guard = self.inner.read().await;
-        if guard.replacement.is_some() {
-            return required_protocols
-                .keys()
-                .map(|backend| (*backend, None))
-                .collect();
-        }
-        complete_partition_heads(&guard.partitions, required_protocols)
-    }
-
     pub async fn is_ready(&self) -> bool {
         let guard = self.inner.read().await;
         self.is_ready_locked(&guard)
@@ -908,15 +870,24 @@ impl BroadcasterSnapshotCache {
         max_payload_bytes: usize,
         upstream: BroadcasterUpstreamSnapshot,
         snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
+        native_progress_lease: Duration,
     ) -> BroadcasterStatusSnapshot {
         let guard = self.inner.read().await;
         let ready = self.is_ready_locked(&guard);
+        let native_progress_stale = self
+            .configured_backends
+            .contains(&BroadcasterBackend::Native)
+            && upstream
+                .last_update_age_ms
+                .is_none_or(|age_ms| age_ms >= native_progress_lease.as_millis() as u64);
         let readiness = if !upstream.connected {
             BroadcasterReadiness::UpstreamDisconnected
         } else if guard.replacement.is_some() {
             BroadcasterReadiness::UpstreamRecovering
         } else if !ready {
             BroadcasterReadiness::SnapshotWarmingUp
+        } else if native_progress_stale {
+            BroadcasterReadiness::NativeProgressStale
         } else {
             BroadcasterReadiness::Ready
         };
@@ -932,9 +903,6 @@ impl BroadcasterSnapshotCache {
                         block_number: status.block_number,
                         pool_count: status.entry_count(),
                         sync_statuses: status.sync_statuses,
-                        complete_head: None,
-                        published_head: None,
-                        head_agreement: None,
                     },
                 )
             })
@@ -977,7 +945,6 @@ impl BroadcasterSnapshotCache {
                 last_error: None,
             },
             state_history: None,
-            chain_head: None,
         }
     }
 
@@ -1144,37 +1111,6 @@ fn collect_snapshot_export_parts(
     }
 
     Ok(())
-}
-
-fn partition_protocol_heads(
-    partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
-) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
-    required_protocols
-        .iter()
-        .map(|(backend, protocols)| {
-            let mut heads = ProtocolStateHeads::new(protocols.clone());
-            if let Some(partition) = partitions.get(backend) {
-                heads.apply_messages(&partition.messages);
-            }
-            (*backend, heads)
-        })
-        .collect()
-}
-
-fn complete_partition_heads(
-    partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
-) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
-    required_protocols
-        .iter()
-        .map(|(backend, protocols)| {
-            let head = partitions.get(backend).and_then(|partition| {
-                complete_broadcaster_snapshot_head(&partition.messages, protocols)
-            });
-            (*backend, head)
-        })
-        .collect()
 }
 
 impl BroadcasterPartitionState {
@@ -4464,6 +4400,7 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         let rfq_status = status
@@ -4489,6 +4426,7 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(status.readiness, BroadcasterReadiness::Ready);
@@ -4546,6 +4484,7 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(
@@ -4559,6 +4498,7 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(warming.readiness, BroadcasterReadiness::SnapshotWarmingUp);
@@ -4570,6 +4510,7 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(ready.readiness, BroadcasterReadiness::Ready);
@@ -5103,106 +5044,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_recovery_rejects_unknown_protocol_before_staging() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
-        let header = linked_header(10, 10, 9);
-        cache.begin_same_generation_recovery().await;
-        let result = cache
-            .apply_feed_message(&raw_feed(
-                vec![(
-                    "uniswap_v2",
-                    raw_snapshot_message("uniswap_v2", header.clone(), 1),
-                )],
-                vec![("uniswap_v2", header.clone()), ("future_protocol", header)],
-            ))
-            .await;
-        let Err(error) = result else {
-            return Err(anyhow!(
-                "unknown required feed protocols cannot be discarded to finish recovery"
-            ));
-        };
-        assert!(error.to_string().contains("future_protocol"));
-        assert!(cache.replacement_pending().await);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn raw_replacement_keeps_noncanonical_upstream_identities_distinct() -> Result<()> {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
-        let protocols = ["uniswap_v2", "UNISWAP_V2"];
-        let block_10 = linked_header(10, 10, 9);
-        cache
-            .apply_feed_message(&raw_feed(
-                protocols
-                    .iter()
-                    .map(|protocol| {
-                        (
-                            *protocol,
-                            raw_snapshot_message(protocol, block_10.clone(), 1),
-                        )
-                    })
-                    .collect(),
-                protocols
-                    .iter()
-                    .map(|protocol| (*protocol, block_10.clone()))
-                    .collect(),
-            ))
-            .await?;
-        cache.begin_same_generation_recovery().await;
-
-        let block_12 = linked_header(12, 12, 11);
-        cache
-            .apply_feed_message(&raw_feed(
-                vec![(
-                    "uniswap_v2",
-                    raw_snapshot_message("uniswap_v2", block_12.clone(), 2),
-                )],
-                protocols
-                    .iter()
-                    .map(|protocol| (*protocol, block_12.clone()))
-                    .collect(),
-            ))
-            .await?;
-        assert!(
-            cache.replacement_pending().await,
-            "a canonical domain identity cannot replace other upstream keys"
-        );
-
-        cache
-            .apply_feed_message(&raw_feed(
-                protocols[1..]
-                    .iter()
-                    .map(|protocol| {
-                        (
-                            *protocol,
-                            raw_snapshot_message(protocol, block_12.clone(), 3),
-                        )
-                    })
-                    .collect(),
-                protocols
-                    .iter()
-                    .map(|protocol| (*protocol, block_12.clone()))
-                    .collect(),
-            ))
-            .await?;
-        assert!(!cache.replacement_pending().await);
-        let snapshot = cache.export_snapshot(8_388_608).await?;
-        let published_protocols = snapshot
-            .payloads
-            .iter()
-            .filter_map(|payload| match payload {
-                BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk),
-                _ => None,
-            })
-            .flat_map(|chunk| &chunk.partitions)
-            .flat_map(|partition| &partition.messages)
-            .map(|message| message.protocol.as_str())
-            .collect::<HashSet<_>>();
-        assert_eq!(published_protocols, HashSet::from(protocols));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn reconnect_mid_recovery_discards_stale_candidates_and_aligns_from_fresh_snapshot(
     ) -> Result<()> {
         let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
@@ -5298,6 +5139,7 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert!(first_status.snapshot.recovery_pending);
@@ -5309,6 +5151,7 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
+                std::time::Duration::from_secs(5),
             )
             .await;
         assert!(second_status.snapshot.recovery_pending);

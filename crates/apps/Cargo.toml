@@ -35,7 +35,6 @@ name = "state-history-migrate"
 path = "src/bin/state-history-migrate.rs"
 
 [dev-dependencies]
-runtime = { path = "../runtime", features = ["test-util"] }
 chrono.workspace = true
 futures.workspace = true
 jemalloc-ctl.workspace = true

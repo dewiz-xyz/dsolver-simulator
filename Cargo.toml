@@ -21,11 +21,8 @@ license = "MIT"
 repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 
 [workspace.dependencies]
-alloy-eips = "1.8.3"
 alloy-primitives = "1.5.4"
-alloy-provider = { version = "1.8.3", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
 alloy-sol-types = "1.5.2"
-alloy-transport = "1.8.3"
 anyhow = "1.0"
 aws-config = "1"
 aws-sdk-rds = "1"

@@ -21,7 +21,6 @@ use crate::{ReplayBackend, StatePoint};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactPoolQuote {
     pub backend: ReplayBackend,
-    /// Exact protocol system from the component DTO, including retained noncanonical names.
     pub protocol: String,
     pub component_id: String,
     pub token_in: Bytes,

@@ -23,11 +23,7 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
-use crate::models::protocol::ProtocolKind;
-use crate::models::state::{
-    AppState, BackendFreshnessFence, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard,
-    SimulatorBackendKind,
-};
+use crate::models::state::{AppState, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard};
 use crate::services::stream_builder::{
     ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
 };
@@ -47,7 +43,6 @@ struct CachedPoolEntry {
     pool_state: Arc<dyn ProtocolSim>,
     component: Arc<ProtocolComponent>,
     backend: PoolBackend,
-    serving_backend: SimulatorBackendKind,
 }
 
 struct SegmentSimState {
@@ -64,8 +59,6 @@ struct RouteResimulator<'a> {
     pool_cache: HashMap<String, CachedPoolEntry>,
     rebuild_guard: Arc<SimulationRebuildGuard>,
     native_pin: PublishedStatePin,
-    native_freshness: Option<BackendFreshnessFence>,
-    vm_freshness: Option<BackendFreshnessFence>,
 }
 
 struct SwapSimulationRequest {
@@ -94,8 +87,6 @@ pub(super) struct ResimulationOutcome {
     pub(super) result: Result<ResimulatedRouteInternal, AttemptError>,
     pub(super) native_pool_ids: HashSet<String>,
     pub(super) uses_rfq: bool,
-    pub(super) freshness_fences: Vec<BackendFreshnessFence>,
-    pub(super) rebuild_guard: Arc<SimulationRebuildGuard>,
 }
 
 pub(super) async fn resimulate_route_with_native_pin(
@@ -115,11 +106,6 @@ pub(super) async fn resimulate_route_with_native_pin(
         result,
         native_pool_ids,
         uses_rfq,
-        freshness_fences: [resimulator.native_freshness, resimulator.vm_freshness]
-            .into_iter()
-            .flatten()
-            .collect(),
-        rebuild_guard: resimulator.rebuild_guard,
     }
 }
 
@@ -140,8 +126,6 @@ impl<'a> RouteResimulator<'a> {
             pool_cache: HashMap::new(),
             rebuild_guard,
             native_pin,
-            native_freshness: None,
-            vm_freshness: None,
         }
     }
 
@@ -165,7 +149,7 @@ impl<'a> RouteResimulator<'a> {
         let native_pool_ids = self
             .pool_cache
             .iter()
-            .filter(|(_, entry)| entry.serving_backend == SimulatorBackendKind::Native)
+            .filter(|(_, entry)| entry.backend.is_native())
             .map(|(id, _)| id.clone())
             .collect();
         let uses_rfq = self.pool_cache.values().any(|entry| entry.backend.is_rfq());
@@ -271,8 +255,7 @@ impl<'a> RouteResimulator<'a> {
         )?;
         let sim_token_in = map_swap_token(&allocated.token_in, self.chain, keep_native_unwrapped);
         let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
-        let native_pin = (pool_entry.serving_backend == SimulatorBackendKind::Native)
-            .then_some(&self.native_pin);
+        let native_pin = pool_entry.backend.is_native().then_some(&self.native_pin);
         let token_in = self.token_cache.get(&sim_token_in, native_pin).await?;
         let token_out = self.token_cache.get(&sim_token_out, native_pin).await?;
         let (pre_state, result) = simulate_swap(SwapSimulationRequest {
@@ -281,7 +264,9 @@ impl<'a> RouteResimulator<'a> {
             token_in,
             token_out,
             pool_id: allocated.pool.component_id.clone(),
-            rebuild_guard: (pool_entry.serving_backend != SimulatorBackendKind::Native)
+            rebuild_guard: pool_entry
+                .backend
+                .uses_rebuild_guard()
                 .then(|| Arc::clone(&self.rebuild_guard)),
         })
         .await?;
@@ -294,7 +279,6 @@ impl<'a> RouteResimulator<'a> {
                 pool_state: Arc::from(result.new_state),
                 component: Arc::clone(&pool_entry.component),
                 backend: pool_entry.backend,
-                serving_backend: pool_entry.serving_backend,
             },
         );
         Ok(ResimulatedSwapInternal {
@@ -316,11 +300,8 @@ impl<'a> RouteResimulator<'a> {
         }
 
         if let Some((pool_state, component)) = self.native_pin.pool_by_id(pool_id) {
-            self.ensure_freshness(SimulatorBackendKind::Native, &self.native_pin.clone())
-                .await?;
             let entry = CachedPoolEntry {
                 backend: PoolBackend::from_component(component.as_ref()),
-                serving_backend: SimulatorBackendKind::Native,
                 pool_state,
                 component,
             };
@@ -328,12 +309,12 @@ impl<'a> RouteResimulator<'a> {
             return Ok(entry);
         }
 
-        let mut requirements = self
+        if let Some((uses_vm, uses_rfq)) = self
             .state
             .pool_rebuild_guard_requirements(pool_id)
             .await
-            .map_err(availability_error)?;
-        if let Some((uses_vm, uses_rfq)) = requirements {
+            .map_err(availability_error)?
+        {
             if (uses_vm || uses_rfq)
                 && !self
                     .rebuild_guard
@@ -343,47 +324,20 @@ impl<'a> RouteResimulator<'a> {
                     .state
                     .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
                     .await;
-                requirements = self
-                    .state
-                    .pool_rebuild_guard_requirements(pool_id)
-                    .await
-                    .map_err(availability_error)?;
             }
         }
-        let serving_backend = match requirements {
-            Some((true, _)) => SimulatorBackendKind::Vm,
-            Some((_, true)) => SimulatorBackendKind::Rfq,
-            Some((false, false)) => SimulatorBackendKind::Native,
-            None => {
-                return Err(AttemptError::state_dependent(EncodeError::not_found(
-                    format!("Pool {} not found", pool_id),
+
+        let (pool_state, component) = self
+            .state
+            .pool_by_id(pool_id)
+            .await
+            .map_err(availability_error)?
+            .ok_or_else(|| {
+                AttemptError::state_dependent(EncodeError::not_found(format!(
+                    "Pool {} not found",
+                    pool_id
                 )))
-            }
-        };
-        let entry = match serving_backend {
-            SimulatorBackendKind::Native => {
-                let pin = self.state.native_state_store.pin().await;
-                self.ensure_freshness(serving_backend, &self.native_pin.clone())
-                    .await?;
-                pin.pool_by_id(pool_id)
-            }
-            SimulatorBackendKind::Vm => {
-                let pin = self.state.vm_state_store.pin().await;
-                self.ensure_freshness(serving_backend, &pin).await?;
-                pin.pool_by_id(pool_id)
-            }
-            SimulatorBackendKind::Rfq => self
-                .state
-                .pool_by_id(pool_id)
-                .await
-                .map_err(availability_error)?,
-        };
-        let (pool_state, component) = entry.ok_or_else(|| {
-            AttemptError::state_dependent(EncodeError::not_found(format!(
-                "Pool {} not found",
-                pool_id
-            )))
-        })?;
+            })?;
         let backend = PoolBackend::from_component(component.as_ref());
         let pool_state = if backend.is_rfq() {
             hydrate_rfq_pool_state(
@@ -399,36 +353,11 @@ impl<'a> RouteResimulator<'a> {
 
         let entry = CachedPoolEntry {
             backend,
-            serving_backend,
             pool_state,
             component,
         };
         self.pool_cache.insert(pool_id.to_string(), entry.clone());
         Ok(entry)
-    }
-
-    async fn ensure_freshness(
-        &mut self,
-        backend: SimulatorBackendKind,
-        pin: &PublishedStatePin,
-    ) -> Result<(), AttemptError> {
-        let freshness = match backend {
-            SimulatorBackendKind::Native => &mut self.native_freshness,
-            SimulatorBackendKind::Vm => &mut self.vm_freshness,
-            SimulatorBackendKind::Rfq => return Ok(()),
-        };
-        if freshness.is_none() {
-            *freshness = self.state.backend_freshness_fence(backend, pin).await;
-            if freshness.is_none() {
-                return Err(AttemptError::state_dependent(EncodeError::unavailable(
-                    format!(
-                        "{} state is unavailable for route simulation",
-                        backend.label()
-                    ),
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn build_resimulated_segments(
@@ -675,7 +604,7 @@ fn ensure_native_swap_supported(
     token_out: &Bytes,
     component: &ProtocolComponent,
     component_id: &str,
-    native_token_protocol_allowlist: &[ProtocolKind],
+    native_token_protocol_allowlist: &[String],
 ) -> Result<bool, AttemptError> {
     let native_address = chain.native_token().address;
     let swap_uses_native = *token_in == native_address || *token_out == native_address;
@@ -812,8 +741,8 @@ mod tests {
     use super::*;
     use crate::models::state::RfqClientConfig;
     use crate::services::encode::fixtures::{
-        component_with_protocol, component_with_tokens, dummy_token, fixture_bytes, fixture_head,
-        pool_ref, test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
+        component_with_protocol, component_with_tokens, dummy_token, fixture_bytes, pool_ref,
+        test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
     };
     use crate::services::encode::mocks::{step_multiplier, StepProtocolSim};
     use crate::services::encode::model::{
@@ -1111,9 +1040,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-1".to_string(), component);
         let update = Update::new(1, states, new_pairs);
-        native_state_store
-            .apply_update_with_head(update, Some(fixture_head(1)))
-            .await;
+        native_state_store.apply_update(update).await;
 
         let app_state = test_app_state(
             tokens_store,
@@ -1184,7 +1111,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-1".to_string(), component);
         native_state_store
-            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
+            .apply_update(Update::new(1, states, new_pairs))
             .await;
 
         let app_state = test_app_state(
@@ -1265,7 +1192,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-vm".to_string(), component);
         vm_state_store
-            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
+            .apply_update(Update::new(1, states, new_pairs))
             .await;
 
         let app_state = test_app_state(
@@ -1315,14 +1242,8 @@ mod tests {
             Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
         vm_state_store
-            .apply_update_with_head(
-                Update::new(2, replacement_states, HashMap::new()),
-                Some(fixture_head(2)),
-            )
+            .apply_update(Update::new(2, replacement_states, HashMap::new()))
             .await;
-        app_state
-            .chain_head_observer
-            .observe_for_test(fixture_head(2));
 
         drop(request_guard);
         let resimulated =
@@ -1364,7 +1285,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-vm".to_string(), component);
         vm_state_store
-            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
+            .apply_update(Update::new(1, states, new_pairs))
             .await;
 
         let app_state = test_app_state(
@@ -1414,14 +1335,8 @@ mod tests {
             Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
         vm_state_store
-            .apply_update_with_head(
-                Update::new(2, replacement_states, HashMap::new()),
-                Some(fixture_head(2)),
-            )
+            .apply_update(Update::new(2, replacement_states, HashMap::new()))
             .await;
-        app_state
-            .chain_head_observer
-            .observe_for_test(fixture_head(2));
 
         drop(request_guard);
         let resimulated =
@@ -1463,7 +1378,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-erc4626".to_string(), component);
         native_state_store
-            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
+            .apply_update(Update::new(1, states, new_pairs))
             .await;
 
         let normalized = NormalizedRouteInternal {
@@ -1570,9 +1485,7 @@ mod tests {
         new_pairs.insert("pool-a".to_string(), component_a);
         new_pairs.insert("pool-shared".to_string(), component_shared);
         let update = Update::new(1, states, new_pairs);
-        native_state_store
-            .apply_update_with_head(update, Some(fixture_head(1)))
-            .await;
+        native_state_store.apply_update(update).await;
 
         let app_state = test_app_state(
             tokens_store,
@@ -1719,7 +1632,7 @@ mod tests {
             ),
         );
         native_state_store
-            .apply_update_with_head(Update::new(1, states, pairs), Some(fixture_head(1)))
+            .apply_update(Update::new(1, states, pairs))
             .await;
         let native_pin = native_state_store.pin().await;
         let app_state = test_app_state(

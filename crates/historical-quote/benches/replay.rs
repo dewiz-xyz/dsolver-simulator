@@ -14,7 +14,6 @@ use serde::Deserialize;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterSnapshotPartition, BroadcasterTokenDto, BroadcasterUpdateMessage,
 };
-use simulator_core::models::protocol::ProtocolKind;
 use simulator_replay::{
     DecoderConfig, ExactPoolQuote, ReplayBackend, ReplayDecoder, ReplayWorld, StatePoint, TokenMap,
 };
@@ -103,10 +102,8 @@ impl PreparedFixture {
         assert_eq!(checkpoint.chain_id, Chain::Base.id());
         let tokens = fixture_tokens(checkpoint.tokens);
         let backend = ReplayBackend::from(checkpoint.quote.backend);
-        let protocol = ProtocolKind::from_canonical_protocol_system(&checkpoint.quote.protocol)
-            .expect("fixture protocol must be canonical");
         let decoder = ReplayDecoder::new(
-            DecoderConfig::for_backend(backend, vec![protocol], 0),
+            DecoderConfig::for_backend(backend, vec![checkpoint.quote.protocol.clone()], 0),
             tokens.clone(),
         )
         .await

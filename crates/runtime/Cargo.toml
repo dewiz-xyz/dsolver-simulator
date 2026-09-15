@@ -7,15 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "DSolver simulator runtime assembly, state, streams, and services."
 
-[features]
-test-util = []
-
 [dependencies]
-alloy-eips.workspace = true
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
 alloy-sol-types.workspace = true
-alloy-transport.workspace = true
 anyhow.workspace = true
 csv.workspace = true
 dotenv.workspace = true

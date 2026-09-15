@@ -17,47 +17,6 @@ use tokio_util::sync::CancellationToken;
 use support::{native_quote_request, rfq_quote_request, FixtureSource};
 
 #[tokio::test]
-async fn retained_protocol_alias_requires_its_exact_selector(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut source = FixtureSource::native()?;
-    let alias = "retained_uniswap_v2";
-    let archive = source
-        .archives
-        .get_mut(&1)
-        .ok_or("missing fixture archive")?;
-    let mut chunk: serde_json::Value = serde_json::from_str(&archive.payloads_json[1])?;
-    chunk["partitions"][0]["states"][0]["component"]["protocol_system"] = alias.into();
-    archive.payloads_json[1] = chunk.to_string();
-    let executor = executor(Arc::new(source));
-
-    for protocol in [alias, "uniswap_v2", "Uniswap V2", "unknown_protocol"] {
-        let mut request = native_quote_request(100, 100);
-        request.pool.protocol = protocol.to_owned();
-        let result = executor
-            .execute(&request, &CancellationToken::new(), &())
-            .await?;
-        assert_eq!(result.pool.protocol, protocol);
-        let outcomes = result.results.iter().flat_map(|entry| {
-            std::iter::once(&entry.start_outcome)
-                .chain(entry.targets.iter().map(|target| &target.outcome))
-        });
-        for outcome in outcomes {
-            if protocol == alias {
-                successful_amount(outcome)?;
-            } else {
-                assert_eq!(
-                    outcome,
-                    &QuoteOutcome::QuoteFailed {
-                        reason: QuoteFailureReason::DirectionUnsupported,
-                    }
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn grouped_quotes_are_sorted_and_replay_each_leg_once(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = Arc::new(FixtureSource::native()?);

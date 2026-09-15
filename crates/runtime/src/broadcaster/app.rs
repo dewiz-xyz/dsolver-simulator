@@ -19,7 +19,6 @@ use crate::broadcaster::state::{
     BroadcasterUpstreamState,
 };
 use crate::broadcaster::state_history::{build_state_history_runtime, StateHistoryRuntime};
-use crate::chain_head::{ChainHeadConfig, ChainHeadObserver};
 use crate::config::{
     init_logging, load_broadcaster_config, load_broadcaster_redis_config,
     load_state_history_config, BroadcasterConfig, MemoryConfig,
@@ -33,8 +32,8 @@ use crate::services::stream_builder::{
     build_broadcaster_raw_stream, build_rfq_stream, BroadcasterProtocols, RFQConfig, RFQTokenStores,
 };
 use crate::stream::{
-    run_broadcaster_raw_stream_once, supervise_broadcaster_stream, BroadcasterRecoveryConfig,
-    BroadcasterStreamControls, StreamSupervisorConfig,
+    run_broadcaster_raw_stream_once, supervise_broadcaster_stream, BroadcasterStreamControls,
+    StreamSupervisorConfig,
 };
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterSnapshotSessionResponse,
@@ -283,7 +282,6 @@ pub struct BroadcasterTasks {
     feed_tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
     promotion_task: tokio::task::JoinHandle<()>,
     heartbeat_task: tokio::task::JoinHandle<()>,
-    chain_head_task: tokio::task::JoinHandle<()>,
 }
 
 impl BroadcasterTasks {
@@ -312,11 +310,7 @@ impl BroadcasterTasks {
                 }
             }
         }
-        for task in [
-            self.promotion_task,
-            self.heartbeat_task,
-            self.chain_head_task,
-        ] {
+        for task in [self.promotion_task, self.heartbeat_task] {
             if let Err(error) = task.await {
                 first_error.get_or_insert_with(|| anyhow::anyhow!(error));
             }
@@ -342,10 +336,6 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     init_logging();
 
     let config = load_broadcaster_config();
-    let rpc_url = config
-        .rpc_url
-        .clone()
-        .context("RPC_URL is required for broadcaster chain head observation")?;
     let chain = config.chain_profile.chain;
     info!(chain_id = chain.id(), chain = %chain, "Initializing Tycho broadcaster...");
     log_memory_config(config.memory);
@@ -378,40 +368,30 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         .map(|backends| BroadcasterSnapshotCache::new(chain.id(), backends.clone()));
     let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
     let recovery_retry_backoff = Duration::from_millis(config.stream_restart_backoff_min_ms);
-    let chain_head_observer = ChainHeadObserver::new(ChainHeadConfig {
-        poll_interval: Duration::from_millis(config.chain_profile.chain_head_poll_interval_ms),
-        rpc_request_timeout: Duration::from_millis(
-            config.chain_profile.chain_head_rpc_request_timeout_ms,
-        ),
-        observation_max_age: Duration::from_secs(
-            config.chain_profile.chain_head_observation_max_age_secs,
-        ),
-    });
-    let raw_service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff(
+    let native_progress_lease =
+        Duration::from_secs(config.chain_profile.native_progress_lease_secs);
+    let raw_service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
         config.tuning.snapshot_max_payload_bytes,
         raw_cache,
         raw_upstream_state,
         Arc::clone(&redis_publisher),
         Arc::clone(&publication_gate),
         recovery_retry_backoff,
-    )
-    .with_chain_head_observer(
-        chain_head_observer.clone(),
-        config.chain_profile.native_protocols.clone(),
-        config.chain_profile.vm_protocols.clone(),
+        native_progress_lease,
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
     let mut supervisors = Vec::new();
 
     let rfq_service = if let Some(rfq_cache) = rfq_cache {
-        let service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff(
+        let service = BroadcasterServiceState::with_lifecycle_gate_and_recovery_backoff_and_lease(
             config.tuning.snapshot_max_payload_bytes,
             rfq_cache,
             BroadcasterUpstreamState::default(),
             Arc::clone(&redis_publisher),
             Arc::clone(&publication_gate),
             recovery_retry_backoff,
+            native_progress_lease,
         );
         let rfq_token_stores = load_rfq_token_stores(RfqTokenStoreConfig {
             tokens: Arc::clone(&tokens),
@@ -454,12 +434,6 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
         state_history_config.as_ref(),
         state_history.as_ref(),
     )?;
-    let observer_stop = stop.clone();
-    let chain_head_task = tokio::spawn(async move {
-        chain_head_observer
-            .run(&rpc_url, chain.id(), observer_stop)
-            .await;
-    });
     supervisors.push(spawn_broadcaster_stream_task(
         &config,
         supervisor_cfg.clone(),
@@ -490,7 +464,6 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
             feed_tasks: supervisors,
             promotion_task,
             heartbeat_task,
-            chain_head_task,
         },
     })
 }
@@ -600,10 +573,6 @@ async fn build_redis_publisher(
             config.chain_profile.recovery_max_buffered_native_blocks,
         ),
         writer,
-    )
-    .with_required_protocols(
-        config.chain_profile.native_protocols.clone(),
-        config.chain_profile.vm_protocols.clone(),
     );
     let publisher = match state_history {
         Some(state_history) => publisher.with_state_history(Arc::clone(state_history)),
@@ -669,9 +638,7 @@ fn effective_rfq_enabled(config: &BroadcasterConfig) -> bool {
 
 fn build_supervisor_config(config: &BroadcasterConfig) -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        initialization_timeout: Duration::from_secs(
-            config.chain_profile.stream_initialization_timeout_secs,
-        ),
+        readiness_stale: Duration::from_secs(config.chain_profile.native_progress_lease_secs),
         stream_stale: Duration::from_secs(config.stream_stale_secs),
         missing_block_burst: config.stream_missing_block_burst,
         missing_block_window: Duration::from_secs(config.stream_missing_block_window_secs),
@@ -701,16 +668,6 @@ fn spawn_broadcaster_stream_task(
         native: config.chain_profile.native_protocols.clone(),
         vm: config.chain_profile.vm_protocols.clone(),
     };
-    let recovery_config = BroadcasterRecoveryConfig {
-        initial_bootstrap_timeout: Duration::from_secs(
-            config.chain_profile.tycho_initial_bootstrap_timeout_secs,
-        ),
-        head_mismatch_recovery_timeout: Duration::from_secs(
-            config
-                .chain_profile
-                .tycho_head_mismatch_recovery_timeout_secs,
-        ),
-    };
 
     tokio::spawn(async move {
         info!("Starting broadcaster upstream supervisor...");
@@ -728,7 +685,6 @@ fn spawn_broadcaster_stream_task(
             },
             health,
             supervisor_cfg,
-            recovery_config,
             BroadcasterStreamControls { service, stop },
         )
         .await
@@ -1048,7 +1004,6 @@ mod tests {
     use std::sync::Arc;
 
     use simulator_core::broadcaster::BroadcasterBackend;
-    use simulator_core::models::protocol::ProtocolKind;
     use tokio_util::sync::CancellationToken;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
@@ -1081,14 +1036,13 @@ mod tests {
                 }),
             ],
             promotion_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
-            heartbeat_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
-            chain_head_task: wait_for_stop(stop, Arc::clone(&stopped)),
+            heartbeat_task: wait_for_stop(stop, Arc::clone(&stopped)),
         };
 
         tasks.wait_for_feed().await?;
         tasks.stop_and_wait().await?;
 
-        assert_eq!(stopped.load(Ordering::Relaxed), 4);
+        assert_eq!(stopped.load(Ordering::Relaxed), 3);
         Ok(())
     }
 
@@ -1106,8 +1060,7 @@ mod tests {
                 Err(anyhow::anyhow!("planned feed failure"))
             })],
             promotion_task: wait_for_stop(stop.clone()),
-            heartbeat_task: wait_for_stop(stop.clone()),
-            chain_head_task: wait_for_stop(stop),
+            heartbeat_task: wait_for_stop(stop),
         };
 
         let result = tasks.wait_for_feed().await;
@@ -1125,15 +1078,10 @@ mod tests {
         BroadcasterConfig {
             chain_profile: ChainProfile {
                 chain: Chain::Ethereum,
-                native_protocols: vec![ProtocolKind::UniswapV2],
+                native_protocols: vec!["uniswap_v2".to_string()],
                 vm_protocols: Vec::new(),
-                rfq_protocols: vec![ProtocolKind::Bebop],
-                stream_initialization_timeout_secs: 25,
-                chain_head_poll_interval_ms: 1_000,
-                chain_head_rpc_request_timeout_ms: 2_000,
-                chain_head_observation_max_age_secs: 15,
-                tycho_initial_bootstrap_timeout_secs: 900,
-                tycho_head_mismatch_recovery_timeout_secs: 60,
+                rfq_protocols: vec!["rfq:bebop".to_string()],
+                native_progress_lease_secs: 25,
                 recovery_max_buffered_native_blocks: 8,
                 native_token_protocol_allowlist: Vec::new(),
                 reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),

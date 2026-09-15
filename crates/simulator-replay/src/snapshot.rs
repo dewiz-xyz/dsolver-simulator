@@ -23,8 +23,6 @@ impl SnapshotReassemblyError {
 
 #[derive(Default)]
 pub struct RawSnapshotReassembly {
-    // Reassembly precedes protocol selection. Keep unknown and noncanonical wire
-    // identities separate so fragments cannot merge into a selected protocol.
     messages: BTreeMap<String, BroadcasterProtocolMessage>,
 }
 

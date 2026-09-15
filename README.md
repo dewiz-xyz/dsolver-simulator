@@ -98,22 +98,6 @@ Common optional inputs:
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
 
-### Protocol identities
-
-Use canonical Tycho protocol names in `simulator-manifest.toml`, such as `uniswap_v3` or
-`vm:curve`. Validation trims surrounding whitespace and requires an exact match. For example,
-`Uniswap-V3` and the protocol type name `uniswap_v3_pool` fail validation. The resolved configuration
-uses `ProtocolKind`, as do decoder registration, applied state tracking, and routing policies.
-
-Tycho messages, JSON payloads, and retained snapshots keep their protocol strings. Snapshot
-reassembly preserves exact upstream keys so differently named streams stay distinct and recovery
-waits for all required streams. Historical pool selectors also match the stored component name
-exactly, including noncanonical names. External metadata and request hints retain their existing
-parsing rules.
-
-Base Uniswap V4 consumes the native wire partition and stores its state in the VM store with
-the shared database. Using `ProtocolKind` preserves that split.
-
 ## Runtime Continuity Contract
 
 The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.
@@ -206,9 +190,9 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 
 - `200 OK` from `/ready` with `status="ready"` when native traffic can be served
 - `503 Service Unavailable` from `/ready` while native readiness is not ready
-- `backends.native.status="ready"` when the broadcaster subscription is live, bootstrap is complete, and the applied native head matches the observed chain head
+- `backends.native.status="ready"` when the broadcaster subscription is live, bootstrap is complete, and native state is ready and not stale
 - `backends.native.status="warming_up"` while initial native state is still loading
-- `backends.native.status="stale"` when the applied complete head cannot be confirmed against a fresh independent RPC observation
+- `backends.native.status="stale"` when native updates are past the readiness freshness window
 
 `backends.vm.status` is one of:
 
@@ -219,51 +203,6 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 - `ready`
 
 `backends.rfq.status` is one of `disabled`, `warming_up`, `stale`, or `ready`. Native and VM backend status use `block_number`; RFQ backend status uses `update_timestamp` for the current Tycho RFQ update cursor.
-
-Each broadcaster and simulator observes `eth_getBlockByNumber("latest", false)` through its required
-`RPC_URL`, verifying that the endpoint matches `CHAIN_ID`. Native and VM state each need a complete
-block number and hash for their own configured protocols. Their availability remains separate:
-a stale VM backend is skipped by native-only quoting, while encoding requires every backend used
-by its route. On Base, Uniswap V4 uses the VM/shared-database state store even though its wire
-protocol is native.
-
-Native and VM entries in `/status` and `/ready` include `observation_age_ms` after the first
-successful RPC observation. It measures elapsed time from that observation's request start,
-including request duration, and comes from the same observation snapshot as `chain_head_agreement`.
-The age keeps increasing after RPC failures or expiry. It is omitted before the first successful
-observation and for RFQ, and does not measure Tycho update age or how far state lags the chain.
-
-A successful RPC observation may justify serving for at most 5 seconds on Base or 15 seconds on
-Ethereum. These limits are not a grace period for state that disagrees with the observed head:
-a fresh observation of a different block number or hash closes affected availability immediately.
-An RPC error leaves the previous observation usable only until its age limit expires. Tycho
-status-only messages leave installed state unchanged, even when they report delayed or stale
-feed progress. Requests spanning a freshness change cannot return affected results after recovery.
-RPC uncertainty alone does not restart the broadcaster. The `ChainHeadRpcOutageSeconds` metric
-reports continuous observation failure, and the companion `solver-iac` alarm alerts after more
-than five minutes.
-
-The per-chain manifest keeps the clocks separate:
-
-| Setting | Base | Ethereum | What it bounds |
-| --- | ---: | ---: | --- |
-| `chain_head_poll_interval_ms` | 500 ms | 1,000 ms | Time between independent RPC observations |
-| `chain_head_rpc_request_timeout_ms` | 2,000 ms | 2,000 ms | Maximum duration of each chain head JSON-RPC request |
-| `chain_head_observation_max_age_secs` | 5 s | 15 s | How long a successful observation may justify serving |
-| `tycho_initial_bootstrap_timeout_secs` | 300 s | 900 s | Tycho construction through the first complete state for all configured chain backends |
-| `tycho_head_mismatch_recovery_timeout_secs` | 60 s | 60 s | Recovery of an established feed after confirmed divergence or incomplete state |
-| `stream_initialization_timeout_secs` | 10 s | 25 s | Individual native replay snapshot requests, incomplete replay recovery, and the first RFQ update |
-
-The bootstrap deadline starts immediately before constructing the raw Tycho feed. It does not cover
-preceding application initialization such as token loading or Redis setup. An established feed keeps
-its existing Tycho stream during the separate 60-second recovery window; there is no second
-client. Matching heads end the recovery incident. An expired recovery window with fresh divergence
-evidence, a bootstrap timeout, or a terminal feed failure follows the existing bounded process shutdown. `/deployment-ready`
-remains separate from serving readiness so ordinary recovery does not revoke deployment admission.
-
-Custom manifests must supply these timing settings, including `chain_head_rpc_request_timeout_ms`.
-`stream_initialization_timeout_secs` replaces the old `native_progress_lease_secs` name; it no longer defines serving freshness or raw-feed lifetime.
-Production V2 `solve-base` uses its own Tycho path and is outside this behavior.
 
 Timeout behavior differs by endpoint:
 

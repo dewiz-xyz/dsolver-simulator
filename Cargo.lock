@@ -6197,11 +6197,8 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 name = "runtime"
 version = "0.1.0"
 dependencies = [
- "alloy-eips",
  "alloy-primitives 1.5.7",
- "alloy-provider",
  "alloy-sol-types",
- "alloy-transport",
  "anyhow",
  "broadcaster-replay-client",
  "chrono",

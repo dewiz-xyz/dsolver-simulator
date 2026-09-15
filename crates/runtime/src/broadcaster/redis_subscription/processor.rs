@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -295,10 +294,7 @@ impl BroadcasterSubscriptionProcessor {
         if partition.messages.is_empty() {
             let decoded = self.decoder.decode_snapshot_partition(partition).await?;
             if let Some(update) = decoded.update {
-                self.controls
-                    .state_store()
-                    .apply_update_with_protocol_heads(update, &decoded.protocol_head_updates)
-                    .await;
+                self.controls.state_store().apply_update(update).await;
             }
             return Ok(());
         }
@@ -312,28 +308,12 @@ impl BroadcasterSubscriptionProcessor {
 
     async fn apply_reassembled_snapshot_messages(&mut self) -> Result<()> {
         let messages = self.raw_snapshot.take_messages();
-        if messages.is_empty() {
-            return Ok(());
-        }
-        let decoded = self
+        if let Some(update) = self
             .decoder
-            .decode_snapshot_partition(BroadcasterSnapshotPartition::with_messages(
-                self.controls.backend(),
-                0,
-                messages,
-                BTreeMap::new(),
-            ))
-            .await?;
-        if let Some(update) = decoded.update {
-            self.controls
-                .state_store()
-                .apply_update_with_protocol_heads(update, &decoded.protocol_head_updates)
-                .await;
-        } else {
-            self.controls
-                .state_store()
-                .apply_protocol_heads(&decoded.protocol_head_updates)
-                .await;
+            .decode_snapshot_messages(ReplayBackend::from(self.controls.backend()), messages)
+            .await?
+        {
+            self.controls.state_store().apply_update(update).await;
         }
         Ok(())
     }
@@ -355,33 +335,18 @@ impl BroadcasterSubscriptionProcessor {
         if !decoded.had_applicable_partition {
             return Ok(());
         }
-        if decoded.update.is_none() && decoded.protocol_head_updates.is_empty() {
-            return Ok(());
-        }
         if let Some(update) = decoded.update {
             match state_version {
                 Some(state_version) => {
                     self.controls
                         .state_store()
-                        .apply_update_at_version_with_protocol_heads(
-                            update,
-                            &decoded.protocol_head_updates,
-                            state_version,
-                        )
+                        .apply_update_at_version(update, state_version)
                         .await?;
                 }
                 None => {
-                    self.controls
-                        .state_store()
-                        .apply_update_with_protocol_heads(update, &decoded.protocol_head_updates)
-                        .await;
+                    self.controls.state_store().apply_update(update).await;
                 }
             }
-        } else {
-            self.controls
-                .state_store()
-                .apply_protocol_heads(&decoded.protocol_head_updates)
-                .await;
         }
         match self.controls.backend() {
             BroadcasterBackend::Rfq => {

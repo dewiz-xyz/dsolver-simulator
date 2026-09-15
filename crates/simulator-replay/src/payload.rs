@@ -7,10 +7,7 @@ use tycho_simulation::{
 };
 
 use simulator_core::{
-    broadcaster::{
-        BroadcasterBackend, BroadcasterSnapshotPartition, BroadcasterUpdatePartition,
-        ProtocolHeadUpdate,
-    },
+    broadcaster::{BroadcasterBackend, BroadcasterSnapshotPartition, BroadcasterUpdatePartition},
     models::protocol::ProtocolKind,
 };
 
@@ -65,7 +62,6 @@ pub struct DecodedReplay {
     pub had_applicable_partition: bool,
     pub block_number: u64,
     pub complete_native_block: Option<u64>,
-    pub protocol_head_updates: Vec<ProtocolHeadUpdate>,
     pub update: Option<Update>,
 }
 

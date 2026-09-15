@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterSnapshotPartition, BroadcasterTokenDto, BroadcasterUpdateMessage,
 };
-use simulator_core::models::protocol::ProtocolKind;
 use simulator_replay::{
     DecoderConfig, ExactPoolQuote, ReplayBackend, ReplayDecoder, ReplayQuoteError, ReplayWorld,
     StatePoint,
@@ -89,48 +88,6 @@ async fn extracted_native_and_rfq_paths_match_characterized_results() -> Result<
 }
 
 #[tokio::test]
-async fn retained_decoded_components_keep_exact_noncanonical_quote_selectors() -> Result<()> {
-    for external_name in ["Uniswap V2", "legacy_system"] {
-        let mut checkpoint: LiveParityCheckpoint = serde_json::from_str(NATIVE_CHECKPOINT_V1)?;
-        // Decoded retained state also admits systems recognized through the component type.
-        checkpoint.partition.states[0].component.protocol_system = external_name.to_owned();
-        let partition_json = serde_json::to_string(&checkpoint.partition)?;
-        let partition = serde_json::from_str(&partition_json)?;
-        let tokens = fixture_tokens(checkpoint.tokens, Chain::Base)?;
-        let decoder = ReplayDecoder::new(DecoderConfig::retained_v1(), tokens.clone()).await?;
-        let decoded = decoder.decode_snapshot_partition(partition).await?;
-        let mut world = ReplayWorld::new(tokens, None);
-        let report = world.apply(
-            decoded
-                .update
-                .ok_or_else(|| anyhow!("snapshot did not decode"))?,
-        );
-        assert!(!report.has_anomalies());
-        let point = world.pin();
-        assert_eq!(
-            point.pool_ids_by_protocol_system(external_name),
-            vec![checkpoint.quote.component_id.clone()]
-        );
-        assert!(point.pool_ids_by_protocol_system("uniswap_v2").is_empty());
-        let mut quote = ExactPoolQuote {
-            backend: ReplayBackend::Native,
-            protocol: external_name.to_owned(),
-            component_id: checkpoint.quote.component_id,
-            token_in: checkpoint.quote.token_in,
-            token_out: checkpoint.quote.token_out,
-            amount_in: U256::from_str_radix(&checkpoint.quote.amount_in, 10)?,
-        };
-        assert!(point.quote(&quote)? > U256::ZERO);
-        quote.protocol = "uniswap_v2".to_owned();
-        assert!(matches!(
-            point.quote(&quote),
-            Err(ReplayQuoteError::ProtocolMismatch { .. })
-        ));
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn delta_applies_only_listed_backends() -> Result<()> {
     let checkpoint: LiveParityCheckpoint = serde_json::from_str(NATIVE_CHECKPOINT_V1)?;
     let delta: LiveParityDelta = serde_json::from_str(NATIVE_DELTA_V1)?;
@@ -138,14 +95,7 @@ async fn delta_applies_only_listed_backends() -> Result<()> {
     let tokens = fixture_tokens(checkpoint.tokens, chain)?;
     let backend = ReplayBackend::from(checkpoint.quote.backend);
     let decoder = ReplayDecoder::new(
-        DecoderConfig::for_backend(
-            backend,
-            vec![
-                ProtocolKind::from_canonical_protocol_system(&checkpoint.quote.protocol)
-                    .ok_or_else(|| anyhow!("fixture quote protocol is not canonical"))?,
-            ],
-            0,
-        ),
+        DecoderConfig::for_backend(backend, vec![checkpoint.quote.protocol.clone()], 0),
         tokens.clone(),
     )
     .await?;
@@ -191,8 +141,8 @@ async fn mixed_delta_preserves_every_partition_state() -> Result<()> {
         DecoderConfig::new(
             0,
             [
-                (ReplayBackend::Native, vec![ProtocolKind::UniswapV2]),
-                (ReplayBackend::Rfq, vec![ProtocolKind::Bebop]),
+                (ReplayBackend::Native, vec!["uniswap_v2".to_owned()]),
+                (ReplayBackend::Rfq, vec!["rfq:bebop".to_owned()]),
             ],
         ),
         HashMap::new(),
@@ -334,14 +284,7 @@ async fn run_extracted_fixture(
     let tokens = fixture_tokens(checkpoint.tokens, chain)?;
     let backend = ReplayBackend::from(checkpoint.quote.backend);
     let decoder = ReplayDecoder::new(
-        DecoderConfig::for_backend(
-            backend,
-            vec![
-                ProtocolKind::from_canonical_protocol_system(&checkpoint.quote.protocol)
-                    .ok_or_else(|| anyhow!("fixture quote protocol is not canonical"))?,
-            ],
-            0,
-        ),
+        DecoderConfig::for_backend(backend, vec![checkpoint.quote.protocol.clone()], 0),
         tokens.clone(),
     )
     .await?;
