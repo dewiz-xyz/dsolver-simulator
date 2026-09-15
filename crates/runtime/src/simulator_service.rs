@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterTokenSnapshotResponse};
+use simulator_core::models::protocol::ProtocolKind;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -706,25 +707,25 @@ fn vm_broadcaster_subscription_controls(
     })
 }
 
-fn core_native_protocols(profile: &ChainProfile) -> Vec<String> {
+fn core_native_protocols(profile: &ChainProfile) -> Vec<ProtocolKind> {
     profile
         .native_protocols
         .iter()
-        .filter(|protocol| protocol.as_str() != "uniswap_v4")
-        .cloned()
+        .filter(|protocol| **protocol != ProtocolKind::UniswapV4)
+        .copied()
         .collect()
 }
 
-fn shared_db_native_protocols(profile: &ChainProfile) -> Vec<String> {
+fn shared_db_native_protocols(profile: &ChainProfile) -> Vec<ProtocolKind> {
     profile
         .native_protocols
         .iter()
-        .filter(|protocol| protocol.as_str() == "uniswap_v4")
-        .cloned()
+        .filter(|protocol| **protocol == ProtocolKind::UniswapV4)
+        .copied()
         .collect()
 }
 
-fn shared_db_protocols(profile: &ChainProfile) -> Vec<String> {
+fn shared_db_protocols(profile: &ChainProfile) -> Vec<ProtocolKind> {
     let native_protocols = shared_db_native_protocols(profile);
     if native_protocols.is_empty() {
         profile.vm_protocols.clone()
@@ -738,11 +739,7 @@ fn shared_db_protocols(profile: &ChainProfile) -> Vec<String> {
 }
 
 fn shared_db_wire_backend(profile: &ChainProfile) -> BroadcasterBackend {
-    if profile
-        .native_protocols
-        .iter()
-        .any(|protocol| protocol == "uniswap_v4")
-    {
+    if profile.native_protocols.contains(&ProtocolKind::UniswapV4) {
         BroadcasterBackend::Native
     } else {
         BroadcasterBackend::Vm
@@ -766,6 +763,7 @@ fn rfq_broadcaster_subscription_controls(
 
 #[cfg(test)]
 mod tests {
+    use simulator_core::models::protocol::ProtocolKind;
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1046,13 +1044,13 @@ mod tests {
         ChainProfile {
             chain: Chain::Base,
             native_protocols: vec![
-                "uniswap_v2".to_string(),
-                "uniswap_v3".to_string(),
-                "uniswap_v4".to_string(),
-                "pancakeswap_v3".to_string(),
+                ProtocolKind::UniswapV2,
+                ProtocolKind::UniswapV3,
+                ProtocolKind::UniswapV4,
+                ProtocolKind::PancakeswapV3,
             ],
             vm_protocols: Vec::new(),
-            rfq_protocols: vec!["rfq:bebop".to_string(), "rfq:hashflow".to_string()],
+            rfq_protocols: vec![ProtocolKind::Bebop, ProtocolKind::Hashflow],
             stream_initialization_timeout_secs: 10,
             chain_head_poll_interval_ms: 500,
             chain_head_rpc_request_timeout_ms: 2_000,
@@ -1073,12 +1071,12 @@ mod tests {
         ChainProfile {
             chain: Chain::Ethereum,
             native_protocols: vec![
-                "uniswap_v2".to_string(),
-                "uniswap_v3".to_string(),
-                "rocketpool".to_string(),
+                ProtocolKind::UniswapV2,
+                ProtocolKind::UniswapV3,
+                ProtocolKind::Rocketpool,
             ],
-            vm_protocols: vec!["vm:curve".to_string()],
-            rfq_protocols: vec!["rfq:hashflow".to_string(), "rfq:liquorice".to_string()],
+            vm_protocols: vec![ProtocolKind::Curve],
+            rfq_protocols: vec![ProtocolKind::Hashflow, ProtocolKind::Liquorice],
             stream_initialization_timeout_secs: 25,
             chain_head_poll_interval_ms: 1000,
             chain_head_rpc_request_timeout_ms: 2_000,
@@ -1086,7 +1084,7 @@ mod tests {
             tycho_initial_bootstrap_timeout_secs: 900,
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 8,
-            native_token_protocol_allowlist: vec!["rocketpool".to_string()],
+            native_token_protocol_allowlist: vec![ProtocolKind::Rocketpool],
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
         }
@@ -1367,15 +1365,12 @@ mod tests {
         let BroadcasterSubscriptionControls::Native(native) = &controls[0] else {
             return Err(anyhow!("first Base subscription should be core native"));
         };
-        assert!(!native
-            .protocols
-            .iter()
-            .any(|protocol| protocol == "uniswap_v4"));
+        assert!(!native.protocols.contains(&ProtocolKind::UniswapV4));
 
         let BroadcasterSubscriptionControls::Vm(v4) = &controls[1] else {
             return Err(anyhow!("second Base subscription should be guarded v4"));
         };
-        assert_eq!(v4.protocols, vec!["uniswap_v4"]);
+        assert_eq!(v4.protocols, vec![ProtocolKind::UniswapV4]);
         assert_eq!(v4.wire_backend, BroadcasterBackend::Native);
         Ok(())
     }
@@ -1410,7 +1405,7 @@ mod tests {
         assert!(app_state.enable_rfq_pools);
         assert_eq!(
             app_state.native_token_protocol_allowlist.as_ref(),
-            &vec!["rocketpool".to_string()]
+            &vec![ProtocolKind::Rocketpool]
         );
         assert!(app_state.reset_allowance_tokens.contains_key(&1));
         assert!(app_state.erc4626_deposits_enabled);

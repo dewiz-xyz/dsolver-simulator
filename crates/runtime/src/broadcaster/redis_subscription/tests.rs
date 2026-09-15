@@ -65,6 +65,7 @@ use simulator_core::broadcaster::{
     BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterTokenDto, BroadcasterUpdateMessage,
     BroadcasterUpdatePartition, ProtocolHeadUpdate,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 const NATIVE_CHECKPOINT_V1: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -290,11 +291,11 @@ impl TestControls {
             rfq_subscription: BroadcasterSubscriptionStatus::default(),
             native_state_store: Arc::new(StateStore::new_with_protocols(
                 Arc::clone(&token_store),
-                vec!["uniswap_v2".to_owned()],
+                vec![ProtocolKind::UniswapV2],
             )),
             vm_state_store: Arc::new(StateStore::new_with_protocols(
                 Arc::clone(&token_store),
-                vec!["vm:curve".to_owned()],
+                vec![ProtocolKind::Curve],
             )),
             rfq_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
             native_stream_health: Arc::new(StreamHealth::new()),
@@ -312,7 +313,7 @@ impl TestControls {
             state_store: Arc::clone(&self.native_state_store),
             stream_health: Arc::clone(&self.native_stream_health),
             tokens: Arc::clone(&self.token_store),
-            protocols: vec!["uniswap_v2".to_string()],
+            protocols: vec![ProtocolKind::UniswapV2],
         })
     }
 
@@ -322,7 +323,7 @@ impl TestControls {
             state_store: Arc::clone(&self.vm_state_store),
             stream_health: Arc::clone(&self.vm_stream_health),
             tokens: Arc::clone(&self.token_store),
-            protocols: vec!["vm:curve".to_string()],
+            protocols: vec![ProtocolKind::Curve],
             vm_stream: Arc::clone(&self.vm_stream),
             simulation_rebuild_gate: Arc::clone(&self.vm_simulation_rebuild_gate),
             wire_backend: BroadcasterBackend::Vm,
@@ -336,7 +337,7 @@ impl TestControls {
             state_store: Arc::clone(&self.rfq_state_store),
             stream_health: Arc::clone(&self.rfq_stream_health),
             tokens: Arc::clone(&self.token_store),
-            protocols: vec!["rfq:hashflow".to_string()],
+            protocols: vec![ProtocolKind::Hashflow],
             simulation_rebuild_gate: Arc::clone(&self.rfq_simulation_rebuild_gate),
         })
     }
@@ -551,6 +552,8 @@ fn fixture_subscription_controls(
     tokens: Arc<TokenStore>,
     state_store: Arc<StateStore>,
 ) -> Result<BroadcasterSubscriptionControls> {
+    let protocol = ProtocolKind::from_canonical_protocol_system(&protocol)
+        .ok_or_else(|| anyhow!("unknown fixture protocol {protocol}"))?;
     let broadcaster_subscription = BroadcasterSubscriptionStatus::default();
     let stream_health = Arc::new(StreamHealth::new());
     match backend {
@@ -1981,7 +1984,7 @@ fn raw_decoder() -> Arc<ReplayDecoder> {
     let mut decoder = TychoStreamDecoder::new();
     decoder.register_decoder::<DummySim>("vm:curve");
     Arc::new(ReplayDecoder::with_decoder(
-        DecoderConfig::for_backend(ReplayBackend::Vm, vec!["vm:curve".to_string()], 0),
+        DecoderConfig::for_backend(ReplayBackend::Vm, vec![ProtocolKind::Curve], 0),
         Arc::new(decoder),
     ))
 }
@@ -1990,7 +1993,7 @@ fn stateful_decoder() -> Arc<ReplayDecoder> {
     let mut decoder = TychoStreamDecoder::new();
     decoder.register_decoder::<StatefulSim>("vm:curve");
     Arc::new(ReplayDecoder::with_decoder(
-        DecoderConfig::for_backend(ReplayBackend::Vm, vec!["vm:curve".to_string()], 0),
+        DecoderConfig::for_backend(ReplayBackend::Vm, vec![ProtocolKind::Curve], 0),
         Arc::new(decoder),
     ))
 }
@@ -2998,12 +3001,12 @@ async fn applied_head_requires_every_protocol_in_the_serving_store() -> Result<(
     let mut controls = TestControls::new();
     controls.native_state_store = Arc::new(StateStore::new_with_protocols(
         controls.token_store.clone(),
-        vec!["uniswap_v2".to_owned(), "uniswap_v3".to_owned()],
+        vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
     ));
     let BroadcasterSubscriptionControls::Native(mut native) = controls.native() else {
         unreachable!("native controls expected");
     };
-    native.protocols.push("uniswap_v3".to_owned());
+    native.protocols.push(ProtocolKind::UniswapV3);
     let mut processor = BroadcasterSubscriptionProcessor::new(
         Chain::Ethereum.id(),
         BroadcasterSubscriptionControls::Native(native),
@@ -3032,13 +3035,13 @@ async fn native_wire_vm_store_compares_only_its_own_protocols() -> Result<()> {
     let mut controls = TestControls::new();
     controls.vm_state_store = Arc::new(StateStore::new_with_protocols(
         controls.token_store.clone(),
-        vec!["uniswap_v4".to_owned()],
+        vec![ProtocolKind::UniswapV4],
     ));
     let BroadcasterSubscriptionControls::Vm(mut vm) = controls.vm() else {
         unreachable!("VM controls expected");
     };
     vm.wire_backend = BroadcasterBackend::Native;
-    vm.protocols = vec!["uniswap_v4".to_owned()];
+    vm.protocols = vec![ProtocolKind::UniswapV4];
     let mut processor = BroadcasterSubscriptionProcessor::new(
         Chain::Ethereum.id(),
         BroadcasterSubscriptionControls::Vm(vm),
@@ -3071,7 +3074,7 @@ async fn native_wire_vm_store_compares_only_its_own_protocols() -> Result<()> {
 #[tokio::test]
 async fn serving_subset_uses_its_head_in_decoded_and_published_state() -> Result<()> {
     let decoder = ReplayDecoder::with_decoder(
-        DecoderConfig::for_backend(ReplayBackend::Native, vec!["uniswap_v2".to_owned()], 0),
+        DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0),
         Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
     );
     let mut envelope = update_envelope_for_stream("stream-1", 4, 101)?;
@@ -3113,7 +3116,7 @@ async fn serving_subset_uses_its_head_in_decoded_and_published_state() -> Result
     assert_eq!(
         decoded.protocol_head_updates,
         vec![ProtocolHeadUpdate {
-            protocol: "uniswap_v2".to_owned(),
+            protocol: ProtocolKind::UniswapV2,
             head: Some(BlockIdentity {
                 number: 100,
                 hash: raw_block_header(100, 100).hash
@@ -3229,12 +3232,12 @@ async fn installed_protocol_heads_override_stale_status_metadata() -> Result<()>
     let mut controls = TestControls::new();
     controls.native_state_store = Arc::new(StateStore::new_with_protocols(
         controls.token_store.clone(),
-        vec!["uniswap_v2".to_owned(), "uniswap_v3".to_owned()],
+        vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
     ));
     let BroadcasterSubscriptionControls::Native(mut native) = controls.native() else {
         unreachable!("native controls expected");
     };
-    native.protocols.push("uniswap_v3".to_owned());
+    native.protocols.push(ProtocolKind::UniswapV3);
     let mut processor = BroadcasterSubscriptionProcessor::new(
         Chain::Ethereum.id(),
         BroadcasterSubscriptionControls::Native(native),

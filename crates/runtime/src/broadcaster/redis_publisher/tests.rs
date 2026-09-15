@@ -37,13 +37,17 @@ use simulator_core::broadcaster::{
     BroadcasterStateDelta, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     ProtocolStateHeads,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 #[tokio::test]
 async fn published_heads_follow_current_backend_state_after_successful_append() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let publisher = Arc::new(
         BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
-            .with_required_protocols(vec!["uniswap_v2".into()], vec!["vm:balancer_v2".into()]),
+            .with_required_protocols(
+                vec![ProtocolKind::UniswapV2],
+                vec![ProtocolKind::BalancerV2],
+            ),
     );
     publisher
         .promote(
@@ -101,7 +105,7 @@ async fn published_heads_follow_current_backend_state_after_successful_append() 
 async fn decoded_state_changes_cannot_retain_a_published_protocol_head() -> Result<()> {
     let publisher =
         BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
-            .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+            .with_required_protocols(vec![ProtocolKind::UniswapV2], Vec::new());
     publisher
         .promote(base_heads([BroadcasterBackend::Native]), "test")
         .await?;
@@ -139,7 +143,7 @@ async fn decoded_state_changes_cannot_retain_a_published_protocol_head() -> Resu
 async fn metadata_only_delayed_and_stale_updates_preserve_published_state() -> Result<()> {
     let publisher =
         BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
-            .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+            .with_required_protocols(vec![ProtocolKind::UniswapV2], Vec::new());
     publisher
         .promote(base_heads([BroadcasterBackend::Native]), "test")
         .await?;
@@ -176,7 +180,7 @@ async fn metadata_only_delayed_and_stale_updates_preserve_published_state() -> R
 
 #[tokio::test]
 async fn published_protocol_heads_catch_up_despite_stale_sync_statuses() -> Result<()> {
-    let required_protocols = vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()];
+    let required_protocols = vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3];
     let publisher =
         BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
             .with_required_protocols(required_protocols.clone(), Vec::new());
@@ -217,7 +221,7 @@ async fn published_protocol_heads_catch_up_despite_stale_sync_statuses() -> Resu
     );
     let statuses = required_protocols
         .into_iter()
-        .map(|protocol| (protocol, stale_status.clone()))
+        .map(|protocol| (protocol.as_str().to_owned(), stale_status.clone()))
         .collect();
     publisher
         .publish_accepted_payload(BroadcasterPayload::Update(BroadcasterUpdateMessage::new(
@@ -240,7 +244,7 @@ async fn published_protocol_heads_catch_up_despite_stale_sync_statuses() -> Resu
 async fn passive_and_buffered_updates_only_advance_heads_when_handoff_is_published() -> Result<()> {
     let publisher =
         BroadcasterRedisPublisher::new(publisher_config(), Arc::new(FakeRedisWriter::default()))
-            .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+            .with_required_protocols(vec![ProtocolKind::UniswapV2], Vec::new());
     publisher
         .publish_accepted_payload(BroadcasterPayload::Update(complete_head_update(
             BroadcasterBackend::Native,
@@ -287,7 +291,10 @@ async fn published_recovery_heads_wait_for_commit_and_follow_buffer_order() -> R
     let writer = FakeRedisWriter::default();
     let publisher = Arc::new(
         BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
-            .with_required_protocols(vec!["uniswap_v2".into()], vec!["vm:balancer_v2".into()]),
+            .with_required_protocols(
+                vec![ProtocolKind::UniswapV2],
+                vec![ProtocolKind::BalancerV2],
+            ),
     );
     publisher
         .promote(
@@ -367,7 +374,7 @@ async fn published_recovery_heads_wait_for_commit_and_follow_buffer_order() -> R
 async fn failed_recovery_commit_preserves_previously_published_heads() -> Result<()> {
     let writer = FakeRedisWriter::default();
     let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()))
-        .with_required_protocols(vec!["uniswap_v2".into()], Vec::new());
+        .with_required_protocols(vec![ProtocolKind::UniswapV2], Vec::new());
     publisher
         .promote(base_heads([BroadcasterBackend::Native]), "test")
         .await?;
@@ -470,7 +477,11 @@ fn snapshot_protocol_heads(
     let update = complete_head_update(backend, number, hash_seed)?;
     let message = &update.partitions[0].messages[0];
     Ok(ProtocolStateHeads::from_snapshot(
-        vec![message.protocol.clone()],
+        vec![
+            ProtocolKind::from_canonical_protocol_system(&message.protocol).ok_or_else(|| {
+                anyhow!("test head message must use a supported canonical protocol")
+            })?,
+        ],
         std::slice::from_ref(message),
     ))
 }

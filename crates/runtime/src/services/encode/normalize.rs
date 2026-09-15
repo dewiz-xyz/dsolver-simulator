@@ -4,10 +4,10 @@ use tracing::info;
 use tycho_simulation::tycho_common::Bytes;
 
 use crate::models::erc4626::{
-    is_erc4626_protocol, request_direction_supported, unsupported_direction_message,
-    Erc4626PairPolicy,
+    request_direction_supported, unsupported_direction_message, Erc4626PairPolicy,
 };
 use crate::models::messages::{HopDraft, PoolSwapDraft, RouteEncodeRequest, SegmentDraft};
+use crate::models::protocol::ProtocolKind;
 
 use super::allocation::{allocate_amounts_by_bps, BPS_DENOMINATOR};
 use super::backend::PoolBackend;
@@ -31,7 +31,7 @@ pub(super) fn normalize_route(
     native_address: &Bytes,
     erc4626_deposits_enabled: bool,
     erc4626_pair_policies: &[Erc4626PairPolicy],
-    native_token_protocol_allowlist: &[String],
+    native_token_protocol_allowlist: &[ProtocolKind],
 ) -> Result<NormalizedRouteInternal, EncodeError> {
     if request.segments.is_empty() {
         return Err(EncodeError::invalid("segments must not be empty"));
@@ -164,7 +164,7 @@ fn normalize_hop(
     native_address: &Bytes,
     erc4626_deposits_enabled: bool,
     erc4626_pair_policies: &[Erc4626PairPolicy],
-    native_token_protocol_allowlist: &[String],
+    native_token_protocol_allowlist: &[ProtocolKind],
 ) -> Result<NormalizedHopInternal, EncodeError> {
     if hop.swaps.is_empty() {
         return Err(EncodeError::invalid("hop.swaps must not be empty"));
@@ -251,11 +251,9 @@ fn validate_erc4626_swap_supported(
     erc4626_deposits_enabled: bool,
     erc4626_pair_policies: &[Erc4626PairPolicy],
 ) -> Result<(), EncodeError> {
-    if !is_erc4626_protocol(&swap.pool.protocol) {
-        return Ok(());
-    }
+    let protocol = ProtocolKind::from_sync_state_key(swap.pool.protocol.trim());
     if request_direction_supported(
-        &swap.pool.protocol,
+        protocol,
         token_in,
         token_out,
         erc4626_deposits_enabled,
@@ -308,8 +306,44 @@ mod tests {
     use crate::services::encode::fixtures::pool_ref;
     use crate::services::encode::wire::{format_address, parse_address, parse_amount};
 
-    fn allowlist() -> Vec<String> {
-        vec!["rocketpool".to_string()]
+    #[test]
+    fn erc4626_request_guard_preserves_system_name_normalization() {
+        let token_in = Bytes::from_str("0xdC035D45d973E3EC169d2276DDab16f1e407384F").unwrap();
+        let token_out = Bytes::from_str("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd").unwrap();
+        for (protocol, rejected) in [
+            ("erc4626", true),
+            (" ERC4626 ", true),
+            ("erc4626_pool", false),
+            ("uniswap_v2", false),
+            ("unknown", false),
+        ] {
+            let swap = PoolSwapDraft {
+                pool: PoolRef {
+                    protocol: protocol.to_string(),
+                    component_id: "p1".to_string(),
+                    pool_address: None,
+                },
+                token_in: token_in.to_string(),
+                token_out: token_out.to_string(),
+                split_bps: 0,
+            };
+            assert_eq!(
+                validate_erc4626_swap_supported(
+                    &swap,
+                    &token_in,
+                    &token_out,
+                    false,
+                    &erc4626_pair_policies(),
+                )
+                .is_err(),
+                rejected,
+                "request protocol {protocol}",
+            );
+        }
+    }
+
+    fn allowlist() -> Vec<ProtocolKind> {
+        vec![ProtocolKind::Rocketpool]
     }
 
     fn erc4626_pair_policies() -> Vec<Erc4626PairPolicy> {

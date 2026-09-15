@@ -1048,6 +1048,7 @@ mod tests {
     use std::sync::Arc;
 
     use simulator_core::broadcaster::BroadcasterBackend;
+    use simulator_core::models::protocol::ProtocolKind;
     use tokio_util::sync::CancellationToken;
     use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
@@ -1124,9 +1125,9 @@ mod tests {
         BroadcasterConfig {
             chain_profile: ChainProfile {
                 chain: Chain::Ethereum,
-                native_protocols: vec!["uniswap_v2".to_string()],
+                native_protocols: vec![ProtocolKind::UniswapV2],
                 vm_protocols: Vec::new(),
-                rfq_protocols: vec!["rfq:bebop".to_string()],
+                rfq_protocols: vec![ProtocolKind::Bebop],
                 stream_initialization_timeout_secs: 25,
                 chain_head_poll_interval_ms: 1_000,
                 chain_head_rpc_request_timeout_ms: 2_000,

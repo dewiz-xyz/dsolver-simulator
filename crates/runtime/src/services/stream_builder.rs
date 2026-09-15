@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Result;
 use futures::StreamExt;
 use simulator_core::broadcaster::BroadcasterBackend;
+use simulator_core::models::protocol::ProtocolKind;
 use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -65,7 +66,7 @@ pub async fn build_broadcaster_raw_stream(
     );
 
     for protocol in protocols.native.iter().chain(protocols.vm.iter()) {
-        builder = builder.exchange(protocol, tvl_filter.clone());
+        builder = builder.exchange(protocol.as_str(), tvl_filter.clone());
     }
 
     let (lifecycle_task, rx) = builder.build().await?;
@@ -82,7 +83,7 @@ pub async fn build_broadcaster_raw_stream(
 pub async fn build_broadcaster_subscription_decoder(
     tokens: Arc<TokenStore>,
     backend: BroadcasterBackend,
-    protocols: &[String],
+    protocols: &[ProtocolKind],
 ) -> Result<Arc<ReplayDecoder>> {
     let config = DecoderConfig::for_backend(ReplayBackend::from(backend), protocols.to_vec(), 0);
     Ok(Arc::new(
@@ -109,8 +110,8 @@ pub struct RFQTokenStores {
 
 #[derive(Clone, Debug, Default)]
 pub struct BroadcasterProtocols {
-    pub native: Vec<String>,
-    pub vm: Vec<String>,
+    pub native: Vec<ProtocolKind>,
+    pub vm: Vec<ProtocolKind>,
 }
 
 #[expect(
@@ -121,7 +122,7 @@ pub async fn build_rfq_stream(
     tvl_add_threshold: f64,
     token_stores: RFQTokenStores,
     chain: Chain,
-    protocols: &[String],
+    protocols: &[ProtocolKind],
     rfq_config: RFQConfig,
 ) -> Result<
     impl futures::Stream<
@@ -134,7 +135,7 @@ pub async fn build_rfq_stream(
 > {
     let mut rfq_builder = RFQStreamBuilder::new();
 
-    if rfq_protocol_enabled(protocols, "rfq:bebop") {
+    if protocols.contains(&ProtocolKind::Bebop) {
         info!("Setting up Bebop RFQ client...\n");
         let rfq_tokens_bebop = token_stores.bebop.snapshot().await.into_keys().collect();
         let bebop_client = BebopClientBuilder::new(chain, rfq_config.bebop_key)
@@ -146,7 +147,7 @@ pub async fn build_rfq_stream(
         rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
     }
 
-    if rfq_protocol_enabled(protocols, "rfq:hashflow") {
+    if protocols.contains(&ProtocolKind::Hashflow) {
         info!("Setting up Hashflow RFQ client...\n");
         let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
         let rfq_tokens_hashflow = token_stores.hashflow.snapshot().await.into_keys().collect();
@@ -161,7 +162,7 @@ pub async fn build_rfq_stream(
             rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
     }
 
-    if rfq_protocol_enabled(protocols, "rfq:liquorice") {
+    if protocols.contains(&ProtocolKind::Liquorice) {
         info!("Setting up Liquorice RFQ client...\n");
         let (user, key) = (rfq_config.liquorice_user, rfq_config.liquorice_key);
         let rfq_tokens_liquorice = token_stores
@@ -197,10 +198,6 @@ pub async fn build_rfq_stream(
     info!("Connected to RFQs! Streaming live price levels...\n");
 
     Ok(ReceiverStream::new(rx).map(Ok).boxed())
-}
-
-fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
-    protocols.iter().any(|configured| configured == protocol)
 }
 
 async fn rfq_decoder_tokens(
@@ -268,6 +265,7 @@ mod tests {
 
     use super::{merge_missing_tokens, rfq_decoder_tokens};
     use crate::config::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
+    use simulator_core::models::protocol::ProtocolKind;
     use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
     use tycho_simulation::tycho_common::{
         models::{token::Token, Chain},
@@ -282,7 +280,7 @@ mod tests {
             .join(MANIFEST_PATH)
     }
 
-    fn chain_protocols(chain_id: u64) -> (Vec<String>, Vec<String>) {
+    fn chain_protocols(chain_id: u64) -> (Vec<ProtocolKind>, Vec<ProtocolKind>) {
         let registries = load_manifest_registries(&manifest_path())
             .unwrap_or_else(|err| panic!("test manifest must load: {err}"));
         let resolved = resolve_chain_config(&registries, chain_id, None)
@@ -314,20 +312,6 @@ mod tests {
             Chain::Ethereum,
             Duration::from_millis(10),
         ))
-    }
-
-    #[test]
-    fn rfq_protocol_enabled_matches_exact_protocol_name() {
-        let protocols = vec![
-            "rfq:bebop".to_string(),
-            "rfq:hashflow".to_string(),
-            "rfq:liquorice".to_string(),
-        ];
-
-        assert!(super::rfq_protocol_enabled(&protocols, "rfq:bebop"));
-        assert!(super::rfq_protocol_enabled(&protocols, "rfq:hashflow"));
-        assert!(super::rfq_protocol_enabled(&protocols, "rfq:liquorice"));
-        assert!(!super::rfq_protocol_enabled(&protocols, "rfq:other"));
     }
 
     #[tokio::test]

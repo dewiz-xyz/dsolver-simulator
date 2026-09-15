@@ -36,6 +36,7 @@ use simulator_core::broadcaster::{
     BroadcasterPayload, BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
     BroadcasterUpdateMessage, ProtocolStateHeads, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 const SNAPSHOT_BOUNDARY_RETENTION_CACHE_TTL: Duration = Duration::from_secs(5);
 
@@ -378,7 +379,7 @@ pub struct BroadcasterServiceState {
     recovery_monitors: Arc<Mutex<Vec<JoinHandle<()>>>>,
     recovery_retry_backoff: Duration,
     chain_head_observer: Option<ChainHeadObserver>,
-    required_protocols: BTreeMap<BroadcasterBackend, Vec<String>>,
+    required_protocols: BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
     initial_bootstrap_completed_at: Arc<OnceLock<Instant>>,
     next_recovery_source_id: Arc<AtomicU64>,
     redis_publisher: Arc<BroadcasterRedisPublisher>,
@@ -448,8 +449,8 @@ impl BroadcasterServiceState {
     pub fn with_chain_head_observer(
         mut self,
         observer: ChainHeadObserver,
-        native_protocols: Vec<String>,
-        vm_protocols: Vec<String>,
+        native_protocols: Vec<ProtocolKind>,
+        vm_protocols: Vec<ProtocolKind>,
     ) -> Self {
         self.chain_head_observer = Some(observer);
         self.required_protocols = [
@@ -2674,6 +2675,7 @@ mod tests {
         BroadcasterProtocolSyncStatus, BroadcasterRedisStreamEntry, BroadcasterSnapshotEnd,
         BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
     };
+    use simulator_core::models::protocol::ProtocolKind;
 
     #[test]
     fn local_state_ahead_of_observer_does_not_hide_unpublished_state() {
@@ -2714,8 +2716,8 @@ mod tests {
     #[tokio::test]
     async fn initial_bootstrap_waits_for_each_configured_backend_and_stays_complete() -> Result<()>
     {
-        let native_protocols = vec!["uniswap_v2".to_string()];
-        let vm_protocols = vec!["vm:balancer_v2".to_string()];
+        let native_protocols = vec![ProtocolKind::UniswapV2];
+        let vm_protocols = vec![ProtocolKind::BalancerV2];
         let service = BroadcasterServiceState::with_lifecycle_gate(
             8_388_608,
             BroadcasterSnapshotCache::new(

@@ -19,6 +19,7 @@ use simulator_core::broadcaster::{
     BroadcasterPayload, BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk,
     BroadcasterRecoveryCommit, BroadcasterRecoveryManifest, BroadcasterRedisReplayBoundary,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 use crate::broadcaster::redis_publisher::replay_entry_encoded_size;
 use crate::config::BroadcasterRedisConfig;
@@ -56,7 +57,7 @@ pub(crate) struct NativeBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub tokens: Arc<TokenStore>,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<ProtocolKind>,
 }
 
 #[derive(Clone)]
@@ -65,7 +66,7 @@ pub(crate) struct VmBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub tokens: Arc<TokenStore>,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<ProtocolKind>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
     pub wire_backend: BroadcasterBackend,
@@ -78,7 +79,7 @@ pub(crate) struct RfqBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub tokens: Arc<TokenStore>,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<ProtocolKind>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
@@ -135,7 +136,7 @@ impl BroadcasterSubscriptionControls {
         }
     }
 
-    fn protocols(&self) -> &[String] {
+    fn protocols(&self) -> &[ProtocolKind] {
         match self {
             Self::Native(controls) => &controls.protocols,
             Self::Vm(controls) => &controls.protocols,

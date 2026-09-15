@@ -16,6 +16,7 @@ use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
+use runtime::models::protocol::ProtocolKind;
 use runtime::models::state::{
     AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
     VmStreamStatus,
@@ -781,7 +782,7 @@ async fn build_app_state_and_request(
         chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(test_rfq_client_config()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription,
@@ -968,7 +969,7 @@ async fn setup_timeout_app(
         chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -2007,7 +2008,7 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

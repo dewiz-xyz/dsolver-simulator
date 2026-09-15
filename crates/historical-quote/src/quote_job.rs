@@ -181,6 +181,7 @@ fn quote_state(
     };
     match state.point.quote(&ExactPoolQuote {
         backend: replay_backend(pool.backend),
+        // Retained components can use noncanonical system names; selectors match them exactly.
         protocol: pool.protocol.clone(),
         component_id: pool.component_id.clone(),
         token_in,

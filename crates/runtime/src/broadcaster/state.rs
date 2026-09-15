@@ -35,6 +35,7 @@ use simulator_core::broadcaster::{
     BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
     BroadcasterUpdateMessage, ProtocolStateHeads,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 use super::redis_publisher::{
     BroadcasterDeploymentAdmissionSnapshot, BroadcasterDeploymentPhase,
@@ -200,7 +201,7 @@ pub(crate) struct BroadcasterRecoverySource {
 impl BroadcasterRecoverySource {
     pub(crate) fn protocol_state_heads(
         &self,
-        required_protocols: &BTreeMap<BroadcasterBackend, Vec<String>>,
+        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
     ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
         partition_protocol_heads(&self.partitions, required_protocols)
     }
@@ -218,7 +219,7 @@ impl BroadcasterRecoverySource {
 impl BroadcasterSnapshotSource {
     pub(crate) fn protocol_state_heads(
         &self,
-        required_protocols: &BTreeMap<BroadcasterBackend, Vec<String>>,
+        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
     ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
         partition_protocol_heads(&self.partitions, required_protocols)
     }
@@ -386,6 +387,8 @@ struct BroadcasterSnapshotCacheData {
     snapshot_id: String,
     partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     known_backends: HashMap<String, BroadcasterBackend>,
+    // Keep exact upstream feed keys: aliases can name separate synchronization streams.
+    // Recovery must wait for every stream rather than merge keys through normalization.
     expected_protocols: BTreeSet<String>,
     replacement: Option<UpstreamReplacementState>,
     next_recovery_id: u64,
@@ -883,7 +886,7 @@ impl BroadcasterSnapshotCache {
 
     pub(crate) async fn complete_backend_heads(
         &self,
-        required_protocols: &BTreeMap<BroadcasterBackend, Vec<String>>,
+        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
     ) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
         let guard = self.inner.read().await;
         if guard.replacement.is_some() {
@@ -1145,7 +1148,7 @@ fn collect_snapshot_export_parts(
 
 fn partition_protocol_heads(
     partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    required_protocols: &BTreeMap<BroadcasterBackend, Vec<String>>,
+    required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
 ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
     required_protocols
         .iter()
@@ -1161,7 +1164,7 @@ fn partition_protocol_heads(
 
 fn complete_partition_heads(
     partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
-    required_protocols: &BTreeMap<BroadcasterBackend, Vec<String>>,
+    required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
 ) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
     required_protocols
         .iter()
@@ -5096,6 +5099,106 @@ mod tests {
                 .any(|message| message.message.header == block_12),
             _ => false,
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_recovery_rejects_unknown_protocol_before_staging() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let header = linked_header(10, 10, 9);
+        cache.begin_same_generation_recovery().await;
+        let result = cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", header.clone(), 1),
+                )],
+                vec![("uniswap_v2", header.clone()), ("future_protocol", header)],
+            ))
+            .await;
+        let Err(error) = result else {
+            return Err(anyhow!(
+                "unknown required feed protocols cannot be discarded to finish recovery"
+            ));
+        };
+        assert!(error.to_string().contains("future_protocol"));
+        assert!(cache.replacement_pending().await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_replacement_keeps_noncanonical_upstream_identities_distinct() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let protocols = ["uniswap_v2", "UNISWAP_V2"];
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                protocols
+                    .iter()
+                    .map(|protocol| {
+                        (
+                            *protocol,
+                            raw_snapshot_message(protocol, block_10.clone(), 1),
+                        )
+                    })
+                    .collect(),
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol, block_10.clone()))
+                    .collect(),
+            ))
+            .await?;
+        cache.begin_same_generation_recovery().await;
+
+        let block_12 = linked_header(12, 12, 11);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_12.clone(), 2),
+                )],
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol, block_12.clone()))
+                    .collect(),
+            ))
+            .await?;
+        assert!(
+            cache.replacement_pending().await,
+            "a canonical domain identity cannot replace other upstream keys"
+        );
+
+        cache
+            .apply_feed_message(&raw_feed(
+                protocols[1..]
+                    .iter()
+                    .map(|protocol| {
+                        (
+                            *protocol,
+                            raw_snapshot_message(protocol, block_12.clone(), 3),
+                        )
+                    })
+                    .collect(),
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol, block_12.clone()))
+                    .collect(),
+            ))
+            .await?;
+        assert!(!cache.replacement_pending().await);
+        let snapshot = cache.export_snapshot(8_388_608).await?;
+        let published_protocols = snapshot
+            .payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .flat_map(|chunk| &chunk.partitions)
+            .flat_map(|partition| &partition.messages)
+            .map(|message| message.protocol.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(published_protocols, HashSet::from(protocols));
         Ok(())
     }
 

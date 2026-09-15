@@ -42,32 +42,33 @@ pub struct BlockIdentity {
 /// A protocol's applied block identity. `None` invalidates its previous full head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolHeadUpdate {
-    pub protocol: String,
+    pub protocol: ProtocolKind,
     pub head: Option<BlockIdentity>,
 }
 
 impl ProtocolHeadUpdate {
-    pub fn from_message(message: &BroadcasterProtocolMessage) -> Self {
+    /// Unknown or noncanonical wire identities do not install a supported protocol head.
+    pub fn from_message(message: &BroadcasterProtocolMessage) -> Option<Self> {
         let header = &message.message.header;
-        Self {
-            protocol: message.protocol.clone(),
+        Some(Self {
+            protocol: ProtocolKind::from_canonical_protocol_system(&message.protocol)?,
             head: header.partial_block_index.is_none().then(|| BlockIdentity {
                 number: header.number,
                 hash: header.hash.clone(),
             }),
-        }
+        })
     }
 }
 
 /// Tracks the state applied for each configured protocol, independently of stream freshness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolStateHeads {
-    required_protocols: Vec<String>,
-    current: BTreeMap<String, Option<BlockIdentity>>,
+    required_protocols: Vec<ProtocolKind>,
+    current: BTreeMap<ProtocolKind, Option<BlockIdentity>>,
 }
 
 impl ProtocolStateHeads {
-    pub fn new(required_protocols: Vec<String>) -> Self {
+    pub fn new(required_protocols: Vec<ProtocolKind>) -> Self {
         Self {
             required_protocols,
             current: BTreeMap::new(),
@@ -76,7 +77,7 @@ impl ProtocolStateHeads {
 
     /// Messages must already contain reassembled snapshot state for each protocol.
     pub fn from_snapshot(
-        required_protocols: Vec<String>,
+        required_protocols: Vec<ProtocolKind>,
         messages: &[BroadcasterProtocolMessage],
     ) -> Self {
         let mut heads = Self::new(required_protocols);
@@ -91,11 +92,11 @@ impl ProtocolStateHeads {
     /// Call after applying messages in order. Partial blocks invalidate that protocol's
     /// full head; protocols absent from the update retain their installed state.
     pub fn apply_messages(&mut self, messages: &[BroadcasterProtocolMessage]) {
-        for message in messages
+        for update in messages
             .iter()
-            .filter(|message| self.required_protocols.contains(&message.protocol))
+            .filter_map(ProtocolHeadUpdate::from_message)
+            .filter(|update| self.required_protocols.contains(&update.protocol))
         {
-            let update = ProtocolHeadUpdate::from_message(message);
             self.current.insert(update.protocol, update.head);
         }
     }
@@ -105,8 +106,7 @@ impl ProtocolStateHeads {
             .iter()
             .filter(|update| self.required_protocols.contains(&update.protocol))
         {
-            self.current
-                .insert(update.protocol.clone(), update.head.clone());
+            self.current.insert(update.protocol, update.head.clone());
         }
     }
 
@@ -925,7 +925,7 @@ pub fn complete_broadcaster_partition_block(
 /// a full state already installed at that block, so sync states are ignored.
 pub fn complete_broadcaster_snapshot_head(
     messages: &[BroadcasterProtocolMessage],
-    required_protocols: &[String],
+    required_protocols: &[ProtocolKind],
 ) -> Option<BlockIdentity> {
     ProtocolStateHeads::from_snapshot(required_protocols.to_vec(), messages).complete_head()
 }
@@ -933,6 +933,7 @@ pub fn complete_broadcaster_snapshot_head(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterProtocolMessage {
+    /// Exact Tycho wire identity; selection converts canonical supported systems to ProtocolKind.
     pub protocol: String,
     pub sync_state: SynchronizerState,
     #[serde(with = "feed_dto_wire")]
@@ -2526,13 +2527,13 @@ mod tests {
         BroadcasterSubscriptionEvent, BroadcasterSubscriptionState, BroadcasterSubscriptionTracker,
         BroadcasterTokenDto, BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
         BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
-        ProtocolHeadUpdate, ProtocolStateHeads,
+        ProtocolHeadUpdate, ProtocolKind, ProtocolStateHeads,
     };
 
     #[test]
     fn protocol_heads_follow_independent_updates_despite_older_stale_metadata() {
         let mut heads =
-            ProtocolStateHeads::new(vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]);
+            ProtocolStateHeads::new(vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3]);
         let first = raw_protocol_message_at_header("uniswap_v2", block_header(99, 1));
         heads.apply_messages(&[first]);
         assert_eq!(heads.complete_head(), None);
@@ -2555,9 +2556,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_heads_invalidate_partial_state_until_every_protocol_catches_up() {
+    fn protocol_heads_invalidate_partial_state_until_every_protocol_catches_up() -> Result<()> {
         let mut heads = ProtocolStateHeads::from_snapshot(
-            vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()],
+            vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
             &[
                 raw_protocol_message("uniswap_v2"),
                 raw_protocol_message("uniswap_v3"),
@@ -2566,11 +2567,13 @@ mod tests {
         assert!(heads.complete_head().is_some());
         let mut partial = raw_protocol_message_at_header("uniswap_v2", block_header(124, 2));
         partial.message.header.partial_block_index = Some(0);
-        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&partial)]);
+        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&partial)
+            .ok_or_else(|| anyhow!("canonical partial update missing"))?]);
         assert_eq!(heads.complete_head(), None);
 
         let full = raw_protocol_message_at_header("uniswap_v2", block_header(124, 2));
-        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&full)]);
+        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&full)
+            .ok_or_else(|| anyhow!("canonical full update missing"))?]);
         assert_eq!(heads.complete_head(), None);
         heads.apply_messages(&[raw_protocol_message_at_header(
             "uniswap_v3",
@@ -2583,12 +2586,13 @@ mod tests {
                 hash: block_header(124, 2).hash,
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn protocol_heads_follow_same_height_replacements_in_application_order() {
+    fn protocol_heads_follow_same_height_replacements_in_application_order() -> Result<()> {
         let mut heads = ProtocolStateHeads::from_snapshot(
-            vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()],
+            vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
             &[
                 raw_protocol_message("uniswap_v2"),
                 raw_protocol_message("uniswap_v3"),
@@ -2601,11 +2605,13 @@ mod tests {
         )]);
         assert_eq!(heads.complete_head(), None);
         heads.apply_updates(&[
-            ProtocolHeadUpdate::from_message(&raw_protocol_message("uniswap_v3")),
+            ProtocolHeadUpdate::from_message(&raw_protocol_message("uniswap_v3"))
+                .ok_or_else(|| anyhow!("canonical original update missing"))?,
             ProtocolHeadUpdate::from_message(&raw_protocol_message_at_header(
                 "uniswap_v3",
                 replacement.clone(),
-            )),
+            ))
+            .ok_or_else(|| anyhow!("canonical replacement update missing"))?,
         ]);
         assert_eq!(
             heads.complete_head(),
@@ -2614,11 +2620,12 @@ mod tests {
                 hash: replacement.hash
             })
         );
+        Ok(())
     }
 
     #[test]
     fn protocol_heads_ignore_unselected_protocols_and_clear_installed_state() {
-        let mut heads = ProtocolStateHeads::new(vec!["uniswap_v2".to_string()]);
+        let mut heads = ProtocolStateHeads::new(vec![ProtocolKind::UniswapV2]);
         let selected = raw_protocol_message("uniswap_v2");
         let mut unrelated =
             raw_protocol_message_at_header("unselected_protocol", block_header(124, 2));
@@ -2629,7 +2636,11 @@ mod tests {
             hash: block_header(123, 1).hash,
         });
         assert_eq!(heads.complete_head(), expected);
-        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&unrelated)]);
+        assert_eq!(ProtocolHeadUpdate::from_message(&unrelated), None);
+        heads.apply_updates(&[ProtocolHeadUpdate {
+            protocol: ProtocolKind::UniswapV3,
+            head: None,
+        }]);
         assert_eq!(heads.complete_head(), expected);
 
         heads.clear();
@@ -2639,6 +2650,24 @@ mod tests {
         heads.apply_messages(&[selected]);
         assert_eq!(heads.complete_head(), expected);
         assert_eq!(ProtocolStateHeads::new(Vec::new()).complete_head(), None);
+    }
+
+    #[test]
+    fn protocol_heads_never_install_unknown_or_normalized_wire_identities() {
+        let mut heads = ProtocolStateHeads::new(vec![ProtocolKind::UniswapV2]);
+        for name in ["Uniswap_V2", "uniswap-v2", "uniswap v2", "future_protocol"] {
+            let message = raw_protocol_message(name);
+            assert_eq!(ProtocolHeadUpdate::from_message(&message), None);
+            heads.apply_messages(&[message]);
+            assert_eq!(heads.complete_head(), None);
+        }
+        heads.apply_messages(&[raw_protocol_message("uniswap_v2")]);
+        let installed = heads.complete_head();
+        assert!(installed.is_some());
+        let mut alias = raw_protocol_message("UNISWAP_V2");
+        alias.message.header.partial_block_index = Some(0);
+        heads.apply_messages(&[alias]);
+        assert_eq!(heads.complete_head(), installed);
     }
 
     #[test]
