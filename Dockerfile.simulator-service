@@ -1,6 +1,27 @@
-# syntax=docker/dockerfile:1.7
-FROM public.ecr.aws/docker/library/rust:1.95.0-bookworm AS builder
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+FROM public.ecr.aws/docker/library/rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 WORKDIR /app
+
+# Keep package selection dated while still requiring Debian's archive signatures.
+RUN <<'EOF'
+set -eu
+rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
+cat > /etc/apt/sources.list.d/debian.sources <<'SOURCES'
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian/20260908T000000Z
+Suites: bookworm bookworm-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian-security/20260908T000000Z
+Suites: bookworm-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+SOURCES
+EOF
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev clang cmake git && rm -rf /var/lib/apt/lists/*
@@ -26,7 +47,11 @@ RUN --mount=type=secret,id=github_token \
     CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked -p apps --bin dsolver-simulator-service --release
 
 
-FROM public.ecr.aws/debian/debian:bookworm-slim AS runner
+FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:833d7afe7d42e2fc552740ebdb947218770eb6f0a533927ed2a04b4d453e4f0a AS runner
+# Bootstrap HTTPS from the pinned builder before installing the runner's CA package.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
+COPY --from=builder /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
     ca-certificates openssl && rm -rf /var/lib/apt/lists/*
 
