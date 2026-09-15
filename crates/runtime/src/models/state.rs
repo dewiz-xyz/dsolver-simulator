@@ -490,6 +490,7 @@ pub struct SimulatorBackendStatusSnapshot {
     pub block_number: Option<u64>,
     pub applied_head: Option<BlockIdentity>,
     pub observed_chain_head: Option<BlockIdentity>,
+    pub observation_age_ms: Option<u64>,
     pub chain_head_agreement: Option<ChainHeadAgreement>,
     pub update_timestamp: Option<u64>,
     pub pool_count: usize,
@@ -588,6 +589,7 @@ pub(crate) struct BackendFreshnessFence {
 struct BackendAssessment {
     readiness: SimulatorBackendReadiness,
     observed_chain_head: Option<BlockIdentity>,
+    observation_age: Option<Duration>,
     chain_head_agreement: ChainHeadAgreement,
 }
 
@@ -639,6 +641,7 @@ impl AppState {
         BackendAssessment {
             readiness,
             observed_chain_head: observation.observed_head,
+            observation_age: observation.observation_age,
             chain_head_agreement,
         }
     }
@@ -781,6 +784,7 @@ impl AppState {
             block_number: Some(pinned.current_block()),
             applied_head: pinned.applied_head().cloned(),
             observed_chain_head: assessment.observed_chain_head,
+            observation_age_ms: assessment.observation_age.map(|age| age.as_millis() as u64),
             chain_head_agreement: Some(assessment.chain_head_agreement),
             update_timestamp: None,
             pool_count: self.native_state_store.total_states().await,
@@ -821,6 +825,7 @@ impl AppState {
             block_number: self.enable_vm_pools.then_some(pinned.current_block()),
             applied_head: pinned.applied_head().cloned(),
             observed_chain_head: assessment.observed_chain_head,
+            observation_age_ms: assessment.observation_age.map(|age| age.as_millis() as u64),
             chain_head_agreement: Some(assessment.chain_head_agreement),
             update_timestamp: None,
             pool_count: self.vm_pools().await,
@@ -877,6 +882,7 @@ impl AppState {
             block_number: None,
             applied_head: None,
             observed_chain_head: None,
+            observation_age_ms: None,
             chain_head_agreement: None,
             update_timestamp,
             pool_count: self.rfq_pools().await,

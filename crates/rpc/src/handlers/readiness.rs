@@ -56,6 +56,8 @@ pub struct BackendStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     observed_chain_head: Option<BlockIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    observation_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     chain_head_agreement: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     update_timestamp: Option<u64>,
@@ -82,6 +84,7 @@ impl From<SimulatorBackendStatusSnapshot> for BackendStatusPayload {
             block_number: snapshot.block_number,
             applied_head: snapshot.applied_head,
             observed_chain_head: snapshot.observed_chain_head,
+            observation_age_ms: snapshot.observation_age_ms,
             chain_head_agreement: snapshot
                 .chain_head_agreement
                 .map(ChainHeadAgreement::as_str),
@@ -158,7 +161,7 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<StatusPay
 
 #[cfg(test)]
 mod tests {
-    use runtime::chain_head::ChainHeadObserver;
+    use runtime::chain_head::{ChainHeadConfig, ChainHeadObserver};
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -326,11 +329,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn status_exposes_native_backend_details_without_legacy_aliases() {
+    #[tokio::test(start_paused = true)]
+    async fn status_exposes_native_backend_details_without_legacy_aliases(
+    ) -> Result<(), serde_json::Error> {
         let state = test_state(false, false);
         seed_native_ready_store(&state).await;
         state.native_stream_health.record_update(1).await;
+        tokio::time::advance(Duration::from_millis(1234)).await;
+        state.chain_head_observer.fail_for_test();
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -338,6 +344,13 @@ mod tests {
         assert_eq!(payload.status, "ready");
         assert_eq!(payload.backends["native"].block_number, Some(1));
         assert_eq!(payload.backends["native"].pool_count, 1);
+        let serialized = serde_json::to_value(payload)?;
+        let native = &serialized["backends"]["native"];
+        assert_eq!(native["observation_age_ms"], 1234);
+        assert_eq!(native["applied_head"], serde_json::to_value(test_head())?);
+        assert_eq!(native["observed_chain_head"], native["applied_head"]);
+        assert_eq!(native["chain_head_agreement"], "matches");
+        Ok(())
     }
 
     async fn expire_chain_observation(state: &mut AppState) {
@@ -358,7 +371,8 @@ mod tests {
         state.native_stream_health.record_update(1).await;
         expire_chain_observation(&mut state).await;
 
-        let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+        let (status_code, Json(payload)): (_, Json<StatusPayload>) =
+            status(State(state.clone())).await;
 
         assert_eq!(status_code, StatusCode::OK);
         assert_eq!(payload.status, "stale");
@@ -366,6 +380,42 @@ mod tests {
         assert_eq!(payload.backends["native"].pool_count, 1);
         assert_eq!(payload.backends["native"].status, "stale");
         assert_eq!(payload.backends["native"].reason, Some("stale"));
+        assert_eq!(payload.backends["native"].observation_age_ms, Some(121_000));
+        assert_eq!(
+            payload.backends["native"].observed_chain_head,
+            Some(test_head())
+        );
+        assert_eq!(
+            payload.backends["native"].chain_head_agreement,
+            Some("observation_unavailable")
+        );
+        let (ready_code, Json(ready_payload)) = ready(State(state)).await;
+        assert_eq!(ready_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            ready_payload.backends["native"].observation_age_ms,
+            Some(121_000)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_omits_age_before_the_first_observation() -> Result<(), serde_json::Error> {
+        let mut state = test_state(false, false);
+        seed_native_ready_store(&state).await;
+        state.chain_head_observer = Arc::new(ChainHeadObserver::new(ChainHeadConfig {
+            poll_interval: Duration::from_secs(1),
+            rpc_request_timeout: Duration::from_secs(2),
+            observation_max_age: Duration::from_secs(120),
+        }));
+        let (status_code, Json(payload)) = status(State(state.clone())).await;
+        assert_eq!(status_code, StatusCode::OK);
+        let serialized = serde_json::to_value(payload)?;
+        let native = &serialized["backends"]["native"];
+        assert!(native.get("observation_age_ms").is_none());
+        assert!(native.get("observed_chain_head").is_none());
+        assert_eq!(native["chain_head_agreement"], "observation_unavailable");
+        let (ready_code, Json(_)) = ready(State(state)).await;
+        assert_eq!(ready_code, StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
@@ -387,8 +437,8 @@ mod tests {
         assert_eq!(stale_payload.status, "stale");
     }
 
-    #[tokio::test]
-    async fn status_reports_native_unavailable_when_vm_is_ready() {
+    #[tokio::test(start_paused = true)]
+    async fn status_reports_native_unavailable_when_vm_is_ready() -> Result<(), serde_json::Error> {
         let state = test_state(true, true);
         let vm_component = ProtocolComponent::new(
             address(4),
@@ -420,6 +470,7 @@ mod tests {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
         }
+        tokio::time::advance(Duration::from_millis(500)).await;
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -432,6 +483,13 @@ mod tests {
         assert_eq!(payload.backends["rfq"].status, "warming_up");
         assert_eq!(payload.backends["rfq"].reason, Some("state_warming_up"));
         assert!(payload.backends["rfq"].subscription.is_some());
+        let serialized = serde_json::to_value(payload)?;
+        assert_eq!(serialized["backends"]["native"]["observation_age_ms"], 500);
+        assert_eq!(serialized["backends"]["vm"]["observation_age_ms"], 500);
+        assert!(serialized["backends"]["rfq"]
+            .get("observation_age_ms")
+            .is_none());
+        Ok(())
     }
 
     #[tokio::test]

@@ -227,11 +227,21 @@ a stale VM backend is skipped by native-only quoting, while encoding requires ev
 by its route. On Base, Uniswap V4 uses the VM/shared-database state store even though its wire
 protocol is native.
 
-An RPC error preserves the last successful observation only until its maximum age expires. Tycho status-only messages leave installed state unchanged, even when they report delayed or stale
-feed progress. A new confirmed block or a same-height hash disagreement closes affected availability immediately;
-requests spanning a freshness change cannot return affected results after recovery. RPC uncertainty
-alone does not restart the broadcaster. The `ChainHeadRpcOutageSeconds` metric reports continuous
-observation failure, and the companion `solver-iac` alarm alerts after more than five minutes.
+Native and VM entries in `/status` and `/ready` include `observation_age_ms` after the first
+successful RPC observation. It measures elapsed time from that observation's request start,
+including request duration, and comes from the same observation snapshot as `chain_head_agreement`.
+The age keeps increasing after RPC failures or expiry. It is omitted before the first successful
+observation and for RFQ, and does not measure Tycho update age or how far state lags the chain.
+
+A successful RPC observation may justify serving for at most 5 seconds on Base or 15 seconds on
+Ethereum. These limits are not a grace period for state that disagrees with the observed head:
+a fresh observation of a different block number or hash closes affected availability immediately.
+An RPC error leaves the previous observation usable only until its age limit expires. Tycho
+status-only messages leave installed state unchanged, even when they report delayed or stale
+feed progress. Requests spanning a freshness change cannot return affected results after recovery.
+RPC uncertainty alone does not restart the broadcaster. The `ChainHeadRpcOutageSeconds` metric
+reports continuous observation failure, and the companion `solver-iac` alarm alerts after more
+than five minutes.
 
 The per-chain manifest keeps the clocks separate:
 
@@ -246,9 +256,9 @@ The per-chain manifest keeps the clocks separate:
 
 The bootstrap deadline starts immediately before constructing the raw Tycho feed. It does not cover
 preceding application initialization such as token loading or Redis setup. An established feed keeps
-its existing Tycho lifecycle during recovery; there is no second client. Matching heads end the
-recovery incident. An expired recovery window with fresh divergence evidence, a bootstrap timeout,
-or a terminal feed failure follows the existing bounded process shutdown. `/deployment-ready`
+its existing Tycho stream during the separate 60-second recovery window; there is no second
+client. Matching heads end the recovery incident. An expired recovery window with fresh divergence
+evidence, a bootstrap timeout, or a terminal feed failure follows the existing bounded process shutdown. `/deployment-ready`
 remains separate from serving readiness so ordinary recovery does not revoke deployment admission.
 
 Custom manifests must supply these timing settings, including `chain_head_rpc_request_timeout_ms`.
