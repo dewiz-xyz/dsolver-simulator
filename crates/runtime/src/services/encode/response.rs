@@ -464,7 +464,8 @@ mod tests {
     use super::*;
     use crate::models::messages::{PoolRef, PoolSwapDraft, SegmentDraft};
     use crate::services::encode::fixtures::{
-        test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
+        fixture_head, test_app_state, test_state_stores, token_store_with_tokens,
+        TestAppStateConfig,
     };
 
     fn test_request(request_id: Option<&str>) -> RouteEncodeRequest {
@@ -559,7 +560,10 @@ mod tests {
             test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
-            .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
+            .apply_update_with_head(
+                Update::new(42, HashMap::new(), HashMap::new()),
+                Some(fixture_head(42)),
+            )
             .await;
 
         let state = test_app_state(
@@ -567,7 +571,10 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            TestAppStateConfig::default(),
+            TestAppStateConfig {
+                observed_head: fixture_head(42),
+                ..TestAppStateConfig::default()
+            },
         );
 
         let request = test_request(None);
@@ -582,7 +589,10 @@ mod tests {
             test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
-            .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
+            .apply_update_with_head(
+                Update::new(42, HashMap::new(), HashMap::new()),
+                Some(fixture_head(42)),
+            )
             .await;
 
         let state = test_app_state(
@@ -590,7 +600,10 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            TestAppStateConfig::default(),
+            TestAppStateConfig {
+                observed_head: fixture_head(42),
+                ..TestAppStateConfig::default()
+            },
         );
 
         let request = test_request(Some("req-1"));

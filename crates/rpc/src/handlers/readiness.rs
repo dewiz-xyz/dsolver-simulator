@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use axum::{extract::State, http::StatusCode, Json};
+use runtime::chain_head::ChainHeadAgreement;
 use serde::Serialize;
-use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+use simulator_core::broadcaster::{BlockIdentity, BroadcasterRedisReplayBoundary};
 
 use crate::models::state::{
     AppState, SimulatorBackendKind, SimulatorBackendStatusSnapshot,
@@ -51,6 +52,14 @@ pub struct BackendStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    applied_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_chain_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_head_agreement: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     update_timestamp: Option<u64>,
     pool_count: usize,
     restart_count: u64,
@@ -73,6 +82,12 @@ impl From<SimulatorBackendStatusSnapshot> for BackendStatusPayload {
             status: snapshot.readiness.label(),
             reason: snapshot.reason.map(SimulatorReadinessReason::label),
             block_number: snapshot.block_number,
+            applied_head: snapshot.applied_head,
+            observed_chain_head: snapshot.observed_chain_head,
+            observation_age_ms: snapshot.observation_age_ms,
+            chain_head_agreement: snapshot
+                .chain_head_agreement
+                .map(ChainHeadAgreement::as_str),
             update_timestamp: snapshot.update_timestamp,
             pool_count: snapshot.pool_count,
             restart_count: snapshot.restart_count,
@@ -146,6 +161,7 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<StatusPay
 
 #[cfg(test)]
 mod tests {
+    use runtime::chain_head::{ChainHeadConfig, ChainHeadObserver};
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -163,7 +179,8 @@ mod tests {
     use chrono::NaiveDateTime;
     use num_bigint::BigUint;
     use num_traits::Zero;
-    use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+    use runtime::models::protocol::ProtocolKind;
+    use simulator_core::broadcaster::{BlockIdentity, BroadcasterRedisReplayBoundary};
     use tycho_simulation::protocol::models::{ProtocolComponent, Update};
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::models::{token::Token, Chain};
@@ -241,6 +258,13 @@ mod tests {
         Token::new(&address(seed), symbol, 18, 0, &[], Chain::Ethereum, 100)
     }
 
+    fn test_head() -> BlockIdentity {
+        BlockIdentity {
+            number: 1,
+            hash: Bytes::from(vec![1; 32]),
+        }
+    }
+
     async fn seed_native_ready_store(state: &AppState) {
         let component = ProtocolComponent::new(
             address(3),
@@ -260,7 +284,7 @@ mod tests {
         let new_pairs = HashMap::from([("pool-native".to_string(), component)]);
         state
             .native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(test_head()))
             .await;
     }
 
@@ -273,9 +297,10 @@ mod tests {
             Duration::from_millis(10),
         ));
         AppState {
+            chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head())),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: Arc::clone(&token_store),
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -293,7 +318,6 @@ mod tests {
             },
             enable_vm_pools,
             enable_rfq_pools,
-            native_progress_lease: Duration::from_secs(120),
             optional_backend_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
             vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -305,11 +329,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn status_exposes_native_backend_details_without_legacy_aliases() {
+    #[tokio::test(start_paused = true)]
+    async fn status_exposes_native_backend_details_without_legacy_aliases(
+    ) -> Result<(), serde_json::Error> {
         let state = test_state(false, false);
         seed_native_ready_store(&state).await;
         state.native_stream_health.record_update(1).await;
+        tokio::time::advance(Duration::from_millis(1234)).await;
+        state.chain_head_observer.fail_for_test();
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -317,17 +344,35 @@ mod tests {
         assert_eq!(payload.status, "ready");
         assert_eq!(payload.backends["native"].block_number, Some(1));
         assert_eq!(payload.backends["native"].pool_count, 1);
+        let serialized = serde_json::to_value(payload)?;
+        let native = &serialized["backends"]["native"];
+        assert_eq!(native["observation_age_ms"], 1234);
+        assert_eq!(native["applied_head"], serde_json::to_value(test_head())?);
+        assert_eq!(native["observed_chain_head"], native["applied_head"]);
+        assert_eq!(native["chain_head_agreement"], "matches");
+        Ok(())
     }
 
-    #[tokio::test]
+    async fn expire_chain_observation(state: &mut AppState) {
+        let head = BlockIdentity {
+            number: 1,
+            hash: Bytes::from(vec![1; 32]),
+        };
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        state.native_state_store.set_applied_head(Some(head)).await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn status_remains_available_for_stale_native_state() {
         let mut state = test_state(false, false);
         seed_native_ready_store(&state).await;
         assert!(state.native_state_store.is_ready());
         state.native_stream_health.record_update(1).await;
-        state.native_progress_lease = Duration::ZERO;
+        expire_chain_observation(&mut state).await;
 
-        let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
+        let (status_code, Json(payload)): (_, Json<StatusPayload>) =
+            status(State(state.clone())).await;
 
         assert_eq!(status_code, StatusCode::OK);
         assert_eq!(payload.status, "stale");
@@ -335,9 +380,45 @@ mod tests {
         assert_eq!(payload.backends["native"].pool_count, 1);
         assert_eq!(payload.backends["native"].status, "stale");
         assert_eq!(payload.backends["native"].reason, Some("stale"));
+        assert_eq!(payload.backends["native"].observation_age_ms, Some(121_000));
+        assert_eq!(
+            payload.backends["native"].observed_chain_head,
+            Some(test_head())
+        );
+        assert_eq!(
+            payload.backends["native"].chain_head_agreement,
+            Some("observation_unavailable")
+        );
+        let (ready_code, Json(ready_payload)) = ready(State(state)).await;
+        assert_eq!(ready_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            ready_payload.backends["native"].observation_age_ms,
+            Some(121_000)
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn status_omits_age_before_the_first_observation() -> Result<(), serde_json::Error> {
+        let mut state = test_state(false, false);
+        seed_native_ready_store(&state).await;
+        state.chain_head_observer = Arc::new(ChainHeadObserver::new(ChainHeadConfig {
+            poll_interval: Duration::from_secs(1),
+            rpc_request_timeout: Duration::from_secs(2),
+            observation_max_age: Duration::from_secs(120),
+        }));
+        let (status_code, Json(payload)) = status(State(state.clone())).await;
+        assert_eq!(status_code, StatusCode::OK);
+        let serialized = serde_json::to_value(payload)?;
+        let native = &serialized["backends"]["native"];
+        assert!(native.get("observation_age_ms").is_none());
+        assert!(native.get("observed_chain_head").is_none());
+        assert_eq!(native["chain_head_agreement"], "observation_unavailable");
+        let (ready_code, Json(_)) = ready(State(state)).await;
+        assert_eq!(ready_code, StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn ready_status_code_matches_the_returned_status_snapshot() {
         let ready_state = test_state(false, false);
         seed_native_ready_store(&ready_state).await;
@@ -350,14 +431,14 @@ mod tests {
         let mut stale_state = test_state(false, false);
         seed_native_ready_store(&stale_state).await;
         stale_state.native_stream_health.record_update(1).await;
-        stale_state.native_progress_lease = Duration::ZERO;
+        expire_chain_observation(&mut stale_state).await;
         let (stale_code, Json(stale_payload)) = ready(State(stale_state)).await;
         assert_eq!(stale_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(stale_payload.status, "stale");
     }
 
-    #[tokio::test]
-    async fn status_reports_native_unavailable_when_vm_is_ready() {
+    #[tokio::test(start_paused = true)]
+    async fn status_reports_native_unavailable_when_vm_is_ready() -> Result<(), serde_json::Error> {
         let state = test_state(true, true);
         let vm_component = ProtocolComponent::new(
             address(4),
@@ -372,20 +453,24 @@ mod tests {
         );
         state
             .vm_state_store
-            .apply_update(Update::new(
-                1,
-                HashMap::from([(
-                    "pool-vm".to_string(),
-                    Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
-                )]),
-                HashMap::from([("pool-vm".to_string(), vm_component)]),
-            ))
+            .apply_update_with_head(
+                Update::new(
+                    1,
+                    HashMap::from([(
+                        "pool-vm".to_string(),
+                        Box::new(ReadyStateSim) as Box<dyn ProtocolSim>,
+                    )]),
+                    HashMap::from([("pool-vm".to_string(), vm_component)]),
+                ),
+                Some(test_head()),
+            )
             .await;
         state.vm_stream_health.record_update(1).await;
         {
             let mut vm_status = state.vm_stream.write().await;
             vm_status.rebuilding = false;
         }
+        tokio::time::advance(Duration::from_millis(500)).await;
 
         let (status_code, Json(payload)): (_, Json<StatusPayload>) = status(State(state)).await;
 
@@ -398,6 +483,13 @@ mod tests {
         assert_eq!(payload.backends["rfq"].status, "warming_up");
         assert_eq!(payload.backends["rfq"].reason, Some("state_warming_up"));
         assert!(payload.backends["rfq"].subscription.is_some());
+        let serialized = serde_json::to_value(payload)?;
+        assert_eq!(serialized["backends"]["native"]["observation_age_ms"], 500);
+        assert_eq!(serialized["backends"]["vm"]["observation_age_ms"], 500);
+        assert!(serialized["backends"]["rfq"]
+            .get("observation_age_ms")
+            .is_none());
+        Ok(())
     }
 
     #[tokio::test]

@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::models::messages::{RouteEncodeRequest, RouteEncodeResponse};
-use crate::models::state::{AppState, NativeFenceStatus, PublishedStatePin};
+use crate::models::state::{
+    AppState, BackendFreshnessFence, NativeFenceStatus, PublishedStatePin, SimulationRebuildGuard,
+};
 use error::AttemptError;
 use model::NormalizedRouteInternal;
 use num_bigint::BigUint;
@@ -154,11 +156,7 @@ async fn encode_route(
     for attempt_number in [AttemptNumber::First, AttemptNumber::Second] {
         let attempt = encode_attempt(&state, &prepared, attempt_number).await;
         let outcome_class = attempt.outcome.class();
-        let fence_evaluation = if outcome_class == AttemptOutcomeClass::Deterministic {
-            None
-        } else {
-            attempt.native_fence.evaluate(&state).await
-        };
+        let fence_evaluation = attempt.evaluate_fences(&state).await?;
         let fence_status = fence_evaluation
             .as_ref()
             .map_or(NativeFenceStatus::Current, |evaluation| evaluation.status);
@@ -314,6 +312,30 @@ struct EncodeAttempt {
     outcome: AttemptOutcome,
     native_fence: NativeAttemptFence,
     route_uses_rfq: bool,
+    freshness_fences: Vec<BackendFreshnessFence>,
+    _rebuild_guard: Arc<SimulationRebuildGuard>,
+}
+
+impl EncodeAttempt {
+    async fn evaluate_fences(
+        &self,
+        state: &AppState,
+    ) -> Result<Option<NativeFenceEvaluation>, EncodeError> {
+        if self.outcome.class() == AttemptOutcomeClass::Deterministic {
+            return Ok(None);
+        }
+        // The identity check awaits readiness, so freshness must be checked afterward.
+        let native = self.native_fence.evaluate(state).await;
+        let fences: Vec<_> = self.freshness_fences.iter().collect();
+        let valid = state.backend_freshness_fences_valid(&fences).await;
+        if valid.into_iter().any(|valid| !valid) {
+            return Err(EncodeError::unavailable(
+                "Simulation state lost freshness while the route was being encoded; \
+                 retry once the simulator is ready",
+            ));
+        }
+        Ok(native)
+    }
 }
 
 async fn encode_attempt(
@@ -333,6 +355,8 @@ async fn encode_attempt(
         outcome: AttemptOutcome::from_result(execution.outcome),
         native_fence,
         route_uses_rfq: execution.route_uses_rfq,
+        freshness_fences: execution.freshness_fences,
+        _rebuild_guard: execution.rebuild_guard,
     }
 }
 
@@ -340,6 +364,8 @@ struct EncodeAttemptExecution {
     outcome: Result<EncodeComputation, AttemptError>,
     native_pool_ids: HashSet<String>,
     route_uses_rfq: bool,
+    freshness_fences: Vec<BackendFreshnessFence>,
+    rebuild_guard: Arc<SimulationRebuildGuard>,
 }
 
 async fn encode_attempt_with_pin(
@@ -365,6 +391,8 @@ async fn encode_attempt_with_pin(
             ))),
             native_pool_ids: normalized_native_pool_ids(&prepared.normalized),
             route_uses_rfq: prepared.backend_usage.rfq,
+            freshness_fences: Vec::new(),
+            rebuild_guard,
         };
     }
     let resimulation = resimulate::resimulate_route_with_native_pin(
@@ -383,6 +411,8 @@ async fn encode_attempt_with_pin(
                 outcome,
                 native_pool_ids: resimulation.native_pool_ids,
                 route_uses_rfq: resimulation.uses_rfq,
+                freshness_fences: resimulation.freshness_fences,
+                rebuild_guard: resimulation.rebuild_guard,
             }
         }
         Err(error) => {
@@ -397,6 +427,8 @@ async fn encode_attempt_with_pin(
                 outcome: Err(error),
                 native_pool_ids,
                 route_uses_rfq: resimulation.uses_rfq || prepared.backend_usage.rfq,
+                freshness_fences: resimulation.freshness_fences,
+                rebuild_guard: resimulation.rebuild_guard,
             }
         }
     }
@@ -743,5 +775,212 @@ mod retry_tests {
         let insufficient = retry_budget(timeout, Duration::from_millis(4_201), false);
         assert!(!insufficient.can_start);
         assert_eq!(insufficient.remaining, Duration::from_millis(299));
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "the request fixture contains valid static JSON"
+)]
+#[expect(
+    clippy::panic,
+    reason = "an unexpected encode outcome fails the regression test"
+)]
+mod freshness_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use simulator_core::broadcaster::BlockIdentity;
+    use tycho_execution::encoding::errors::EncodingError;
+    use tycho_execution::encoding::models::{EncodedSolution, Solution, Transaction};
+    use tycho_simulation::protocol::models::Update;
+    use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
+
+    use crate::chain_head::ChainHeadObserver;
+    use fixtures::{
+        component_with_protocol, dummy_token, fixture_bytes, test_app_state, test_state_stores,
+        token_store_with_tokens, TestAppStateConfig,
+    };
+    use mocks::{MockTychoEncoder, StepProtocolSim};
+
+    struct ChangeHeadDuringEncoding {
+        inner: MockTychoEncoder,
+        observer: Arc<ChainHeadObserver>,
+        original_head: BlockIdentity,
+    }
+
+    impl TychoEncoder for ChangeHeadDuringEncoding {
+        fn encode_solutions(
+            &self,
+            solutions: Vec<Solution>,
+        ) -> Result<Vec<EncodedSolution>, EncodingError> {
+            self.observer.observe_for_test(BlockIdentity {
+                number: self.original_head.number,
+                hash: Bytes::from(vec![2; 32]),
+            });
+            self.observer.observe_for_test(self.original_head.clone());
+            self.inner.encode_solutions(solutions)
+        }
+
+        fn encode_full_calldata(
+            &self,
+            _solutions: Vec<Solution>,
+        ) -> Result<Vec<Transaction>, EncodingError> {
+            Err(EncodingError::FatalError(
+                "encode_full_calldata not supported in tests".to_string(),
+            ))
+        }
+
+        fn validate_solution(&self, solution: &Solution) -> Result<(), EncodingError> {
+            self.inner.validate_solution(solution)
+        }
+    }
+
+    async fn freshness_fixture(
+        uses_vm: bool,
+        protocol: &str,
+        hint: &str,
+    ) -> (AppState, RouteEncodeRequest, BlockIdentity) {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens = token_store_with_tokens([token_in.clone(), token_out.clone()]);
+        let (native, vm, rfq) = test_state_stores(Arc::clone(&tokens));
+        let store = if uses_vm { &vm } else { &native };
+        let head = BlockIdentity {
+            number: 1,
+            hash: Bytes::from(vec![1; 32]),
+        };
+        store
+            .apply_update_with_head(
+                Update::new(
+                    1,
+                    HashMap::from([(
+                        "pool".to_string(),
+                        Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+                    )]),
+                    HashMap::from([(
+                        "pool".to_string(),
+                        component_with_protocol(
+                            "0x0000000000000000000000000000000000000009",
+                            protocol,
+                            protocol,
+                            vec![token_in, token_out],
+                        ),
+                    )]),
+                ),
+                Some(head.clone()),
+            )
+            .await;
+        let mut state = test_app_state(
+            tokens,
+            native,
+            vm,
+            rfq,
+            TestAppStateConfig {
+                enable_vm_pools: uses_vm,
+                request_timeout: Duration::from_secs(2),
+                ..TestAppStateConfig::default()
+            },
+        );
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        let request: RouteEncodeRequest = serde_json::from_value(serde_json::json!({
+            "chainId": 1,
+            "tokenIn": "0x0000000000000000000000000000000000000001",
+            "tokenOut": "0x0000000000000000000000000000000000000002",
+            "amountIn": "10", "minAmountOut": "8",
+            "settlementAddress": "0x0000000000000000000000000000000000000003",
+            "tychoRouterAddress": "0x0000000000000000000000000000000000000004",
+            "swapKind": "SimpleSwap",
+            "segments": [{"kind": "SimpleSwap", "shareBps": 0, "hops": [{
+                "tokenIn": "0x0000000000000000000000000000000000000001",
+                "tokenOut": "0x0000000000000000000000000000000000000002",
+                "swaps": [{"pool": {"protocol": hint, "componentId": "pool"},
+                    "tokenIn": "0x0000000000000000000000000000000000000001",
+                    "tokenOut": "0x0000000000000000000000000000000000000002",
+                    "splitBps": 0}]
+            }]}]
+        }))
+        .expect("valid route fixture");
+        (state, request, head)
+    }
+
+    #[tokio::test]
+    async fn encoding_rejects_chain_mismatch_even_after_recovery() {
+        for (uses_vm, protocol, hint) in [
+            (false, "uniswap_v2", "uniswap_v2"),
+            (true, "uniswap_v4", "uniswap_v4"),
+            (true, "uniswap_v2", "vm:curve"),
+        ] {
+            let (state, request, head) = freshness_fixture(uses_vm, protocol, hint).await;
+            let mock_encoder = || {
+                MockTychoEncoder::new(
+                    "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
+                    fixture_bytes("0x0000000000000000000000000000000000000004"),
+                )
+            };
+            let baseline = EncodeService::with_encoder(state.clone(), Arc::new(mock_encoder()));
+            assert!(
+                baseline.encode(request.clone()).await.is_ok(),
+                "fixture should encode for {protocol}"
+            );
+            let encoder = ChangeHeadDuringEncoding {
+                inner: mock_encoder(),
+                observer: Arc::clone(&state.chain_head_observer),
+                original_head: head,
+            };
+            let service = EncodeService::with_encoder(state.clone(), Arc::new(encoder));
+            let result = service.encode(request).await;
+            let Err(EncodeServiceError::Failed { error, .. }) = result else {
+                panic!("head mismatch must invalidate encoding for {protocol}");
+            };
+            assert_eq!(error.kind(), EncodeErrorKind::Unavailable);
+            assert!(error.message().contains("lost freshness"));
+            if uses_vm {
+                assert!(state.vm_ready().await);
+                assert!(
+                    !state.is_ready().await,
+                    "VM-only encoding must not require native state"
+                );
+            } else {
+                assert!(state.is_ready().await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn encoding_checks_freshness_after_waiting_for_native_pool_identity() {
+        let (state, request, head) = freshness_fixture(false, "uniswap_v2", "uniswap_v2").await;
+        let encoder: Arc<dyn TychoEncoder> = Arc::new(MockTychoEncoder::new(
+            "singleSwap(uint256,address,address,uint256,bool,bool,address,bool,bytes)",
+            fixture_bytes("0x0000000000000000000000000000000000000004"),
+        ));
+        let prepared = prepare_encode_route(
+            &state,
+            request,
+            Arc::new(move |_, _| Ok(Arc::clone(&encoder))),
+        )
+        .await
+        .expect("fixture should prepare");
+        let attempt = encode_attempt(&state, &prepared, AttemptNumber::First).await;
+        assert!(matches!(attempt.outcome, AttemptOutcome::Success(_)));
+        let subscription = &state.native_broadcaster_subscription;
+        let first_writer = subscription.hold_readiness_for_test().await;
+        let mut finish = Box::pin(attempt.evaluate_fences(&state));
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        let mut second_writer = Box::pin(subscription.hold_readiness_for_test());
+        assert!(futures::poll!(second_writer.as_mut()).is_pending());
+        drop(first_writer);
+        // FIFO locking lets the first check finish, then holds the second check here.
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        let second_writer = second_writer.await;
+        state.chain_head_observer.observe_for_test(BlockIdentity {
+            number: head.number,
+            hash: Bytes::from(vec![2; 32]),
+        });
+        state.chain_head_observer.observe_for_test(head);
+        drop(second_writer);
+        let result = finish.await;
+        assert!(matches!(result, Err(error) if error.message().contains("lost freshness")));
     }
 }

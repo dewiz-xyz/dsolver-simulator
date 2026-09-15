@@ -10,7 +10,10 @@ use runtime::broadcaster::state::{
     BroadcasterSnapshotStatus, BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
 };
 use runtime::broadcaster::state_history::{StreamPosition, WriterStatus};
-use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
+use runtime::chain_head::{ChainHeadAgreement, ChainHeadSnapshot};
+use simulator_core::broadcaster::{
+    BlockIdentity, BroadcasterBackend, BroadcasterProtocolSyncStatus,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BroadcasterStatusPayload {
@@ -26,6 +29,8 @@ pub struct BroadcasterStatusPayload {
     pub deployment_admission: BroadcasterDeploymentAdmissionPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_history: Option<BroadcasterStateHistoryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_head: Option<BroadcasterChainHeadPayload>,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -50,6 +55,28 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
             redis_publisher: snapshot.redis_publisher,
             deployment_admission: snapshot.deployment_admission.into(),
             state_history: snapshot.state_history.map(Into::into),
+            chain_head: snapshot.chain_head.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterChainHeadPayload {
+    pub observed_head: Option<BlockIdentity>,
+    pub observation_available: bool,
+    pub observation_age_ms: Option<u64>,
+    pub rpc_outage_age_ms: Option<u64>,
+    pub last_error: Option<&'static str>,
+}
+
+impl From<ChainHeadSnapshot> for BroadcasterChainHeadPayload {
+    fn from(snapshot: ChainHeadSnapshot) -> Self {
+        Self {
+            observation_available: snapshot.is_observation_available(),
+            observed_head: snapshot.observed_head,
+            observation_age_ms: snapshot.observation_age.map(|age| age.as_millis() as u64),
+            rpc_outage_age_ms: snapshot.rpc_outage_age.map(|age| age.as_millis() as u64),
+            last_error: snapshot.last_error,
         }
     }
 }
@@ -285,6 +312,12 @@ pub struct BroadcasterBackendPayload {
     pub pool_count: usize,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_agreement: Option<&'static str>,
 }
 
 impl BroadcasterBackendPayload {
@@ -299,6 +332,9 @@ impl BroadcasterBackendPayload {
             update_timestamp,
             pool_count: status.pool_count,
             sync_statuses: status.sync_statuses,
+            complete_head: status.complete_head,
+            published_head: status.published_head,
+            head_agreement: status.head_agreement.map(ChainHeadAgreement::as_str),
         }
     }
 }
@@ -347,6 +383,7 @@ mod tests {
             snapshot_sessions: BroadcasterSnapshotSessionsSnapshot::default(),
             backends: BTreeMap::new(),
             redis_publisher: None,
+            chain_head: None,
             deployment_admission: BroadcasterDeploymentAdmissionSnapshot {
                 admitted: true,
                 phase: BroadcasterDeploymentPhase::Admitted,

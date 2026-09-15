@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use simulator_core::broadcaster::BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES;
+use simulator_core::models::protocol::ProtocolKind;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 mod logging;
@@ -24,14 +25,25 @@ const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
 #[derive(Clone, Debug)]
 pub struct ChainProfile {
     pub chain: Chain,
-    pub native_protocols: Vec<String>,
-    pub vm_protocols: Vec<String>,
-    pub rfq_protocols: Vec<String>,
-    /// Only a strictly newer complete native block renews this lease.
-    pub native_progress_lease_secs: u64,
+    pub native_protocols: Vec<ProtocolKind>,
+    pub vm_protocols: Vec<ProtocolKind>,
+    pub rfq_protocols: Vec<ProtocolKind>,
+    /// Per-operation bound for replay snapshot requests, incomplete replay recovery,
+    /// and the first RFQ update. This is separate from overall Tycho bootstrap and serving freshness.
+    pub stream_initialization_timeout_secs: u64,
+    /// Interval between independent observations of the configured chain's latest block.
+    pub chain_head_poll_interval_ms: u64,
+    /// Timeout for each JSON-RPC request used to observe the chain head.
+    pub chain_head_rpc_request_timeout_ms: u64,
+    /// Maximum age of a successful observation that may still justify serving state.
+    pub chain_head_observation_max_age_secs: u64,
+    /// Time from starting Tycho construction until all configured chain state is complete.
+    pub tycho_initial_bootstrap_timeout_secs: u64,
+    /// Time an established feed may remain behind the observed chain before process exit.
+    pub tycho_head_mismatch_recovery_timeout_secs: u64,
     pub recovery_max_buffered_native_blocks: usize,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
-    pub native_token_protocol_allowlist: Vec<String>,
+    pub native_token_protocol_allowlist: Vec<ProtocolKind>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
     pub erc4626_pair_policies: Vec<Erc4626PairPolicy>,
 }
@@ -197,7 +209,7 @@ fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile)
 )]
 fn load_rfq_credentials(
     rfq_enabled: bool,
-    rfq_protocols: &[String],
+    rfq_protocols: &[ProtocolKind],
 ) -> (String, String, String, String, String) {
     match try_load_rfq_credentials(rfq_enabled, rfq_protocols) {
         Ok(credentials) => credentials,
@@ -209,23 +221,20 @@ fn load_rfq_credentials(
 
 fn try_load_rfq_credentials(
     rfq_enabled: bool,
-    rfq_protocols: &[String],
+    rfq_protocols: &[ProtocolKind],
 ) -> Result<(String, String, String, String, String), String> {
     if !rfq_enabled || rfq_protocols.is_empty() {
         return Ok(empty_rfq_credentials());
     }
 
-    let bebop_key = load_provider_key(
-        rfq_protocol_enabled(rfq_protocols, "rfq:bebop"),
-        "BEBOP_KEY",
-    )?;
+    let bebop_key = load_provider_key(rfq_protocols.contains(&ProtocolKind::Bebop), "BEBOP_KEY")?;
     let (hashflow_user, hashflow_key) = load_provider_credentials(
-        rfq_protocol_enabled(rfq_protocols, "rfq:hashflow"),
+        rfq_protocols.contains(&ProtocolKind::Hashflow),
         "HASHFLOW_USER",
         "HASHFLOW_KEY",
     )?;
     let (liquorice_user, liquorice_key) = load_provider_credentials(
-        rfq_protocol_enabled(rfq_protocols, "rfq:liquorice"),
+        rfq_protocols.contains(&ProtocolKind::Liquorice),
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
     )?;
@@ -270,10 +279,6 @@ fn load_provider_credentials(
     let key = required_trimmed_env(auth_key)?;
 
     Ok((user, key))
-}
-
-fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
-    protocols.iter().any(|configured| configured == protocol)
 }
 
 struct NetworkConfig {
@@ -1126,28 +1131,45 @@ mod tests {
             "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
         );
         assert_eq!(chain.hashflow_filename, "./hashflow_supported_tokens.csv");
-        assert_eq!(chain.chain_profile.native_progress_lease_secs, 25);
+        assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 25);
+        assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 1000);
+        assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
+        assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 15);
+        assert_eq!(
+            chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
+            900
+        );
+        assert_eq!(
+            chain
+                .chain_profile
+                .tycho_head_mismatch_recovery_timeout_secs,
+            60
+        );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
         assert!(!chain
             .chain_profile
             .native_protocols
-            .contains(&"uniswap_v4".to_string()));
+            .contains(&ProtocolKind::UniswapV4));
         assert!(chain
             .chain_profile
             .native_protocols
-            .contains(&"rocketpool".to_string()));
+            .contains(&ProtocolKind::Rocketpool));
         assert_eq!(
             chain.chain_profile.vm_protocols,
-            vec!["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
+            vec![
+                ProtocolKind::Curve,
+                ProtocolKind::BalancerV2,
+                ProtocolKind::MaverickV2
+            ]
         );
         assert!(chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:bebop".to_string()));
+            .contains(&ProtocolKind::Bebop));
         assert!(!chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:liquorice".to_string()));
+            .contains(&ProtocolKind::Liquorice));
         assert_eq!(
             chain.liquorice_url.as_deref(),
             Some("https://api.liquorice.tech/v1/solver/supported-tokens")
@@ -1155,7 +1177,7 @@ mod tests {
         assert!(chain
             .chain_profile
             .native_token_protocol_allowlist
-            .contains(&"rocketpool".to_string()));
+            .contains(&ProtocolKind::Rocketpool));
         assert!(chain.chain_profile.reset_allowance_tokens.contains_key(&1));
         assert_eq!(chain.chain_profile.erc4626_pair_policies.len(), 3);
     }
@@ -1168,22 +1190,35 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
-        assert_eq!(chain.chain_profile.native_progress_lease_secs, 10);
+        assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 10);
+        assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 500);
+        assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
+        assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 5);
+        assert_eq!(
+            chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
+            300
+        );
+        assert_eq!(
+            chain
+                .chain_profile
+                .tycho_head_mismatch_recovery_timeout_secs,
+            60
+        );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 64);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
             .chain_profile
             .native_protocols
-            .contains(&"aerodrome_slipstreams".to_string()));
+            .contains(&ProtocolKind::AerodromeSlipstreams));
         assert!(chain.chain_profile.vm_protocols.is_empty());
         assert!(chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:bebop".to_string()));
+            .contains(&ProtocolKind::Bebop));
         assert!(!chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:liquorice".to_string()));
+            .contains(&ProtocolKind::Liquorice));
         assert!(chain.liquorice_url.is_none());
         assert!(chain
             .chain_profile
@@ -1222,7 +1257,12 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1241,7 +1281,7 @@ route_policy = "default"
     }
 
     #[test]
-    fn parse_manifest_requires_native_progress_lease() {
+    fn parse_manifest_requires_stream_initialization_timeout() {
         let manifest = r#"
 [[protocols]]
 id = "uniswap_v2"
@@ -1266,9 +1306,48 @@ route_policy = "default"
 
         let error = manifest::parse_manifest_registries(manifest)
             .err()
-            .unwrap_or_else(|| unreachable!("missing native progress lease must fail"));
+            .unwrap_or_else(|| unreachable!("missing stream initialization timeout must fail"));
 
-        assert!(format!("{error:#}").contains("native_progress_lease_secs"));
+        assert!(format!("{error:#}").contains("stream_initialization_timeout_secs"));
+    }
+
+    #[test]
+    fn parse_manifest_rejects_missing_or_invalid_chain_timing() {
+        let manifest = fs::read_to_string(manifest_path())
+            .unwrap_or_else(|_| unreachable!("expected checked-in manifest"));
+        for field in [
+            "stream_initialization_timeout_secs",
+            "chain_head_poll_interval_ms",
+            "chain_head_rpc_request_timeout_ms",
+            "chain_head_observation_max_age_secs",
+            "tycho_initial_bootstrap_timeout_secs",
+            "tycho_head_mismatch_recovery_timeout_secs",
+        ] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(field))
+                .unwrap_or_else(|| unreachable!("manifest contains timing field"));
+            let invalid = manifest.replacen(line, &format!("{field} = 0"), 1);
+            let error = manifest::parse_manifest_registries(&invalid)
+                .err()
+                .unwrap_or_else(|| unreachable!("zero timing must fail"));
+            assert!(format!("{error:#}").contains(field));
+
+            let missing = manifest.replacen(line, "", 1);
+            let error = manifest::parse_manifest_registries(&missing)
+                .err()
+                .unwrap_or_else(|| unreachable!("missing timing must fail"));
+            assert!(format!("{error:#}").contains(field));
+        }
+        let invalid = manifest.replacen(
+            "chain_head_observation_max_age_secs = 15",
+            "chain_head_observation_max_age_secs = 1",
+            1,
+        );
+        let error = manifest::parse_manifest_registries(&invalid)
+            .err()
+            .unwrap_or_else(|| unreachable!("observation would expire before the next poll"));
+        assert!(format!("{error:#}").contains("observation maximum age"));
     }
 
     #[test]
@@ -1303,7 +1382,12 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1335,7 +1419,12 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1367,7 +1456,12 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 999999
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1409,7 +1503,12 @@ allow_share_to_asset = false
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = "tycho"
 bebop_url = "bebop"
@@ -1445,7 +1544,12 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
 tycho_url = " tycho "
 bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "
@@ -1469,12 +1573,15 @@ route_policy = " default "
             "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
         );
         assert_eq!(chain.hashflow_filename, "./hashflow.csv");
-        assert_eq!(chain.chain_profile.native_protocols, vec!["uniswap_v2"]);
+        assert_eq!(
+            chain.chain_profile.native_protocols,
+            vec![ProtocolKind::UniswapV2]
+        );
         assert!(chain.chain_profile.vm_protocols.is_empty());
-        assert_eq!(chain.chain_profile.rfq_protocols, vec!["rfq:bebop"]);
+        assert_eq!(chain.chain_profile.rfq_protocols, vec![ProtocolKind::Bebop]);
         assert_eq!(
             chain.chain_profile.native_token_protocol_allowlist,
-            vec!["uniswap_v2"]
+            vec![ProtocolKind::UniswapV2]
         );
     }
 
@@ -1621,7 +1728,7 @@ route_policy = " default "
         std::env::set_var("HASHFLOW_KEY", "hashflow-key");
 
         let Ok((bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key)) =
-            try_load_rfq_credentials(true, &["rfq:hashflow".to_string()])
+            try_load_rfq_credentials(true, &[ProtocolKind::Hashflow])
         else {
             unreachable!("expected hashflow-only credentials to load");
         };
@@ -1642,7 +1749,7 @@ route_policy = " default "
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_rfq_credential_env();
 
-        let Err(err) = try_load_rfq_credentials(true, &["rfq:liquorice".to_string()]) else {
+        let Err(err) = try_load_rfq_credentials(true, &[ProtocolKind::Liquorice]) else {
             unreachable!("expected missing Liquorice credentials to fail");
         };
 
@@ -1658,7 +1765,7 @@ route_policy = " default "
         std::env::set_var("HASHFLOW_USER", "  ");
         std::env::set_var("HASHFLOW_KEY", "hashflow-key");
 
-        let Err(err) = try_load_rfq_credentials(true, &["rfq:hashflow".to_string()]) else {
+        let Err(err) = try_load_rfq_credentials(true, &[ProtocolKind::Hashflow]) else {
             unreachable!("expected blank Hashflow user to fail");
         };
 
