@@ -100,19 +100,19 @@ is an example setup, not the source of truth for every default.
 
 ### Protocol identities
 
-Resolved configuration, decoder registration, applied protocol heads, and routing policies use
-`ProtocolKind`. Manifest protocol names must match canonical Tycho systems such as `uniswap_v3`
-or `vm:curve`; surrounding whitespace is trimmed, but case, spaces, hyphens, and protocol type
-names are not aliases in configuration. Invalid names fail during manifest validation.
+Use canonical Tycho protocol names in `simulator-manifest.toml`, such as `uniswap_v3` or
+`vm:curve`. Validation trims surrounding whitespace and requires an exact match. For example,
+`Uniswap-V3` and the protocol type name `uniswap_v3_pool` fail validation. The resolved configuration
+uses `ProtocolKind`, as do decoder registration, applied state tracking, and routing policies.
 
-Strings remain at the Tycho, JSON, and retained replay boundaries. Raw snapshot fragments keep
-their exact upstream keys until validation and selection so differently spelled identities
-cannot merge or disappear from a required snapshot. Component metadata, request hints, response
-metadata, and diagnostics can also carry external names that are not supported protocol systems.
-Their existing parsing rules remain separate from exact configured protocol selection.
+Tycho messages, JSON payloads, and retained snapshots keep their protocol strings. Snapshot
+reassembly preserves exact upstream keys so differently named streams stay distinct and recovery
+waits for all required streams. Historical pool selectors also match the stored component name
+exactly, including noncanonical names. External metadata and request hints retain their existing
+parsing rules.
 
-Protocol identity does not determine store ownership. Base Uniswap V4 still uses the VM store
-and its shared database while consuming the native wire partition.
+Base Uniswap V4 consumes the native wire partition and stores its state in the VM store with
+the shared database. Using `ProtocolKind` preserves that split.
 
 ## Runtime Continuity Contract
 
