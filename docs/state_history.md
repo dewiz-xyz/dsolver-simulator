@@ -402,3 +402,13 @@ The five-second broadcaster EMF snapshot adds no-dimension `Tycho/Simulation` me
 Gaps are honest reporting. They record losses the writer knows about, but their absence is not proof that a range is complete. Consumers should call `RangePlan::ensure_gap_free()` before using a replay plan.
 
 Retention is keep everything. There is no state history TTL or cleanup policy for PostgreSQL rows, S3 checkpoint archives, or token snapshots.
+
+### Local storage tests
+
+Run `scripts/verify_state_history.sh --repo .` to build MinIO, start disposable
+PostgreSQL and MinIO services on loopback, and run the storage checks. The script
+removes the containers and volumes when it exits.
+
+[Dockerfile.state-history-minio](../Dockerfile.state-history-minio) builds pinned
+MinIO source because upstream does not publish an image for this release. Compose
+pins the client and PostgreSQL images by digest.

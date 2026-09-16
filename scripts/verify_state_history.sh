@@ -86,7 +86,7 @@ fi
 echo "Starting local state history storage stack..."
 (
   cd "$repo"
-  docker compose -p "$compose_project" -f "$compose_file" up -d --wait --wait-timeout 120 postgres minio
+  docker compose -p "$compose_project" -f "$compose_file" up -d --build --wait --wait-timeout 120 postgres minio
   docker compose -p "$compose_project" -f "$compose_file" run --rm minio-init
   docker compose -p "$compose_project" -f "$compose_file" exec -T postgres \
     psql -U postgres -d state_history -v ON_ERROR_STOP=1 <<'SQL'
