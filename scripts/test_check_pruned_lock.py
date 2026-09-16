@@ -13,7 +13,7 @@ REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 PRIVATE = {
     "name": "tycho-execution",
     "version": "0.165.1",
-    "source": "git+ssh://git@github.com/pedrobergamini/dsolver-execution.git#46596c8",
+    "source": "git+ssh://git@github.com/dewiz-xyz/dsolver-execution.git#46596c8",
     "dependencies": [],
 }
 PUBLIC = [

@@ -40,10 +40,10 @@ RUN --mount=type=secret,id=github_token \
     GITHUB_TOKEN="$(cat /run/secrets/github_token)" && \
     test -n "$GITHUB_TOKEN" && \
     GIT_CONFIG_COUNT=2 \
-    GIT_CONFIG_KEY_0="url.https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/.insteadOf" \
-    GIT_CONFIG_VALUE_0="ssh://git@github.com/pedrobergamini/" \
-    GIT_CONFIG_KEY_1="url.https://x-access-token:${GITHUB_TOKEN}@github.com/pedrobergamini/.insteadOf" \
-    GIT_CONFIG_VALUE_1="git@github.com:pedrobergamini/" \
+    GIT_CONFIG_KEY_0="url.https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/.insteadOf" \
+    GIT_CONFIG_VALUE_0="ssh://git@github.com/dewiz-xyz/" \
+    GIT_CONFIG_KEY_1="url.https://x-access-token:${GITHUB_TOKEN}@github.com/dewiz-xyz/.insteadOf" \
+    GIT_CONFIG_VALUE_1="git@github.com:dewiz-xyz/" \
     CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked -p apps \
         --bin dsolver-tycho-broadcaster-service \
         --bin state-history-migrate \
