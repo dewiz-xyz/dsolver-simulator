@@ -63,7 +63,7 @@ tower = { version = "0.5", features = ["timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 tycho-common = "=0.341.8"
-tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
+tycho-execution = { git = "ssh://git@github.com/dewiz-xyz/dsolver-execution.git", rev = "46596c8" }
 tycho-simulation = "=0.341.8"
 typetag = "0.2"
 utoipa = { version = "5", features = ["chrono", "uuid"] }

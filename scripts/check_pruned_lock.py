@@ -36,7 +36,7 @@ def check(original, pruned):
                 f"Pruned lock added or retargeted dependencies for "
                 f"{identity[0]} {identity[1]}: {sorted(added_edges)}"
             )
-        if identity[2] and "pedrobergamini/dsolver-execution" in identity[2]:
+        if identity[2] and "dewiz-xyz/dsolver-execution" in identity[2]:
             raise ValueError(
                 "Historical workspace still resolves the private execution repository"
             )
