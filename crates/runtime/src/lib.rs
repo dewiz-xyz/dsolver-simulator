@@ -1,5 +1,6 @@
 pub mod broadcaster;
 pub mod chain_head;
+mod chain_tip_telemetry;
 pub mod config;
 pub mod memory;
 pub mod metrics;

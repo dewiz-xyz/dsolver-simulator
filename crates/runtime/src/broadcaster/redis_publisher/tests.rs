@@ -49,6 +49,7 @@ async fn published_heads_follow_current_backend_state_after_successful_append() 
                 vec![ProtocolKind::BalancerV2],
             ),
     );
+    assert_eq!(publisher.published_heads_for_telemetry(), Err("passive"));
     publisher
         .promote(
             base_heads([BroadcasterBackend::Native, BroadcasterBackend::Vm]),
@@ -80,6 +81,10 @@ async fn published_heads_follow_current_backend_state_after_successful_append() 
         publisher.published_backend_heads()[&BroadcasterBackend::Native],
         Some(block_identity(10, 1))
     );
+    assert_eq!(
+        publisher.published_heads_for_telemetry(),
+        Err("publisher_busy")
+    );
     writer.release_blocked_append();
     publish.await??;
     assert_eq!(
@@ -95,7 +100,9 @@ async fn published_heads_follow_current_backend_state_after_successful_append() 
     publisher
         .publish_accepted_payload(BroadcasterPayload::Update(incomplete))
         .await?;
-    let heads = publisher.published_backend_heads();
+    let heads = publisher
+        .published_heads_for_telemetry()
+        .map_err(|reason| anyhow!(reason))?;
     assert_eq!(heads[&BroadcasterBackend::Native], None);
     assert_eq!(heads[&BroadcasterBackend::Vm], Some(block_identity(10, 1)));
     Ok(())

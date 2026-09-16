@@ -923,6 +923,18 @@ impl BroadcasterRedisPublisher {
             .collect()
     }
 
+    pub(crate) fn published_heads_for_telemetry(
+        &self,
+    ) -> Result<BTreeMap<BroadcasterBackend, Option<BlockIdentity>>, &'static str> {
+        // Redis writes hold this mutex across I/O. A busy publisher is an unknown sample,
+        // so telemetry never queues behind publication or combines heads from different modes.
+        let guard = self.inner.try_lock().map_err(|_| "publisher_busy")?;
+        if guard.mode != BroadcasterRedisPublisherMode::Active {
+            return Err(guard.mode.as_str());
+        }
+        Ok(self.published_backend_heads())
+    }
+
     /// Install the frozen snapshot's heads after its artifact is available, before handoff drain.
     pub(crate) async fn install_published_snapshot_heads(
         &self,
