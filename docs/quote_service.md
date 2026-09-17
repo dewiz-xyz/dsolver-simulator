@@ -288,3 +288,139 @@ CloudWatch and query presets:
 - completion logs already emit `quote_status`, `quote_result_quality`, and `partial_kind`
 - preset filters distinguish usable successes from degraded but contract-valid responses
 - query docs and presets should stay aligned with this contract when log fields evolve
+
+## Observed chain tip catch-up episodes
+
+The broadcaster and simulator inspect existing in-memory heads every 100 ms. This
+adds no RPC requests and does not log each check. Each service keeps native and VM
+series separate; disabled VM and RFQ do not produce series. The broadcaster compares
+**published** complete heads with its own RPC observer, only while the publisher is
+active. The simulator compares **applied** complete heads with its own observer.
+Simulator readiness is context, so a head can match while another readiness gate
+is closed. A broadcaster match does not prove that a subscriber has applied it.
+
+An observed catch-up episode begins at the first positive block gap and completes
+only when number **and hash** match again. For `0, 1, 50, 20, 0`, one completion
+records a peak of 50 blocks and the monotonic duration from the first `1` to the
+last `0`. Decreasing gaps stay in the same episode. Detection timestamps and peaks
+are sampled observations, not exact mutation times or the maximum distance from
+the live chain. Short episodes and peaks between checks or RPC polls can be missed.
+
+A first observation already behind has `start_observed=false`; its elapsed duration
+is only a lower bound. Expired RPC observations, incomplete local state, hash
+conflicts, an observer behind local state, publisher ineligibility, and publisher
+lock contention are unclassifiable, never healthy zero-gap samples. An active
+episode stays open through these states with `continuous_observations=false` and
+retains the reasons. A later matching observation completes that censored record,
+but cannot prove the backend stayed behind throughout the unknown interval.
+Spacing **greater than 200 ms** also censors affected episodes and invalidates the
+previous matching boundary. Timers skip missed ticks rather than inventing checks.
+
+Structured JSON fields live under `fields`. Schema version 1 emits:
+
+| `fields.event` | Meaning |
+| --- | --- |
+| `chain_tip_episode_started` | First positive gap, including whether the starting boundary was observed |
+| `chain_tip_episode_completed` | One detection-to-match interval with `duration_ms` and `peak_gap_blocks` |
+| `chain_tip_observation_summary` | Coverage since the previous summary, every 15 seconds; active episode checkpoint if present |
+| `chain_tip_episode_unfinished` | Best-effort broadcaster graceful shutdown record; never a completion |
+
+Every record identifies `chain_id`, `service`, `backend`, `head_stage`, and
+`tracker_run_id`. Episodes also have `episode_sequence`,
+`episode_started_at_unix_ms`, initial and peak local/observed numbers and hashes,
+`observations`, and `max_observation_interval_ms`. The current `local_*` and
+`observed_*` fields on a completion identify the matching heads. Checkpoints and
+unfinished records use `elapsed_ms`, not `duration_ms`. Unknown values are omitted.
+`uncertainty_reasons` and `coverage_reasons` are diagnostic strings containing the
+observed reason labels. Use the boolean fields to select the complete cohort.
+
+Trackers survive internal feed/subscription restarts. They do not persist across
+processes. The simulator has no graceful supervisor shutdown hook; a start or
+checkpoint without a completion remains unfinished. Abrupt broadcaster termination
+has the same rule. Keep CloudWatch log stream identity alongside the tracker run
+and sequence, and never stitch different processes into one episode.
+
+### Query episode distributions
+
+Select the explicit UTC report window in CloudWatch Logs Insights and the relevant
+log groups. In both queries below, replace `WINDOW_START_UNIX_MS` with that window's
+start in Unix milliseconds. The query time range filters completion timestamps;
+the additional start filter prevents episodes crossing the left boundary from
+entering the complete cohort. Grouping below counts backend episodes across all
+selected replicas, not distinct chain incidents. Add `@logStream` for task-level
+results. Keep chains separate too.
+
+Peak block-gap distribution, with one row per observed maximum:
+
+```text
+fields fields.chain_id as chain_id, fields.service as service,
+       fields.backend as backend, fields.head_stage as head_stage,
+       fields.peak_gap_blocks as peak_gap_blocks
+| filter fields.schema_version = 1
+    and fields.event = "chain_tip_episode_completed"
+    and fields.start_observed = true
+    and fields.continuous_observations = true
+    and fields.episode_started_at_unix_ms >= WINDOW_START_UNIX_MS
+| stats count(*) as episodes by chain_id, service, backend, head_stage, peak_gap_blocks
+| sort peak_gap_blocks asc
+```
+
+Elapsed catch-up distribution and peak quantiles for the same cohort:
+
+```text
+fields fields.chain_id as chain_id, fields.service as service,
+       fields.backend as backend, fields.head_stage as head_stage,
+       fields.peak_gap_blocks as peak_gap_blocks, fields.duration_ms as duration_ms
+| filter fields.schema_version = 1
+    and fields.event = "chain_tip_episode_completed"
+    and fields.start_observed = true
+    and fields.continuous_observations = true
+    and fields.episode_started_at_unix_ms >= WINDOW_START_UNIX_MS
+| stats count(*) as episodes,
+        pct(peak_gap_blocks, 50) as peak_blocks_p50,
+        pct(peak_gap_blocks, 90) as peak_blocks_p90,
+        pct(peak_gap_blocks, 99) as peak_blocks_p99,
+        pct(duration_ms, 50) as catch_up_ms_p50,
+        pct(duration_ms, 90) as catch_up_ms_p90,
+        pct(duration_ms, 99) as catch_up_ms_p99
+  by chain_id, service, backend, head_stage
+```
+
+For a final 12-hour report, export all four event types with explicit UTC bounds
+and retain all fields and `@logStream`. Check query completion and result limits,
+splitting bounded windows as needed. Deduplicate lifecycle events by log stream,
+tracker run, episode sequence, and event kind. For periodic summaries include
+`observed_at_unix_ms` in the key so multiple checkpoints are retained. Compute
+percentiles from individual completed episodes using a stated percentile convention,
+never percentiles of time-bin percentiles.
+
+Report left-boundary episodes, censored completions, and right-boundary or otherwise
+unfinished episodes separately. Active checkpoints can reveal an episode whose
+start predates the window. Fetch adjacent summaries around the boundaries to
+identify partial coverage intervals; do not assign an entire straddling summary to
+the report window. Fetch preceding starts when needed for drill-down. An unmatched
+start at the right edge means unfinished **as of that edge**, even if it later
+completes. An abrupt process loss can hide a start before the next summary, so
+absence of an unfinished record is not evidence of completeness.
+
+Use `matching_observations / (matching_observations + behind_observations)` from
+summaries for the caught-up share of classified checks. Report
+`unclassifiable_observations`, `hash_mismatch_observations`, `delayed_observations`,
+`summary_max_observation_interval_ms`, interval bounds and expected task coverage
+alongside it. This is approximately time-weighted under regular sampling, not an
+exact percentage of elapsed time. A zero denominator is unknown. Missing summaries,
+process restarts, and unknown intervals cannot be counted healthy; empty episode
+results alone never establish no lag.
+
+### Output volume
+
+Steady state emits four summaries per minute per enabled backend. Each episode
+adds one start and one completion (or a best-effort unfinished record). At 10 checks
+per second, alternating match/gap observations produce at most five completed
+episodes and ten lifecycle records per second per backend, plus summaries. Ordinary
+one-block episodes are not filtered or rate-limited. The focused telemetry tests
+measure actual JSON bytes for a controlled steady minute and this alternating
+upper-bound sequence. A local run produced 4 records / 3,836 bytes for 601 steady
+checks, and 604 records / 831,741 bytes for 601 alternating checks (300 episodes),
+per backend. This is roughly 14 KB/s at the alternating upper bound. Production
+bytes depend on hashes, reasons and task identity.

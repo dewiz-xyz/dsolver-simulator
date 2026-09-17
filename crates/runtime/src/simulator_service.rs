@@ -7,6 +7,7 @@ use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterTokenSnapshotRe
 use simulator_core::models::protocol::ProtocolKind;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
@@ -21,6 +22,7 @@ use crate::broadcaster::redis_subscription::{
     VmBroadcasterSubscriptionControls,
 };
 use crate::chain_head::{ChainHeadConfig, ChainHeadObserver};
+use crate::chain_tip_telemetry::{Telemetry, SAMPLE_INTERVAL};
 use crate::config::{
     init_logging, load_broadcaster_redis_config, load_config, AppConfig, BroadcasterRedisConfig,
     ChainProfile, MemoryConfig,
@@ -120,6 +122,8 @@ pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> 
         &app_state,
     );
 
+    supervisors.push(spawn_chain_tip_telemetry_task(app_state.clone()));
+
     let observer = Arc::clone(&app_state.chain_head_observer);
     supervisors.push(tokio::spawn(async move {
         observer
@@ -172,6 +176,30 @@ fn spawn_memory_snapshot_task(memory_cfg: MemoryConfig) {
             maybe_log_memory_snapshot("service", "periodic", None, memory_cfg, false);
         }
     });
+}
+
+fn spawn_chain_tip_telemetry_task(app_state: AppState) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Subscription restarts reuse these trackers. Process termination can leave an
+        // unmatched start, since the simulator has no graceful supervisor shutdown hook.
+        let mut trackers: Vec<_> = app_state
+            .chain_tip_backends()
+            .map(|backend| {
+                (
+                    backend,
+                    Telemetry::new(app_state.chain.id(), "simulator", backend.label()),
+                )
+            })
+            .collect();
+        let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            for (backend, tracker) in &mut trackers {
+                tracker.observe(app_state.chain_tip_observation(*backend).await);
+            }
+        }
+    })
 }
 
 fn spawn_health_snapshot_task(app_state: AppState) {

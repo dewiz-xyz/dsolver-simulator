@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::future::select_all;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tycho_simulation::utils::load_all_tokens;
 
@@ -20,6 +22,7 @@ use crate::broadcaster::state::{
 };
 use crate::broadcaster::state_history::{build_state_history_runtime, StateHistoryRuntime};
 use crate::chain_head::{ChainHeadConfig, ChainHeadObserver};
+use crate::chain_tip_telemetry::{Telemetry, SAMPLE_INTERVAL};
 use crate::config::{
     init_logging, load_broadcaster_config, load_broadcaster_redis_config,
     load_state_history_config, BroadcasterConfig, MemoryConfig,
@@ -284,6 +287,7 @@ pub struct BroadcasterTasks {
     promotion_task: tokio::task::JoinHandle<()>,
     heartbeat_task: tokio::task::JoinHandle<()>,
     chain_head_task: tokio::task::JoinHandle<()>,
+    chain_tip_telemetry_task: JoinHandle<()>,
 }
 
 impl BroadcasterTasks {
@@ -316,6 +320,7 @@ impl BroadcasterTasks {
             self.promotion_task,
             self.heartbeat_task,
             self.chain_head_task,
+            self.chain_tip_telemetry_task,
         ] {
             if let Err(error) = task.await {
                 first_error.get_or_insert_with(|| anyhow::anyhow!(error));
@@ -481,6 +486,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     .with_state_history(state_history)
     .with_stop(stop.clone());
     spawn_broadcaster_health_snapshot_task(app_state.clone(), heartbeat_interval);
+    let chain_tip_telemetry_task = spawn_chain_tip_telemetry_task(app_state.clone(), raw_backends);
 
     Ok(BroadcasterServiceParts {
         config,
@@ -491,6 +497,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
             promotion_task,
             heartbeat_task,
             chain_head_task,
+            chain_tip_telemetry_task,
         },
     })
 }
@@ -802,6 +809,47 @@ fn spawn_heartbeat_task(
     })
 }
 
+fn spawn_chain_tip_telemetry_task(
+    app_state: BroadcasterAppState,
+    backends: Vec<BroadcasterBackend>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // These trackers outlive feed attempts, including recovery and stream restarts.
+        let mut trackers: Vec<_> = backends
+            .into_iter()
+            .filter_map(|backend| {
+                let label = match backend {
+                    BroadcasterBackend::Native => "native",
+                    BroadcasterBackend::Vm => "vm",
+                    BroadcasterBackend::Rfq => return None,
+                };
+                Some((
+                    backend,
+                    Telemetry::new(app_state.chain_id, "broadcaster", label),
+                ))
+            })
+            .collect();
+        let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                () = app_state.stop.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            let mut observations = app_state.raw_service.chain_tip_observations();
+            for (backend, tracker) in &mut trackers {
+                if let Some(observation) = observations.remove(backend) {
+                    tracker.observe(observation);
+                }
+            }
+        }
+        for (_, tracker) in &mut trackers {
+            tracker.finish();
+        }
+    })
+}
+
 fn spawn_broadcaster_health_snapshot_task(app_state: BroadcasterAppState, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -1082,13 +1130,14 @@ mod tests {
             ],
             promotion_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
             heartbeat_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
-            chain_head_task: wait_for_stop(stop, Arc::clone(&stopped)),
+            chain_head_task: wait_for_stop(stop.clone(), Arc::clone(&stopped)),
+            chain_tip_telemetry_task: wait_for_stop(stop, Arc::clone(&stopped)),
         };
 
         tasks.wait_for_feed().await?;
         tasks.stop_and_wait().await?;
 
-        assert_eq!(stopped.load(Ordering::Relaxed), 4);
+        assert_eq!(stopped.load(Ordering::Relaxed), 5);
         Ok(())
     }
 
@@ -1107,7 +1156,8 @@ mod tests {
             })],
             promotion_task: wait_for_stop(stop.clone()),
             heartbeat_task: wait_for_stop(stop.clone()),
-            chain_head_task: wait_for_stop(stop),
+            chain_head_task: wait_for_stop(stop.clone()),
+            chain_tip_telemetry_task: wait_for_stop(stop),
         };
 
         let result = tasks.wait_for_feed().await;

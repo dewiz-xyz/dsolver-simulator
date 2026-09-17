@@ -30,11 +30,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
-          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -47,11 +47,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
-          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -64,11 +64,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
-          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Check historical image lock guard
         run: python3 scripts/test_check_pruned_lock.py
       - uses: taiki-e/install-action@nextest
@@ -86,11 +86,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
-          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Verify state history storage contract
         run: scripts/verify_state_history.sh --repo .
 
@@ -103,11 +103,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
-          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "ssh://git@github.com/pedrobergamini/"
-          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/pedrobergamini/".insteadOf "git@github.com:pedrobergamini/"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Build simulator release binary
         run: cargo build --locked -p apps --bin dsolver-simulator-service --release
       - name: Build broadcaster release binary

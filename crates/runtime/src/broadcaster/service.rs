@@ -30,6 +30,7 @@ use crate::broadcaster::state::{
     BroadcasterUpstreamState,
 };
 use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver, ChainHeadSnapshot};
+use crate::chain_tip_telemetry::Observation;
 use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapshot_export_failure};
 use simulator_core::broadcaster::{
     BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
@@ -467,6 +468,26 @@ impl BroadcasterServiceState {
         self.chain_head_observer
             .as_ref()
             .map(ChainHeadObserver::snapshot)
+    }
+
+    pub(crate) fn chain_tip_observations(&self) -> BTreeMap<BroadcasterBackend, Observation> {
+        let Some(observer) = self.chain_head_snapshot() else {
+            return BTreeMap::new();
+        };
+        let published = self.redis_publisher.published_heads_for_telemetry();
+        self.required_protocols
+            .keys()
+            .map(|backend| {
+                let head = published
+                    .as_ref()
+                    .ok()
+                    .and_then(|heads| heads.get(backend))
+                    .cloned()
+                    .flatten();
+                let reason = published.as_ref().err().copied();
+                (*backend, Observation::new(head, &observer, reason, None))
+            })
+            .collect()
     }
 
     pub(crate) fn initial_bootstrap_is_complete(&self) -> bool {
@@ -2711,6 +2732,57 @@ mod tests {
             super::backend_head_agreement(&observer.snapshot(), Some(&reference), Some(&reference)),
             ChainHeadAgreement::Matches,
         );
+    }
+
+    #[tokio::test]
+    async fn chain_tip_telemetry_uses_published_heads_even_when_cache_is_ahead() -> Result<()> {
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )
+            .with_required_protocols(vec![ProtocolKind::UniswapV2], Vec::new()),
+        );
+        publisher
+            .promote(base_heads([BroadcasterBackend::Native]), "test_active")
+            .await?;
+        let observed_head = BlockIdentity {
+            number: 11,
+            hash: Bytes::from([11; 32]),
+        };
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(
+            ChainHeadObserver::ready_for_test(observed_head.clone()),
+            vec![ProtocolKind::UniswapV2],
+            Vec::new(),
+        );
+        service.mark_upstream_connected().await;
+        assert!(service.apply_feed_message(&raw_feed(10, 10, 9)).await?);
+        service
+            .cache
+            .apply_feed_message(&raw_feed(11, 11, 10))
+            .await?;
+        assert_eq!(
+            service
+                .cache
+                .complete_backend_heads(&service.required_protocols)
+                .await[&BroadcasterBackend::Native],
+            Some(observed_head.clone()),
+        );
+        let samples = service.chain_tip_observations();
+        assert_eq!(samples.len(), 1);
+        let native = &samples[&BroadcasterBackend::Native];
+        assert_eq!(native.local.as_ref().map(|head| head.number), Some(10));
+        assert_eq!(native.observed, Some(observed_head));
+        assert_eq!(native.agreement, ChainHeadAgreement::ObserverAhead);
+        assert_eq!(native.unavailable_reason, None);
+        Ok(())
     }
 
     #[tokio::test]

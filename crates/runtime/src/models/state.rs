@@ -17,6 +17,7 @@ use tycho_simulation::{
 };
 
 use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
+use crate::chain_tip_telemetry::Observation;
 use crate::config::SlippageConfig;
 
 use super::{
@@ -643,6 +644,28 @@ impl AppState {
             observed_chain_head: observation.observed_head,
             observation_age: observation.observation_age,
             chain_head_agreement,
+        }
+    }
+
+    pub(crate) fn chain_tip_backends(&self) -> impl Iterator<Item = SimulatorBackendKind> {
+        [
+            Some(SimulatorBackendKind::Native),
+            (self.configured_backends.vm && self.enable_vm_pools)
+                .then_some(SimulatorBackendKind::Vm),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub(crate) async fn chain_tip_observation(&self, backend: SimulatorBackendKind) -> Observation {
+        let pinned = self.backend_store(backend).pin().await;
+        let assessment = self.backend_assessment_for_pin(backend, &pinned).await;
+        Observation {
+            local: pinned.applied_head().cloned(),
+            observed: assessment.observed_chain_head,
+            agreement: assessment.chain_head_agreement,
+            unavailable_reason: None,
+            readiness: Some(assessment.readiness.label()),
         }
     }
 
@@ -2105,6 +2128,55 @@ mod tests {
             .await;
         state.vm_state_store.set_applied_head(Some(head)).await;
         state
+    }
+
+    #[tokio::test]
+    async fn chain_tip_telemetry_keeps_applied_backend_heads_and_readiness_separate() {
+        let state = observed_ready_state().await;
+        let native_head = test_block_head(1, 1);
+        let vm_head = test_block_head(2, 2);
+        state
+            .vm_state_store
+            .set_applied_head(Some(vm_head.clone()))
+            .await;
+        state.chain_head_observer.observe_for_test(vm_head.clone());
+        state
+            .vm_broadcaster_subscription
+            .mark_redis_gap("test_gap")
+            .await;
+
+        let native = state
+            .chain_tip_observation(SimulatorBackendKind::Native)
+            .await;
+        let vm = state.chain_tip_observation(SimulatorBackendKind::Vm).await;
+        assert_eq!(native.local, Some(native_head));
+        assert_eq!(native.agreement, ChainHeadAgreement::ObserverAhead);
+        assert_eq!(native.readiness, Some("stale"));
+        assert_eq!(vm.local, Some(vm_head.clone()));
+        assert_eq!(vm.observed, Some(vm_head));
+        assert_eq!(vm.agreement, ChainHeadAgreement::Matches);
+        assert_eq!(vm.readiness, Some("warming_up"));
+        assert_eq!(vm.unavailable_reason, None);
+    }
+
+    #[tokio::test]
+    async fn chain_tip_telemetry_omits_disabled_and_unconfigured_vm() {
+        let mut state = observed_ready_state().await;
+        assert_eq!(
+            state.chain_tip_backends().collect::<Vec<_>>(),
+            vec![SimulatorBackendKind::Native, SimulatorBackendKind::Vm],
+        );
+        state.enable_vm_pools = false;
+        assert_eq!(
+            state.chain_tip_backends().collect::<Vec<_>>(),
+            vec![SimulatorBackendKind::Native],
+        );
+        state.enable_vm_pools = true;
+        state.configured_backends.vm = false;
+        assert_eq!(
+            state.chain_tip_backends().collect::<Vec<_>>(),
+            vec![SimulatorBackendKind::Native],
+        );
     }
 
     #[tokio::test]
