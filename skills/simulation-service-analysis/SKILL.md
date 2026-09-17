@@ -10,9 +10,9 @@ metadata:
 ## Quick start
 
 1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
-2. Ensure `.env` exists and contains `TYCHO_API_KEY`, `TYCHO_BROADCASTER_URL`, `BROADCASTER_REDIS_URL`, and `BROADCASTER_REDIS_STREAM_KEY`.
+2. Create `.env` from `.env.example` and set `TYCHO_API_KEY`, `TYCHO_BROADCASTER_URL`, `BROADCASTER_REDIS_URL`, and `BROADCASTER_REDIS_STREAM_KEY`. Read `simulator-manifest.toml` for the selected chain and configure any additional enabled-provider credentials.
    The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator, while Redis carries deltas after each HTTP snapshot replay boundary.
-   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently enable Bebop only; Hashflow and Liquorice remain implemented but are not part of an active chain profile.
+   RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and derive the active providers from that chain's `rfq_protocols` list instead of relying on this skill for a copied protocol list.
    When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
@@ -43,6 +43,12 @@ metadata:
 - Optionally compares the current run against the latest compatible saved report.
 - `/status` is always-live state reporting. `/ready` carries the HTTP readiness result, and nested `backends.*.status` explains backend state.
 
+This is the local reproduction workflow. It can reproduce a captured request from
+the quoter, a standalone deployment, or any future DSolver V2 deployment whose
+resolved runtime manifest proves that it uses the simulator service. The current
+production V2 request path is in-process, but that is deployed topology, not a
+permanent limitation of this skill.
+
 ## Behavior model
 
 - Non-zero exit codes are reserved for harness/runtime failures such as startup failures, readiness timeouts, transport failures that prevent analysis, or report-writing failures.
@@ -50,6 +56,11 @@ metadata:
 - The analyzer is meant to help local reviewers investigate behavior, not to decide prod-readiness by itself.
 
 ## Useful commands
+
+Normal full-suite validation:
+```bash
+cargo test --workspace
+```
 
 Base run:
 ```bash
@@ -97,6 +108,11 @@ Target a different local base URL:
 ```bash
 cargo run -p apps --bin sim-analysis -- --chain-id 1 --base-url http://127.0.0.1:3000 --stop
 ```
+
+To reproduce a captured request, keep its original chain and body intact, record
+the deployment manifest that established the simulator dependency, and point the
+analyzer or a focused request at the local service. Never infer a simulator edge
+from the mere presence of a simulator ECS service.
 
 ## Investigation flow
 

@@ -8,7 +8,7 @@
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
 - Keep `TYCHO_BROADCASTER_URL` pointed at the broadcaster HTTP base URL and configure `BROADCASTER_REDIS_URL` plus `BROADCASTER_REDIS_STREAM_KEY` for Redis deltas. The local default lets the lifecycle helper start the broadcaster on port `3001` before the simulator.
-- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true`. Ethereum and Base currently enable Bebop only; Hashflow and Liquorice remain implemented but are not part of an active chain profile.
+- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and read the selected chain's `rfq_protocols` in `simulator-manifest.toml` for the actual provider set.
 - When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
@@ -50,7 +50,8 @@
 ## Useful commands
 - Format: `cargo fmt --all`
 - Lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- Test: `cargo nextest run --workspace`
+- Normal full suite: `cargo test --workspace`
+- Exact nextest parity when needed: `cargo nextest run --workspace --test-threads 16`
 - Build simulator: `cargo build -p apps --bin dsolver-simulator-service --release`
 - Build broadcaster: `cargo build -p apps --bin dsolver-tycho-broadcaster-service --release`
 - Manual lifecycle:
@@ -64,3 +65,9 @@
 - [docs/simulate_example.md](../../../docs/simulate_example.md)
 - [docs/encode_example.md](../../../docs/encode_example.md)
 - [docs/quote_service.md](../../../docs/quote_service.md)
+
+## Deployment context
+
+- This skill owns local analysis, not AWS topology discovery.
+- A captured request may come from any deployment whose resolved manifest proves a simulator dependency.
+- Current production DSolver V2 performs its simulation work in-process. Do not turn that observed topology into a claim that V2 can never use this service.
