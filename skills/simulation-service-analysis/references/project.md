@@ -71,4 +71,3 @@
 - This skill owns local analysis, not AWS topology discovery.
 - A captured request may come from any deployment whose resolved manifest proves a simulator dependency.
 - Current production DSolver V2 performs its simulation work in-process. Do not turn that observed topology into a claim that V2 can never use this service.
-- Use the global `solver-simulator-health` skill for deployed simulator health and its resolved dependency context.

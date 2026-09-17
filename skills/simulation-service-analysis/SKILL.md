@@ -10,7 +10,7 @@ metadata:
 ## Quick start
 
 1. Confirm the repo root (expect `Cargo.toml` and `crates/`).
-2. Read `simulator-manifest.toml` for the selected chain, then ensure `.env` contains the credentials and endpoints required by that effective configuration.
+2. Create `.env` from `.env.example` and set `TYCHO_API_KEY`, `TYCHO_BROADCASTER_URL`, `BROADCASTER_REDIS_URL`, and `BROADCASTER_REDIS_STREAM_KEY`. Read `simulator-manifest.toml` for the selected chain and configure any additional enabled-provider credentials.
    The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator, while Redis carries deltas after each HTTP snapshot replay boundary.
    RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and derive the active providers from that chain's `rfq_protocols` list instead of relying on this skill for a copied protocol list.
    When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
