@@ -1,0 +1,146 @@
+name: Release Deploy
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: release-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  determine-version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Resolve and validate version tag
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="$RELEASE_TAG"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          if ! echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "Invalid version: $VERSION" >&2
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+  build-and-push:
+    name: Build & Push (${{ matrix.target }})
+    needs: determine-version
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      matrix:
+        target: [quoter-base, solve-base]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.determine-version.outputs.version }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push tycho-simulator image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:${{ needs.determine-version.outputs.version }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/tycho-simulator-${{ matrix.target }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  open-iac-pr:
+    name: Open bump PR in solver-iac
+    needs: [determine-version, build-and-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Generate GitHub App token (cross-repo)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.SOLVER_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SOLVER_RELEASE_APP_PRIVATE_KEY }}
+          owner: dewiz-xyz
+          repositories: solver-iac
+
+      - name: Checkout solver-iac
+        uses: actions/checkout@v4
+        with:
+          repository: dewiz-xyz/solver-iac
+          token: ${{ steps.app-token.outputs.token }}
+          path: solver-iac
+
+      - name: Update simulatorImageTag in prod stacks
+        env:
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd solver-iac
+          for STACK in Pulumi.quoter-base.yaml Pulumi.solve-base.yaml; do
+            yq -i ".config.\"dsolver:simulatorImageTag\" = strenv(VERSION)" "$STACK"
+            echo "$STACK updated to $VERSION"
+            grep "dsolver:simulatorImageTag" "$STACK"
+          done
+
+      - name: Create PR in solver-iac
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: solver-iac
+          token: ${{ steps.app-token.outputs.token }}
+          branch: release/dsolver-simulator-${{ needs.determine-version.outputs.version }}
+          base: main
+          delete-branch: true
+          commit-message: |
+            chore(deps): bump dsolver-simulator to ${{ needs.determine-version.outputs.version }}
+          title: "chore(deps): bump dsolver-simulator to ${{ needs.determine-version.outputs.version }}"
+          body: |
+            Automatic bump after release **${{ needs.determine-version.outputs.version }}** in dsolver-simulator.
+
+            **Images published to ECR:**
+            - `tycho-simulator-quoter-base:${{ needs.determine-version.outputs.version }}`
+            - `tycho-simulator-solve-base:${{ needs.determine-version.outputs.version }}`
+
+            **Release notes:** ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.determine-version.outputs.version }}
+
+            After merge, `pulumi up` will run in the `quoter-base` and `solve-base` stacks, updating the production ECS task definitions.
+          labels: |
+            release-bump
+            dsolver-simulator

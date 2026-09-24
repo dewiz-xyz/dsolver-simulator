@@ -1,0 +1,78 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.SOLVER_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SOLVER_RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: master
+          token: ${{ steps.app-token.outputs.token }}
+
+  correct-label-drift:
+    name: Correct release PR label drift
+    runs-on: ubuntu-latest
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Force autorelease label sync on merged release PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          DRIFTED=$(gh pr list \
+            --repo "$REPO" \
+            --state merged \
+            --label "autorelease: pending" \
+            --search "head:release-please--branches--master" \
+            --json number \
+            --jq '[.[].number]')
+
+          COUNT=$(echo "$DRIFTED" | jq 'length')
+          echo "Release PRs with label drift detected: $COUNT (release ${TAG})"
+
+          if [ "$COUNT" -eq 0 ]; then
+            exit 0
+          fi
+
+          echo "$DRIFTED" | jq -r '.[]' | while read -r NUMBER; do
+            [ -z "$NUMBER" ] && continue
+            echo "Fixing label drift on PR #${NUMBER}"
+            gh pr edit "$NUMBER" --repo "$REPO" \
+              --remove-label "autorelease: pending" \
+              --add-label "autorelease: tagged"
+          done
