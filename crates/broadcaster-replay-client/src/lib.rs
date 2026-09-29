@@ -39,7 +39,8 @@ mod tests {
 
     use super::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction};
     use super::reader::{
-        blocking_read_timeout, redis_xread_messages, RedisStreamInfo, RedisStreamMessage,
+        blocking_read_timeout, redis_connect_error, redis_xread_messages, RedisStreamInfo,
+        RedisStreamMessage,
     };
     use super::ReplayCheckpoint;
 
@@ -284,6 +285,41 @@ mod tests {
             super::BroadcasterReplayClientError::RedisReadTransport { .. }
         ));
         Ok(())
+    }
+
+    #[test]
+    fn redis_connect_setup_failure_is_not_transport() -> Result<()> {
+        let invalid_url = redis::Client::open("not-a-redis-url")
+            .err()
+            .ok_or_else(|| anyhow!("an invalid Redis URL should fail"))?;
+        let rejected =
+            redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "invalid password"));
+
+        for error in [invalid_url, rejected] {
+            assert!(matches!(
+                redis_connect_error(error),
+                super::BroadcasterReplayClientError::RedisConnect { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redis_connect_refused_or_timed_out_connection_uses_transport_retry() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = redis::RedisError::from(std::io::Error::new(kind, "connection failed"));
+
+            assert!(
+                matches!(
+                    redis_connect_error(error),
+                    super::BroadcasterReplayClientError::RedisConnectTransport { .. }
+                ),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

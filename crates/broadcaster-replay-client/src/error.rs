@@ -9,9 +9,13 @@ pub enum BroadcasterReplayClientError {
     /// The configured broadcaster URL is not a usable HTTP(S) base URL.
     #[error("invalid broadcaster URL: {message}")]
     InvalidBroadcasterUrl { message: String },
-    /// Redis connection setup failed.
+    /// Redis connection setup failed in a way retrying does not fix, such as an invalid URL or
+    /// rejected credentials.
     #[error("failed to connect to broadcaster Redis: {message}")]
     RedisConnect { message: String },
+    /// Redis connection setup hit a transient transport failure.
+    #[error("failed to connect to broadcaster Redis: {message}")]
+    RedisConnectTransport { message: String },
     /// Blocking Redis stream read failed.
     #[error("Redis XREAD failed: {message}")]
     RedisRead { message: String },
@@ -88,6 +92,12 @@ impl BroadcasterReplayClientError {
 
     pub(crate) fn redis_connect(message: impl Into<String>) -> Self {
         Self::RedisConnect {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn redis_connect_transport(message: impl Into<String>) -> Self {
+        Self::RedisConnectTransport {
             message: message.into(),
         }
     }
