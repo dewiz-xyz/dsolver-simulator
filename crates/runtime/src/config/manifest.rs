@@ -62,6 +62,7 @@ struct ChainRegistryEntry {
     tycho_initial_bootstrap_timeout_secs: u64,
     tycho_head_mismatch_recovery_timeout_secs: u64,
     recovery_max_buffered_native_blocks: usize,
+    token_max_days_since_last_trade: u64,
     route_policy_id: String,
 }
 
@@ -127,6 +128,8 @@ struct RawChain {
     tycho_initial_bootstrap_timeout_secs: NonZeroU64,
     tycho_head_mismatch_recovery_timeout_secs: NonZeroU64,
     recovery_max_buffered_native_blocks: usize,
+    /// How many days back a token must have last traded for the broadcaster to load it.
+    token_max_days_since_last_trade: NonZeroU64,
     route_policy: String,
 }
 
@@ -191,6 +194,7 @@ pub(crate) fn resolve_chain_config(
             tycho_head_mismatch_recovery_timeout_secs: chain
                 .tycho_head_mismatch_recovery_timeout_secs,
             recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
+            token_max_days_since_last_trade: chain.token_max_days_since_last_trade,
             native_token_protocol_allowlist: route_policy.native_token_protocol_allowlist.clone(),
             reset_allowance_tokens,
             erc4626_pair_policies: route_policy.erc4626_pair_policies.clone(),
@@ -435,6 +439,7 @@ fn validate_chains(
                     .tycho_head_mismatch_recovery_timeout_secs
                     .get(),
                 recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
+                token_max_days_since_last_trade: chain.token_max_days_since_last_trade.get(),
                 route_policy_id: route_policy_id.to_string(),
             },
         );

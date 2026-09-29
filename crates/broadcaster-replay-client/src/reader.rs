@@ -17,20 +17,19 @@ pub(crate) struct TokioRedisStreamReader {
 
 impl TokioRedisStreamReader {
     pub(crate) async fn connect(redis_url: &str, block_ms: u64) -> Result<Self> {
-        let client = redis::Client::open(redis_url)
-            .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        let client = redis::Client::open(redis_url).map_err(redis_connect_error)?;
         let blocking_read_connection = redis::aio::ConnectionManager::new_with_config(
             client.clone(),
             connection_manager_config(blocking_read_timeout(block_ms)),
         )
         .await
-        .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        .map_err(redis_connect_error)?;
         let inspection_connection = redis::aio::ConnectionManager::new_with_config(
             client,
             connection_manager_config(REDIS_INSPECTION_TIMEOUT),
         )
         .await
-        .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        .map_err(redis_connect_error)?;
         Ok(Self {
             blocking_read_connection,
             inspection_connection,
@@ -62,6 +61,14 @@ impl TokioRedisStreamReader {
             .query_async::<StreamInfoStreamReply>(&mut connection)
             .await;
         redis_stream_info(reply)
+    }
+}
+
+pub(crate) fn redis_connect_error(error: redis::RedisError) -> BroadcasterReplayClientError {
+    if redis_transport_failure(&error) {
+        BroadcasterReplayClientError::redis_connect_transport(error.to_string())
+    } else {
+        BroadcasterReplayClientError::redis_connect(error.to_string())
     }
 }
 
