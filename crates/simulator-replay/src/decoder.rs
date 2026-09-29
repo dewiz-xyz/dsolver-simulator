@@ -37,10 +37,11 @@ use simulator_core::broadcaster::{
     BroadcasterUpdateMessage, ProtocolHeadUpdate,
 };
 
+use simulator_core::broadcaster::RawSnapshotReassembly;
 use simulator_core::models::protocol::ProtocolKind;
 
 use crate::payload::{live_partition_update, snapshot_partition_update};
-use crate::{DecodedReplay, RawSnapshotReassembly, ReplayBackend};
+use crate::{DecodedReplay, ReplayBackend};
 
 pub type TokenMap = HashMap<Bytes, Token>;
 

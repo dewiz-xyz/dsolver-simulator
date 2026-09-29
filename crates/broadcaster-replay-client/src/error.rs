@@ -51,6 +51,13 @@ pub enum BroadcasterReplayClientError {
         url: String,
         message: String,
     },
+    /// A snapshot session was for another chain, broke the wire contract, or held fragments
+    /// that do not merge.
+    #[error("invalid broadcaster snapshot session: {message}")]
+    Snapshot { message: String },
+    /// The token catalog, or a token in it, belongs to another chain.
+    #[error("invalid broadcaster token catalog: {message}")]
+    TokenCatalog { message: String },
     /// Snapshot-session HTTP response body could not be decoded.
     #[error("failed to decode {operation} response from {url}: {message}")]
     JsonDecode {
@@ -63,6 +70,18 @@ pub enum BroadcasterReplayClientError {
 impl BroadcasterReplayClientError {
     pub(crate) fn invalid_broadcaster_url(message: impl Into<String>) -> Self {
         Self::InvalidBroadcasterUrl {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn snapshot(message: impl Into<String>) -> Self {
+        Self::Snapshot {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn token_catalog(message: impl Into<String>) -> Self {
+        Self::TokenCatalog {
             message: message.into(),
         }
     }

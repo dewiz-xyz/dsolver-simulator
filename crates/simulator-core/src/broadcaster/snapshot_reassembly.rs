@@ -5,7 +5,7 @@ use std::collections::{
 use thiserror::Error;
 use tycho_simulation::tycho_common::{models::contract::Account, Bytes};
 
-use simulator_core::broadcaster::BroadcasterProtocolMessage;
+use super::BroadcasterProtocolMessage;
 
 #[derive(Debug, Error)]
 #[error("{message}")]

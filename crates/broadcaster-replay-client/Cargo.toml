@@ -15,10 +15,13 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
+tycho-common.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+axum.workspace = true
 tokio.workspace = true
+tycho-simulation.workspace = true
 
 [lints]
 workspace = true

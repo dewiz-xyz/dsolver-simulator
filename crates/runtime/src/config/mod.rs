@@ -14,6 +14,13 @@ mod manifest;
 mod memory;
 use crate::models::erc4626::Erc4626PairPolicy;
 pub use logging::init_logging;
+
+/// Installs aws-lc-rs as the process rustls provider unless one is installed already. Cargo
+/// enables both rustls providers, and Redis over `rediss://` builds its TLS config from the
+/// process default, which panics until one is installed.
+pub fn install_tls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
 pub(crate) use manifest::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
 pub use memory::MemoryConfig;
 
@@ -42,6 +49,8 @@ pub struct ChainProfile {
     /// Time an established feed may remain behind the observed chain before process exit.
     pub tycho_head_mismatch_recovery_timeout_secs: u64,
     pub recovery_max_buffered_native_blocks: usize,
+    /// How many days back a token must have last traded for the broadcaster to load it.
+    pub token_max_days_since_last_trade: u64,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
     pub native_token_protocol_allowlist: Vec<ProtocolKind>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
@@ -1125,6 +1134,7 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Ethereum);
+        assert_eq!(chain.chain_profile.token_max_days_since_last_trade, 42);
         assert_eq!(chain.tycho_url, "tycho-beta.propellerheads.xyz");
         assert_eq!(
             chain.bebop_url,
@@ -1190,6 +1200,7 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
+        assert_eq!(chain.chain_profile.token_max_days_since_last_trade, 1);
         assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 10);
         assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 500);
         assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
@@ -1264,6 +1275,7 @@ chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1295,6 +1307,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1389,6 +1402,7 @@ chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1426,6 +1440,7 @@ chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1463,6 +1478,7 @@ chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1510,6 +1526,7 @@ chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1551,6 +1568,7 @@ chain_head_observation_max_age_secs = 15
 tycho_initial_bootstrap_timeout_secs = 900
 tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = " tycho "
 bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "
 hashflow_filename = " ./hashflow.csv "

@@ -24,8 +24,8 @@ use crate::broadcaster::redis_subscription::{
 use crate::chain_head::{ChainHeadConfig, ChainHeadObserver};
 use crate::chain_tip_telemetry::{Telemetry, SAMPLE_INTERVAL};
 use crate::config::{
-    init_logging, load_broadcaster_redis_config, load_config, AppConfig, BroadcasterRedisConfig,
-    ChainProfile, MemoryConfig,
+    init_logging, install_tls_provider, load_broadcaster_redis_config, load_config, AppConfig,
+    BroadcasterRedisConfig, ChainProfile, MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
 use crate::metrics::emit_simulator_health_snapshot;
@@ -95,6 +95,7 @@ impl SimulatorRuntime {
 }
 
 pub async fn build_simulator_service() -> anyhow::Result<SimulatorServiceParts> {
+    install_tls_provider();
     init_logging();
     let config = load_config();
     let rpc_url = config.rpc_url.clone().ok_or_else(|| {
@@ -1086,6 +1087,7 @@ mod tests {
             tycho_initial_bootstrap_timeout_secs: 300,
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 64,
+            token_max_days_since_last_trade: 1,
             native_token_protocol_allowlist: Vec::new(),
             reset_allowance_tokens: HashMap::new(),
             erc4626_pair_policies: Vec::new(),
@@ -1112,6 +1114,7 @@ mod tests {
             tycho_initial_bootstrap_timeout_secs: 900,
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 8,
+            token_max_days_since_last_trade: 1,
             native_token_protocol_allowlist: vec![ProtocolKind::Rocketpool],
             reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),

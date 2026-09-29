@@ -3,6 +3,7 @@
 //! The current bootstrap source is the broadcaster HTTP snapshot-session API. Redis Streams
 //! carry deltas after the snapshot replay boundary returned by that session.
 
+mod bootstrap;
 mod checkpoint;
 mod client;
 mod error;
@@ -10,14 +11,18 @@ mod reader;
 mod snapshot;
 mod url;
 
+pub use bootstrap::{SnapshotBackend, SnapshotBootstrap};
 pub use client::{
     BroadcasterReplayClient, BroadcasterReplayConfig, ReplayBatch, ReplayMessage, ReplayPoll,
 };
 pub use error::{BroadcasterReplayClientError, Result};
 pub use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterProgress, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
-    BroadcasterSnapshotSessionResponse,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterBlockRef, BroadcasterContractError,
+    BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress,
+    BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind,
+    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterSnapshotSessionResponse, BroadcasterStateEntry, BroadcasterUpdateMessage,
+    BroadcasterUpdatePartition,
 };
 
 pub use self::checkpoint::ReplayCheckpoint;
