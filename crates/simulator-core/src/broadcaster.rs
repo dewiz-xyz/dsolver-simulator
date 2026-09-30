@@ -25,7 +25,9 @@ pub use raw_state::{
     raw_residue_entry_count, RawCompactionStats, RawResidueGrowth, RawStateError,
 };
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
-pub use snapshot_reassembly::{RawSnapshotReassembly, SnapshotReassemblyError};
+pub use snapshot_reassembly::{
+    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError, SnapshotReassemblyError,
+};
 
 // Producers and consumers must agree on the largest snapshot response they can exchange.
 pub const BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
