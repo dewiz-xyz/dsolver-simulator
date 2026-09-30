@@ -610,7 +610,7 @@ async fn exact_checkpoint(
     rows.first().map(manifest_from_row).transpose()
 }
 
-async fn segment_boundary_position(
+pub(super) async fn segment_boundary_position(
     connection: &mut sqlx::PgConnection,
     chain_id: u64,
     position: StreamPosition,

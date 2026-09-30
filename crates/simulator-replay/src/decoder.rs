@@ -33,11 +33,13 @@ use tycho_simulation::{
 
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterTokenDto,
-    BroadcasterUpdateMessage, ProtocolHeadUpdate,
+    BroadcasterSnapshotPartition, BroadcasterTokenDto, BroadcasterUpdateMessage,
+    ProtocolHeadUpdate,
 };
 
-use simulator_core::broadcaster::RawSnapshotReassembly;
+use simulator_core::broadcaster::{
+    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError,
+};
 use simulator_core::models::protocol::ProtocolKind;
 
 use crate::payload::{live_partition_update, snapshot_partition_update};
@@ -170,6 +172,15 @@ pub enum ReplayDecodeError {
     TokenSnapshot(String),
 }
 
+impl From<SnapshotPayloadsError> for ReplayDecodeError {
+    fn from(error: SnapshotPayloadsError) -> Self {
+        match error {
+            SnapshotPayloadsError::Decode(error) => Self::PayloadDecode(error.to_string()),
+            SnapshotPayloadsError::Layout(message) => Self::InvalidCheckpoint(message.to_owned()),
+        }
+    }
+}
+
 pub struct ReplayDecoder {
     config: DecoderConfig,
     decoder: Arc<TychoStreamDecoder<BlockHeader>>,
@@ -230,7 +241,7 @@ impl ReplayDecoder {
             self.ensure_backend_configured(*backend)?;
         }
 
-        let (start, chunks) = parse_checkpoint_payloads(payloads_json)?;
+        let (start, chunks) = parse_snapshot_payloads(payloads_json)?;
         let advertised = start
             .backends
             .iter()
@@ -246,13 +257,11 @@ impl ReplayDecoder {
             ));
         }
 
-        self.decode_checkpoint_chunks(&start.snapshot_id, chunks, &selected)
-            .await
+        self.decode_checkpoint_chunks(chunks, &selected).await
     }
 
     async fn decode_checkpoint_chunks(
         &self,
-        snapshot_id: &str,
         chunks: BTreeMap<u32, BroadcasterSnapshotChunk>,
         selected: &HashSet<ReplayBackend>,
     ) -> Result<DecodedReplay, ReplayDecodeError> {
@@ -262,11 +271,6 @@ impl ReplayDecoder {
         let mut protocol_head_updates = Vec::new();
         let mut block_number = 0;
         for chunk in chunks.into_values() {
-            if chunk.snapshot_id != snapshot_id {
-                return Err(ReplayDecodeError::InvalidCheckpoint(
-                    "snapshot chunk identifier differs from snapshot start".to_owned(),
-                ));
-            }
             for partition in chunk.partitions {
                 let backend = ReplayBackend::from(partition.backend);
                 if !selected.contains(&backend) {
@@ -524,58 +528,6 @@ impl ReplayDecoder {
             Ok(())
         }
     }
-}
-
-fn parse_checkpoint_payloads(
-    payloads_json: &[String],
-) -> Result<
-    (
-        BroadcasterSnapshotStart,
-        BTreeMap<u32, BroadcasterSnapshotChunk>,
-    ),
-    ReplayDecodeError,
-> {
-    let mut start = None;
-    let mut chunks = BTreeMap::new();
-    let mut end = None;
-    for payload_json in payloads_json {
-        let payload: BroadcasterPayload = serde_json::from_str(payload_json)
-            .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
-        match payload {
-            BroadcasterPayload::SnapshotStart(value) if start.is_none() => start = Some(value),
-            BroadcasterPayload::SnapshotChunk(value) => {
-                if chunks.insert(value.chunk_index, value).is_some() {
-                    return Err(ReplayDecodeError::InvalidCheckpoint(
-                        "duplicate snapshot chunk index".to_owned(),
-                    ));
-                }
-            }
-            BroadcasterPayload::SnapshotEnd(value) if end.is_none() => end = Some(value),
-            _ => {
-                return Err(ReplayDecodeError::InvalidCheckpoint(
-                    "archive must contain one snapshot start, chunks, and one snapshot end"
-                        .to_owned(),
-                ));
-            }
-        }
-    }
-    let start = start
-        .ok_or_else(|| ReplayDecodeError::InvalidCheckpoint("missing snapshot start".to_owned()))?;
-    let end =
-        end.ok_or_else(|| ReplayDecodeError::InvalidCheckpoint("missing snapshot end".to_owned()))?;
-    if start.snapshot_id != end.snapshot_id {
-        return Err(ReplayDecodeError::InvalidCheckpoint(
-            "snapshot start and end identifiers differ".to_owned(),
-        ));
-    }
-    if usize::try_from(start.total_chunks).ok() != Some(chunks.len())
-        || chunks.keys().copied().ne(0..start.total_chunks)
-    {
-        return Err(ReplayDecodeError::InvalidCheckpoint(
-            "snapshot chunks are incomplete or out of range".to_owned(),
-        ));
-    }
-    Ok((start, chunks))
 }
 
 /// Decodes the canonical retained token array for a supported chain.

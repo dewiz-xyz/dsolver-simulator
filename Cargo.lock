@@ -7228,6 +7228,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "chrono",
  "futures 0.3.32",
  "hex",
  "serde",
@@ -7239,6 +7240,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tycho-simulation",
  "zstd",
 ]
 
