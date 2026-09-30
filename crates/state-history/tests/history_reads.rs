@@ -7,7 +7,8 @@ use sqlx::PgPool;
 use state_history::{
     Backend, BlockInterval, CheckpointKind, CheckpointManifest, CheckpointPairQuery,
     CheckpointPairSelection, CheckpointStatus, CoverageQuery, ExplicitCheckpointPair,
-    ReadLimitError, ReadLimits, StateHistoryReader, StreamPosition, TargetPlanQuery, TokenAnchor,
+    PositionRangeQuery, ReadLimitError, ReadLimits, StateHistoryReader, StoredPayloadError,
+    StreamPosition, TargetPlanQuery, TokenAnchor,
 };
 
 const CHAIN_ID: u64 = 8453;
@@ -856,6 +857,288 @@ async fn unknown_delta_format_fails_closed(pool: PgPool) -> anyhow::Result<()> {
     assert!(error
         .to_string()
         .contains("unsupported delta payload format 99"));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn a_position_range_returns_the_stored_updates_between_its_ends(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    // Stored out of order, and the latest one carries only RFQ.
+    seed_delta(&pool, 1, 9, 109, 1, &[Backend::Native]).await?;
+    seed_delta(&pool, 1, 12, 112, 1, &[Backend::Rfq]).await?;
+    seed_delta(&pool, 1, 5, 105, 1, &[Backend::Native]).await?;
+    seed_delta(&pool, 1, 8, 108, 1, &[Backend::Rfq]).await?;
+    seed_delta(&pool, 1, 7, 107, 1, &[Backend::Native, Backend::Rfq]).await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+
+    let range = reader
+        .read_position_range(
+            &PositionRangeQuery::new(
+                CHAIN_ID,
+                position(1, 5),
+                position(1, 9),
+                vec![Backend::Native],
+            ),
+            ReadLimits::unbounded(),
+        )
+        .await?;
+
+    let positions = range
+        .deltas
+        .iter()
+        .map(|delta| delta.position)
+        .collect::<Vec<_>>();
+    assert_eq!(positions, [position(1, 7), position(1, 9)]);
+    let backends = range
+        .deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .applicable_backends
+                .iter()
+                .map(|cursor| cursor.backend)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backends, [vec![Backend::Native], vec![Backend::Native]]);
+    assert_eq!(
+        range.deltas[0].raw_payload.get(),
+        r#"{"generation":1,"messageSeq":7}"#
+    );
+    assert_eq!(range.last_stored, Some(position(1, 12)));
+    assert!(range.gaps.is_empty() && range.boundaries.is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn a_position_range_reports_the_gaps_and_boundaries_inside_it(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_delta(&pool, 1, 9, 109, 1, &[Backend::Native]).await?;
+    seed_gap(&pool, 1, 3, 4, None, None).await?;
+    seed_gap(&pool, 1, 6, 9, None, None).await?;
+    seed_gap(&pool, 1, 10, 11, None, None).await?;
+    seed_checkpoint(&pool, 1, 8, 108, CheckpointKind::Boundary, false).await?;
+    seed_checkpoint(&pool, 1, 14, 114, CheckpointKind::Boundary, false).await?;
+    sqlx::query(
+        "UPDATE state_history.checkpoints SET status = 'failed', error = 'export failed'
+         WHERE generation = 1 AND message_seq = 14",
+    )
+    .execute(&pool)
+    .await?;
+    seed_checkpoint(&pool, 2, 0, 120, CheckpointKind::Boundary, false).await?;
+    seed_checkpoint(&pool, 2, 5, 125, CheckpointKind::Interval, false).await?;
+    seed_delta(&pool, 2, 6, 126, 1, &[Backend::Native]).await?;
+    seed_checkpoint(&pool, 2, 6, 126, CheckpointKind::Boundary, false).await?;
+    seed_checkpoint(&pool, 3, 0, 130, CheckpointKind::Boundary, false).await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+
+    let range = reader
+        .read_position_range(
+            &PositionRangeQuery::new(
+                CHAIN_ID,
+                position(1, 8),
+                position(2, 6),
+                vec![Backend::Native],
+            ),
+            ReadLimits::unbounded(),
+        )
+        .await?;
+
+    let gaps = range
+        .gaps
+        .iter()
+        .map(|gap| (gap.from_position, gap.to_position))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gaps,
+        [
+            (Some(position(1, 6)), Some(position(1, 9))),
+            (Some(position(1, 10)), Some(position(1, 11)))
+        ]
+    );
+    let boundaries = range
+        .boundaries
+        .iter()
+        .map(|checkpoint| checkpoint.position)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        boundaries,
+        [position(1, 14), position(2, 0), position(2, 6)]
+    );
+    assert_eq!(range.boundaries[0].status, CheckpointStatus::Failed);
+    assert_eq!(range.deltas.len(), 2);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn only_a_stored_delta_bounds_what_is_stored_and_a_later_gap_does_not(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let reader = StateHistoryReader::new(pool.clone(), object_store().await);
+    let query = PositionRangeQuery::new(
+        CHAIN_ID,
+        position(1, 100),
+        position(1, 111),
+        vec![Backend::Native],
+    );
+
+    let empty = reader
+        .read_position_range(&query, ReadLimits::unbounded())
+        .await?;
+    // The writer stored 101, while 102 to 110 still wait in its queue and the
+    // overflow of 111 is already recorded as a gap.
+    seed_delta(&pool, 1, 101, 201, 1, &[Backend::Native]).await?;
+    seed_gap(&pool, 1, 111, 111, None, None).await?;
+    let queued = reader
+        .read_position_range(&query, ReadLimits::unbounded())
+        .await?;
+
+    assert_eq!(empty.last_stored, None);
+    assert_eq!(queued.last_stored, Some(position(1, 101)));
+    assert_eq!(queued.gaps.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn a_newer_generation_does_not_bound_what_an_older_one_stored(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    // The new writer of generation 469 already stored while the old writer of
+    // 468 may still drain its queue.
+    seed_delta(&pool, 468, 5, 105, 1, &[Backend::Native]).await?;
+    seed_delta(&pool, 469, 1, 110, 1, &[Backend::Native]).await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+
+    let range = reader
+        .read_position_range(
+            &PositionRangeQuery::new(
+                CHAIN_ID,
+                position(468, 0),
+                position(468, 10),
+                vec![Backend::Native],
+            ),
+            ReadLimits::unbounded(),
+        )
+        .await?;
+
+    assert_eq!(range.last_stored, Some(position(468, 5)));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn a_query_built_with_unsorted_backends_keeps_each_requested_partition(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_delta(&pool, 1, 7, 107, 1, &[Backend::Native, Backend::Rfq]).await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let query = PositionRangeQuery {
+        chain_id: CHAIN_ID,
+        after: position(1, 5),
+        through: position(1, 9),
+        backends: vec![Backend::Rfq, Backend::Native],
+    };
+
+    let range = reader
+        .read_position_range(&query, ReadLimits::unbounded())
+        .await?;
+
+    let mut backends = range.deltas[0]
+        .applicable_backends
+        .iter()
+        .map(|cursor| cursor.backend)
+        .collect::<Vec<_>>();
+    backends.sort_unstable();
+    assert_eq!(backends, [Backend::Native, Backend::Rfq]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+#[expect(
+    clippy::expect_used,
+    reason = "the limit rejections are the fixture outcome"
+)]
+async fn a_position_range_holds_its_deltas_to_both_byte_limits(pool: PgPool) -> anyhow::Result<()> {
+    seed_delta(&pool, 1, 7, 107, 1, &[Backend::Native]).await?;
+    seed_delta(&pool, 1, 9, 109, 1, &[Backend::Native]).await?;
+    let (compressed, largest_compressed): (i64, i64) = sqlx::query_as(
+        "SELECT sum(octet_length(payload))::bigint, max(octet_length(payload))::bigint
+         FROM state_history.deltas",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let compressed = u64::try_from(compressed)?;
+    let decoded = [7, 9]
+        .map(|seq| format!(r#"{{"generation":1,"messageSeq":{seq}}}"#).len() as u64)
+        .iter()
+        .sum::<u64>();
+    assert!(u64::try_from(largest_compressed)? < compressed);
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let query = PositionRangeQuery::new(
+        CHAIN_ID,
+        position(1, 5),
+        position(1, 9),
+        vec![Backend::Native],
+    );
+
+    let exact = reader
+        .read_position_range(&query, ReadLimits::new(compressed, decoded)?)
+        .await?;
+    let compressed_short = reader
+        .read_position_range(&query, ReadLimits::new(compressed - 1, decoded)?)
+        .await
+        .expect_err("the two deltas exceed the compressed limit together");
+    let decoded_short = reader
+        .read_position_range(&query, ReadLimits::new(compressed, decoded - 1)?)
+        .await
+        .expect_err("the two deltas exceed the decoded limit together");
+
+    assert_eq!(exact.deltas.len(), 2);
+    assert_eq!(exact.estimated_decoded_bytes, decoded);
+    assert!(compressed_short.to_string().contains("exceed limit"));
+    assert!(decoded_short.to_string().contains("exceed"));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn a_corrupt_delta_fails_the_whole_position_range(pool: PgPool) -> anyhow::Result<()> {
+    seed_delta(&pool, 1, 7, 107, 1, &[Backend::Native]).await?;
+    seed_delta(&pool, 1, 9, 109, 1, &[Backend::Native]).await?;
+    sqlx::query(
+        "UPDATE state_history.deltas SET payload_sha256 = repeat('0', 64)
+         WHERE generation = 1 AND message_seq = 9",
+    )
+    .execute(&pool)
+    .await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+
+    let read = reader
+        .read_position_range(
+            &PositionRangeQuery::new(
+                CHAIN_ID,
+                position(1, 5),
+                position(1, 9),
+                vec![Backend::Native],
+            ),
+            ReadLimits::unbounded(),
+        )
+        .await;
+
+    let error = read
+        .err()
+        .context("a corrupt delta returns no partial range")?;
+    assert!(matches!(
+        error.downcast_ref::<StoredPayloadError>(),
+        Some(StoredPayloadError::Sha256Mismatch(at)) if *at == position(1, 9)
+    ));
     Ok(())
 }
 

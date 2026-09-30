@@ -23,10 +23,12 @@ use crate::{
 mod checkpoints;
 mod coverage;
 mod limits;
+mod positions;
 
 pub use checkpoints::*;
 pub use coverage::*;
 pub use limits::*;
+pub use positions::*;
 
 pub trait ReadConnectionProvider: Send + Sync + 'static {
     type Connection<'a>: Deref<Target = PgConnection> + DerefMut + Send + 'a
