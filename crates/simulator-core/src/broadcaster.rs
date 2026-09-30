@@ -16,9 +16,14 @@ use tycho_simulation::{
 
 use crate::models::protocol::ProtocolKind;
 
+mod raw_state;
 mod redis_streams;
 mod snapshot_reassembly;
 
+pub use raw_state::{
+    apply_raw_protocol_messages, fold_account_update_into_snapshot, merge_shared_vm_accounts,
+    raw_residue_entry_count, RawCompactionStats, RawResidueGrowth, RawStateError,
+};
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
 pub use snapshot_reassembly::{RawSnapshotReassembly, SnapshotReassemblyError};
 
