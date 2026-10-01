@@ -4,10 +4,10 @@ use anyhow::Context;
 use serde_json::value::RawValue;
 use sha2::Digest;
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
-    BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterUpdateMessage,
-    BroadcasterUpdatePartition,
+    apply_raw_protocol_messages, BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload,
+    BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterRemovedPair,
+    BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotPartition,
+    BroadcasterSnapshotStart, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
 };
 use sqlx::PgPool;
 use state_history::{
@@ -25,8 +25,9 @@ use tycho_simulation::{
     tycho_common::{
         models::{
             blockchain::BlockAggregatedChanges,
+            contract::{Account, AccountDelta},
             protocol::{ProtocolComponent, ProtocolComponentState, ProtocolComponentStateDelta},
-            Chain,
+            Chain, ChangeType,
         },
         Bytes,
     },
@@ -1612,6 +1613,154 @@ async fn a_raw_snapshot_passes_a_gap_that_lost_only_rfq(pool: PgPool) -> anyhow:
     Ok(())
 }
 
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL and MinIO"]
+async fn a_raw_snapshot_refuses_an_update_with_decoded_state(pool: PgPool) -> anyhow::Result<()> {
+    seed_checkpoint(&pool, 32, 1, 100, CheckpointKind::Boundary, false).await?;
+    seed_raw_checkpoint(
+        &pool,
+        position(32, 10),
+        110,
+        vec![vec![raw_message(110, vec![component("a", 1)], None, &[])]],
+    )
+    .await?;
+    let removed = tycho_simulation::protocol::models::ProtocolComponent::new(
+        Bytes::from([4u8; 20]),
+        "uniswap_v2".to_string(),
+        "uniswap_v2".to_string(),
+        Chain::Base,
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        Bytes::from([5u8; 32]),
+        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+            .unwrap_or_default()
+            .naive_utc(),
+    );
+    seed_raw_update_partition(
+        &pool,
+        position(32, 11),
+        BroadcasterUpdatePartition::new(
+            BroadcasterBackend::Native,
+            111,
+            Vec::new(),
+            Vec::new(),
+            vec![BroadcasterRemovedPair::new("a", removed)],
+            BTreeMap::new(),
+        ),
+    )
+    .await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+
+    let error = reader
+        .read_raw_snapshot(
+            &RawSnapshotQuery::new(CHAIN_ID, position(32, 11), vec![Backend::Native]),
+            ReadLimits::unbounded(),
+        )
+        .await
+        .err()
+        .context("a decoded change to a raw partition must not be skipped")?;
+
+    assert!(matches!(
+        error,
+        RawSnapshotError::Read(ref error) if error.to_string().contains("carries decoded state")
+    ));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL and MinIO"]
+async fn a_raw_vm_snapshot_matches_the_live_merge_of_the_same_messages(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (shared, deleted) = (vm_account(7, &[(1, 1)]), vm_account(8, &[(2, 2)]));
+    let balancer = vm_message("vm:balancer_v2", 110, vec![shared.clone()], None);
+    let curve = vm_message("vm:curve", 110, vec![shared.clone(), deleted.clone()], None);
+    let mut changes = BlockAggregatedChanges::default();
+    changes.account_deltas.insert(
+        shared.address.clone(),
+        AccountDelta::new(
+            Chain::Base,
+            shared.address.clone(),
+            HashMap::from([(Bytes::from([1u8; 32]), Some(Bytes::from([9u8; 32])))]),
+            None,
+            None,
+            ChangeType::Update,
+        ),
+    );
+    changes.account_deltas.insert(
+        deleted.address.clone(),
+        AccountDelta::new(
+            Chain::Base,
+            deleted.address.clone(),
+            HashMap::new(),
+            None,
+            None,
+            ChangeType::Deletion,
+        ),
+    );
+    let update = vm_message("vm:curve", 111, Vec::new(), Some(changes));
+    seed_checkpoint(&pool, 33, 1, 100, CheckpointKind::Boundary, false).await?;
+    seed_raw_checkpoint_for(
+        &pool,
+        position(33, 10),
+        110,
+        BroadcasterBackend::Vm,
+        vec![
+            vec![
+                balancer.clone(),
+                vm_message("vm:curve", 110, vec![shared.clone()], None),
+            ],
+            vec![vm_message("vm:curve", 110, vec![deleted.clone()], None)],
+        ],
+    )
+    .await?;
+    seed_raw_update_partition(
+        &pool,
+        position(33, 11),
+        BroadcasterUpdatePartition::with_messages(
+            BroadcasterBackend::Vm,
+            111,
+            vec![update.clone()],
+            sync_statuses(std::slice::from_ref(&update)),
+        ),
+    )
+    .await?;
+    let mut live = vec![balancer, curve];
+    apply_raw_protocol_messages(&mut live, std::slice::from_ref(&update))?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+
+    let snapshot = reader
+        .read_raw_snapshot(
+            &RawSnapshotQuery::new(CHAIN_ID, position(33, 11), vec![Backend::Vm]),
+            ReadLimits::unbounded(),
+        )
+        .await?;
+
+    let [partition] = snapshot.partitions.as_slice() else {
+        anyhow::bail!("expected one VM partition");
+    };
+    assert_eq!(partition.backend, BroadcasterBackend::Vm);
+    assert_eq!(partition.block_number, 111);
+    assert_eq!(
+        partition.sync_statuses,
+        sync_statuses(std::slice::from_ref(&update))
+    );
+    assert_eq!(
+        serde_json::to_value(&partition.messages)?,
+        serde_json::to_value(&live)?
+    );
+    for message in &partition.messages {
+        let storage = &message.message.snapshots.vm_storage;
+        assert_eq!(
+            storage[&shared.address].slots[&Bytes::from([1u8; 32])],
+            Bytes::from([9u8; 32])
+        );
+        assert!(!storage.contains_key(&deleted.address));
+    }
+    Ok(())
+}
+
 async fn seed_checkpoint(
     pool: &PgPool,
     generation: u64,
@@ -1900,12 +2049,23 @@ async fn seed_raw_checkpoint(
     block_number: u64,
     chunks: Vec<Vec<BroadcasterProtocolMessage>>,
 ) -> anyhow::Result<CheckpointManifest> {
+    seed_raw_checkpoint_for(pool, at, block_number, BroadcasterBackend::Native, chunks).await
+}
+
+async fn seed_raw_checkpoint_for(
+    pool: &PgPool,
+    at: StreamPosition,
+    block_number: u64,
+    backend: BroadcasterBackend,
+    chunks: Vec<Vec<BroadcasterProtocolMessage>>,
+) -> anyhow::Result<CheckpointManifest> {
+    let history_backend = history_backend(backend);
     let snapshot_id = format!("snapshot-{}-{}", at.generation, at.message_seq);
     let mut payloads = vec![BroadcasterPayload::SnapshotStart(
         BroadcasterSnapshotStart::new(
             snapshot_id.clone(),
             CHAIN_ID,
-            vec![BroadcasterBackend::Native],
+            vec![backend],
             u32::try_from(chunks.len())?,
         )?,
     )];
@@ -1915,7 +2075,7 @@ async fn seed_raw_checkpoint(
                 snapshot_id.clone(),
                 u32::try_from(index)?,
                 vec![BroadcasterSnapshotPartition::with_messages(
-                    BroadcasterBackend::Native,
+                    backend,
                     block_number,
                     messages.clone(),
                     sync_statuses(&messages),
@@ -1935,7 +2095,7 @@ async fn seed_raw_checkpoint(
             kind: CheckpointKind::Interval,
             block_number,
             rfq_observed_at_ms: None,
-            backends: vec![Backend::Native],
+            backends: vec![history_backend],
         },
         payloads_json: payloads
             .iter()
@@ -1960,9 +2120,17 @@ async fn seed_raw_checkpoint(
                 false,
             )
         },
-        &[Backend::Native],
+        &[history_backend],
     )
     .await
+}
+
+fn history_backend(backend: BroadcasterBackend) -> Backend {
+    match backend {
+        BroadcasterBackend::Native => Backend::Native,
+        BroadcasterBackend::Vm => Backend::Vm,
+        BroadcasterBackend::Rfq => Backend::Rfq,
+    }
 }
 
 async fn seed_raw_update(
@@ -1990,6 +2158,7 @@ async fn seed_raw_update_partition(
     partition: BroadcasterUpdatePartition,
 ) -> anyhow::Result<()> {
     let block_number = partition.block_number;
+    let backends = [history_backend(partition.backend)];
     let update = BroadcasterUpdateMessage::new(vec![partition])?;
     let envelope = BroadcasterEnvelope::new(
         format!("stream-{}", at.generation),
@@ -1997,7 +2166,7 @@ async fn seed_raw_update_partition(
         BroadcasterPayload::Update(update),
     );
     let raw = RawValue::from_string(serde_json::to_string(&envelope)?)?;
-    seed_delta_payload(pool, at, block_number, 1, &[Backend::Native], &raw).await
+    seed_delta_payload(pool, at, block_number, 1, &backends, &raw).await
 }
 
 fn raw_message(
@@ -2061,6 +2230,50 @@ fn sync_statuses(
             )
         })
         .collect()
+}
+
+fn vm_account(seed: u8, slots: &[(u8, u8)]) -> Account {
+    Account::new(
+        Chain::Base,
+        Bytes::from([seed; 20]),
+        "vm-account".to_string(),
+        slots
+            .iter()
+            .map(|(slot, value)| (Bytes::from([*slot; 32]), Bytes::from([*value; 32])))
+            .collect(),
+        Bytes::from([0u8; 32]),
+        HashMap::new(),
+        Bytes::from([seed; 4]),
+        Bytes::from([seed; 32]),
+        Bytes::from([0u8; 32]),
+        Bytes::from([0u8; 32]),
+        None,
+    )
+}
+
+fn vm_message(
+    protocol: &str,
+    block_number: u64,
+    accounts: Vec<Account>,
+    deltas: Option<BlockAggregatedChanges>,
+) -> BroadcasterProtocolMessage {
+    let header = header(block_number);
+    BroadcasterProtocolMessage::new(
+        protocol,
+        SynchronizerState::Ready(header.clone()),
+        StateSyncMessage {
+            header,
+            snapshots: Snapshot {
+                states: HashMap::new(),
+                vm_storage: accounts
+                    .into_iter()
+                    .map(|account| (account.address.clone(), account))
+                    .collect(),
+            },
+            deltas,
+            removed_components: HashMap::new(),
+        },
+    )
 }
 
 fn component(id: &str, liquidity: u8) -> ComponentWithState {

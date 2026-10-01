@@ -1,6 +1,6 @@
-//! The raw snapshot the broadcaster served at a stream position, rebuilt from
-//! the last checkpoint before it and the stored updates up to it, with the
-//! broadcaster's own merge rules.
+//! The raw snapshot at a stream position, rebuilt from the last checkpoint
+//! before it and the stored updates up to it, with the broadcaster's own merge
+//! rules.
 
 use std::collections::BTreeMap;
 
@@ -55,6 +55,7 @@ pub enum RawSnapshotError {
         "no complete checkpoint with the requested backends at or before {0:?} in its segment"
     )]
     NoCheckpoint(StreamPosition),
+    /// The writer has not stored through the position, with no promise that it will.
     #[error("history is stored through {last_stored:?}, not yet through {position:?}")]
     NotYetStored {
         position: StreamPosition,
@@ -75,6 +76,9 @@ pub enum RawSnapshotError {
 }
 
 impl<P: ReadConnectionProvider> StateHistoryReader<P> {
+    /// Rebuilds the raw state from the history visible now. Success does not prove
+    /// the history is complete. A gap or a recovery boundary stored late or never
+    /// can make the result differ from the snapshot the broadcaster served.
     pub async fn read_raw_snapshot(
         &self,
         query: &RawSnapshotQuery,
@@ -102,7 +106,10 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             self.stored_updates_after(&checkpoint, query, remaining(limits, &checkpoint))
                 .await?
         };
-        let partitions = rebuild_partitions(&archive, &deltas, &backends)?;
+        let partitions =
+            tokio::task::spawn_blocking(move || rebuild_partitions(&archive, &deltas, &backends))
+                .await
+                .context("raw snapshot rebuild task failed")??;
         Ok(RawSnapshot {
             position: query.position,
             checkpoint,
@@ -305,6 +312,14 @@ fn rebuild_partitions(
             else {
                 continue;
             };
+            ensure!(
+                incoming.new_pairs.is_empty()
+                    && incoming.updated_states.is_empty()
+                    && incoming.removed_pairs.is_empty(),
+                "stored delta {:?} carries decoded state for the {} partition",
+                delta.position,
+                incoming.backend
+            );
             partition.block_number = incoming.block_number;
             partition.sync_statuses = incoming.sync_statuses;
             apply_raw_protocol_messages(&mut partition.messages, &incoming.messages).with_context(

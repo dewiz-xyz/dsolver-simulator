@@ -54,13 +54,12 @@ pub struct PositionRange {
     pub boundaries: Vec<CheckpointManifest>,
     /// The latest delta stored in `through`'s generation, whatever its
     /// backends. It says how far the writer has come, not whether `deltas` is
-    /// complete. One writer stores a generation's deltas in stream order and records a
-    /// lost one's gap before storing the next, so a position of that generation
-    /// at or below it that is neither in `deltas` nor in a gap holds no stored
-    /// update with a partition of the requested backends, while one above it
-    /// may still be on its way. A recorded gap past it proves nothing about the
-    /// positions before the gap, and another generation's deltas prove nothing
-    /// about this one, since a new writer can store while the old one drains.
+    /// complete. One writer stores a generation's deltas in stream order, so a
+    /// position above it may still be on its way. A lost delta's gap can be
+    /// stored after later deltas or not at all, so a position at or below it that
+    /// is neither in `deltas` nor in a gap is no proof that no update was lost
+    /// there. Another generation's deltas prove nothing about this one, since a
+    /// new writer can store while the old one drains.
     pub last_stored: Option<StreamPosition>,
     pub estimated_decoded_bytes: u64,
 }
