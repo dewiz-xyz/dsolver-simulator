@@ -20,6 +20,12 @@ pub enum HistoricalError {
     CheckBudgetExceeded,
     #[error("canonical VM comparison is unsupported")]
     UnsupportedCanonicalVm,
+    #[error("the history has not stored the requested position yet")]
+    NotYetStored,
+    #[error("the history cannot give the requested data: {0}")]
+    HistoryUnavailable(String),
+    #[error("{operation} needs more data than one job may read")]
+    ReadLimitExceeded { operation: &'static str },
 }
 
 impl HistoricalError {

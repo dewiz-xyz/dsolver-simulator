@@ -1,10 +1,15 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{deserialize_uuid_v4, Backend, ConsistencyCheckReport, HistoricalQuoteResult};
+use super::{
+    deserialize_uuid_v4, Backend, ConsistencyCheckReport, HistoricalQuoteResult,
+    RawHistoryProgress, RawSnapshotResult, StoredMessagesResult,
+};
 
 /// Work type stored by the shared in-memory scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -12,6 +17,8 @@ use super::{deserialize_uuid_v4, Backend, ConsistencyCheckReport, HistoricalQuot
 pub enum JobType {
     HistoricalQuote,
     HistoricalStateConsistencyCheck,
+    RawSnapshot,
+    StoredMessages,
 }
 
 /// Lifecycle state of an admitted job.
@@ -51,6 +58,7 @@ pub struct ConsistencyCheckProgress {
 pub enum JobProgress {
     HistoricalQuote(HistoricalQuoteProgress),
     HistoricalStateConsistencyCheck(ConsistencyCheckProgress),
+    RawHistory(RawHistoryProgress),
 }
 
 /// Response returned when a job is submitted or reused.
@@ -80,11 +88,28 @@ pub struct JobSubmission {
 }
 
 /// Terminal result selected by the job type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum JobResult {
     HistoricalQuote(HistoricalQuoteResult),
     HistoricalStateConsistencyCheck(ConsistencyCheckReport),
+    RawSnapshot(RawSnapshotResult),
+    StoredMessages(StoredMessagesResult),
+}
+
+// A derived untagged enum buffers its input, and raw JSON cannot be read back
+// from a buffer, so each variant reads the result's own text.
+impl<'de> Deserialize<'de> for JobResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let json = raw.get();
+        serde_json::from_str(json)
+            .map(Self::HistoricalQuote)
+            .or_else(|_| serde_json::from_str(json).map(Self::HistoricalStateConsistencyCheck))
+            .or_else(|_| serde_json::from_str(json).map(Self::RawSnapshot))
+            .or_else(|_| serde_json::from_str(json).map(Self::StoredMessages))
+            .map_err(|_| D::Error::custom("data did not match any variant of JobResult"))
+    }
 }
 
 /// Stable terminal failure code.
@@ -96,6 +121,15 @@ pub enum JobFailureCode {
     HistoricalDataInvalid,
     StateReconstructionFailed,
     CheckBudgetExceeded,
+    /// The history has not stored the requested position yet. A later job may
+    /// read it.
+    HistoryNotYetStored,
+    /// The history cannot give the requested range or position, a recorded
+    /// gap or a boundary checkpoint lies in it, or no checkpoint precedes it.
+    HistoryUnavailable,
+    /// The job needs more data than the service reads or keeps for one job.
+    /// The same request fails again, a narrower one may not.
+    ReadLimitExceeded,
     InternalError,
 }
 

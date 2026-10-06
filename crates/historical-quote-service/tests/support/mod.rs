@@ -88,6 +88,7 @@ impl StartedJob {
     }
 }
 
+/// Runs each job until the test ends it or the job is cancelled.
 #[derive(Clone)]
 pub struct ControlledExecutor {
     started_tx: mpsc::UnboundedSender<StartedJob>,
@@ -125,6 +126,7 @@ impl JobExecutor for ControlledExecutor {
         context: ExecutionContext,
     ) -> Pin<Box<dyn Future<Output = ExecutionResult> + Send + 'static>> {
         let (finish, result) = oneshot::channel();
+        let cancellation = context.cancellation.clone();
         self.started_tx
             .send(StartedJob {
                 job_id: context.job_id,
@@ -133,6 +135,11 @@ impl JobExecutor for ControlledExecutor {
                 finish,
             })
             .expect("test receiver must remain open");
-        Box::pin(async move { result.await.unwrap_or(Err(JobExecutionError::Cancelled)) })
+        Box::pin(async move {
+            tokio::select! {
+                result = result => result.unwrap_or(Err(JobExecutionError::Cancelled)),
+                () = cancellation.cancelled() => Err(JobExecutionError::Cancelled),
+            }
+        })
     }
 }

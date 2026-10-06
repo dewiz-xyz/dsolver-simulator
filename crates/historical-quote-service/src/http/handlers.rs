@@ -8,8 +8,8 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use historical_quote::api::{
     is_uuid_v4, Backend, ComparisonBudgetDetails, ConsistencyCheckRequest, ConsistencySelection,
-    CoverageRequest, DependencyHealth, DependencyState, QuoteJobRequest, ReadyResponse,
-    StatusResponse, API_REVISION,
+    CoverageRequest, DependencyHealth, DependencyState, QuoteJobRequest, RawSnapshotRequest,
+    ReadyResponse, StatusResponse, StoredMessagesRequest, API_REVISION,
 };
 use uuid::Uuid;
 
@@ -67,6 +67,48 @@ pub async fn submit_consistency_check(
         ))
         .await;
     tracing::info!(%request_id, "historical state consistency check submission resolved");
+    submission_response(outcome)
+}
+
+pub async fn submit_raw_snapshot(
+    State(state): State<AppState>,
+    request: Result<Json<RawSnapshotRequest>, JsonRejection>,
+) -> Result<Response, HttpError> {
+    let request = request
+        .map_err(|_| HttpError::invalid("request body is invalid", None))?
+        .0;
+    validate_timeout(&state, request.timeout_ms)?;
+    validate_backends(&state, &request.backends)?;
+    let request_id = request.request_id;
+    let outcome = state
+        .registry
+        .submit(ScheduledJob::new(
+            JobRequest::RawSnapshot(request),
+            state.config.job_decoded_byte_reservation,
+        ))
+        .await;
+    tracing::info!(%request_id, "raw snapshot job submission resolved");
+    submission_response(outcome)
+}
+
+pub async fn submit_stored_messages(
+    State(state): State<AppState>,
+    request: Result<Json<StoredMessagesRequest>, JsonRejection>,
+) -> Result<Response, HttpError> {
+    let request = request
+        .map_err(|_| HttpError::invalid("request body is invalid", None))?
+        .0;
+    validate_timeout(&state, request.timeout_ms)?;
+    validate_backends(&state, &request.backends)?;
+    let request_id = request.request_id;
+    let outcome = state
+        .registry
+        .submit(ScheduledJob::new(
+            JobRequest::StoredMessages(request),
+            state.config.job_decoded_byte_reservation,
+        ))
+        .await;
+    tracing::info!(%request_id, "stored messages job submission resolved");
     submission_response(outcome)
 }
 

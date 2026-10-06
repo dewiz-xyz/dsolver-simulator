@@ -1,8 +1,9 @@
 use historical_quote::api::{
-    normalize_consistency_request, normalize_quote_request, ApiError, ApiErrorCode, Backend,
-    BlockRange, ConsistencyCheckReport, ConsistencyCheckRequest, ConsistencySelectionStatus,
-    CoverageRequest, CoverageResponse, HistoricalQuoteResult, JobEnvelope, QuoteJobRequest,
-    UnsignedAmount, API_REVISION,
+    normalize_consistency_request, normalize_quote_request, normalize_raw_snapshot_request,
+    normalize_stored_messages_request, ApiError, ApiErrorCode, Backend, BlockRange,
+    ConsistencyCheckReport, ConsistencyCheckRequest, ConsistencySelectionStatus, CoverageRequest,
+    CoverageResponse, HistoricalQuoteResult, JobEnvelope, JobResult, QuoteJobRequest,
+    RawSnapshotRequest, StoredMessagesRequest, UnsignedAmount, API_REVISION,
 };
 use serde_json::{json, Value};
 
@@ -122,6 +123,40 @@ const JOB_ENVELOPE_GOLDEN: &str = r#"{
     "completedComparisons": 12,
     "totalComparisons": 30,
     "percentComplete": 40
+  }
+}"#;
+
+const STORED_MESSAGES_ENVELOPE_GOLDEN: &str = r#"{
+  "jobId": "997b4517-2377-4c83-91a8-577e919ce72a",
+  "requestId": "3bbd9a8c-d942-4f9d-b96d-7ee63b9308aa",
+  "jobType": "storedMessages",
+  "state": "completed",
+  "submittedAt": "2026-08-13T15:00:00Z",
+  "deadlineAt": "2026-08-13T15:02:00Z",
+  "startedAt": "2026-08-13T15:00:01Z",
+  "finishedAt": "2026-08-13T15:00:02Z",
+  "cancellationRequested": false,
+  "progress": {
+    "percentComplete": 100
+  },
+  "result": {
+    "after": {
+      "generation": 9,
+      "messageSeq": 41
+    },
+    "through": {
+      "generation": 9,
+      "messageSeq": 44
+    },
+    "messages": [
+      {
+        "position": {
+          "generation": 9,
+          "messageSeq": 43
+        },
+        "envelope": {"kind":  "update"}
+      }
+    ]
   }
 }"#;
 
@@ -245,6 +280,64 @@ fn quote_fingerprint_ignores_accepted_order_but_includes_timeout() {
     let third = normalize_quote_request(&third);
     assert_eq!(first.fingerprint().unwrap(), second.fingerprint().unwrap());
     assert_ne!(first.fingerprint().unwrap(), third.fingerprint().unwrap());
+}
+
+/// A raw history request's fingerprint ignores its id and the order of its
+/// backends, and follows its backends, its position, its range and its
+/// timeout.
+#[test]
+fn raw_history_fingerprints_ignore_id_and_backend_order() -> Result<(), Box<dyn std::error::Error>>
+{
+    let position = |message_seq: u64| json!({"generation": 9, "messageSeq": message_seq});
+    let request = |request_id: &str, backends: Value, timeout_ms: u64, fields: Value| {
+        let mut request = json!({
+            "requestId": request_id,
+            "apiRevision": 1,
+            "timeoutMs": timeout_ms,
+            "chainId": 8453,
+            "backends": backends,
+        });
+        if let (Some(request), Some(fields)) = (request.as_object_mut(), fields.as_object()) {
+            request.extend(fields.clone());
+        }
+        request
+    };
+    let other_id = "8021caa1-0257-4d42-9690-6d7ebd10b8f8";
+    let snapshot = |request_id, backends, timeout_ms, at| {
+        serde_json::from_value::<RawSnapshotRequest>(request(
+            request_id,
+            backends,
+            timeout_ms,
+            json!({"position": position(at)}),
+        ))
+        .map(|request| normalize_raw_snapshot_request(&request).fingerprint())
+    };
+    let messages = |request_id, backends, timeout_ms, after, through| {
+        serde_json::from_value::<StoredMessagesRequest>(request(
+            request_id,
+            backends,
+            timeout_ms,
+            json!({"after": position(after), "through": position(through)}),
+        ))
+        .map(|request| normalize_stored_messages_request(&request).fingerprint())
+    };
+    let both = || json!(["native", "vm"]);
+    let reversed = || json!(["vm", "native"]);
+    let native = || json!(["native"]);
+
+    let base = snapshot(REQUEST_ID, both(), 1_000, 5)??;
+    assert_eq!(base, snapshot(other_id, reversed(), 1_000, 5)??);
+    assert_ne!(base, snapshot(REQUEST_ID, native(), 1_000, 5)??);
+    assert_ne!(base, snapshot(REQUEST_ID, both(), 999, 5)??);
+    assert_ne!(base, snapshot(REQUEST_ID, both(), 1_000, 6)??);
+
+    let base = messages(REQUEST_ID, both(), 1_000, 1, 5)??;
+    assert_eq!(base, messages(other_id, reversed(), 1_000, 1, 5)??);
+    assert_ne!(base, messages(REQUEST_ID, native(), 1_000, 1, 5)??);
+    assert_ne!(base, messages(REQUEST_ID, both(), 999, 1, 5)??);
+    assert_ne!(base, messages(REQUEST_ID, both(), 1_000, 2, 5)??);
+    assert_ne!(base, messages(REQUEST_ID, both(), 1_000, 1, 6)??);
+    Ok(())
 }
 
 #[test]
@@ -459,6 +552,24 @@ fn job_envelope_golden_pins_progress_and_lifecycle_fields() {
     );
 }
 
+/// A raw history result reads back from its envelope with the stored bytes
+/// unchanged.
+#[test]
+fn stored_messages_envelope_golden_keeps_the_stored_bytes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let envelope: JobEnvelope = serde_json::from_str(STORED_MESSAGES_ENVELOPE_GOLDEN)?;
+
+    let Some(JobResult::StoredMessages(result)) = &envelope.result else {
+        return Err("a stored messages result".into());
+    };
+    assert_eq!(result.messages[0].envelope.get(), r#"{"kind":  "update"}"#);
+    assert_eq!(
+        serde_json::to_string_pretty(&envelope)?,
+        STORED_MESSAGES_ENVELOPE_GOLDEN
+    );
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::unwrap_used, reason = "the error fixture must be valid")]
 fn shared_error_shape_is_exact() {
@@ -516,6 +627,8 @@ fn openapi_covers_exact_routes_security_headers_and_union_fields() {
             "/coverage",
             "/jobs/consistency-check",
             "/jobs/quote",
+            "/jobs/raw-snapshot",
+            "/jobs/stored-messages",
             "/jobs/{jobId}",
             "/jobs/{jobId}/cancel",
             "/ready",
@@ -532,6 +645,8 @@ fn openapi_covers_exact_routes_security_headers_and_union_fields() {
         ("/coverage", "post"),
         ("/jobs/consistency-check", "post"),
         ("/jobs/quote", "post"),
+        ("/jobs/raw-snapshot", "post"),
+        ("/jobs/stored-messages", "post"),
         ("/jobs/{jobId}", "get"),
         ("/jobs/{jobId}/cancel", "post"),
         ("/status", "get"),
