@@ -1124,8 +1124,14 @@ async fn a_position_range_holds_its_deltas_to_both_byte_limits(pool: PgPool) -> 
 
     assert_eq!(exact.deltas.len(), 2);
     assert_eq!(exact.estimated_decoded_bytes, decoded);
-    assert!(compressed_short.to_string().contains("exceed limit"));
-    assert!(decoded_short.to_string().contains("exceed"));
+    assert!(matches!(
+        compressed_short.downcast_ref::<ReadLimitError>(),
+        Some(ReadLimitError::CompressedBytesExceeded { .. })
+    ));
+    assert!(matches!(
+        decoded_short.downcast_ref::<ReadLimitError>(),
+        Some(ReadLimitError::DecodedBytesExceeded { .. })
+    ));
     Ok(())
 }
 

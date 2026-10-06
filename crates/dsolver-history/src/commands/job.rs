@@ -127,6 +127,7 @@ pub fn print_progress(envelope: &JobEnvelope) {
     let percent = match envelope.progress {
         JobProgress::HistoricalQuote(progress) => progress.percent_complete,
         JobProgress::HistoricalStateConsistencyCheck(progress) => progress.percent_complete,
+        JobProgress::RawHistory(progress) => progress.percent_complete,
     };
     eprintln!(
         "job {}: {:?}, {}% complete",

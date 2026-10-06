@@ -9,8 +9,8 @@ use sqlx::Row;
 use super::{
     begin_range_transaction, database_backends, database_i64, database_u64,
     decode_delta_row_with_limit, encoded_delta_from_row, fetch_delta_backends, gap_from_row,
-    manifest_from_row, EncodedDeltaRow, RangeGap, ReadConnectionProvider, ReadLimits,
-    StateHistoryReader, StoredDelta,
+    manifest_from_row, EncodedDeltaRow, RangeGap, ReadConnectionProvider, ReadLimitError,
+    ReadLimits, StateHistoryReader, StoredDelta,
 };
 use crate::{Backend, CheckpointManifest, DeltaBackendCursor, StreamPosition};
 
@@ -154,10 +154,13 @@ pub(super) async fn fetch_delta_rows_between(
     .await
     .context("failed to preflight position range delta bytes")?;
     let compressed_bytes = database_u64(compressed_bytes, "position range delta bytes")?;
-    ensure!(
-        compressed_bytes <= max_compressed_bytes,
-        "compressed bytes {compressed_bytes} exceed limit {max_compressed_bytes}"
-    );
+    if compressed_bytes > max_compressed_bytes {
+        return Err(ReadLimitError::CompressedBytesExceeded {
+            declared: compressed_bytes,
+            limit: max_compressed_bytes,
+        }
+        .into());
+    }
 
     let rows = sqlx::query(
         "SELECT d.id, d.generation, d.message_seq, d.observed_at_ms,

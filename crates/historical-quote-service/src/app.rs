@@ -11,14 +11,16 @@ use historical_quote::api::{
 };
 use historical_quote::{
     ConsistencyChecker, CoverageService, HistoricalError, HistoricalQuoteExecutor,
-    HistoricalReconstructor, HistorySource,
+    HistoricalReconstructor, HistorySource, RawHistoryReader,
 };
 use state_history::{ReadConnectionProvider, ReadLimits, StateHistoryReader};
 
 use crate::auth::{require_bearer, BearerKeySetHandle};
 use crate::config::ServiceConfig;
 use crate::http::handlers;
-use crate::jobs::{ExecutionContext, JobExecutionError, JobExecutor, JobRegistry, JobRequest};
+use crate::jobs::{
+    ExecutionContext, JobExecutionError, JobExecutor, JobRegistry, JobRequest, READ_LIMIT_EXCEEDED,
+};
 
 type ServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ServiceDependencyError>> + Send + 'a>>;
@@ -57,6 +59,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/jobs/consistency-check",
             post(handlers::submit_consistency_check),
+        )
+        .route("/jobs/raw-snapshot", post(handlers::submit_raw_snapshot))
+        .route(
+            "/jobs/stored-messages",
+            post(handlers::submit_stored_messages),
         )
         .route("/jobs/:job_id", get(handlers::get_job))
         .route("/jobs/:job_id/cancel", post(handlers::cancel_job))
@@ -134,6 +141,16 @@ where
                         .map(JobResult::HistoricalStateConsistencyCheck)
                         .map_err(map_engine_error)
                 }
+                JobRequest::RawSnapshot(request) => RawHistoryReader::new(source, read_limits)
+                    .raw_snapshot(&request, &context.cancellation)
+                    .await
+                    .map(JobResult::RawSnapshot)
+                    .map_err(map_engine_error),
+                JobRequest::StoredMessages(request) => RawHistoryReader::new(source, read_limits)
+                    .stored_messages(&request, &context.cancellation)
+                    .await
+                    .map(JobResult::StoredMessages)
+                    .map_err(map_engine_error),
             }
         })
     }
@@ -236,7 +253,10 @@ fn history_backend(backend: Backend) -> state_history::Backend {
 }
 
 fn map_engine_error(error: HistoricalError) -> JobExecutionError {
-    let retryable = matches!(&error, HistoricalError::HistoryRead { .. });
+    let retryable = matches!(
+        &error,
+        HistoricalError::HistoryRead { .. } | HistoricalError::NotYetStored
+    );
     let (code, message) = match error {
         HistoricalError::Cancelled => return JobExecutionError::Cancelled,
         HistoricalError::HistoryRead { .. } => (
@@ -261,6 +281,17 @@ fn map_engine_error(error: HistoricalError) -> JobExecutionError {
             JobFailureCode::InternalError,
             "historical job could not be completed",
         ),
+        HistoricalError::NotYetStored => (
+            JobFailureCode::HistoryNotYetStored,
+            "the history has not stored the requested position yet",
+        ),
+        HistoricalError::HistoryUnavailable(_) => (
+            JobFailureCode::HistoryUnavailable,
+            "the history cannot give the requested data",
+        ),
+        HistoricalError::ReadLimitExceeded { .. } => {
+            (JobFailureCode::ReadLimitExceeded, READ_LIMIT_EXCEEDED)
+        }
     };
     JobExecutionError::Failed(JobFailure {
         code,
@@ -323,6 +354,26 @@ mod tests {
                 HistoricalError::InvalidSelector(private_detail.to_owned()),
                 JobFailureCode::InternalError,
                 "historical job could not be completed",
+                false,
+            ),
+            (
+                HistoricalError::NotYetStored,
+                JobFailureCode::HistoryNotYetStored,
+                "the history has not stored the requested position yet",
+                true,
+            ),
+            (
+                HistoricalError::HistoryUnavailable(private_detail.to_owned()),
+                JobFailureCode::HistoryUnavailable,
+                "the history cannot give the requested data",
+                false,
+            ),
+            (
+                HistoricalError::ReadLimitExceeded {
+                    operation: private_detail,
+                },
+                JobFailureCode::ReadLimitExceeded,
+                "the job needs more data than the service reads or keeps for one job",
                 false,
             ),
         ] {

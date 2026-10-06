@@ -20,7 +20,7 @@ pub use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterBackendHead, BroadcasterBlockRef, BroadcasterContractError,
     BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress,
     BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind,
-    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotPartition,
     BroadcasterSnapshotSessionResponse, BroadcasterStateEntry, BroadcasterUpdateMessage,
     BroadcasterUpdatePartition,
 };
