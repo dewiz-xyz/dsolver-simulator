@@ -2199,6 +2199,7 @@ dependencies = [
  "futures 0.3.32",
  "redis",
  "reqwest 0.12.28",
+ "rustls 0.23.39",
  "serde",
  "serde_json",
  "simulator-core",

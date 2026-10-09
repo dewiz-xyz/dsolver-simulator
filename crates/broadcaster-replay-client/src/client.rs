@@ -45,8 +45,8 @@ impl BroadcasterReplayClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the Redis URL is invalid or the connection manager
-    /// cannot be created.
+    /// Returns an error when the Redis URL is invalid, a `rediss://` URL finds no
+    /// installed crypto provider, or the connection manager cannot be created.
     pub async fn connect(config: BroadcasterReplayConfig) -> Result<Self> {
         let redis = TokioRedisStreamReader::connect(&config.redis_url, config.block_ms).await?;
         Ok(Self {

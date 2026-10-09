@@ -9,8 +9,8 @@ pub enum BroadcasterReplayClientError {
     /// The configured broadcaster URL is not a usable HTTP(S) base URL.
     #[error("invalid broadcaster URL: {message}")]
     InvalidBroadcasterUrl { message: String },
-    /// Redis connection setup failed in a way retrying does not fix, such as an invalid URL or
-    /// rejected credentials.
+    /// Redis connection setup failed for a reason that points at the configuration, such as an
+    /// invalid URL, rejected credentials, a TLS failure or a failed name lookup.
     #[error("failed to connect to broadcaster Redis: {message}")]
     RedisConnect { message: String },
     /// Redis connection setup hit a transient transport failure.
