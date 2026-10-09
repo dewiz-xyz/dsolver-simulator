@@ -4143,6 +4143,47 @@ mod tests {
     }
 
     #[test]
+    fn a_split_snapshot_message_joins_back_to_the_original() -> Result<()> {
+        use simulator_core::broadcaster::RawSnapshotReassembly;
+
+        let states = (0..24u8)
+            .map(|seed| {
+                let component_id = format!("pool-{seed:04}");
+                let state = raw_component_with_state(&component_id, seed);
+                (component_id, state)
+            })
+            .collect();
+        let account_address = DtoBytes::from([45u8; 20]);
+        let vm = raw_vm_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address, 48, 256),
+        );
+        for (message, backend) in [
+            (
+                raw_protocol_message_with_states(states),
+                BroadcasterBackend::Native,
+            ),
+            (residual_tail_message(24, 384), BroadcasterBackend::Native),
+            (vm, BroadcasterBackend::Vm),
+        ] {
+            let sizing_ctx = snapshot_chunk_build_context_for_backend(usize::MAX, backend);
+            let whole = sizing_ctx.raw_fragment_size(message.clone(), &BTreeMap::new(), false)?;
+            let ctx = snapshot_chunk_build_context_for_backend(whole / 3, backend);
+
+            let fragments =
+                super::split_protocol_message_for_snapshot(&ctx, &message, &BTreeMap::new())?;
+            assert!(fragments.len() > 1, "the cap forces a split");
+
+            let mut reassembly = RawSnapshotReassembly::default();
+            for fragment in fragments {
+                reassembly.push(fragment)?;
+            }
+            assert_eq!(reassembly.take_messages(), vec![message]);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn raw_cache_tail_preserves_unsplittable_delta_fields_and_wire_contract() -> Result<()> {
         let mut message = residual_tail_message(12, 256);
         let deltas = message

@@ -49,6 +49,17 @@ fn rfq_update_matches_wire_fixture() -> Result<()> {
     assert_wire_fixture("rfq_update.json", rfq_update_envelope(2)?)
 }
 
+/// An RFQ update written before the Bebop client gained its optional origin fields still
+/// reads, as the current wire form with those fields empty. Only this direction is tested.
+#[test]
+fn rfq_update_written_before_the_bebop_origin_fields_still_reads() -> Result<()> {
+    let legacy = fs::read(fixture_path("rfq_update_before_bebop_origin.json"))?;
+    let decoded: BroadcasterEnvelope = serde_json::from_slice(&legacy)?;
+    let current = fs::read(fixture_path("rfq_update.json"))?;
+    assert_eq!(serde_json::to_string(&decoded)?.as_bytes(), current);
+    Ok(())
+}
+
 #[test]
 fn heartbeat_matches_wire_fixture() -> Result<()> {
     let heartbeat = BroadcasterHeartbeat::new(
@@ -528,6 +539,9 @@ fn bebop_state() -> Result<BebopState> {
         "fixture-key".to_string(),
         HashSet::from([quote_token.address.clone()]),
         Duration::from_secs(5),
+        None,
+        None,
+        None,
     )?;
     Ok(serde_json::from_value(serde_json::json!({
         "base_token": base_token,

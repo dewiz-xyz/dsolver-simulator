@@ -7,7 +7,8 @@ use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
-use simulator_replay::{DecoderConfig, RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
+use simulator_core::broadcaster::RawSnapshotReassembly;
+use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
 use tokio::sync::RwLock;
 use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -394,7 +395,7 @@ async fn native_and_bebop_fixtures_characterize_current_live_path() -> Result<()
     assert_eq!(rfq.amount_out, "1995000000");
     assert_eq!(
         rfq.state_digest,
-        "e3f5c9f476d43de6e4eb7840644c5beccd90e00c9076334e02a958bee6d3f201"
+        "e61eec744107cc67994fce061e007b27ec7037e40ebb0544ee9edc5ded2d3f76"
     );
     Ok(())
 }

@@ -2,16 +2,18 @@ use std::time::Duration;
 
 use futures::Stream;
 use reqwest::Client;
+use simulator_core::broadcaster::BroadcasterTokenSnapshotResponse;
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterRedisStreamEntry, BroadcasterSnapshotSessionResponse,
 };
+use tycho_common::models::{token::Token, Chain};
 
 use crate::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction, ReplayCheckpoint};
 use crate::error::{BroadcasterReplayClientError, Result};
 use crate::reader::{RedisStreamMessage, TokioRedisStreamReader};
 use crate::snapshot::{
     create_broadcaster_snapshot_session, fetch_broadcaster_snapshot_payload,
-    fetch_broadcaster_snapshot_payloads,
+    fetch_broadcaster_snapshot_payloads, fetch_broadcaster_token_snapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -39,10 +41,12 @@ pub struct BroadcasterReplayClient {
 impl BroadcasterReplayClient {
     /// Connect to Redis and prepare the HTTP client.
     ///
+    /// Over `rediss://` the process must have installed a rustls crypto provider first.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the Redis URL is invalid or the connection manager
-    /// cannot be created.
+    /// Returns an error when the Redis URL is invalid, a `rediss://` URL finds no
+    /// installed crypto provider, or the connection manager cannot be created.
     pub async fn connect(config: BroadcasterReplayConfig) -> Result<Self> {
         let redis = TokioRedisStreamReader::connect(&config.redis_url, config.block_ms).await?;
         Ok(Self {
@@ -77,7 +81,8 @@ impl BroadcasterReplayClient {
     ///
     /// Returns an error when the broadcaster URL is invalid, the request fails,
     /// the broadcaster returns a non-success status, or the response cannot be
-    /// decoded.
+    /// decoded. A session the broadcaster no longer serves is
+    /// [`BroadcasterReplayClientError::SnapshotSessionLost`].
     pub async fn fetch_snapshot_payload(
         &self,
         session: &BroadcasterSnapshotSessionResponse,
@@ -86,7 +91,7 @@ impl BroadcasterReplayClient {
         fetch_broadcaster_snapshot_payload(
             &self.http,
             &self.config.broadcaster_url,
-            session,
+            session.session_id,
             index,
             self.config.request_timeout,
         )
@@ -107,6 +112,24 @@ impl BroadcasterReplayClient {
             session,
             self.config.request_timeout,
         )
+    }
+
+    /// The broadcaster's current token catalog as Tycho tokens of `chain`.
+    ///
+    /// The catalog is read at call time and is not tied to any snapshot session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the catalog, or any token in it, belongs
+    /// to another chain.
+    pub async fn token_catalog(&self, chain: Chain) -> Result<Vec<Token>> {
+        let catalog = fetch_broadcaster_token_snapshot(
+            &self.http,
+            &self.config.broadcaster_url,
+            self.config.request_timeout,
+        )
+        .await?;
+        tokens_of_chain(catalog, chain)
     }
 
     /// Read and validate the next Redis replay batch after `checkpoint`.
@@ -217,4 +240,83 @@ pub(crate) fn build_replay_batch(
         items,
         caught_up_after_batch,
     })
+}
+
+/// The catalog's tokens as Tycho tokens of `chain`. A catalog or token of another chain is
+/// refused.
+fn tokens_of_chain(catalog: BroadcasterTokenSnapshotResponse, chain: Chain) -> Result<Vec<Token>> {
+    if catalog.chain_id != chain.id() {
+        return Err(BroadcasterReplayClientError::token_catalog(format!(
+            "a catalog of chain {}, expected {}",
+            catalog.chain_id,
+            chain.id()
+        )));
+    }
+    catalog
+        .tokens
+        .into_iter()
+        .map(|token| {
+            token
+                .into_token(chain)
+                .map_err(|error| BroadcasterReplayClientError::token_catalog(error.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use simulator_core::broadcaster::{BroadcasterTokenDto, BroadcasterTokenSnapshotResponse};
+    use tycho_common::{models::Chain, Bytes};
+
+    use super::tokens_of_chain;
+    use crate::error::BroadcasterReplayClientError;
+
+    fn catalog(catalog_chain: u64, token_chains: &[u64]) -> BroadcasterTokenSnapshotResponse {
+        let tokens = token_chains
+            .iter()
+            .zip(1u8..)
+            .map(|(chain_id, seed)| BroadcasterTokenDto {
+                address: Bytes::from(vec![seed; 20]),
+                symbol: format!("T{seed}"),
+                decimals: 18,
+                tax: 0,
+                gas: vec![Some(30_000)],
+                chain_id: *chain_id,
+                quality: 100,
+            })
+            .collect();
+        BroadcasterTokenSnapshotResponse {
+            chain_id: catalog_chain,
+            tokens,
+        }
+    }
+
+    #[test]
+    fn a_catalog_of_the_chain_becomes_its_tokens() -> Result<()> {
+        let tokens = tokens_of_chain(catalog(8453, &[8453, 8453]), Chain::Base)?;
+        let addresses: Vec<_> = tokens.iter().map(|token| token.address.clone()).collect();
+        assert_eq!(
+            addresses,
+            [Bytes::from(vec![1u8; 20]), Bytes::from(vec![2u8; 20])]
+        );
+        assert!(tokens.iter().all(|token| token.chain == Chain::Base));
+        Ok(())
+    }
+
+    #[test]
+    fn a_catalog_or_a_token_of_another_chain_is_refused() {
+        for (catalog, what) in [
+            (catalog(1, &[8453]), "a catalog of another chain"),
+            (catalog(8453, &[8453, 1]), "a token of another chain"),
+        ] {
+            assert!(
+                matches!(
+                    tokens_of_chain(catalog, Chain::Base),
+                    Err(BroadcasterReplayClientError::TokenCatalog { .. })
+                ),
+                "{what}"
+            );
+        }
+    }
 }

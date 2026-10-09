@@ -12,7 +12,10 @@ use tycho_simulation::{
             ekubo::state::EkuboState,
             ekubo_v3::state::EkuboV3State,
             erc4626::state::ERC4626State,
-            filters::{balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter},
+            filters::{
+                balancer_v2_pool_filter, ekubo_v3_extension_filter, erc4626_filter,
+                fluid_v1_paused_pools_filter,
+            },
             fluid::FluidV1,
             pancakeswap_v2::state::PancakeswapV2State,
             rocketpool::state::RocketpoolState,
@@ -37,10 +40,11 @@ use simulator_core::broadcaster::{
     BroadcasterUpdateMessage, ProtocolHeadUpdate,
 };
 
+use simulator_core::broadcaster::RawSnapshotReassembly;
 use simulator_core::models::protocol::ProtocolKind;
 
 use crate::payload::{live_partition_update, snapshot_partition_update};
-use crate::{DecodedReplay, RawSnapshotReassembly, ReplayBackend};
+use crate::{DecodedReplay, ReplayBackend};
 
 pub type TokenMap = HashMap<Bytes, Token>;
 
@@ -643,7 +647,10 @@ fn register_native_decoder(
             decoder.register_filter(protocol.as_str(), fluid_v1_paused_pools_filter);
         }
         ProtocolKind::Rocketpool => decoder.register_decoder::<RocketpoolState>(protocol.as_str()),
-        ProtocolKind::EkuboV3 => decoder.register_decoder::<EkuboV3State>(protocol.as_str()),
+        ProtocolKind::EkuboV3 => {
+            decoder.register_decoder::<EkuboV3State>(protocol.as_str());
+            decoder.register_filter(protocol.as_str(), ekubo_v3_extension_filter);
+        }
         ProtocolKind::AerodromeSlipstreams => {
             decoder.register_decoder::<AerodromeSlipstreamsState>(protocol.as_str())
         }
@@ -798,6 +805,68 @@ mod tests {
                 removed_components: HashMap::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn ekubo_v3_leaves_out_signed_exclusive_swap_pools() -> anyhow::Result<()> {
+        let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
+        register_native_decoder(&mut decoder, ProtocolKind::EkuboV3)?;
+        let signed_exclusive_swap: Bytes = "0x55b703eED01b35641963da2FB2E14885993605A3".parse()?;
+
+        let update = decoder
+            .decode(&ekubo_v3_pool(signed_exclusive_swap))
+            .await?;
+        assert!(update.states.is_empty());
+        assert!(update.new_pairs.is_empty());
+
+        // A pool without an extension passes the filter, so its empty state reaches the state
+        // decoder and fails there.
+        assert!(decoder
+            .decode(&ekubo_v3_pool(Bytes::from([0; 20])))
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    fn ekubo_v3_pool(extension: Bytes) -> FeedMessage<BlockHeader> {
+        use tycho_simulation::tycho_client::feed::synchronizer::{
+            ComponentWithState, Snapshot, StateSyncMessage,
+        };
+        use tycho_simulation::tycho_common::models::protocol::{
+            ProtocolComponent, ProtocolComponentState,
+        };
+        let id = "0x01";
+        let pool = ComponentWithState {
+            state: ProtocolComponentState::new(id, HashMap::new(), HashMap::new()),
+            component: ProtocolComponent {
+                id: id.to_string(),
+                protocol_system: "ekubo_v3".to_string(),
+                static_attributes: HashMap::from([("extension".to_string(), extension)]),
+                ..Default::default()
+            },
+            component_tvl: None,
+            entrypoints: Vec::new(),
+        };
+        let message = StateSyncMessage {
+            header: BlockHeader {
+                number: 123,
+                hash: Bytes::from([1; 32]),
+                parent_hash: Bytes::from([0; 32]),
+                revert: false,
+                timestamp: 1230,
+                partial_block_index: None,
+            },
+            snapshots: Snapshot {
+                states: HashMap::from([(id.to_string(), pool)]),
+                vm_storage: HashMap::new(),
+            },
+            deltas: None,
+            removed_components: HashMap::new(),
+        };
+        FeedMessage {
+            state_msgs: HashMap::from([("ekubo_v3".to_string(), message)]),
+            sync_states: HashMap::new(),
+        }
     }
 
     #[tokio::test]
