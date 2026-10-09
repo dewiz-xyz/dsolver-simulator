@@ -637,3 +637,56 @@ pub(super) async fn segment_boundary_position(
     })
     .transpose()
 }
+
+/// What the history holds about a generation's boundary checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GenerationBoundary {
+    /// The status of the generation's latest boundary checkpoint row, if one is recorded.
+    pub(super) status: Option<CheckpointStatus>,
+    /// Whether a `checkpoint_failed` gap is recorded in the generation.
+    pub(super) failure_recorded: bool,
+}
+
+impl GenerationBoundary {
+    /// Reads it for `generation`.
+    pub(super) async fn read(
+        connection: &mut sqlx::PgConnection,
+        chain_id: u64,
+        generation: u64,
+    ) -> anyhow::Result<Self> {
+        let row = sqlx::query(
+            "SELECT
+                 (SELECT status
+                  FROM state_history.checkpoints
+                  WHERE chain_id = $1 AND kind = 'boundary' AND generation = $2
+                  ORDER BY message_seq DESC
+                  LIMIT 1) AS status,
+                 EXISTS (SELECT 1
+                         FROM state_history.gaps
+                         WHERE chain_id = $1 AND generation = $2
+                           AND reason = 'checkpoint_failed') AS failure_recorded",
+        )
+        .bind(database_i64(chain_id, "boundary chain_id")?)
+        .bind(database_i64(generation, "boundary generation")?)
+        .fetch_one(connection)
+        .await
+        .context("failed to select the generation boundary")?;
+        let status = row
+            .try_get::<Option<String>, _>("status")?
+            .map(|status| super::checkpoint_status_from_database(&status))
+            .transpose()?;
+        Ok(Self {
+            status,
+            failure_recorded: row.try_get("failure_recorded")?,
+        })
+    }
+
+    /// Whether the boundary may still land: no row and no recorded failure yet, or a
+    /// row still writing.
+    pub(super) fn pending(self) -> bool {
+        match self.status {
+            None => !self.failure_recorded,
+            Some(status) => status == CheckpointStatus::Writing,
+        }
+    }
+}

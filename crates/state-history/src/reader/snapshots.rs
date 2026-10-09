@@ -13,11 +13,12 @@ use simulator_core::broadcaster::{
 use thiserror::Error;
 
 use super::{
-    begin_range_transaction, checkpoints::segment_boundary_position, database_backends,
-    database_i64, manifest_from_row, PositionRangeQuery, RangeGap, ReadConnectionProvider,
-    ReadLimits, StateHistoryReader, StoredDelta,
+    begin_range_transaction,
+    checkpoints::{segment_boundary_position, GenerationBoundary},
+    database_backends, database_i64, manifest_from_row, PositionRangeQuery, RangeGap,
+    ReadConnectionProvider, ReadLimits, StateHistoryReader, StoredDelta,
 };
-use crate::{Backend, CheckpointArchive, CheckpointManifest, StreamPosition};
+use crate::{Backend, CheckpointArchive, CheckpointManifest, CheckpointStatus, StreamPosition};
 
 /// The snapshot of one chain at `position`, for backends kept as raw messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,11 @@ pub enum RawSnapshotError {
         "no complete checkpoint with the requested backends at or before {0:?} in its segment"
     )]
     NoCheckpoint(StreamPosition),
+    /// The position has no checkpoint of its own generation yet, and that
+    /// generation's boundary checkpoint may still land. Once it lands or fails,
+    /// the answer is final.
+    #[error("the boundary checkpoint of generation {} is not stored yet", .0.generation)]
+    BoundaryNotYetStored(StreamPosition),
     /// The writer has not stored through the position, with no promise that it will.
     #[error("history is stored through {last_stored:?}, not yet through {position:?}")]
     NotYetStored {
@@ -92,10 +98,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .iter()
             .map(|backend| raw_backend(*backend).ok_or(RawSnapshotError::NotRaw(*backend)))
             .collect::<Result<Vec<_>, _>>()?;
-        let checkpoint = self
-            .checkpoint_before(query)
-            .await?
-            .ok_or(RawSnapshotError::NoCheckpoint(query.position))?;
+        let checkpoint = self.checkpoint_before(query).await?;
         let archive = self
             .fetch_checkpoint_with_limit(&checkpoint, limits)
             .await
@@ -118,11 +121,11 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
     }
 
     /// The latest complete checkpoint with the query's backends at or before its
-    /// position, when it lies in the position's segment.
+    /// position, when it lies in the position's segment and generation.
     async fn checkpoint_before(
         &self,
         query: &RawSnapshotQuery,
-    ) -> anyhow::Result<Option<CheckpointManifest>> {
+    ) -> Result<CheckpointManifest, RawSnapshotError> {
         let mut connection = self
             .connections
             .acquire()
@@ -158,13 +161,14 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         let checkpoint = row.as_ref().map(manifest_from_row).transpose()?;
         let segment_start =
             segment_boundary_position(&mut transaction, query.chain_id, query.position).await?;
+        let boundary =
+            GenerationBoundary::read(&mut transaction, query.chain_id, query.position.generation)
+                .await?;
         transaction
             .commit()
             .await
             .context("failed to commit raw snapshot checkpoint transaction")?;
-        Ok(checkpoint.filter(|checkpoint| {
-            segment_start.is_some_and(|segment_start| checkpoint.position >= segment_start)
-        }))
+        rebuild_base(query.position, checkpoint, segment_start, boundary)
     }
 
     async fn stored_updates_after(
@@ -223,6 +227,30 @@ fn is_rfq_only(gap: &RangeGap) -> bool {
             .from_observed_at_ms
             .zip(gap.to_observed_at_ms)
             .is_some_and(|(from, to)| from <= to)
+}
+
+/// The checkpoint a rebuild at `position` starts from. One before the segment
+/// start is no base, and neither is one of an earlier generation, whose writer
+/// never stored this generation's updates. While this generation's boundary may
+/// still land, the refusal is not final. With no checkpoint at all, only a
+/// boundary already writing gives that hope.
+pub(super) fn rebuild_base(
+    position: StreamPosition,
+    checkpoint: Option<CheckpointManifest>,
+    segment_start: Option<StreamPosition>,
+    boundary: GenerationBoundary,
+) -> Result<CheckpointManifest, RawSnapshotError> {
+    let in_segment = checkpoint.filter(|checkpoint| {
+        segment_start.is_some_and(|segment_start| checkpoint.position >= segment_start)
+    });
+    match in_segment {
+        Some(checkpoint) if checkpoint.position.generation == position.generation => Ok(checkpoint),
+        Some(_) if boundary.pending() => Err(RawSnapshotError::BoundaryNotYetStored(position)),
+        None if boundary.status == Some(CheckpointStatus::Writing) => {
+            Err(RawSnapshotError::BoundaryNotYetStored(position))
+        }
+        _ => Err(RawSnapshotError::NoCheckpoint(position)),
+    }
 }
 
 fn raw_backend(backend: Backend) -> Option<BroadcasterBackend> {

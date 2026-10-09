@@ -1412,6 +1412,67 @@ async fn a_raw_snapshot_never_starts_before_its_segment(pool: PgPool) -> anyhow:
     Ok(())
 }
 
+/// A position in a new generation never starts from the previous generation's
+/// checkpoint. It waits while the new generation's boundary is missing or
+/// writing, and is refused for good once a failed capture left its gap.
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL and MinIO"]
+async fn a_raw_snapshot_never_starts_from_an_earlier_generation(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_checkpoint(&pool, 34, 1, 100, CheckpointKind::Boundary, false).await?;
+    seed_raw_checkpoint(
+        &pool,
+        position(34, 10),
+        110,
+        vec![vec![raw_message(110, vec![component("a", 1)], None, &[])]],
+    )
+    .await?;
+    seed_raw_update(
+        &pool,
+        position(35, 2),
+        raw_message(111, Vec::new(), Some(liquidity_change("a", 2)), &[]),
+    )
+    .await?;
+    let reader = StateHistoryReader::new(pool.clone(), object_store().await);
+    let query = RawSnapshotQuery::new(CHAIN_ID, position(35, 2), vec![Backend::Native]);
+    let read = || reader.read_raw_snapshot(&query, ReadLimits::unbounded());
+
+    assert!(matches!(
+        read().await,
+        Err(RawSnapshotError::BoundaryNotYetStored(_))
+    ));
+    sqlx::query(
+        "INSERT INTO state_history.checkpoints
+            (chain_id, generation, message_seq, kind, block_number, backends)
+         VALUES ($1, 35, 1, 'boundary', 111, ARRAY['native'])",
+    )
+    .bind(database_i64(CHAIN_ID)?)
+    .execute(&pool)
+    .await?;
+    assert!(matches!(
+        read().await,
+        Err(RawSnapshotError::BoundaryNotYetStored(_))
+    ));
+    sqlx::query("DELETE FROM state_history.checkpoints WHERE chain_id = $1 AND generation = 35")
+        .bind(database_i64(CHAIN_ID)?)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO state_history.gaps
+            (chain_id, generation, from_message_seq, to_message_seq, reason)
+         VALUES ($1, 35, 1, 1, 'checkpoint_failed')",
+    )
+    .bind(database_i64(CHAIN_ID)?)
+    .execute(&pool)
+    .await?;
+    assert!(matches!(
+        read().await,
+        Err(RawSnapshotError::NoCheckpoint(at)) if at == position(35, 2)
+    ));
+    Ok(())
+}
+
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
 async fn a_raw_snapshot_refuses_a_backend_kept_as_decoded_state(

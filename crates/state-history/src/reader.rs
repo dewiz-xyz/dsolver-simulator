@@ -4383,6 +4383,96 @@ mod tests {
         }
     }
 
+    /// A raw rebuild starts only from a checkpoint in its position's segment and
+    /// generation. An earlier generation's checkpoint waits while the
+    /// generation's boundary may still land, a missing one with no recorded
+    /// failure or one writing, and is no base once the boundary is complete,
+    /// failed, or lost to a recorded failure. With no checkpoint at all, only a
+    /// boundary writing waits.
+    #[test]
+    fn a_raw_rebuild_starts_only_from_its_own_generation() {
+        use checkpoints::GenerationBoundary;
+        let at = position(8, 5);
+        let segment_start = Some(position(7, 0));
+        let own = manifest(
+            8,
+            2,
+            100,
+            CheckpointKind::Interval,
+            CheckpointStatus::Complete,
+        );
+        let earlier = manifest(
+            7,
+            40,
+            90,
+            CheckpointKind::Interval,
+            CheckpointStatus::Complete,
+        );
+        let boundary = |status, failure_recorded| GenerationBoundary {
+            status,
+            failure_recorded,
+        };
+        let waits = |result: Result<CheckpointManifest, RawSnapshotError>| {
+            matches!(result, Err(RawSnapshotError::BoundaryNotYetStored(_)))
+        };
+        let refused = |result: Result<CheckpointManifest, RawSnapshotError>| {
+            matches!(result, Err(RawSnapshotError::NoCheckpoint(_)))
+        };
+
+        assert_eq!(
+            rebuild_base(
+                at,
+                Some(own.clone()),
+                segment_start,
+                boundary(Some(CheckpointStatus::Writing), false)
+            )
+            .ok(),
+            Some(own.clone())
+        );
+        for pending in [
+            boundary(None, false),
+            boundary(Some(CheckpointStatus::Writing), false),
+            boundary(Some(CheckpointStatus::Writing), true),
+        ] {
+            assert!(waits(rebuild_base(
+                at,
+                Some(earlier.clone()),
+                segment_start,
+                pending
+            )));
+        }
+        for settled in [
+            boundary(None, true),
+            boundary(Some(CheckpointStatus::Complete), false),
+            boundary(Some(CheckpointStatus::Failed), false),
+        ] {
+            assert!(refused(rebuild_base(
+                at,
+                Some(earlier.clone()),
+                segment_start,
+                settled
+            )));
+        }
+        assert!(waits(rebuild_base(
+            at,
+            None,
+            segment_start,
+            boundary(Some(CheckpointStatus::Writing), false)
+        )));
+        assert!(refused(rebuild_base(
+            at,
+            None,
+            segment_start,
+            boundary(None, false)
+        )));
+        assert!(refused(rebuild_base(
+            at,
+            Some(own),
+            Some(position(8, 3)),
+            boundary(None, false)
+        )));
+    }
+
     fn manifest(
         generation: u64,
         message_seq: u64,

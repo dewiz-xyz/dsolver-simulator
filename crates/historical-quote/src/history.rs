@@ -145,7 +145,8 @@ where
         StateHistoryReader::read_raw_snapshot(self, &query, limits)
             .await
             .map_err(|error| match error {
-                RawSnapshotError::NotYetStored { .. } => HistoricalError::NotYetStored,
+                RawSnapshotError::NotYetStored { .. }
+                | RawSnapshotError::BoundaryNotYetStored(_) => HistoricalError::NotYetStored,
                 RawSnapshotError::NotRaw(backend) => HistoricalError::InvalidSelector(format!(
                     "backend {} is not kept as raw messages",
                     backend.as_str()
