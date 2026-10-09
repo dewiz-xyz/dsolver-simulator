@@ -81,7 +81,8 @@ impl BroadcasterReplayClient {
     ///
     /// Returns an error when the broadcaster URL is invalid, the request fails,
     /// the broadcaster returns a non-success status, or the response cannot be
-    /// decoded.
+    /// decoded. A session the broadcaster no longer serves is
+    /// [`BroadcasterReplayClientError::SnapshotSessionLost`].
     pub async fn fetch_snapshot_payload(
         &self,
         session: &BroadcasterSnapshotSessionResponse,
@@ -90,7 +91,7 @@ impl BroadcasterReplayClient {
         fetch_broadcaster_snapshot_payload(
             &self.http,
             &self.config.broadcaster_url,
-            session,
+            session.session_id,
             index,
             self.config.request_timeout,
         )

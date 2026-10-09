@@ -48,6 +48,14 @@ pub enum BroadcasterReplayClientError {
         url: String,
         status: u16,
     },
+    /// The broadcaster no longer serves the snapshot session, because it expired or a new
+    /// broadcaster took over. A new bootstrap opens a new session.
+    #[error("snapshot session {session_id} is gone: fetch at {url} failed with HTTP {status}")]
+    SnapshotSessionLost {
+        session_id: u64,
+        url: String,
+        status: u16,
+    },
     /// Snapshot-session HTTP response body could not be read.
     #[error("failed to read {operation} response from {url}: {message}")]
     HttpBody {
@@ -157,6 +165,18 @@ impl BroadcasterReplayClientError {
     ) -> Self {
         Self::HttpStatus {
             operation,
+            url: url.into(),
+            status,
+        }
+    }
+
+    pub(crate) fn snapshot_session_lost(
+        session_id: u64,
+        url: impl Into<String>,
+        status: u16,
+    ) -> Self {
+        Self::SnapshotSessionLost {
+            session_id,
             url: url.into(),
             status,
         }

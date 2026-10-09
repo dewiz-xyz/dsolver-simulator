@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use simulator_core::broadcaster::{
     BroadcasterEnvelope, BroadcasterSnapshotSessionResponse, BroadcasterTokenSnapshotResponse,
@@ -33,13 +33,13 @@ pub(crate) async fn create_broadcaster_snapshot_session(
 pub(crate) async fn fetch_broadcaster_snapshot_payload(
     client: &Client,
     broadcaster_url: &str,
-    session: &BroadcasterSnapshotSessionResponse,
+    session_id: u64,
     index: u32,
     request_timeout: Duration,
 ) -> Result<BroadcasterEnvelope> {
     let payload_url = derive_broadcaster_http_url(
         broadcaster_url,
-        &broadcaster_snapshot_payload_path(session.session_id, index),
+        &broadcaster_snapshot_payload_path(session_id, index),
     )?;
     request_json(
         client.get(&payload_url).timeout(request_timeout),
@@ -47,6 +47,14 @@ pub(crate) async fn fetch_broadcaster_snapshot_payload(
         "fetch broadcaster snapshot payload",
     )
     .await
+    .map_err(|error| match error {
+        BroadcasterReplayClientError::HttpStatus { url, status, .. }
+            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
+        {
+            BroadcasterReplayClientError::snapshot_session_lost(session_id, url, status)
+        }
+        other => other,
+    })
 }
 
 pub(crate) fn fetch_broadcaster_snapshot_payloads<'a>(
@@ -56,8 +64,14 @@ pub(crate) fn fetch_broadcaster_snapshot_payloads<'a>(
     request_timeout: Duration,
 ) -> impl Stream<Item = Result<BroadcasterEnvelope>> + 'a {
     ordered_payload_fetches(session.payload_count, move |index| async move {
-        fetch_broadcaster_snapshot_payload(client, broadcaster_url, session, index, request_timeout)
-            .await
+        fetch_broadcaster_snapshot_payload(
+            client,
+            broadcaster_url,
+            session.session_id,
+            index,
+            request_timeout,
+        )
+        .await
     })
 }
 
@@ -218,6 +232,58 @@ mod tests {
             fetch("garbled").await,
             Err(BroadcasterReplayClientError::JsonDecode { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_payload_status_is_a_lost_session_only_for_a_dropped_session() -> Result<()> {
+        use axum::http::StatusCode;
+        let cases = [
+            (StatusCode::NOT_FOUND, true),
+            (StatusCode::GONE, true),
+            (StatusCode::RANGE_NOT_SATISFIABLE, false),
+            (StatusCode::TOO_MANY_REQUESTS, false),
+            (StatusCode::INTERNAL_SERVER_ERROR, false),
+        ];
+        let app = (0..)
+            .zip(cases)
+            .fold(axum::Router::new(), |app, (index, (status, _))| {
+                app.route(
+                    &format!("/snapshot-sessions/7/payloads/{index}"),
+                    axum::routing::get(move || async move { status }),
+                )
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}");
+        let fetch = |index| {
+            super::fetch_broadcaster_snapshot_payload(
+                &client,
+                &url,
+                7,
+                index,
+                Duration::from_secs(5),
+            )
+        };
+
+        for (index, (status, lost)) in (0..).zip(cases) {
+            let fetched = fetch(index).await;
+            let expected = if lost {
+                matches!(
+                    fetched,
+                    Err(BroadcasterReplayClientError::SnapshotSessionLost { session_id: 7, .. })
+                )
+            } else {
+                matches!(
+                    fetched,
+                    Err(BroadcasterReplayClientError::HttpStatus { status: code, .. })
+                        if code == status.as_u16()
+                )
+            };
+            assert!(expected, "{status}");
+        }
         Ok(())
     }
 }
