@@ -1,10 +1,10 @@
 # Historical Pool Quote API
 
-The Historical Pool Quote API reconstructs retained Base state and returns directed pool quotes for one exact component and token direction. This document covers the service boundary, reconstruction semantics, HTTP contract, configuration, sizing, and operator workflow.
+The Historical Pool Quote API reconstructs retained Base state and returns directed pool quotes for one exact component and token direction. It also returns the raw history a replay consumer rebuilds a market session from. This document covers the service boundary, reconstruction semantics, HTTP contract, configuration, sizing, and operator workflow.
 
 Client users should start with the [Historical Pool Quote Client Guide](historical_pool_quote_client.md). Agents helping with client requests should use the repo-local [`historical-pool-quote-cli` skill](../skills/historical-pool-quote-cli/SKILL.md).
 
-The first release is for bounded interactive analysis. It is not a route replay service, a pool discovery service, a public endpoint, or a data export system.
+The service serves bounded interactive analysis and the raw history a replay consumer needs. It is not a pool discovery service, a public endpoint, or a bulk export system, and every raw history read stays within a job's decoded-byte reservation.
 
 ## Mental model
 
@@ -32,6 +32,8 @@ Jobs are in memory. A deployment or task restart can lose them.
 
 The first terminal `GET /jobs/{jobId}` selects the terminal body for delivery. The service removes the retained result only after it finishes writing that body. If the write fails, it releases the delivery lease so a later poll can retry. A successful terminal poll consumes the result. Later polls return `job_not_found`.
 
+A cancelled job, or one past its deadline, ends at once, but its running slot and its decoded-byte reservation stay taken until its work stops. Terminal bodies are kept within a count and a byte limit, the oldest dropped first, but a body being delivered is never dropped or expired. A result that does not fit beside the bodies being delivered, by count or by bytes, waits, its job still running, until a delivery ends, and fails at its deadline if none does. A result written after its job's deadline or cancellation is not published as a success. A result larger than the byte limit fails its job with `read_limit_exceeded`. A failure or cancellation body is always kept, since it is a few hundred bytes.
+
 The high-level `quotes` and `verify` CLI commands can recompute once after `job_not_found` when they still own the original request and time remains. Generic `job get` and `job wait` cannot recompute because they do not have the request body. See the [client guide](historical_pool_quote_client.md) for command behavior, interruption, output, and exit codes.
 
 ## Coverage and status semantics
@@ -43,6 +45,16 @@ Coverage describes safe reconstruction for the requested backends. It does not p
 Use bounded coverage as the normal preflight for a quote or consistency-check range. `knownGaps` returns an original, unclipped gap only when its projected unsafe interval intersects the effective requested range. Complete block bounds apply to native and VM state; complete observation-time bounds apply to RFQ state. One-sided and entirely cursorless gaps project conservatively. A missing bound domain is ignored when the other domain completely identifies the gap.
 
 Unbounded coverage remains available for retained-history inventory and diagnosis. It scans retained history and should not be used as the routine per-request health check.
+
+## Raw history
+
+A replay consumer rebuilds a market session from the raw messages the broadcaster kept, so it reads them here rather than from the state-history store. Both reads are jobs and share the job lifecycle, its deadline, cancellation, decoded-byte reservation and single delivery. They accept only backends kept as raw messages, native and VM.
+
+`POST /jobs/raw-snapshot` returns the snapshot at `position`, rebuilt from the latest complete checkpoint in the position's segment and generation and the stored updates after it with the broadcaster's own merge rules. The result names the checkpoint it started from and carries one partition per requested backend in the broadcaster's snapshot wire form. A position the history has not stored yet fails with `history_not_yet_stored`, which is retryable. So does a position whose latest checkpoint is from an earlier generation while its own generation's boundary checkpoint may still land, either missing with no recorded failed capture or still writing, since an earlier writer's checkpoint never carries this generation's updates, and a position with no checkpoint at all while a boundary checkpoint is writing. A recorded gap or a boundary checkpoint between the checkpoint and the position, or no checkpoint in its segment and generation, fails with `history_unavailable`. A successful rebuild does not prove the history complete. A gap or a recovery boundary stored late or never can make it differ from the snapshot the broadcaster served.
+
+`POST /jobs/stored-messages` returns the stored messages in `(after, through]` that carry a requested backend, in stream order, each envelope exactly as the broadcaster stored it. Only updates are stored, so positions between them may be messages that were never stored. `after` and `through` must be in one generation, since each generation has its own writer. A recorded gap anywhere in the range, other than one that lost only RFQ updates, or a boundary checkpoint in it fails with `history_unavailable`, since the messages would come back without the lost ones. A range with neither that is not stored through `through` fails with `history_not_yet_stored`. A successful read does not prove the range complete, since a gap can be stored late or never.
+
+A long session is read as several `stored-messages` jobs. A read that needs more than one job may read fails with `read_limit_exceeded`, which is not retryable, so the consumer narrows the range.
 
 ## Manual historical state consistency check
 
@@ -66,6 +78,8 @@ The check is manual. Quote admission, readiness, deployment, and continuous inte
 | --- | --- | --- |
 | `POST` | `/jobs/quote` | Submit a historical quote job. |
 | `POST` | `/jobs/consistency-check` | Submit a manual consistency check. |
+| `POST` | `/jobs/raw-snapshot` | Submit a raw snapshot read at one stream position. |
+| `POST` | `/jobs/stored-messages` | Submit a read of the stored messages in a position range. |
 | `GET` | `/jobs/{jobId}` | Poll and possibly consume a terminal result. |
 | `POST` | `/jobs/{jobId}/cancel` | Request cancellation without consuming a result. |
 | `POST` | `/coverage` | Read reconstruction coverage synchronously. |
@@ -121,6 +135,7 @@ Measured application defaults are listed below. Every setting has a matching `DS
 | Running jobs | `4` |
 | Waiting jobs | `16` |
 | Retained terminal jobs | `20` |
+| Retained terminal bytes | `1024 MiB` |
 | Terminal retention | `3600` seconds |
 | Comparison count | `20000` |
 | Requested block span | `1800` blocks |

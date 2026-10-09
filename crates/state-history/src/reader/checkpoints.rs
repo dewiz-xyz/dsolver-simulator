@@ -3,10 +3,11 @@ use futures::TryStreamExt;
 use sqlx::Row;
 
 use super::{
-    begin_range_transaction, database_backends, database_i64, database_u64,
-    decode_delta_row_with_limit, encoded_delta_from_row, fetch_delta_backends, gap_from_row,
-    manifest_from_row, BlockInterval, RangeGap, ReadConnectionProvider, ReadLimits,
-    StateHistoryReader, StoredDelta,
+    begin_range_transaction, database_i64, manifest_from_row,
+    positions::{
+        decode_stored_deltas, fetch_backend_cursors, fetch_delta_rows_between, fetch_gaps_between,
+    },
+    BlockInterval, RangeGap, ReadConnectionProvider, ReadLimits, StateHistoryReader, StoredDelta,
 };
 use crate::{Backend, CheckpointKind, CheckpointManifest, CheckpointStatus, StreamPosition};
 
@@ -211,42 +212,34 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         let remaining_decoded_bytes = limits
             .max_decoded_bytes
             .saturating_sub(checkpoint_decoded_bytes);
-        let encoded_rows = fetch_pair_delta_rows(
+        let encoded_rows = fetch_delta_rows_between(
             &mut transaction,
-            &earlier,
-            &target,
+            earlier.chain_id,
+            earlier.position,
+            target.position,
             &backends,
             remaining_compressed_bytes,
         )
         .await?;
-        let delta_ids = encoded_rows.iter().map(|row| row.id).collect::<Vec<_>>();
-        let backend_cursors = fetch_delta_backends(&mut transaction, &delta_ids).await?;
-        let mut delta_decoded_bytes = 0_u64;
-        let mut deltas = Vec::with_capacity(encoded_rows.len());
-        for row in encoded_rows {
-            let remaining = remaining_decoded_bytes.saturating_sub(delta_decoded_bytes);
-            let (row, decoded_bytes) =
-                decode_delta_row_with_limit(row, &backend_cursors, remaining)?;
-            delta_decoded_bytes = delta_decoded_bytes
-                .checked_add(decoded_bytes)
-                .context("checkpoint pair decoded byte estimate overflowed")?;
-            deltas.push(StoredDelta {
-                position: row.position,
-                observed_at_ms: row.observed_at_ms,
-                payload_format_version: row.payload_format_version,
-                raw_payload: row.payload,
-                applicable_backends: row
-                    .backends
-                    .into_iter()
-                    .filter(|cursor| backends.binary_search(&cursor.backend).is_ok())
-                    .collect(),
-            });
-        }
-        let gaps = fetch_pair_gaps(&mut transaction, &earlier, &target).await?;
+        let backend_cursors = fetch_backend_cursors(&mut transaction, &encoded_rows).await?;
+        let gaps = fetch_gaps_between(
+            &mut transaction,
+            earlier.chain_id,
+            earlier.position,
+            target.position,
+        )
+        .await?;
         transaction
             .commit()
             .await
             .context("failed to commit checkpoint pair plan transaction")?;
+        drop(connection);
+        let (deltas, delta_decoded_bytes) = decode_stored_deltas(
+            encoded_rows,
+            &backend_cursors,
+            &backends,
+            remaining_decoded_bytes,
+        )?;
         Ok(CheckpointPairReplayPlan {
             pair: CheckpointPair { earlier, target },
             earlier_token_anchor,
@@ -331,127 +324,6 @@ fn declared_pair_checkpoint_bytes(
         }
     }
     Ok((compressed_bytes, decoded_bytes))
-}
-
-async fn fetch_pair_delta_rows(
-    connection: &mut sqlx::PgConnection,
-    earlier: &CheckpointManifest,
-    target: &CheckpointManifest,
-    backends: &[Backend],
-    max_compressed_bytes: u64,
-) -> anyhow::Result<Vec<super::EncodedDeltaRow>> {
-    let compressed_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(sum(octet_length(d.payload)), 0)::bigint
-         FROM state_history.deltas d
-         WHERE d.chain_id = $1
-           AND (d.generation, d.message_seq) > ($2, $3)
-           AND (d.generation, d.message_seq) <= ($4, $5)
-           AND EXISTS (
-               SELECT 1 FROM state_history.delta_backends matched
-               WHERE matched.delta_id = d.id AND matched.backend = ANY($6::text[])
-           )",
-    )
-    .bind(database_i64(earlier.chain_id, "checkpoint pair chain_id")?)
-    .bind(database_i64(
-        earlier.position.generation,
-        "earlier generation",
-    )?)
-    .bind(database_i64(
-        earlier.position.message_seq,
-        "earlier message_seq",
-    )?)
-    .bind(database_i64(
-        target.position.generation,
-        "target generation",
-    )?)
-    .bind(database_i64(
-        target.position.message_seq,
-        "target message_seq",
-    )?)
-    .bind(database_backends(backends))
-    .fetch_one(&mut *connection)
-    .await
-    .context("failed to preflight checkpoint pair delta bytes")?;
-    let compressed_bytes = database_u64(compressed_bytes, "checkpoint pair delta bytes")?;
-    ensure!(
-        compressed_bytes <= max_compressed_bytes,
-        "compressed bytes {compressed_bytes} exceed limit {max_compressed_bytes}"
-    );
-
-    let rows = sqlx::query(
-        "SELECT d.id, d.generation, d.message_seq, d.observed_at_ms,
-                d.payload_format_version, d.payload, d.payload_sha256
-         FROM state_history.deltas d
-         WHERE d.chain_id = $1
-           AND (d.generation, d.message_seq) > ($2, $3)
-           AND (d.generation, d.message_seq) <= ($4, $5)
-           AND EXISTS (
-               SELECT 1 FROM state_history.delta_backends matched
-               WHERE matched.delta_id = d.id AND matched.backend = ANY($6::text[])
-           )
-         ORDER BY d.generation, d.message_seq",
-    )
-    .bind(database_i64(earlier.chain_id, "checkpoint pair chain_id")?)
-    .bind(database_i64(
-        earlier.position.generation,
-        "earlier generation",
-    )?)
-    .bind(database_i64(
-        earlier.position.message_seq,
-        "earlier message_seq",
-    )?)
-    .bind(database_i64(
-        target.position.generation,
-        "target generation",
-    )?)
-    .bind(database_i64(
-        target.position.message_seq,
-        "target message_seq",
-    )?)
-    .bind(database_backends(backends))
-    .fetch_all(connection)
-    .await
-    .context("failed to select checkpoint pair deltas")?;
-    rows.iter().map(encoded_delta_from_row).collect()
-}
-
-async fn fetch_pair_gaps(
-    connection: &mut sqlx::PgConnection,
-    earlier: &CheckpointManifest,
-    target: &CheckpointManifest,
-) -> anyhow::Result<Vec<RangeGap>> {
-    let rows = sqlx::query(
-        "SELECT generation, from_message_seq, to_message_seq, reason,
-                from_block_number, to_block_number, from_observed_at_ms, to_observed_at_ms
-         FROM state_history.gaps
-         WHERE chain_id = $1
-           AND (generation > $2 OR (generation = $2 AND to_message_seq > $3))
-           AND (generation < $4 OR (generation = $4 AND from_message_seq <= $5))
-         ORDER BY generation, from_message_seq, to_message_seq, id",
-    )
-    .bind(database_i64(earlier.chain_id, "checkpoint pair chain_id")?)
-    .bind(database_i64(
-        earlier.position.generation,
-        "earlier generation",
-    )?)
-    .bind(database_i64(
-        earlier.position.message_seq,
-        "earlier message_seq",
-    )?)
-    .bind(database_i64(
-        target.position.generation,
-        "target generation",
-    )?)
-    .bind(database_i64(
-        target.position.message_seq,
-        "target message_seq",
-    )?)
-    .fetch_all(connection)
-    .await
-    .context("failed to select checkpoint pair gaps")?;
-    rows.iter()
-        .map(|row| gap_from_row(row).map(RangeGap::from))
-        .collect()
 }
 
 pub(super) async fn token_fallback_in_segment(
@@ -738,7 +610,7 @@ async fn exact_checkpoint(
     rows.first().map(manifest_from_row).transpose()
 }
 
-async fn segment_boundary_position(
+pub(super) async fn segment_boundary_position(
     connection: &mut sqlx::PgConnection,
     chain_id: u64,
     position: StreamPosition,
@@ -764,4 +636,57 @@ async fn segment_boundary_position(
         })
     })
     .transpose()
+}
+
+/// What the history holds about a generation's boundary checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GenerationBoundary {
+    /// The status of the generation's latest boundary checkpoint row, if one is recorded.
+    pub(super) status: Option<CheckpointStatus>,
+    /// Whether a `checkpoint_failed` gap is recorded in the generation.
+    pub(super) failure_recorded: bool,
+}
+
+impl GenerationBoundary {
+    /// Reads it for `generation`.
+    pub(super) async fn read(
+        connection: &mut sqlx::PgConnection,
+        chain_id: u64,
+        generation: u64,
+    ) -> anyhow::Result<Self> {
+        let row = sqlx::query(
+            "SELECT
+                 (SELECT status
+                  FROM state_history.checkpoints
+                  WHERE chain_id = $1 AND kind = 'boundary' AND generation = $2
+                  ORDER BY message_seq DESC
+                  LIMIT 1) AS status,
+                 EXISTS (SELECT 1
+                         FROM state_history.gaps
+                         WHERE chain_id = $1 AND generation = $2
+                           AND reason = 'checkpoint_failed') AS failure_recorded",
+        )
+        .bind(database_i64(chain_id, "boundary chain_id")?)
+        .bind(database_i64(generation, "boundary generation")?)
+        .fetch_one(connection)
+        .await
+        .context("failed to select the generation boundary")?;
+        let status = row
+            .try_get::<Option<String>, _>("status")?
+            .map(|status| super::checkpoint_status_from_database(&status))
+            .transpose()?;
+        Ok(Self {
+            status,
+            failure_recorded: row.try_get("failure_recorded")?,
+        })
+    }
+
+    /// Whether the boundary may still land: no row and no recorded failure yet, or a
+    /// row still writing.
+    pub(super) fn pending(self) -> bool {
+        match self.status {
+            None => !self.failure_recorded,
+            Some(status) => status == CheckpointStatus::Writing,
+        }
+    }
 }

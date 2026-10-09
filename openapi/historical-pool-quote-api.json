@@ -387,6 +387,288 @@
         ]
       }
     },
+    "/jobs/raw-snapshot": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "post_raw_snapshot_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RawSnapshotRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing retained job",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "New raw snapshot job admitted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Job polling path"
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request ID conflicts with retained content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Waiting queue is full",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service cannot safely admit work",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/stored-messages": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "post_stored_messages_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoredMessagesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing retained job",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "New stored messages job admitted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Job polling path"
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request ID conflicts with retained content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Waiting queue is full",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service cannot safely admit work",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/jobs/{jobId}": {
       "get": {
         "tags": [
@@ -1809,6 +2091,9 @@
           "historical_data_invalid",
           "state_reconstruction_failed",
           "check_budget_exceeded",
+          "history_not_yet_stored",
+          "history_unavailable",
+          "read_limit_exceeded",
           "internal_error"
         ]
       },
@@ -1819,6 +2104,9 @@
           },
           {
             "$ref": "#/components/schemas/ConsistencyCheckProgress"
+          },
+          {
+            "$ref": "#/components/schemas/RawHistoryProgress"
           }
         ],
         "description": "Progress shape selected by the job type."
@@ -1830,6 +2118,12 @@
           },
           {
             "$ref": "#/components/schemas/ConsistencyCheckReport"
+          },
+          {
+            "$ref": "#/components/schemas/RawSnapshotResult"
+          },
+          {
+            "$ref": "#/components/schemas/StoredMessagesResult"
           }
         ],
         "description": "Terminal result selected by the job type."
@@ -1923,7 +2217,9 @@
         "description": "Work type stored by the shared in-memory scheduler.",
         "enum": [
           "historicalQuote",
-          "historicalStateConsistencyCheck"
+          "historicalStateConsistencyCheck",
+          "rawSnapshot",
+          "storedMessages"
         ]
       },
       "KnownGap": {
@@ -2276,6 +2572,102 @@
         },
         "additionalProperties": false
       },
+      "RawHistoryProgress": {
+        "type": "object",
+        "description": "Raw-history progress, a single read that is either pending or done.",
+        "required": [
+          "percentComplete"
+        ],
+        "properties": {
+          "percentComplete": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "RawSnapshotRequest": {
+        "type": "object",
+        "description": "Request for the raw snapshot the broadcaster served at a stream position,\nfor backends kept as raw Tycho messages.",
+        "required": [
+          "requestId",
+          "apiRevision",
+          "timeoutMs",
+          "chainId",
+          "backends",
+          "position"
+        ],
+        "properties": {
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "position": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "RawSnapshotResult": {
+        "type": "object",
+        "description": "The raw snapshot at a stream position.",
+        "required": [
+          "position",
+          "checkpointPosition",
+          "partitions"
+        ],
+        "properties": {
+          "checkpointPosition": {
+            "$ref": "#/components/schemas/StreamPosition",
+            "description": "The checkpoint the snapshot was rebuilt from."
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "One snapshot partition per requested backend, in the broadcaster's\nsnapshot wire form."
+          },
+          "position": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
       "ReadyResponse": {
         "type": "object",
         "description": "Readiness response used by the internal load balancer.",
@@ -2493,6 +2885,107 @@
         },
         "additionalProperties": false
       },
+      "StoredMessage": {
+        "type": "object",
+        "description": "One stored message, the envelope exactly as the broadcaster stored it.",
+        "required": [
+          "position",
+          "envelope"
+        ],
+        "properties": {
+          "envelope": {
+            "type": "object"
+          },
+          "position": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StoredMessagesRequest": {
+        "type": "object",
+        "description": "Request for the stored messages after one stream position through another,\nas the broadcaster stored them.",
+        "required": [
+          "requestId",
+          "apiRevision",
+          "timeoutMs",
+          "chainId",
+          "backends",
+          "after",
+          "through"
+        ],
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/StreamPosition",
+            "description": "The position before the first message returned."
+          },
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "through": {
+            "$ref": "#/components/schemas/StreamPosition",
+            "description": "The position of the last message returned, which must be stored."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "StoredMessagesResult": {
+        "type": "object",
+        "description": "The stored messages in a range, in stream order.",
+        "required": [
+          "after",
+          "through",
+          "messages"
+        ],
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StoredMessage"
+            }
+          },
+          "through": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
       "StreamPosition": {
         "type": "object",
         "description": "One ordered position in state history.",
@@ -2544,7 +3037,7 @@
   "tags": [
     {
       "name": "jobs",
-      "description": "Historical quote and consistency jobs"
+      "description": "Historical quote, consistency and raw history jobs"
     },
     {
       "name": "coverage",
