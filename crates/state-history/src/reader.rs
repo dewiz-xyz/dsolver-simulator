@@ -574,6 +574,19 @@ pub struct RangeGap {
     pub reason: String,
 }
 
+impl RangeGap {
+    /// A gap with RFQ time bounds and no block bounds lost only RFQ updates, the same
+    /// rule coverage applies to a block backend.
+    pub fn rfq_only(&self) -> bool {
+        self.from_block.is_none()
+            && self.to_block_inclusive.is_none()
+            && self
+                .from_observed_at_ms
+                .zip(self.to_observed_at_ms)
+                .is_some_and(|(from, to)| from <= to)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapFreeError {
     pub gaps: Vec<(RangeGapKind, String)>,

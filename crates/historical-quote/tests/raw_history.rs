@@ -66,14 +66,20 @@ fn range(last_stored: Option<u64>, gaps: Vec<(u64, u64)>) -> PositionRange {
 }
 
 /// A stored range gives every stored message in stream order, each envelope
-/// exactly as stored, whatever gaps lie before its end, and reads the range
-/// it names within the reader's limits.
+/// exactly as stored, a gap that lost only RFQ updates included, and reads
+/// the range it names within the reader's limits.
 #[tokio::test]
 async fn a_stored_range_gives_its_messages_as_stored() -> TestResult {
     let mut source = FixtureSource::native()?;
     let stored = vec![native_delta(2, 101)?, native_delta(3, 102)?];
-    let mut stored_range = range(Some(5), vec![(4, 4)]);
+    let mut stored_range = range(Some(5), Vec::new());
     stored_range.deltas = stored.clone();
+    let mut rfq_only = recorded_gap(4, 4, 0, 0);
+    rfq_only.from_block = None;
+    rfq_only.to_block_inclusive = None;
+    rfq_only.from_observed_at_ms = Some(1_000);
+    rfq_only.to_observed_at_ms = Some(1_000);
+    stored_range.gaps = vec![rfq_only];
     source.position_range = Some(stored_range);
     let source = Arc::new(source);
     let request = messages_request(1, 5);
@@ -108,12 +114,11 @@ async fn a_stored_range_gives_its_messages_as_stored() -> TestResult {
     Ok(())
 }
 
-/// A range not stored through its end lags while no recorded gap holds the
-/// message at its end, a gap elsewhere included, and is lost once one does,
-/// a gap that starts at the end included. A boundary checkpoint in the range
-/// is refused outright.
+/// A range with a recorded gap anywhere in it, or a boundary checkpoint, is
+/// lost, whether or not it is stored through its end. A range with neither
+/// that is not stored through its end lags.
 #[tokio::test]
-async fn an_unstored_end_is_a_lag_unless_a_gap_holds_it() -> TestResult {
+async fn a_gap_or_boundary_loses_the_range_and_an_unstored_end_lags() -> TestResult {
     let mut boundary = range(Some(5), Vec::new());
     boundary.boundaries = vec![manifest(
         7,
@@ -125,7 +130,8 @@ async fn an_unstored_end_is_a_lag_unless_a_gap_holds_it() -> TestResult {
     )];
     for (stored, lag) in [
         (range(Some(3), Vec::new()), true),
-        (range(None, vec![(2, 2)]), true),
+        (range(Some(5), vec![(2, 2)]), false),
+        (range(None, vec![(2, 2)]), false),
         (range(Some(3), vec![(4, 5)]), false),
         (range(Some(3), vec![(5, 6)]), false),
         (boundary, false),
@@ -137,7 +143,7 @@ async fn an_unstored_end_is_a_lag_unless_a_gap_holds_it() -> TestResult {
             .stored_messages(&messages_request(1, 5), &CancellationToken::new())
             .await
         else {
-            return Err("a range not stored through 5 must be refused".into());
+            return Err("each of these ranges must be refused".into());
         };
 
         assert_eq!(

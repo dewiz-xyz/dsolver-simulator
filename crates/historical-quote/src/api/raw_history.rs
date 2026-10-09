@@ -113,6 +113,10 @@ impl TryFrom<UncheckedStoredMessagesRequest> for StoredMessagesRequest {
         if value.after >= value.through {
             return Err("after must precede through".to_owned());
         }
+        // Each generation has its own writer, so no stored order runs across two.
+        if value.after.generation != value.through.generation {
+            return Err("after and through must be in one generation".to_owned());
+        }
         Ok(Self {
             request_id: value.request_id,
             api_revision: value.api_revision,

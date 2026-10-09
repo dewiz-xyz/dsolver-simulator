@@ -340,6 +340,28 @@ fn raw_history_fingerprints_ignore_id_and_backend_order() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// A stored messages range stays in one generation, since each generation has
+/// its own writer and no stored order runs across two.
+#[test]
+fn stored_messages_request_stays_in_one_generation() {
+    let at = |generation: u64, message_seq: u64| json!({"generation": generation, "messageSeq": message_seq});
+    let request = |after: Value, through: Value| {
+        serde_json::from_value::<StoredMessagesRequest>(json!({
+            "requestId": REQUEST_ID,
+            "apiRevision": 1,
+            "timeoutMs": 1_000,
+            "chainId": 8453,
+            "backends": ["native"],
+            "after": after,
+            "through": through,
+        }))
+    };
+
+    assert!(request(at(9, 1), at(9, 5)).is_ok());
+    let across = request(at(8, 900), at(9, 5)).map_err(|error| error.to_string());
+    assert!(matches!(across, Err(error) if error.contains("one generation")));
+}
+
 #[test]
 #[expect(clippy::unwrap_used, reason = "the test needs each validation error")]
 fn quote_request_rejects_every_boundary_violation() {

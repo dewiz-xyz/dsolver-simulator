@@ -191,7 +191,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         let gaps = range
             .gaps
             .into_iter()
-            .filter(|gap| !is_rfq_only(gap))
+            .filter(|gap| !gap.rfq_only())
             .collect::<Vec<_>>();
         if !gaps.is_empty() {
             return Err(RawSnapshotError::Gaps {
@@ -216,17 +216,6 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
         }
         Ok(range.deltas)
     }
-}
-
-/// A gap with RFQ time bounds and no block bounds lost only RFQ updates, the same
-/// rule coverage applies to a block backend.
-fn is_rfq_only(gap: &RangeGap) -> bool {
-    gap.from_block.is_none()
-        && gap.to_block_inclusive.is_none()
-        && gap
-            .from_observed_at_ms
-            .zip(gap.to_observed_at_ms)
-            .is_some_and(|(from, to)| from <= to)
 }
 
 /// The checkpoint a rebuild at `position` starts from. One before the segment
