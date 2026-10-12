@@ -8062,7 +8062,7 @@ dependencies = [
 [[package]]
 name = "tycho-execution"
 version = "0.165.1"
-source = "git+ssh://git@github.com/dewiz-xyz/dsolver-execution.git?rev=46596c8#46596c8fd137661161edf11a7ed3e5be50452d95"
+source = "git+ssh://git@github.com/dewiz-xyz/dsolver-execution.git?rev=f4d4444#f4d444414c43d2cecf626139fd1749e11d15cba6"
 dependencies = [
  "alloy",
  "chrono",
