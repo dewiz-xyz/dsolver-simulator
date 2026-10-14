@@ -1937,6 +1937,15 @@ impl BroadcasterRedisPublisher {
                 guard.mode.as_str()
             ));
         }
+        // A promotion that started before a feed fatal or shutdown can still get here.
+        // Consumers reset on every new generation, so a writer that is exiting must not start one.
+        let phase = self.deployment_admission.borrow().phase;
+        if phase.is_terminal() {
+            return Err(anyhow!(
+                "Redis broadcaster publisher cannot promote a writer generation while {}",
+                phase.as_str()
+            ));
+        }
         let normal_marker_fields =
             generation_marker_template_fields(self.config.chain_id, backends, reason.clone())?;
         let expected_writer_token = recovering.then_some(self.writer_token.as_str());

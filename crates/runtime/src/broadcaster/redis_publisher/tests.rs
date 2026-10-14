@@ -1326,6 +1326,60 @@ async fn lease_loss_recovers_in_a_new_generation_without_reusing_the_fence() -> 
 }
 
 #[tokio::test]
+async fn shutting_down_publisher_never_promotes_a_generation() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher.begin_shutdown();
+
+    let promotion = publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await;
+
+    assert!(promotion.is_err());
+    assert!(writer.appends().await.is_empty());
+    assert_eq!(publisher.status_snapshot().await.mode, "passive");
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutting_down_publisher_never_recovers_a_lost_writer_fence() -> Result<()> {
+    let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
+    let writer = FakeRedisWriter::default();
+    let publisher = BroadcasterRedisPublisher::new(publisher_config(), Arc::new(writer.clone()));
+    publisher
+        .promote(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_promoted",
+        )
+        .await?;
+    writer.expire_active_writer().await;
+    let update = raw_cache
+        .apply_update(&update(BroadcasterBackend::Native, 11, "native-2"))
+        .await?;
+    assert!(publisher
+        .publish_accepted_payload(BroadcasterPayload::Update(update))
+        .await
+        .is_err());
+    assert_eq!(publisher.status_snapshot().await.mode, "unhealthy");
+    publisher.begin_shutdown();
+
+    let recovery = publisher
+        .recover_writer(
+            base_heads([BroadcasterBackend::Native]),
+            "active_writer_recovered",
+        )
+        .await;
+
+    assert!(recovery.is_err());
+    assert_eq!(writer.appends().await.len(), 1);
+    assert_eq!(publisher.status_snapshot().await.mode, "unhealthy");
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_redis_recovery_advances_past_the_lost_local_generation() -> Result<()> {
     let raw_cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
     let writer = FakeRedisWriter::default();
