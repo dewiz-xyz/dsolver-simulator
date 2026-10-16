@@ -18,8 +18,9 @@ use crate::api::{
     HistoricalQuoteProgress, HistoricalQuoteResult, HistoricalQuoteTarget, JobCounts, JobEnvelope,
     JobFailure, JobFailureCode, JobProgress, JobResult, JobState, JobSubmission, JobType, KnownGap,
     PairStatus, PoolSelector, QuoteComparisonRequest, QuoteFailureReason, QuoteJobRequest,
-    QuoteOutcome, QuoteProvenance, ReadyResponse, ServiceLimits, StatusResponse,
-    StorageVerificationSummary, StreamPosition, UnavailableReason, UnsignedAmount,
+    QuoteOutcome, QuoteProvenance, RawHistoryProgress, RawSnapshotRequest, RawSnapshotResult,
+    ReadyResponse, ServiceLimits, StatusResponse, StorageVerificationSummary, StoredMessage,
+    StoredMessagesRequest, StoredMessagesResult, StreamPosition, UnavailableReason, UnsignedAmount,
 };
 
 #[utoipa::path(
@@ -75,6 +76,58 @@ pub(crate) fn post_quote_job() {}
 )]
 #[expect(dead_code, reason = "Utoipa reads this contract-only path")]
 pub(crate) fn post_consistency_job() {}
+
+#[utoipa::path(
+    post,
+    path = "/jobs/raw-snapshot",
+    request_body = RawSnapshotRequest,
+    responses(
+        (status = 200, description = "Existing retained job", body = JobSubmission,
+            headers(("Retry-After" = u64, description = "Polling delay in seconds"))),
+        (status = 202, description = "New raw snapshot job admitted", body = JobSubmission,
+            headers(
+                ("Location" = String, description = "Job polling path"),
+                ("Retry-After" = u64, description = "Polling delay in seconds")
+            )),
+        (status = 400, description = "Invalid request", body = ApiError),
+        (status = 401, description = "Bearer token is absent or wrong", body = ApiError),
+        (status = 409, description = "Request ID conflicts with retained content", body = ApiError),
+        (status = 429, description = "Waiting queue is full", body = ApiError,
+            headers(("Retry-After" = u64, description = "Retry delay in seconds"))),
+        (status = 503, description = "Service cannot safely admit work", body = ApiError,
+            headers(("Retry-After" = u64, description = "Retry delay in seconds")))
+    ),
+    security(("bearerAuth" = [])),
+    tag = "jobs"
+)]
+#[expect(dead_code, reason = "Utoipa reads this contract-only path")]
+pub(crate) fn post_raw_snapshot_job() {}
+
+#[utoipa::path(
+    post,
+    path = "/jobs/stored-messages",
+    request_body = StoredMessagesRequest,
+    responses(
+        (status = 200, description = "Existing retained job", body = JobSubmission,
+            headers(("Retry-After" = u64, description = "Polling delay in seconds"))),
+        (status = 202, description = "New stored messages job admitted", body = JobSubmission,
+            headers(
+                ("Location" = String, description = "Job polling path"),
+                ("Retry-After" = u64, description = "Polling delay in seconds")
+            )),
+        (status = 400, description = "Invalid request", body = ApiError),
+        (status = 401, description = "Bearer token is absent or wrong", body = ApiError),
+        (status = 409, description = "Request ID conflicts with retained content", body = ApiError),
+        (status = 429, description = "Waiting queue is full", body = ApiError,
+            headers(("Retry-After" = u64, description = "Retry delay in seconds"))),
+        (status = 503, description = "Service cannot safely admit work", body = ApiError,
+            headers(("Retry-After" = u64, description = "Retry delay in seconds")))
+    ),
+    security(("bearerAuth" = [])),
+    tag = "jobs"
+)]
+#[expect(dead_code, reason = "Utoipa reads this contract-only path")]
+pub(crate) fn post_stored_messages_job() {}
 
 #[utoipa::path(
     get,
@@ -185,6 +238,8 @@ pub(crate) fn get_ready() {}
     paths(
         post_quote_job,
         post_consistency_job,
+        post_raw_snapshot_job,
+        post_stored_messages_job,
         get_job,
         cancel_job,
         post_coverage,
@@ -238,17 +293,23 @@ pub(crate) fn get_ready() {}
         QuoteJobRequest,
         QuoteOutcome,
         QuoteProvenance,
+        RawHistoryProgress,
+        RawSnapshotRequest,
+        RawSnapshotResult,
         ReadyResponse,
         ServiceLimits,
         StatusResponse,
         StorageVerificationSummary,
+        StoredMessage,
+        StoredMessagesRequest,
+        StoredMessagesResult,
         StreamPosition,
         UnavailableReason,
         UnsignedAmount
     )),
     modifiers(&BearerSecurity, &StrictTaggedUnions),
     tags(
-        (name = "jobs", description = "Historical quote and consistency jobs"),
+        (name = "jobs", description = "Historical quote, consistency and raw history jobs"),
         (name = "coverage", description = "State reconstruction coverage"),
         (name = "service", description = "Readiness and protected status")
     )

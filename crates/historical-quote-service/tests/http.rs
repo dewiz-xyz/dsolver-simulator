@@ -15,11 +15,13 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use historical_quote::api::{
     Backend, CoverageRequest, CoverageResponse, DependencyHealth, DependencyState,
-    HistoricalQuoteResult, JobResult, StatusResponse,
+    HistoricalQuoteResult, JobEnvelope, JobFailureCode, JobResult, JobState, JobType, RawJson,
+    StatusResponse, StreamPosition,
 };
-use historical_quote::EngineProgress;
+use historical_quote::{EngineProgress, HistoricalError, HistorySource};
 use historical_quote_service::app::{
-    router, AppState, CoverageResolver, ServiceDependencyError, StatusDependencies, StatusProbe,
+    router, AppState, CoverageResolver, EngineJobExecutor, ServiceDependencyError,
+    StatusDependencies, StatusProbe,
 };
 use historical_quote_service::auth::{
     BearerKeySetError, BearerKeySetHandle, BearerKeySetReloader, KeySetSource, KeySetVersion,
@@ -28,7 +30,8 @@ use historical_quote_service::config::{
     ObjectStoreConfig, ReplicaDatabaseConfig, ServiceConfig, DEFAULT_DECODED_BYTE_BUDGET,
     DEFAULT_JOB_DECODED_BYTE_RESERVATION, DEFAULT_MAX_AMOUNTS_PER_QUOTE, DEFAULT_MAX_BLOCK_SPAN,
     DEFAULT_MAX_COMBINATION_COUNT, DEFAULT_MAX_CONSISTENCY_PAIRS, DEFAULT_MAX_QUOTE_SELECTORS,
-    DEFAULT_MAX_STRUCTURED_DIFFERENCES, DEFAULT_MAX_TIMEOUT_MS, DEFAULT_TIMEOUT_MS,
+    DEFAULT_MAX_STRUCTURED_DIFFERENCES, DEFAULT_MAX_TERMINAL_BYTES, DEFAULT_MAX_TIMEOUT_MS,
+    DEFAULT_TIMEOUT_MS,
 };
 use historical_quote_service::jobs::{
     ExecutionContext, JobExecutionError, JobExecutor, JobLimits, JobRegistry, JobRequest, JobRunner,
@@ -49,6 +52,12 @@ const INITIAL_KEY_VERSION: &str = "00000000-0000-4000-8000-000000000001";
 const AUTH_VERSION_HEADER: &str = "x-dsolver-history-auth-version";
 const AUTH_AGE_HEADER: &str = "x-dsolver-history-auth-refresh-age-seconds";
 const AUTH_STATE_HEADER: &str = "x-dsolver-history-auth-refresh-state";
+const RAW_PARTITION: &str = r#"{"backend":"native","blockNumber":7}"#;
+/// The one stored message of every range that holds its position, kept with
+/// its original spacing.
+const STORED_ENVELOPE: &str =
+    r#"{"stream_id":"s",  "message_seq":43,"kind":"update","partitions":[]}"#;
+const STORED_POSITION: u64 = 43;
 
 #[tokio::test]
 async fn only_ready_is_open_and_bodyless_routes_require_exact_revision() {
@@ -571,6 +580,174 @@ async fn consistency_submission_uses_the_shared_job_lifecycle() {
     registry.begin_shutdown().await;
 }
 
+/// Both raw history jobs run the shared job lifecycle through the engine, a
+/// typed client reads their results with the stored bytes unchanged, and a
+/// range larger than one job may read fails for good.
+#[tokio::test]
+async fn raw_history_jobs_deliver_stored_bytes_through_the_job_lifecycle() {
+    let executor = EngineJobExecutor::new(Arc::new(RawHistory), &test_config())
+        .expect("an engine over the fixture history");
+    let (app, registry) = test_app(Arc::new(executor)).await;
+    let wire = |message_seq: u64| serde_json::json!({"generation": 9, "messageSeq": message_seq});
+    let at = |message_seq: u64| StreamPosition {
+        generation: 9,
+        message_seq,
+    };
+    let request = |fields: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "requestId": Uuid::new_v4(),
+            "apiRevision": 1,
+            "timeoutMs": 60_000,
+            "chainId": 8453,
+            "backends": ["native"],
+        });
+        for (key, value) in fields.as_object().expect("an object") {
+            body[key] = value.clone();
+        }
+        body
+    };
+
+    let snapshot = ended_job(
+        &app,
+        &registry,
+        "/jobs/raw-snapshot",
+        request(serde_json::json!({"position": wire(41)})),
+    )
+    .await;
+    assert_eq!(
+        (snapshot.job_type, snapshot.state),
+        (JobType::RawSnapshot, JobState::Completed)
+    );
+    let Some(JobResult::RawSnapshot(result)) = snapshot.result else {
+        panic!("a raw snapshot result");
+    };
+    assert_eq!(
+        (result.position, result.checkpoint_position),
+        (at(41), at(41))
+    );
+    assert_eq!(
+        result
+            .partitions
+            .iter()
+            .map(RawJson::get)
+            .collect::<Vec<_>>(),
+        vec![RAW_PARTITION]
+    );
+
+    let messages = ended_job(
+        &app,
+        &registry,
+        "/jobs/stored-messages",
+        request(serde_json::json!({"after": wire(41), "through": wire(44)})),
+    )
+    .await;
+    assert_eq!(
+        (messages.job_type, messages.state),
+        (JobType::StoredMessages, JobState::Completed)
+    );
+    let Some(JobResult::StoredMessages(result)) = messages.result else {
+        panic!("a stored messages result");
+    };
+    assert_eq!((result.after, result.through), (at(41), at(44)));
+    let [message] = result.messages.as_slice() else {
+        panic!("one stored message");
+    };
+    assert_eq!(message.position, at(STORED_POSITION));
+    assert_eq!(message.envelope.get(), STORED_ENVELOPE);
+
+    let too_many = ended_job(
+        &app,
+        &registry,
+        "/jobs/stored-messages",
+        request(serde_json::json!({
+            "after": wire(41),
+            "through": wire(41 + RAW_HISTORY_MAX_MESSAGES + 1),
+        })),
+    )
+    .await;
+    assert_eq!(too_many.state, JobState::Failed);
+    assert!(too_many.result.is_none());
+    let failure = too_many.failure.expect("a failure");
+    assert_eq!(failure.code, JobFailureCode::ReadLimitExceeded);
+    assert!(!failure.retryable);
+    registry.begin_shutdown().await;
+}
+
+/// Submits `body` at `path` and returns the ended job, read as a typed client
+/// reads it.
+async fn ended_job(
+    app: &axum::Router,
+    registry: &JobRegistry,
+    path: &str,
+    body: serde_json::Value,
+) -> JobEnvelope {
+    let submitted = send(
+        app,
+        request("POST", path, Some(&body), Some(EDSON_TOKEN), false),
+    )
+    .await;
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED, "{path}");
+    let location = submitted.headers()["location"]
+        .to_str()
+        .expect("location must be text")
+        .to_owned();
+    wait_terminal(registry, &location).await;
+    let terminal = send(
+        app,
+        request("GET", &location, None, Some(EDSON_TOKEN), true),
+    )
+    .await;
+    assert_eq!(terminal.status(), StatusCode::OK, "{path}");
+    let body = to_bytes(terminal.into_body(), usize::MAX)
+        .await
+        .expect("response body must be readable");
+    serde_json::from_slice(&body).expect("a job envelope")
+}
+
+/// A raw history request for RFQ, or a message range that does not move
+/// forward, is refused at admission.
+#[tokio::test]
+async fn raw_history_requests_out_of_their_domain_are_refused() {
+    let (app, registry) = test_app(Arc::new(ImmediateExecutor)).await;
+    let position =
+        |message_seq: u64| serde_json::json!({"generation": 9, "messageSeq": message_seq});
+    let body = |path: &str, backends: serde_json::Value, through: u64| {
+        let mut body = serde_json::json!({
+            "requestId": Uuid::new_v4(),
+            "apiRevision": 1,
+            "timeoutMs": 60_000,
+            "chainId": 8453,
+            "backends": backends,
+        });
+        if path == "/jobs/raw-snapshot" {
+            body["position"] = position(41);
+        } else {
+            body["after"] = position(41);
+            body["through"] = position(through);
+        }
+        body
+    };
+
+    for (path, backends, through) in [
+        ("/jobs/raw-snapshot", serde_json::json!(["rfq"]), 0),
+        ("/jobs/stored-messages", serde_json::json!(["native"]), 41),
+        (
+            "/jobs/stored-messages",
+            serde_json::json!(["native", "rfq"]),
+            44,
+        ),
+    ] {
+        let body = body(path, backends, through);
+        let response = send(
+            &app,
+            request("POST", path, Some(&body), Some(EDSON_TOKEN), false),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {body}");
+    }
+    registry.begin_shutdown().await;
+}
+
 #[tokio::test]
 async fn full_queue_stays_ready_and_drain_turns_readiness_off() {
     let executor = Arc::new(ControlledExecutor::default());
@@ -742,6 +919,7 @@ fn test_job_limits() -> JobLimits {
         max_waiting: 16,
         decoded_byte_budget: DEFAULT_DECODED_BYTE_BUDGET,
         max_terminal_jobs: 20,
+        max_terminal_bytes: DEFAULT_MAX_TERMINAL_BYTES,
         terminal_ttl: Duration::from_secs(3_600),
     }
 }
@@ -822,8 +1000,141 @@ impl JobExecutor for ImmediateExecutor {
                     .expect("quote result fixture must be valid");
                     Ok(JobResult::HistoricalQuote(result))
                 }
-                JobRequest::HistoricalStateConsistencyCheck(_) => Err(JobExecutionError::Cancelled),
+                JobRequest::HistoricalStateConsistencyCheck(_)
+                | JobRequest::RawSnapshot(_)
+                | JobRequest::StoredMessages(_) => Err(JobExecutionError::Cancelled),
             }
+        })
+    }
+}
+
+/// How many messages the fixture history reads in one job.
+const RAW_HISTORY_MAX_MESSAGES: u64 = 10;
+
+/// A history that holds a raw snapshot at every position and one stored
+/// message at [`STORED_POSITION`], and refuses a range longer than
+/// [`RAW_HISTORY_MAX_MESSAGES`] as the reader refuses one over its limits.
+struct RawHistory;
+
+impl RawHistory {
+    fn not_held() -> HistoricalError {
+        HistoricalError::HistoryUnavailable("the fixture holds raw history only".to_owned())
+    }
+}
+
+impl HistorySource for RawHistory {
+    async fn plan_targets(
+        &self,
+        _: state_history::TargetPlanQuery,
+    ) -> Result<state_history::TargetPlan, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn coverage(
+        &self,
+        _: state_history::CoverageQuery,
+    ) -> Result<state_history::CoverageSnapshot, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn fetch_checkpoint(
+        &self,
+        _: state_history::CheckpointManifest,
+        _: state_history::ReadLimits,
+    ) -> Result<state_history::CheckpointArchive, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn fetch_checkpoint_token_snapshot(
+        &self,
+        _: state_history::CheckpointManifest,
+        _: state_history::ReadLimits,
+    ) -> Result<Option<state_history::RawTokenSnapshot>, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn select_token_anchor(
+        &self,
+        _: state_history::CheckpointManifest,
+    ) -> Result<state_history::TokenAnchor, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn resolve_checkpoint_pairs(
+        &self,
+        _: state_history::CheckpointPairQuery,
+    ) -> Result<Vec<state_history::CheckpointPair>, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn plan_checkpoint_pair(
+        &self,
+        _: state_history::CheckpointPair,
+        _: Vec<state_history::Backend>,
+        _: state_history::ReadLimits,
+    ) -> Result<state_history::CheckpointPairReplayPlan, HistoricalError> {
+        Err(Self::not_held())
+    }
+
+    async fn raw_snapshot(
+        &self,
+        query: state_history::RawSnapshotQuery,
+        _: state_history::ReadLimits,
+    ) -> Result<state_history::RawSnapshot, HistoricalError> {
+        Ok(state_history::RawSnapshot {
+            position: query.position,
+            checkpoint: state_history::CheckpointManifest {
+                id: 1,
+                chain_id: 8453,
+                position: query.position,
+                state_version: Some(1),
+                kind: state_history::CheckpointKind::Interval,
+                block_number: 7,
+                rfq_observed_at_ms: None,
+                backends: query.backends,
+                s3_key: None,
+                archive_sha256: None,
+                archive_bytes: None,
+                compressed_bytes: None,
+                token_reference: None,
+                status: state_history::CheckpointStatus::Complete,
+                error: None,
+            },
+            partitions: vec![serde_json::from_str(RAW_PARTITION).expect("a raw partition")],
+        })
+    }
+
+    async fn position_range(
+        &self,
+        query: state_history::PositionRangeQuery,
+        _: state_history::ReadLimits,
+    ) -> Result<state_history::PositionRange, HistoricalError> {
+        if query.through.message_seq - query.after.message_seq > RAW_HISTORY_MAX_MESSAGES {
+            return Err(HistoricalError::ReadLimitExceeded {
+                operation: "stored message read",
+            });
+        }
+        let stored = state_history::StreamPosition {
+            generation: query.through.generation,
+            message_seq: STORED_POSITION,
+        };
+        let deltas = (query.after < stored && stored <= query.through)
+            .then(|| state_history::StoredDelta {
+                position: stored,
+                observed_at_ms: 0,
+                payload_format_version: 1,
+                raw_payload: serde_json::value::RawValue::from_string(STORED_ENVELOPE.to_owned())
+                    .expect("a stored envelope"),
+                applicable_backends: Vec::new(),
+            })
+            .into_iter()
+            .collect();
+        Ok(state_history::PositionRange {
+            deltas,
+            gaps: Vec::new(),
+            boundaries: Vec::new(),
+            last_stored: Some(query.through),
+            estimated_decoded_bytes: 0,
         })
     }
 }
@@ -909,11 +1220,14 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("response body must be JSON")
 }
 
+/// Waits until the job at `location` has ended, its result written on the
+/// blocking pool included, and fails the test when it has not within ten
+/// seconds.
 async fn wait_terminal(registry: &JobRegistry, location: &str) {
     let job_id = Uuid::parse_str(location.trim_start_matches("/jobs/"))
         .expect("location must contain a UUID");
-    for _ in 0..20 {
-        if registry.inspect(job_id).await.is_some_and(|job| {
+    let ended = async {
+        while !registry.inspect(job_id).await.is_some_and(|job| {
             matches!(
                 job.state,
                 historical_quote::api::JobState::Completed
@@ -921,9 +1235,10 @@ async fn wait_terminal(registry: &JobRegistry, location: &str) {
                     | historical_quote::api::JobState::Failed
             )
         }) {
-            return;
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
-    panic!("job did not become terminal");
+    };
+    tokio::time::timeout(Duration::from_secs(10), ended)
+        .await
+        .expect("job did not become terminal");
 }

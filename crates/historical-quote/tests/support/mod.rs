@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use historical_quote::api::{
     Backend as PublicBackend, BlockRange, ConsistencyCheckRequest, ConsistencySelection,
@@ -22,9 +23,10 @@ use state_history::{
     ArchiveMetadata, Backend, BlockInterval, BlockTimeObservation, CheckpointArchive,
     CheckpointKind, CheckpointManifest, CheckpointPair, CheckpointPairQuery,
     CheckpointPairReplayPlan, CheckpointStatus, CoverageQuery, CoverageSnapshot,
-    DeltaBackendCursor, RangeGap, RangeGapKind, RangeLeg, RawTokenSnapshot, ReadLimits,
-    StoredDelta, StreamPosition, TargetPlan, TargetPlanQuery, TokenAnchor, TokenSnapshotRef,
-    ARCHIVE_SCHEMA_VERSION, DELTA_PAYLOAD_FORMAT_VERSION, TOKEN_SNAPSHOT_SCHEMA_VERSION,
+    DeltaBackendCursor, PositionRange, PositionRangeQuery, RangeGap, RangeGapKind, RangeLeg,
+    RawSnapshot, RawSnapshotQuery, RawTokenSnapshot, ReadLimits, StoredDelta, StreamPosition,
+    TargetPlan, TargetPlanQuery, TokenAnchor, TokenSnapshotRef, ARCHIVE_SCHEMA_VERSION,
+    DELTA_PAYLOAD_FORMAT_VERSION, TOKEN_SNAPSHOT_SCHEMA_VERSION,
 };
 use tycho_simulation::{
     tycho_client::feed::{
@@ -65,8 +67,14 @@ pub struct FixtureSource {
     pub token_snapshots: BTreeMap<i64, RawTokenSnapshot>,
     pub pairs: Vec<CheckpointPair>,
     pub pair_plan: Option<CheckpointPairReplayPlan>,
+    pub raw_snapshot: Option<RawSnapshot>,
+    pub position_range: Option<PositionRange>,
     pub checkpoint_fetches: AtomicUsize,
     pub token_fetches: AtomicUsize,
+    /// Every raw snapshot read, with the limits it was given.
+    pub raw_snapshot_reads: Mutex<Vec<(RawSnapshotQuery, ReadLimits)>>,
+    /// Every position range read, with the limits it was given.
+    pub position_range_reads: Mutex<Vec<(PositionRangeQuery, ReadLimits)>>,
 }
 
 impl FixtureSource {
@@ -100,8 +108,12 @@ impl FixtureSource {
             token_snapshots,
             pairs: Vec::new(),
             pair_plan: None,
+            raw_snapshot: None,
+            position_range: None,
             checkpoint_fetches: AtomicUsize::new(0),
             token_fetches: AtomicUsize::new(0),
+            raw_snapshot_reads: Mutex::new(Vec::new()),
+            position_range_reads: Mutex::new(Vec::new()),
         })
     }
 
@@ -190,8 +202,12 @@ impl FixtureSource {
             token_snapshots: BTreeMap::new(),
             pairs: Vec::new(),
             pair_plan: None,
+            raw_snapshot: None,
+            position_range: None,
             checkpoint_fetches: AtomicUsize::new(0),
             token_fetches: AtomicUsize::new(0),
+            raw_snapshot_reads: Mutex::new(Vec::new()),
+            position_range_reads: Mutex::new(Vec::new()),
         })
     }
 
@@ -291,6 +307,38 @@ impl HistorySource for FixtureSource {
             HistoricalError::HistoricalDataInvalid(
                 "fixture checkpoint pair plan is missing".to_owned(),
             )
+        }))
+    }
+
+    #[expect(clippy::expect_used, reason = "a poisoned read log fails the test")]
+    fn raw_snapshot(
+        &self,
+        query: RawSnapshotQuery,
+        limits: ReadLimits,
+    ) -> impl Future<Output = Result<RawSnapshot, HistoricalError>> + Send {
+        self.raw_snapshot_reads
+            .lock()
+            .expect("the raw snapshot read log")
+            .push((query, limits));
+        std::future::ready(
+            self.raw_snapshot
+                .clone()
+                .ok_or(HistoricalError::NotYetStored),
+        )
+    }
+
+    #[expect(clippy::expect_used, reason = "a poisoned read log fails the test")]
+    fn position_range(
+        &self,
+        query: PositionRangeQuery,
+        limits: ReadLimits,
+    ) -> impl Future<Output = Result<PositionRange, HistoricalError>> + Send {
+        self.position_range_reads
+            .lock()
+            .expect("the position range read log")
+            .push((query, limits));
+        std::future::ready(self.position_range.clone().ok_or_else(|| {
+            HistoricalError::HistoricalDataInvalid("fixture position range is missing".to_owned())
         }))
     }
 }

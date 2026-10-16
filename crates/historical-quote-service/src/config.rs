@@ -13,6 +13,7 @@ const DEFAULT_MAX_RUNNING_JOBS: usize = 4;
 const DEFAULT_MAX_WAITING_JOBS: usize = 16;
 const DEFAULT_MAX_TERMINAL_JOBS: usize = 20;
 const DEFAULT_TERMINAL_TTL_SECONDS: u64 = 3_600;
+pub const DEFAULT_MAX_TERMINAL_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_COMBINATION_COUNT: u64 = 20_000;
 pub const DEFAULT_MAX_BLOCK_SPAN: u64 = 1_800;
 pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
@@ -162,6 +163,7 @@ impl ServiceConfig {
             && self.scheduler.max_waiting > 0
             && self.scheduler.decoded_byte_budget > 0
             && self.scheduler.max_terminal_jobs > 0
+            && self.scheduler.max_terminal_bytes > 0
             && !self.scheduler.terminal_ttl.is_zero()
             && self.max_combination_count > 0
             && self.max_block_span > 0
@@ -234,6 +236,10 @@ fn workload_config() -> Result<WorkloadConfig, ConfigError> {
             max_terminal_jobs: parse_optional(
                 "DSOLVER_HISTORY_MAX_TERMINAL_JOBS",
                 DEFAULT_MAX_TERMINAL_JOBS,
+            )?,
+            max_terminal_bytes: parse_optional(
+                "DSOLVER_HISTORY_MAX_TERMINAL_BYTES",
+                DEFAULT_MAX_TERMINAL_BYTES,
             )?,
             terminal_ttl: Duration::from_secs(parse_optional(
                 "DSOLVER_HISTORY_TERMINAL_TTL_SECONDS",

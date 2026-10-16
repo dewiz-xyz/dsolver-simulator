@@ -14,6 +14,8 @@ mod history;
 #[cfg(feature = "engine")]
 mod quote_job;
 #[cfg(feature = "engine")]
+mod raw_history;
+#[cfg(feature = "engine")]
 mod replay;
 
 #[cfg(feature = "engine")]
@@ -26,6 +28,8 @@ pub use error::HistoricalError;
 pub use history::{EngineProgress, HistorySource};
 #[cfg(feature = "engine")]
 pub use quote_job::HistoricalQuoteExecutor;
+#[cfg(feature = "engine")]
+pub use raw_history::RawHistoryReader;
 #[cfg(feature = "engine")]
 pub use replay::{
     HistoricalReconstructor, ReconstructedState, ReconstructedTimeline, ReconstructionRequest,

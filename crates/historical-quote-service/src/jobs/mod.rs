@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use historical_quote::api::{
-    normalize_consistency_request, normalize_quote_request, ConsistencyCheckProgress,
-    ConsistencyCheckRequest, ConsistencySelection, HistoricalQuoteProgress, JobFailure, JobResult,
-    JobType, QuoteJobRequest,
+    normalize_consistency_request, normalize_quote_request, normalize_raw_snapshot_request,
+    normalize_stored_messages_request, ConsistencyCheckProgress, ConsistencyCheckRequest,
+    ConsistencySelection, HistoricalQuoteProgress, JobFailure, JobResult, JobType, QuoteJobRequest,
+    RawHistoryProgress, RawSnapshotRequest, StoredMessagesRequest,
 };
 use historical_quote::EngineProgress;
 use uuid::Uuid;
@@ -22,12 +23,19 @@ pub use registry::{
 pub use result_body::terminal_response_body;
 pub use worker::JobRunner;
 
+/// The public message of a job that needs more data than the service reads or
+/// keeps for one job.
+pub const READ_LIMIT_EXCEEDED: &str =
+    "the job needs more data than the service reads or keeps for one job";
+
 #[derive(Debug, Clone)]
 pub struct JobLimits {
     pub max_running: usize,
     pub max_waiting: usize,
     pub decoded_byte_budget: u64,
     pub max_terminal_jobs: usize,
+    /// The most bytes of terminal response bodies kept for delivery.
+    pub max_terminal_bytes: u64,
     pub terminal_ttl: Duration,
 }
 
@@ -38,6 +46,7 @@ impl Default for JobLimits {
             max_waiting: 16,
             decoded_byte_budget: u64::MAX,
             max_terminal_jobs: 20,
+            max_terminal_bytes: u64::MAX,
             terminal_ttl: Duration::from_secs(3_600),
         }
     }
@@ -47,6 +56,8 @@ impl Default for JobLimits {
 pub enum JobRequest {
     HistoricalQuote(QuoteJobRequest),
     HistoricalStateConsistencyCheck(ConsistencyCheckRequest),
+    RawSnapshot(RawSnapshotRequest),
+    StoredMessages(StoredMessagesRequest),
 }
 
 impl JobRequest {
@@ -55,6 +66,8 @@ impl JobRequest {
         match self {
             Self::HistoricalQuote(request) => request.request_id,
             Self::HistoricalStateConsistencyCheck(request) => request.request_id,
+            Self::RawSnapshot(request) => request.request_id,
+            Self::StoredMessages(request) => request.request_id,
         }
     }
 
@@ -63,6 +76,8 @@ impl JobRequest {
         match self {
             Self::HistoricalQuote(_) => JobType::HistoricalQuote,
             Self::HistoricalStateConsistencyCheck(_) => JobType::HistoricalStateConsistencyCheck,
+            Self::RawSnapshot(_) => JobType::RawSnapshot,
+            Self::StoredMessages(_) => JobType::StoredMessages,
         }
     }
 
@@ -71,6 +86,8 @@ impl JobRequest {
         match self {
             Self::HistoricalQuote(request) => request.timeout_ms,
             Self::HistoricalStateConsistencyCheck(request) => request.timeout_ms,
+            Self::RawSnapshot(request) => request.timeout_ms,
+            Self::StoredMessages(request) => request.timeout_ms,
         }
     }
 
@@ -79,6 +96,10 @@ impl JobRequest {
             Self::HistoricalQuote(request) => normalize_quote_request(request).fingerprint(),
             Self::HistoricalStateConsistencyCheck(request) => {
                 normalize_consistency_request(request).fingerprint()
+            }
+            Self::RawSnapshot(request) => normalize_raw_snapshot_request(request).fingerprint(),
+            Self::StoredMessages(request) => {
+                normalize_stored_messages_request(request).fingerprint()
             }
         }
     }
@@ -99,6 +120,9 @@ impl JobRequest {
                     ConsistencySelection::BlockRange { .. } => 0,
                 };
                 Arc::new(ProgressCounters::consistency(total))
+            }
+            Self::RawSnapshot(_) | Self::StoredMessages(_) => {
+                Arc::new(ProgressCounters::raw_history())
             }
         }
     }
@@ -169,6 +193,7 @@ impl EngineProgress for ProgressReporter {
 enum ProgressKind {
     Quote,
     Consistency,
+    RawHistory,
 }
 
 pub(crate) struct ProgressCounters {
@@ -184,6 +209,10 @@ impl ProgressCounters {
 
     fn consistency(total: usize) -> Self {
         Self::new(ProgressKind::Consistency, total)
+    }
+
+    fn raw_history() -> Self {
+        Self::new(ProgressKind::RawHistory, 1)
     }
 
     fn new(kind: ProgressKind, total: usize) -> Self {
@@ -222,6 +251,11 @@ impl ProgressCounters {
                         percent_complete: percent,
                     },
                 )
+            }
+            ProgressKind::RawHistory => {
+                historical_quote::api::JobProgress::RawHistory(RawHistoryProgress {
+                    percent_complete: percent,
+                })
             }
         }
     }

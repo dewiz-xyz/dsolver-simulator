@@ -48,6 +48,7 @@ fn limits() -> JobLimits {
         max_waiting: 16,
         decoded_byte_budget: GLOBAL_BUDGET_BYTES,
         max_terminal_jobs: 20,
+        max_terminal_bytes: u64::MAX,
         terminal_ttl: Duration::from_secs(3_600),
     }
 }

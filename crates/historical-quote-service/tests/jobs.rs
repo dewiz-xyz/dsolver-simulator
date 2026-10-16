@@ -4,14 +4,18 @@
     reason = "integration tests should fail immediately when a fixture or assertion is invalid"
 )]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use historical_quote::api::{JobProgress, JobState, JobType};
+use historical_quote::api::{JobProgress, JobResult, JobState, JobType};
 use historical_quote::EngineProgress;
 use historical_quote_service::jobs::{
-    JobLimits, JobRegistry, JobRequest, JobRunner, PollOutcome, ScheduledJob, SubmitOutcome,
+    CancelOutcome, ExecutionContext, JobExecutionError, JobExecutor, JobLimits, JobRegistry,
+    JobRequest, JobRunner, PollOutcome, ScheduledJob, SubmitOutcome,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod support;
@@ -39,6 +43,7 @@ async fn byte_budget_preserves_fifo_head_blocking_and_one_based_positions() {
         max_waiting: 16,
         decoded_byte_budget: 100,
         max_terminal_jobs: 20,
+        max_terminal_bytes: u64::MAX,
         terminal_ttl: Duration::from_secs(3_600),
     });
     let runner = JobRunner::new(registry.clone(), executor.clone());
@@ -235,7 +240,7 @@ async fn terminal_delivery_is_leased_and_retryable_until_committed() {
         .await
         .accepted_job_id();
     executor.next_started().await.complete_quote();
-    tokio::task::yield_now().await;
+    settle().await;
 
     let PollOutcome::Terminal(first_delivery) = registry.poll(job_id).await else {
         panic!("first terminal poll must acquire delivery");
@@ -485,7 +490,7 @@ async fn terminal_retention_evicts_on_replacement_and_expires_unfetched_results(
             .await
             .accepted_job_id();
         executor.next_started().await.complete_quote();
-        tokio::task::yield_now().await;
+        settle().await;
         completed.push(job_id);
         if completed.len() == 2 {
             assert!(registry.inspect(completed[0]).await.is_some());
@@ -500,4 +505,311 @@ async fn terminal_retention_evicts_on_replacement_and_expires_unfetched_results(
     assert!(registry.inspect(completed[2]).await.is_none());
     registry.begin_shutdown().await;
     run_task.await.expect("runner task must stop");
+}
+
+/// A cancelled job, or one past its deadline, ends at once, but its slot and
+/// its reservation stay taken until its work stops, so the next job waits.
+#[tokio::test(start_paused = true)]
+async fn an_ended_job_keeps_its_slot_until_its_work_stops() {
+    let executor = ControlledExecutor::default();
+    let registry = JobRegistry::new(JobLimits {
+        max_running: 1,
+        ..JobLimits::default()
+    });
+    let runner = JobRunner::new(
+        registry.clone(),
+        Arc::new(IgnoringCancellation(executor.clone())),
+    );
+    let run_task = tokio::spawn(runner.run());
+    let submit = |timeout_ms, reserved| {
+        let registry = registry.clone();
+        async move {
+            registry
+                .submit(ScheduledJob::new(
+                    JobRequest::HistoricalQuote(quote_request(Uuid::new_v4(), timeout_ms)),
+                    reserved,
+                ))
+                .await
+                .accepted_job_id()
+        }
+    };
+    let cancelled = submit(60_000, 5).await;
+    let cancelled_work = executor.next_started().await;
+    let timed_out = submit(10_000, 7).await;
+
+    let _ = registry.cancel(cancelled).await;
+    tokio::task::yield_now().await;
+    let ended = registry.inspect(cancelled).await.expect("cancelled job");
+    assert_eq!(ended.state, JobState::Cancelled);
+    assert!(executor.try_next_started().is_none());
+    assert_eq!(registry.snapshot().await.reserved_decoded_bytes, 5);
+
+    cancelled_work.complete_quote();
+    let timed_out_work = executor.next_started().await;
+    assert_eq!(timed_out_work.job_id, timed_out);
+    assert_eq!(registry.snapshot().await.reserved_decoded_bytes, 7);
+    let next = submit(60_000, 3).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    let ended = registry.inspect(timed_out).await.expect("timed out job");
+    assert_eq!(ended.state, JobState::Failed);
+    assert!(executor.try_next_started().is_none());
+    assert_eq!(registry.snapshot().await.reserved_decoded_bytes, 7);
+
+    timed_out_work.complete_quote();
+    let next_work = executor.next_started().await;
+    assert_eq!(next_work.job_id, next);
+    registry.begin_shutdown().await;
+    next_work.complete_quote();
+    run_task.await.expect("runner task must stop");
+}
+
+/// Kept results are bounded by their bytes as well as their count, the oldest
+/// dropped first, and a result larger than the service keeps fails its job.
+#[tokio::test(start_paused = true)]
+async fn kept_results_are_bounded_by_their_bytes() {
+    let one = one_body_bytes().await;
+    let limit = one * 2 + one / 2;
+    let (registry, executor, run_task) = started(kept_bytes_limits(1, limit));
+    let mut kept = Vec::new();
+    for _ in 0..3 {
+        kept.push(completed_quote(&registry, &executor).await);
+    }
+    assert!(registry.inspect(kept[0]).await.is_none());
+    assert!(registry.inspect(kept[1]).await.is_some());
+    assert!(registry.inspect(kept[2]).await.is_some());
+    assert_eq!(registry.snapshot().await.counts.retained_terminal, 2);
+    registry.begin_shutdown().await;
+    run_task.await.expect("runner task must stop");
+
+    let (registry, executor, run_task) = started(kept_bytes_limits(1, one - 1));
+    let job_id = completed_quote(&registry, &executor).await;
+    assert_eq!(failure_code(&registry, job_id).await, "read_limit_exceeded");
+    registry.begin_shutdown().await;
+    run_task.await.expect("runner task must stop");
+}
+
+/// A result being delivered is neither dropped for room nor expired, so a
+/// failed delivery can be read again.
+#[tokio::test(start_paused = true)]
+async fn a_result_being_delivered_is_neither_dropped_nor_expired() {
+    let one = one_body_bytes().await;
+    let limit = one * 2 + one / 2;
+    let (registry, executor, run_task) = started(kept_bytes_limits(1, limit));
+    let delivered = completed_quote(&registry, &executor).await;
+    let PollOutcome::Terminal(delivery) = registry.poll(delivered).await else {
+        panic!("the job must have ended");
+    };
+    let older = completed_quote(&registry, &executor).await;
+    let newer = completed_quote(&registry, &executor).await;
+
+    assert!(registry.inspect(delivered).await.is_some());
+    assert!(registry.inspect(older).await.is_none());
+    assert!(registry.inspect(newer).await.is_some());
+    let body = delivery.bytes();
+    delivery.release().await;
+    let PollOutcome::Terminal(retry) = registry.poll(delivered).await else {
+        panic!("a released delivery must be readable again");
+    };
+    assert_eq!(retry.bytes(), body);
+
+    tokio::time::advance(Duration::from_secs(3_600)).await;
+    assert!(registry.inspect(delivered).await.is_some());
+    assert!(registry.inspect(newer).await.is_none());
+    retry.commit().await;
+    assert!(registry.inspect(delivered).await.is_none());
+    registry.begin_shutdown().await;
+    run_task.await.expect("runner task must stop");
+}
+
+/// A result with no room beside a result being delivered, by bytes or by
+/// count, waits, its job running and its slot taken, until the delivery ends,
+/// and fails at its deadline or ends on cancellation if none does.
+#[tokio::test(start_paused = true)]
+async fn a_result_waits_for_the_room_a_delivery_holds() {
+    let one = one_body_bytes().await;
+    let by_count = JobLimits {
+        max_running: 2,
+        max_terminal_jobs: 1,
+        ..JobLimits::default()
+    };
+    for limits in [kept_bytes_limits(2, one + one / 2), by_count] {
+        let (registry, executor, run_task) = started(limits);
+        let delivered = completed_quote(&registry, &executor).await;
+        let PollOutcome::Terminal(delivery) = registry.poll(delivered).await else {
+            panic!("the job must have ended");
+        };
+
+        let waiting = completed_quote(&registry, &executor).await;
+        let job = registry.inspect(waiting).await.expect("waiting job");
+        assert_eq!(job.state, JobState::Running);
+        let snapshot = registry.snapshot().await;
+        assert_eq!(snapshot.counts.running, 1);
+        assert_eq!(snapshot.counts.retained_terminal, 1);
+        delivery.commit().await;
+        settle().await;
+        let job = registry.inspect(waiting).await.expect("published job");
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(registry.snapshot().await.counts.running, 0);
+
+        let PollOutcome::Terminal(delivery) = registry.poll(waiting).await else {
+            panic!("the job must have ended");
+        };
+        let late = registry
+            .submit(ScheduledJob::new(
+                JobRequest::HistoricalQuote(quote_request(Uuid::new_v4(), 5_000)),
+                1,
+            ))
+            .await
+            .accepted_job_id();
+        executor.next_started().await.complete_quote();
+        settle().await;
+        assert_eq!(
+            registry.inspect(late).await.expect("late job").state,
+            JobState::Running
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle().await;
+        assert_eq!(failure_code(&registry, late).await, "deadline_exceeded");
+
+        let cancelled = completed_quote(&registry, &executor).await;
+        assert_eq!(
+            registry
+                .inspect(cancelled)
+                .await
+                .expect("waiting job")
+                .state,
+            JobState::Running
+        );
+        let _ = registry.cancel(cancelled).await;
+        settle().await;
+        assert_eq!(
+            registry
+                .inspect(cancelled)
+                .await
+                .expect("cancelled job")
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(registry.snapshot().await.counts.running, 0);
+        delivery.commit().await;
+        registry.begin_shutdown().await;
+        run_task.await.expect("runner task must stop");
+    }
+}
+
+/// Limits that run `max_running` jobs and keep `max_terminal_bytes` of their
+/// bodies.
+fn kept_bytes_limits(max_running: usize, max_terminal_bytes: u64) -> JobLimits {
+    JobLimits {
+        max_running,
+        max_terminal_bytes,
+        ..JobLimits::default()
+    }
+}
+
+/// Cancelling a job that already failed changes nothing: the answer shows the
+/// job as it is, without its terminal failure, and the failure still waits
+/// for its one delivery.
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_failed_job_leaves_its_failure_to_deliver() {
+    let (registry, executor, run_task) = started(kept_bytes_limits(1, u64::MAX));
+    let job_id = registry
+        .submit(ScheduledJob::new(
+            JobRequest::HistoricalQuote(quote_request(Uuid::new_v4(), 1_000)),
+            1,
+        ))
+        .await
+        .accepted_job_id();
+    let _running = executor.next_started().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+
+    let CancelOutcome::Found(answer) = registry.cancel(job_id).await else {
+        panic!("the failed job must be found");
+    };
+    assert_eq!(answer.state, JobState::Failed);
+    assert!(answer.failure.is_none());
+    assert_eq!(failure_code(&registry, job_id).await, "deadline_exceeded");
+    registry.begin_shutdown().await;
+    run_task.await.expect("runner task must stop");
+}
+
+/// Runs each job as the wrapped executor does, but its work never sees the
+/// job's cancellation, so it runs on until the test ends it.
+struct IgnoringCancellation(ControlledExecutor);
+
+impl JobExecutor for IgnoringCancellation {
+    fn execute(
+        &self,
+        context: ExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<JobResult, JobExecutionError>> + Send + 'static>> {
+        self.0.execute(ExecutionContext {
+            cancellation: CancellationToken::new(),
+            ..context
+        })
+    }
+}
+
+fn started(
+    limits: JobLimits,
+) -> (
+    JobRegistry,
+    Arc<ControlledExecutor>,
+    tokio::task::JoinHandle<()>,
+) {
+    let executor = Arc::new(ControlledExecutor::default());
+    let registry = JobRegistry::new(limits);
+    let run_task = tokio::spawn(JobRunner::new(registry.clone(), executor.clone()).run());
+    (registry, executor, run_task)
+}
+
+/// Runs one quote job to its end and returns its id.
+async fn completed_quote(registry: &JobRegistry, executor: &ControlledExecutor) -> Uuid {
+    let job_id = registry
+        .submit(ScheduledJob::new(
+            JobRequest::HistoricalQuote(quote_request(Uuid::new_v4(), 60_000)),
+            1,
+        ))
+        .await
+        .accepted_job_id();
+    executor.next_started().await.complete_quote();
+    settle().await;
+    job_id
+}
+
+/// The bytes one completed quote keeps.
+async fn one_body_bytes() -> u64 {
+    let (registry, executor, run_task) = started(kept_bytes_limits(1, u64::MAX));
+    let job_id = completed_quote(&registry, &executor).await;
+    let PollOutcome::Terminal(delivery) = registry.poll(job_id).await else {
+        panic!("the job must have ended");
+    };
+    let bytes = u64::try_from(delivery.bytes().len()).expect("a body length");
+    registry.begin_shutdown().await;
+    run_task.await.expect("runner task must stop");
+    bytes
+}
+
+/// The failure code of the ended job `job_id`, read through its delivery.
+async fn failure_code(registry: &JobRegistry, job_id: Uuid) -> String {
+    let PollOutcome::Terminal(delivery) = registry.poll(job_id).await else {
+        panic!("the job must have ended");
+    };
+    let body: serde_json::Value =
+        serde_json::from_slice(&delivery.bytes()).expect("a JSON terminal body");
+    assert_eq!(body["state"], "failed");
+    assert!(body.get("result").is_none());
+    body["failure"]["code"]
+        .as_str()
+        .expect("a failure code")
+        .to_owned()
+}
+
+/// Lets the runner and its jobs act on what the test just did, the results
+/// they write on the blocking pool included. A paused clock advances only once
+/// the runtime is idle and no blocking task runs, so this short sleep ends
+/// after all of it.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }

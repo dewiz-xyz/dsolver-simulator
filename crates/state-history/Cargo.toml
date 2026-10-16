@@ -27,5 +27,9 @@ tokio-util.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 
+[dev-dependencies]
+chrono.workspace = true
+tycho-simulation.workspace = true
+
 [lints]
 workspace = true

@@ -5,7 +5,18 @@ use std::collections::{
 use thiserror::Error;
 use tycho_simulation::tycho_common::{models::contract::Account, Bytes};
 
-use super::BroadcasterProtocolMessage;
+use super::{
+    BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
+    BroadcasterSnapshotStart,
+};
+
+#[derive(Debug, Error)]
+pub enum SnapshotPayloadsError {
+    #[error(transparent)]
+    Decode(#[from] serde_json::Error),
+    #[error("{0}")]
+    Layout(&'static str),
+}
 
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -19,6 +30,62 @@ impl SnapshotReassemblyError {
             message: message.into(),
         }
     }
+}
+
+pub fn parse_snapshot_payloads(
+    payloads_json: &[String],
+) -> Result<
+    (
+        BroadcasterSnapshotStart,
+        BTreeMap<u32, BroadcasterSnapshotChunk>,
+    ),
+    SnapshotPayloadsError,
+> {
+    let mut start = None;
+    let mut chunks = BTreeMap::new();
+    let mut end = None;
+    for payload_json in payloads_json {
+        let payload: BroadcasterPayload = serde_json::from_str(payload_json)?;
+        match payload {
+            BroadcasterPayload::SnapshotStart(value) if start.is_none() => start = Some(value),
+            BroadcasterPayload::SnapshotChunk(value) => {
+                if chunks.insert(value.chunk_index, value).is_some() {
+                    return Err(SnapshotPayloadsError::Layout(
+                        "duplicate snapshot chunk index",
+                    ));
+                }
+            }
+            BroadcasterPayload::SnapshotEnd(value) if end.is_none() => end = Some(value),
+            _ => {
+                return Err(SnapshotPayloadsError::Layout(
+                    "archive must contain one snapshot start, chunks, and one snapshot end",
+                ));
+            }
+        }
+    }
+    let start = start.ok_or(SnapshotPayloadsError::Layout("missing snapshot start"))?;
+    let end = end.ok_or(SnapshotPayloadsError::Layout("missing snapshot end"))?;
+    if chunks
+        .values()
+        .any(|chunk| chunk.snapshot_id != start.snapshot_id)
+    {
+        return Err(SnapshotPayloadsError::Layout(
+            "snapshot chunk identifier differs from snapshot start",
+        ));
+    }
+    if start.snapshot_id != end.snapshot_id {
+        return Err(SnapshotPayloadsError::Layout(
+            "snapshot start and end identifiers differ",
+        ));
+    }
+    if usize::try_from(start.total_chunks).ok() != Some(chunks.len())
+        || chunks.keys().copied().ne(0..start.total_chunks)
+    {
+        return Err(SnapshotPayloadsError::Layout(
+            "snapshot chunks are incomplete or out of range",
+        ));
+    }
+    Ok((start, chunks))
 }
 
 #[derive(Default)]
@@ -275,4 +342,42 @@ fn ensure_vm_account_metadata_matches(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_snapshot_payloads, SnapshotPayloadsError};
+    use crate::broadcaster::{
+        BroadcasterBackend, BroadcasterPayload, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
+        BroadcasterSnapshotStart,
+    };
+
+    #[test]
+    fn a_chunk_of_another_snapshot_is_refused() -> anyhow::Result<()> {
+        let payloads = [
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                "snapshot-1",
+                8453,
+                vec![BroadcasterBackend::Native],
+                1,
+            )?),
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "snapshot-2",
+                0,
+                Vec::new(),
+            )?),
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
+        ]
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+
+        assert!(matches!(
+            parse_snapshot_payloads(&payloads),
+            Err(SnapshotPayloadsError::Layout(
+                "snapshot chunk identifier differs from snapshot start"
+            ))
+        ));
+        Ok(())
+    }
 }
