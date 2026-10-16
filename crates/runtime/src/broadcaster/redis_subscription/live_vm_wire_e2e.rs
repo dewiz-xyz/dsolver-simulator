@@ -13,12 +13,13 @@ use futures::StreamExt;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use serde_json::Value;
+use simulator_core::broadcaster::RawSnapshotReassembly;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
     BroadcasterSnapshotPartition, BroadcasterTokenSnapshotResponse, BroadcasterUpdatePartition,
 };
 use simulator_core::models::protocol::ProtocolKind;
-use simulator_replay::{RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
+use simulator_replay::{ReplayBackend, ReplayDecoder};
 use tokio::{sync::RwLock, time::Instant};
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
@@ -69,6 +70,7 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
         println!("skipping live VM wire e2e; set {LIVE_E2E_GATE}=1 to run it");
         return Ok(());
     }
+    crate::config::install_tls_provider();
 
     let config = LiveConfig::from_env()?;
     require_broadcaster_ready(&config.broadcaster_url).await?;

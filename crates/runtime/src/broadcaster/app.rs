@@ -24,7 +24,7 @@ use crate::broadcaster::state_history::{build_state_history_runtime, StateHistor
 use crate::chain_head::{ChainHeadConfig, ChainHeadObserver};
 use crate::chain_tip_telemetry::{Telemetry, SAMPLE_INTERVAL};
 use crate::config::{
-    init_logging, load_broadcaster_config, load_broadcaster_redis_config,
+    init_logging, install_tls_provider, load_broadcaster_config, load_broadcaster_redis_config,
     load_state_history_config, BroadcasterConfig, MemoryConfig,
 };
 use crate::memory::maybe_log_memory_snapshot;
@@ -344,6 +344,7 @@ pub struct BroadcasterServiceParts {
     reason = "shared publisher, cache, and task ownership are assembled in one startup path"
 )]
 pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
+    install_tls_provider();
     init_logging();
 
     let config = load_broadcaster_config();
@@ -641,7 +642,7 @@ async fn load_token_store(config: &BroadcasterConfig) -> Result<Arc<TokenStore>>
         true,
         chain,
         Some(config.tuning.token_min_quality),
-        None,
+        Some(config.chain_profile.token_max_days_since_last_trade),
     )
     .await?;
     info!("Loaded {} broadcaster tokens", all_tokens.len());
@@ -1185,6 +1186,7 @@ mod tests {
                 tycho_initial_bootstrap_timeout_secs: 900,
                 tycho_head_mismatch_recovery_timeout_secs: 60,
                 recovery_max_buffered_native_blocks: 8,
+                token_max_days_since_last_trade: 1,
                 native_token_protocol_allowlist: Vec::new(),
                 reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),
                 erc4626_pair_policies: Vec::new(),

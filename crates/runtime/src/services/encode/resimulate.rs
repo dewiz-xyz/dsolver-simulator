@@ -466,6 +466,9 @@ fn hydrate_rfq_pool_state(
             config.bebop_key.clone(),
             HashSet::new(),
             quote_timeout,
+            None,
+            None,
+            None,
         )
         .map_err(|err| rfq_hydration_error(pool_id, "Bebop", err))?;
         return Ok(Arc::new(hydrated));
@@ -891,6 +894,9 @@ mod tests {
             "snapshot-key".to_string(),
             HashSet::new(),
             Duration::from_secs(30),
+            None,
+            None,
+            None,
         )
         .unwrap();
         serde_json::from_value(serde_json::json!({

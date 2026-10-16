@@ -631,6 +631,9 @@ fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Resul
         "snapshot-key".to_string(),
         HashSet::new(),
         Duration::from_secs(5),
+        None,
+        None,
+        None,
     )?;
     Ok(serde_json::from_value(serde_json::json!({
         "base_token": token_in,

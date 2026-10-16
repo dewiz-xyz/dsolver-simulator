@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use simulator_replay::{RawSnapshotReassembly, ReplayBackend, ReplayDecoder};
+use simulator_core::broadcaster::RawSnapshotReassembly;
+use simulator_replay::{ReplayBackend, ReplayDecoder};
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
 use tracing::{info, warn};

@@ -17,8 +17,10 @@ use tycho_simulation::{
 use crate::models::protocol::ProtocolKind;
 
 mod redis_streams;
+mod snapshot_reassembly;
 
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
+pub use snapshot_reassembly::{RawSnapshotReassembly, SnapshotReassemblyError};
 
 // Producers and consumers must agree on the largest snapshot response they can exchange.
 pub const BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -1162,6 +1164,32 @@ impl BroadcasterProtocolSyncStatus {
             },
         }
     }
+
+    /// The Tycho synchronizer state this status was written from, the inverse of
+    /// [`Self::from_synchronizer_state`]. A status missing the block or reason its kind
+    /// requires is refused.
+    pub fn to_synchronizer_state(&self) -> Result<SynchronizerState, BroadcasterContractError> {
+        let incomplete = |missing: &'static str| BroadcasterContractError::IncompleteSyncStatus {
+            kind: self.kind,
+            missing,
+        };
+        let header = || {
+            self.block
+                .as_ref()
+                .map(BroadcasterBlockRef::to_block_header)
+                .ok_or_else(|| incomplete("block"))
+        };
+        Ok(match self.kind {
+            BroadcasterProtocolSyncStatusKind::Started => SynchronizerState::Started,
+            BroadcasterProtocolSyncStatusKind::Ready => SynchronizerState::Ready(header()?),
+            BroadcasterProtocolSyncStatusKind::Delayed => SynchronizerState::Delayed(header()?),
+            BroadcasterProtocolSyncStatusKind::Stale => SynchronizerState::Stale(header()?),
+            BroadcasterProtocolSyncStatusKind::Advanced => SynchronizerState::Advanced(header()?),
+            BroadcasterProtocolSyncStatusKind::Ended => {
+                SynchronizerState::Ended(self.reason.clone().ok_or_else(|| incomplete("reason"))?)
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1196,6 +1224,20 @@ impl From<&BlockHeader> for BroadcasterBlockRef {
             revert: block.revert,
             timestamp: block.timestamp,
             partial_block_index: block.partial_block_index,
+        }
+    }
+}
+
+impl BroadcasterBlockRef {
+    /// The Tycho block header this reference was written from.
+    pub fn to_block_header(&self) -> BlockHeader {
+        BlockHeader {
+            hash: self.hash.clone(),
+            number: self.number,
+            parent_hash: self.parent_hash.clone(),
+            revert: self.revert,
+            timestamp: self.timestamp,
+            partial_block_index: self.partial_block_index,
         }
     }
 }
@@ -1611,6 +1653,11 @@ pub enum BroadcasterContractError {
     UnexpectedSnapshotId { expected: String, found: String },
     #[error("unexpected snapshot chunk index: expected {expected}, found {found}")]
     UnexpectedChunkIndex { expected: u32, found: u32 },
+    #[error("a {kind:?} sync status without its {missing}")]
+    IncompleteSyncStatus {
+        kind: BroadcasterProtocolSyncStatusKind,
+        missing: &'static str,
+    },
     #[error("received extra snapshot chunk {found} after declared total of {total_chunks}")]
     ExtraSnapshotChunk { total_chunks: u32, found: u32 },
     #[error("snapshot incomplete: expected {expected_chunks} chunks, observed {observed_chunks}")]
@@ -4161,5 +4208,49 @@ mod tests {
                 removed_components: HashMap::new(),
             },
         )
+    }
+
+    #[test]
+    fn sync_status_round_trips_to_the_synchronizer_state() -> Result<()> {
+        let header = block_header(42, 7);
+        let partial = BlockHeader {
+            partial_block_index: Some(3),
+            ..block_header(43, 8)
+        };
+        let reverted = BlockHeader {
+            revert: true,
+            ..block_header(41, 9)
+        };
+        for state in [
+            SynchronizerState::Started,
+            SynchronizerState::Ready(header.clone()),
+            SynchronizerState::Ready(partial),
+            SynchronizerState::Delayed(reverted),
+            SynchronizerState::Stale(header.clone()),
+            SynchronizerState::Advanced(header),
+            SynchronizerState::Ended("stream closed".to_string()),
+        ] {
+            let status = BroadcasterProtocolSyncStatus::from_synchronizer_state(&state);
+            assert_eq!(status.to_synchronizer_state()?, state);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sync_status_missing_its_block_or_reason_is_refused() {
+        for kind in [
+            BroadcasterProtocolSyncStatusKind::Ready,
+            BroadcasterProtocolSyncStatusKind::Ended,
+        ] {
+            let status = BroadcasterProtocolSyncStatus {
+                kind,
+                block: None,
+                reason: None,
+            };
+            assert!(matches!(
+                status.to_synchronizer_state(),
+                Err(BroadcasterContractError::IncompleteSyncStatus { .. })
+            ));
+        }
     }
 }

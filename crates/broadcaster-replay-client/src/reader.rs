@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use redis::streams::{StreamId, StreamInfoStreamReply, StreamReadOptions, StreamReadReply};
@@ -17,20 +18,20 @@ pub(crate) struct TokioRedisStreamReader {
 
 impl TokioRedisStreamReader {
     pub(crate) async fn connect(redis_url: &str, block_ms: u64) -> Result<Self> {
-        let client = redis::Client::open(redis_url)
-            .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        let client = redis::Client::open(redis_url).map_err(redis_connect_error)?;
+        ensure_tls_provider(&client)?;
         let blocking_read_connection = redis::aio::ConnectionManager::new_with_config(
             client.clone(),
             connection_manager_config(blocking_read_timeout(block_ms)),
         )
         .await
-        .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        .map_err(redis_connect_error)?;
         let inspection_connection = redis::aio::ConnectionManager::new_with_config(
             client,
             connection_manager_config(REDIS_INSPECTION_TIMEOUT),
         )
         .await
-        .map_err(|error| BroadcasterReplayClientError::redis_connect(error.to_string()))?;
+        .map_err(redis_connect_error)?;
         Ok(Self {
             blocking_read_connection,
             inspection_connection,
@@ -63,6 +64,56 @@ impl TokioRedisStreamReader {
             .await;
         redis_stream_info(reply)
     }
+}
+
+pub(crate) fn redis_connect_error(error: redis::RedisError) -> BroadcasterReplayClientError {
+    if redis_connect_transport_failure(&error) {
+        BroadcasterReplayClientError::redis_connect_transport(error.to_string())
+    } else {
+        BroadcasterReplayClientError::redis_connect(error.to_string())
+    }
+}
+
+// A refused, dropped or timed out connection, an unreachable network and a server that asks
+// to wait can succeed on a later try. Anything else counts as configuration: a TLS failure,
+// rejected credentials, a reply that is not Redis and a failed name lookup. A resolver that is
+// only down for a while lands there too, since it fails the same way as an unknown name.
+fn redis_connect_transport_failure(error: &redis::RedisError) -> bool {
+    let server_asks_to_wait = matches!(error.kind(), redis::ErrorKind::Server(_))
+        && matches!(error.retry_method(), redis::RetryMethod::WaitAndRetry);
+    let unreachable = matches!(
+        io_error_kind(error),
+        Some(
+            std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkDown
+        )
+    );
+    error.is_connection_dropped() || error.is_timeout() || unreachable || server_asks_to_wait
+}
+
+// Redis keeps an IO failure as its source, behind a shared error.
+fn io_error_kind(error: &redis::RedisError) -> Option<std::io::ErrorKind> {
+    let shared = std::error::Error::source(error)?
+        .downcast_ref::<Arc<dyn std::error::Error + Send + Sync>>()?;
+    shared
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+}
+
+// Redis builds its TLS config from the process's rustls provider, which panics when none is
+// installed and the build enables more than one.
+pub(crate) fn ensure_tls_provider(client: &redis::Client) -> Result<()> {
+    let tls = matches!(
+        client.get_connection_info().addr(),
+        redis::ConnectionAddr::TcpTls { .. }
+    );
+    if tls && rustls::crypto::CryptoProvider::get_default().is_none() {
+        return Err(BroadcasterReplayClientError::redis_connect(
+            "a rediss:// connection needs a rustls crypto provider installed by the process",
+        ));
+    }
+    Ok(())
 }
 
 fn connection_manager_config(response_timeout: Duration) -> redis::aio::ConnectionManagerConfig {

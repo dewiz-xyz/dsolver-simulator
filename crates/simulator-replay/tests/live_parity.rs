@@ -83,7 +83,7 @@ async fn extracted_native_and_rfq_paths_match_characterized_results() -> Result<
     assert_eq!(rfq.amount_out, U256::from(1_995_000_000_u64));
     assert_eq!(
         rfq.state_digest,
-        "e3f5c9f476d43de6e4eb7840644c5beccd90e00c9076334e02a958bee6d3f201"
+        "e61eec744107cc67994fce061e007b27ec7037e40ebb0544ee9edc5ded2d3f76"
     );
     Ok(())
 }

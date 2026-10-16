@@ -3,6 +3,7 @@
 //! The current bootstrap source is the broadcaster HTTP snapshot-session API. Redis Streams
 //! carry deltas after the snapshot replay boundary returned by that session.
 
+mod bootstrap;
 mod checkpoint;
 mod client;
 mod error;
@@ -10,14 +11,18 @@ mod reader;
 mod snapshot;
 mod url;
 
+pub use bootstrap::{SnapshotBackend, SnapshotBootstrap};
 pub use client::{
     BroadcasterReplayClient, BroadcasterReplayConfig, ReplayBatch, ReplayMessage, ReplayPoll,
 };
 pub use error::{BroadcasterReplayClientError, Result};
 pub use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterPayload,
-    BroadcasterProgress, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
-    BroadcasterSnapshotSessionResponse,
+    BroadcasterBackend, BroadcasterBackendHead, BroadcasterBlockRef, BroadcasterContractError,
+    BroadcasterEnvelope, BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress,
+    BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind,
+    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterSnapshotSessionResponse, BroadcasterStateEntry, BroadcasterUpdateMessage,
+    BroadcasterUpdatePartition,
 };
 
 pub use self::checkpoint::ReplayCheckpoint;
@@ -34,7 +39,8 @@ mod tests {
 
     use super::checkpoint::{redis_empty_poll_action, RedisEmptyPollAction};
     use super::reader::{
-        blocking_read_timeout, redis_xread_messages, RedisStreamInfo, RedisStreamMessage,
+        blocking_read_timeout, ensure_tls_provider, redis_connect_error, redis_xread_messages,
+        RedisStreamInfo, RedisStreamMessage,
     };
     use super::ReplayCheckpoint;
 
@@ -277,6 +283,81 @@ mod tests {
         assert!(matches!(
             error,
             super::BroadcasterReplayClientError::RedisReadTransport { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn redis_connect_setup_failure_is_not_transport() -> Result<()> {
+        let invalid_url = redis::Client::open("not-a-redis-url")
+            .err()
+            .ok_or_else(|| anyhow!("an invalid Redis URL should fail"))?;
+        let rejected =
+            redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "invalid password"));
+        let bad_certificate = redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate",
+        ));
+        let unknown_host = redis::RedisError::from(std::io::Error::other(
+            "failed to lookup address information",
+        ));
+        let not_redis = redis::RedisError::from((redis::ErrorKind::Parse, "invalid first byte"));
+
+        for error in [
+            invalid_url,
+            rejected,
+            bad_certificate,
+            unknown_host,
+            not_redis,
+        ] {
+            assert!(matches!(
+                redis_connect_error(error),
+                super::BroadcasterReplayClientError::RedisConnect { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redis_connect_network_failure_or_waiting_server_uses_transport_retry() {
+        let network = [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkDown,
+        ]
+        .map(|kind| redis::RedisError::from(std::io::Error::new(kind, "connection failed")));
+        let server = [
+            redis::ServerErrorKind::BusyLoading,
+            redis::ServerErrorKind::TryAgain,
+            redis::ServerErrorKind::MasterDown,
+            redis::ServerErrorKind::ClusterDown,
+        ]
+        .map(|kind| redis::RedisError::from((redis::ErrorKind::Server(kind), "server busy")));
+
+        for error in network.into_iter().chain(server) {
+            let message = error.to_string();
+            assert!(
+                matches!(
+                    redis_connect_error(error),
+                    super::BroadcasterReplayClientError::RedisConnectTransport { .. }
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tls_redis_url_without_a_crypto_provider_is_refused() -> Result<()> {
+        let plain = redis::Client::open("redis://localhost:6379")?;
+        let tls = redis::Client::open("rediss://localhost:6379")?;
+
+        ensure_tls_provider(&plain)?;
+        assert!(matches!(
+            ensure_tls_provider(&tls),
+            Err(super::BroadcasterReplayClientError::RedisConnect { .. })
         ));
         Ok(())
     }
