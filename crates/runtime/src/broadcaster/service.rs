@@ -540,6 +540,17 @@ impl BroadcasterServiceState {
             .collect()
     }
 
+    /// Consumers drop their state on every new generation, so a passive process promotes
+    /// only once every required protocol sits on one complete block. The initial bootstrap
+    /// completes on the same condition.
+    async fn startup_state_is_complete(&self) -> bool {
+        self.cache
+            .complete_backend_heads(&self.required_protocols)
+            .await
+            .values()
+            .all(Option::is_some)
+    }
+
     pub(crate) fn chain_id(&self) -> u64 {
         self.cache.chain_id()
     }
@@ -1915,6 +1926,11 @@ impl BroadcasterServiceState {
         {
             return Ok(None);
         }
+        for service in services {
+            if !service.startup_state_is_complete().await {
+                return Ok(None);
+            }
+        }
 
         let chain_id = services[0].cache.chain_id();
         let mut captured = Vec::with_capacity(services.len());
@@ -2838,6 +2854,139 @@ mod tests {
                 .await[&BroadcasterBackend::Native],
             None
         );
+        Ok(())
+    }
+
+    fn passive_service_requiring(native_protocols: Vec<ProtocolKind>) -> BroadcasterServiceState {
+        let publisher = BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(ServiceFakeRedisWriter::default()),
+        )
+        .with_required_protocols(native_protocols.clone(), Vec::new());
+        BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::new(publisher),
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(
+            ChainHeadObserver::ready_for_test(block(10)),
+            native_protocols,
+            Vec::new(),
+        )
+    }
+
+    fn block(number: u8) -> BlockIdentity {
+        BlockIdentity {
+            number: u64::from(number),
+            hash: Bytes::from([number; 32]),
+        }
+    }
+
+    #[tokio::test]
+    async fn promotion_waits_for_every_required_protocol_to_reach_one_block() -> Result<()> {
+        let service =
+            passive_service_requiring(vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3]);
+        service.mark_upstream_connected().await;
+        // Tycho can start a block feed while one synchronizer is still delayed on an
+        // older block. The partition then has a block number but no complete head.
+        let mut delayed = raw_feed_for_protocols(10, 10, 9, &["uniswap_v2", "uniswap_v3"]);
+        if let Some(message) = delayed.state_msgs.get_mut("uniswap_v3") {
+            message.header.number = 9;
+            message.header.hash = Bytes::from([9; 32]);
+        }
+        service.apply_feed_message(&delayed).await?;
+        assert!(service.cache.is_ready().await);
+
+        let promotion = BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "active_writer_promoted",
+        )
+        .await?;
+
+        assert!(promotion.is_none(), "incomplete state must stay passive");
+        assert_eq!(
+            service.redis_publisher.status_snapshot().await.mode,
+            "passive"
+        );
+
+        service
+            .apply_feed_message(&raw_feed_for_protocols(10, 10, 9, &["uniswap_v3"]))
+            .await?;
+        let boundary = BroadcasterServiceState::promote_when_ready(
+            std::slice::from_ref(&service),
+            "active_writer_promoted",
+        )
+        .await?
+        .ok_or_else(|| anyhow!("complete state should promote on the next attempt"))?;
+
+        assert_eq!(boundary.generation, 1);
+        assert_eq!(
+            service.redis_publisher.published_backend_heads()[&BroadcasterBackend::Native],
+            Some(block(10))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_without_required_protocols_does_not_hold_promotion() -> Result<()> {
+        let required_protocols = vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3];
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )
+            .with_required_protocols(required_protocols.clone(), Vec::new()),
+        );
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        let raw_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::clone(&lifecycle_gate),
+        )
+        .with_chain_head_observer(
+            ChainHeadObserver::ready_for_test(block(10)),
+            required_protocols,
+            Vec::new(),
+        );
+        // Production builds the RFQ service without a chain head observer, so it has no
+        // required protocols and its completeness check passes vacuously.
+        let rfq_service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            lifecycle_gate,
+        );
+        raw_service.mark_upstream_connected().await;
+        rfq_service.mark_upstream_connected().await;
+        raw_service.apply_feed_message(&raw_feed(10, 10, 9)).await?;
+        rfq_service
+            .apply_update(&rfq_only_update(202, "rfq-1", 7))
+            .await?;
+        let services = vec![raw_service.clone(), rfq_service];
+
+        let promotion =
+            BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
+                .await?;
+
+        assert!(
+            promotion.is_none(),
+            "raw state without uniswap_v3 must stay passive"
+        );
+        assert_eq!(publisher.status_snapshot().await.mode, "passive");
+
+        raw_service
+            .apply_feed_message(&raw_feed_for_protocols(10, 10, 9, &["uniswap_v3"]))
+            .await?;
+        BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted")
+            .await?
+            .ok_or_else(|| anyhow!("complete raw state should promote alongside RFQ"))?;
+
+        assert_eq!(publisher.status_snapshot().await.mode, "active");
         Ok(())
     }
 
