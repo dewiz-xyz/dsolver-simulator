@@ -584,6 +584,9 @@ impl BroadcasterServiceState {
         reason: impl Into<String>,
         last_error: Option<String>,
     ) {
+        // Close promotion here instead of waiting for main to get the feed error, so an
+        // attempt that finishes in that gap can't promote a writer that's about to exit.
+        self.redis_publisher.begin_shutdown();
         // Fatal feed paths must reach main before the process shutdown deadline can start.
         self.upstream.mark_disconnected(reason, last_error).await;
     }
@@ -2680,7 +2683,8 @@ mod tests {
         BroadcasterSnapshotSessionRegistry, RecoveryPublicationPhase, SnapshotSessionError,
     };
     use crate::broadcaster::redis_publisher::{
-        BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig, RedisStreamWriter,
+        BroadcasterDeploymentPhase, BroadcasterRedisPublisher, BroadcasterRedisPublisherConfig,
+        RedisStreamWriter,
     };
     use crate::broadcaster::state::{
         BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
@@ -4271,6 +4275,69 @@ mod tests {
         assert_eq!(status.readiness, BroadcasterReadiness::SnapshotUnexportable);
         assert!(!status.snapshot.exportable);
         assert!(status.snapshot.last_export_error.is_some());
+        assert!(writer.appends().await.is_empty());
+        assert_eq!(publisher.status_snapshot().await.mode, "passive");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_feed_fatal_stops_an_in_flight_startup_promotion() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&native_only_update(10, "native-1"))
+            .await?;
+
+        // The candidate records its preflight result before promoting, so holding
+        // this lock parks the promotion after capture, where the fatal landed in prod.
+        let preflight = service.snapshot_preflight.read().await;
+        let promotion = tokio::spawn({
+            let service = service.clone();
+            async move {
+                BroadcasterServiceState::promote_when_ready(
+                    std::slice::from_ref(&service),
+                    "active_writer_promoted",
+                )
+                .await
+            }
+        });
+        timeout(Duration::from_secs(5), async {
+            while publisher.deployment_admission_snapshot().phase
+                != BroadcasterDeploymentPhase::CandidateBuilding
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        service
+            .mark_stream_disconnected_for_exit(
+                "error",
+                Some(
+                    "Tycho header gap requires reconnect and a fresh authoritative replacement"
+                        .to_string(),
+                ),
+            )
+            .await;
+        drop(preflight);
+
+        let result = timeout(Duration::from_secs(5), promotion).await??;
+        assert!(
+            result.is_err(),
+            "a process that hit a feed fatal must not promote"
+        );
+        assert_eq!(writer.active_generation().await, 0);
         assert!(writer.appends().await.is_empty());
         assert_eq!(publisher.status_snapshot().await.mode, "passive");
         Ok(())
