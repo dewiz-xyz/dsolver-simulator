@@ -424,6 +424,106 @@ async fn one_sided_gap_uses_conservative_boundary_projection(pool: PgPool) -> an
     Ok(())
 }
 
+// Gap 501 shape: generation 3 starts with a boundary that slipped to message 54 at block 300.
+// The derived floor is generation 2's interval checkpoint at 280.
+async fn seed_slip_history(pool: &PgPool) -> anyhow::Result<()> {
+    seed_block_times(pool, 100, 302).await?;
+    seed_checkpoint(pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(pool, 1, 50, 150, CheckpointKind::Interval, true).await?;
+    seed_delta(pool, 1, 60, 199, 1, &[Backend::Native]).await?;
+    seed_checkpoint(pool, 2, 0, 200, CheckpointKind::Boundary, true).await?;
+    seed_checkpoint(pool, 2, 80, 280, CheckpointKind::Interval, true).await?;
+    seed_delta(pool, 2, 90, 290, 1, &[Backend::Native]).await?;
+    seed_checkpoint(pool, 3, 54, 300, CheckpointKind::Boundary, true).await?;
+    seed_delta(pool, 3, 55, 301, 1, &[Backend::Native]).await?;
+    seed_delta(pool, 3, 56, 302, 1, &[Backend::Native]).await?;
+    seed_gap(pool, 3, 2, 54, Some((280, 300)), None).await
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn coverage_restores_the_block_of_the_checkpoint_that_absorbed_a_gap(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_slip_history(&pool).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            Some(BlockInterval::new(100, 302)?),
+        )?)
+        .await?;
+
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![BlockInterval::new(100, 279)?, BlockInterval::new(300, 302)?]
+    );
+    assert_eq!(snapshot.known_gaps.len(), 1);
+    assert_eq!(snapshot.known_gaps[0].from_block, Some(280));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn coverage_projects_an_unbounded_gap_from_the_nearest_interval_checkpoint(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    seed_slip_history(&pool).await?;
+    seed_checkpoint(&pool, 3, 103, 301, CheckpointKind::Interval, true).await?;
+    seed_gap(&pool, 4, 1, 1, None, None).await?;
+
+    let snapshot = StateHistoryReader::new(pool, object_store().await)
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            Some(BlockInterval::new(100, 302)?),
+        )?)
+        .await?;
+
+    // Projected from the boundary at 300, block 300 would stay unsafe.
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![BlockInterval::new(100, 279)?, BlockInterval::new(300, 300)?]
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn coverage_and_target_plans_agree_around_a_slip(pool: PgPool) -> anyhow::Result<()> {
+    seed_slip_history(&pool).await?;
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let snapshot = reader
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            vec![Backend::Native],
+            Some(BlockInterval::new(100, 302)?),
+        )?)
+        .await?;
+
+    for block in 100..=302 {
+        let continuous = snapshot
+            .continuous_intervals
+            .iter()
+            .any(|interval| interval.start <= block && block <= interval.end_inclusive);
+        let plan = reader
+            .plan_targets(&TargetPlanQuery::new(
+                CHAIN_ID,
+                vec![Backend::Native],
+                BTreeSet::from([block]),
+                ReadLimits::new(1_000_000, 1_000_000)?,
+            )?)
+            .await?;
+        let recorded_gap = plan
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == state_history::RangeGapKind::Recorded);
+        assert_eq!(continuous, !recorded_gap, "block {block}");
+    }
+    Ok(())
+}
+
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
 async fn coverage_ignores_gaps_fully_identified_for_another_backend(

@@ -160,6 +160,26 @@ impl FixtureSource {
         Ok(source)
     }
 
+    /// Adds a second replay leg anchored at `position`, as a later generation's boundary would.
+    pub fn native_with_second_leg(
+        position: StreamPosition,
+        block_number: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut source = Self::native()?;
+        let checkpoint = manifest(2, block_number, position, Backend::Native, true, None);
+        source
+            .archives
+            .insert(checkpoint.id, native_archive(&checkpoint, false)?);
+        source
+            .token_snapshots
+            .insert(checkpoint.id, native_tokens()?);
+        source.target_plan.legs.push(RangeLeg {
+            checkpoint,
+            deltas: Vec::new(),
+        });
+        Ok(source)
+    }
+
     pub fn native_with_apply_anomaly() -> Result<Self, Box<dyn std::error::Error>> {
         let mut source = Self::native()?;
         let fixture: Value = serde_json::from_str(NATIVE_DELTA)?;
