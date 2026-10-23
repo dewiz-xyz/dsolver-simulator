@@ -491,6 +491,59 @@ async fn coverage_projects_an_unbounded_gap_from_the_nearest_interval_checkpoint
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
+async fn rfq_coverage_restores_only_where_the_checkpoint_can_anchor(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let both = [Backend::Native, Backend::Rfq];
+    seed_block_times(&pool, 100, 131).await?;
+    seed_checkpoint_with_backends(&pool, 1, 0, 100, CheckpointKind::Boundary, true, &both).await?;
+    seed_checkpoint_with_backends(&pool, 1, 10, 110, CheckpointKind::Interval, true, &both).await?;
+    let restoring =
+        seed_checkpoint_with_backends(&pool, 2, 54, 120, CheckpointKind::Boundary, true, &both)
+            .await?;
+    // Its RFQ cursor lands after block 121's timestamp, so it anchors block 121 on, not 120.
+    sqlx::query("UPDATE state_history.checkpoints SET rfq_observed_at_ms = 121500 WHERE id = $1")
+        .bind(restoring.id)
+        .execute(&pool)
+        .await?;
+    seed_delta(&pool, 2, 60, 130, 1, &both).await?;
+    seed_gap(&pool, 2, 2, 54, Some((110, 120)), Some((110_000, 120_000))).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let snapshot = reader
+        .coverage(&CoverageQuery::new(
+            CHAIN_ID,
+            both.to_vec(),
+            Some(BlockInterval::new(100, 130)?),
+        )?)
+        .await?;
+    assert_eq!(
+        snapshot.continuous_intervals,
+        vec![BlockInterval::new(100, 109)?, BlockInterval::new(121, 130)?]
+    );
+
+    for (target, recorded_gap) in [(119, true), (120, true), (121, false)] {
+        let plan = reader
+            .plan_targets(&TargetPlanQuery::new(
+                CHAIN_ID,
+                both.to_vec(),
+                BTreeSet::from([target]),
+                ReadLimits::new(1_000_000, 1_000_000)?,
+            )?)
+            .await?;
+        assert_eq!(
+            plan.gaps
+                .iter()
+                .any(|gap| gap.kind == state_history::RangeGapKind::Recorded),
+            recorded_gap,
+            "block {target}"
+        );
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
 async fn coverage_and_target_plans_agree_around_a_slip(pool: PgPool) -> anyhow::Result<()> {
     seed_slip_history(&pool).await?;
     let reader = StateHistoryReader::new(pool, object_store().await);

@@ -82,6 +82,7 @@ struct PendingGapProjection {
 struct CheckpointPoint {
     position: StreamPosition,
     block_number: u64,
+    rfq_observed_at_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -536,7 +537,19 @@ async fn project_gap_intervals(
     }
 
     let checkpoints = compatible_checkpoint_points(connection, query).await?;
-    for (gap, projection) in gaps.iter().zip(&mut pending) {
+    let restoring = gaps
+        .iter()
+        .map(|gap| restoring_checkpoint(&checkpoints, gap))
+        .collect::<Vec<_>>();
+    let restored_from = if includes_rfq {
+        rfq_restoring_blocks(connection, query.chain_id, &restoring).await?
+    } else {
+        restoring
+            .iter()
+            .map(|point| point.map(|point| point.block_number))
+            .collect()
+    };
+    for ((gap, projection), restored_from) in gaps.iter().zip(&mut pending).zip(restored_from) {
         if projection.needs_conservative_projection {
             let (prior, next) = surrounding_checkpoint_blocks(&checkpoints, gap);
             if let Some(interval) = conservative_gap_interval(prior, next, start, end)? {
@@ -545,7 +558,7 @@ async fn project_gap_intervals(
         }
         projection.unsafe_intervals = clip_at_restoring_checkpoint(
             mem::take(&mut projection.unsafe_intervals),
-            restoring_checkpoint_block(&checkpoints, gap),
+            restored_from,
         );
     }
 
@@ -561,15 +574,87 @@ async fn project_gap_intervals(
         .collect())
 }
 
-/// The block of the first compatible checkpoint at or after the gap's last position. Targets at
-/// or above it anchor there or later, so the quote engine never replays through the gap.
-fn restoring_checkpoint_block(checkpoints: &[CheckpointPoint], gap: &GapRow) -> Option<u64> {
+/// The first compatible checkpoint at or after the gap's last position. Targets it can anchor
+/// replay from there or a later checkpoint, so the quote engine never crosses the gap.
+fn restoring_checkpoint<'a>(
+    checkpoints: &'a [CheckpointPoint],
+    gap: &GapRow,
+) -> Option<&'a CheckpointPoint> {
     let to = StreamPosition {
         generation: gap.generation,
         message_seq: gap.to_message_seq,
     };
     let index = checkpoints.partition_point(|point| point.position < to);
-    checkpoints.get(index).map(|point| point.block_number)
+    checkpoints.get(index)
+}
+
+/// With RFQ in the query, a checkpoint anchors a target only when its RFQ cursor is before the
+/// target's next-block timestamp, the rule `fetch_anchor` applies. So restoration starts at the
+/// first block at or after the checkpoint's own block whose successor is later than the cursor.
+async fn rfq_restoring_blocks(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    restoring: &[Option<&CheckpointPoint>],
+) -> anyhow::Result<Vec<Option<u64>>> {
+    let mut gap_indices = Vec::new();
+    let mut from_blocks = Vec::new();
+    let mut cursors = Vec::new();
+    for (gap_index, point) in restoring.iter().enumerate() {
+        let Some((block_number, cursor)) = point.and_then(|point| {
+            point
+                .rfq_observed_at_ms
+                .map(|cursor| (point.block_number, cursor))
+        }) else {
+            continue;
+        };
+        gap_indices.push(
+            i64::try_from(gap_index).context("coverage RFQ gap index exceeds PostgreSQL bigint")?,
+        );
+        from_blocks.push(database_i64(block_number, "restoring checkpoint block")?);
+        cursors.push(database_i64(cursor, "restoring checkpoint RFQ cursor")?);
+    }
+    let mut restored_from = vec![None; restoring.len()];
+    if gap_indices.is_empty() {
+        return Ok(restored_from);
+    }
+    let rows = sqlx::query(
+        "WITH requested(gap_index, from_block, cursor_ms) AS (
+             SELECT * FROM unnest($2::bigint[], $3::bigint[], $4::bigint[])
+         )
+         SELECT requested.gap_index, restored.block_number
+         FROM requested
+         CROSS JOIN LATERAL (
+             SELECT current.block_number
+             FROM state_history.block_times current
+             JOIN state_history.block_times successor
+               ON successor.chain_id = current.chain_id
+              AND successor.block_number = current.block_number + 1
+             WHERE current.chain_id = $1
+               AND current.block_number >= requested.from_block
+               AND successor.timestamp_ms > requested.cursor_ms
+             ORDER BY current.block_number
+             LIMIT 1
+         ) restored",
+    )
+    .bind(database_i64(chain_id, "coverage chain_id")?)
+    .bind(gap_indices)
+    .bind(from_blocks)
+    .bind(cursors)
+    .fetch_all(connection)
+    .await
+    .context("failed to find where restoring checkpoints anchor RFQ targets")?;
+    for row in rows {
+        let gap_index = usize::try_from(database_u64(
+            row.try_get("gap_index")?,
+            "restoring RFQ gap index",
+        )?)
+        .context("restoring RFQ gap index exceeds usize")?;
+        let block_number = database_u64(row.try_get("block_number")?, "restoring RFQ block")?;
+        *restored_from
+            .get_mut(gap_index)
+            .context("RFQ restoration returned an unknown gap index")? = Some(block_number);
+    }
+    Ok(restored_from)
 }
 
 fn clip_at_restoring_checkpoint(
@@ -633,7 +718,7 @@ async fn compatible_checkpoint_points(
     // Interval checkpoints bound lost messages as well as boundaries do, and skipping them would
     // stretch a projection across most of a generation.
     let rows = sqlx::query(
-        "SELECT generation, message_seq, block_number, backends
+        "SELECT generation, message_seq, block_number, rfq_observed_at_ms, backends
          FROM state_history.checkpoints
          WHERE chain_id = $1 AND status = 'complete'
            AND backends @> $2::text[]
@@ -660,6 +745,10 @@ async fn compatible_checkpoint_points(
                     )?,
                 },
                 block_number: database_u64(row.try_get("block_number")?, "checkpoint block")?,
+                rfq_observed_at_ms: row
+                    .try_get::<Option<i64>, _>("rfq_observed_at_ms")?
+                    .map(|value| database_u64(value, "checkpoint RFQ cursor"))
+                    .transpose()?,
             })
         })
         .collect()
@@ -989,8 +1078,8 @@ fn merge_intervals(mut intervals: Vec<BlockInterval>) -> Vec<BlockInterval> {
 mod tests {
     use super::{
         analyze_coverage_blocks, clip_at_restoring_checkpoint, conservative_gap_interval,
-        pending_gap_projection, restoring_checkpoint_block, surrounding_checkpoint_blocks,
-        BlockInterval, CheckpointPoint, CoverageBlockRow, GapRow, StreamPosition,
+        pending_gap_projection, restoring_checkpoint, surrounding_checkpoint_blocks, BlockInterval,
+        CheckpointPoint, CoverageBlockRow, GapRow, StreamPosition,
     };
 
     fn block(block_number: u64) -> CoverageBlockRow {
@@ -1023,6 +1112,7 @@ mod tests {
                     message_seq: 5,
                 },
                 block_number: 105,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1030,6 +1120,7 @@ mod tests {
                     message_seq: 20,
                 },
                 block_number: 120,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1037,24 +1128,28 @@ mod tests {
                     message_seq: 1,
                 },
                 block_number: 130,
+                rfq_observed_at_ms: None,
             },
         ];
 
         assert_eq!(
-            restoring_checkpoint_block(&checkpoints, &gap(10, 20)),
+            restoring_checkpoint(&checkpoints, &gap(10, 20)).map(|point| point.block_number),
             Some(120)
         );
         assert_eq!(
-            restoring_checkpoint_block(&checkpoints, &gap(10, 19)),
+            restoring_checkpoint(&checkpoints, &gap(10, 19)).map(|point| point.block_number),
             Some(120)
         );
         assert_eq!(
-            restoring_checkpoint_block(&checkpoints, &gap(10, 21)),
+            restoring_checkpoint(&checkpoints, &gap(10, 21)).map(|point| point.block_number),
             Some(130)
         );
         let mut later = gap(1, 1);
         later.generation = 3;
-        assert_eq!(restoring_checkpoint_block(&checkpoints, &later), None);
+        assert_eq!(
+            restoring_checkpoint(&checkpoints, &later).map(|point| point.block_number),
+            None
+        );
     }
 
     #[test]
@@ -1175,6 +1270,7 @@ mod tests {
                     message_seq: 9,
                 },
                 block_number: 104,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1182,6 +1278,7 @@ mod tests {
                     message_seq: 10,
                 },
                 block_number: 105,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1189,6 +1286,7 @@ mod tests {
                     message_seq: 20,
                 },
                 block_number: 115,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1196,6 +1294,7 @@ mod tests {
                     message_seq: 21,
                 },
                 block_number: 116,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1203,6 +1302,7 @@ mod tests {
                     message_seq: 30,
                 },
                 block_number: 125,
+                rfq_observed_at_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1210,6 +1310,7 @@ mod tests {
                     message_seq: 31,
                 },
                 block_number: 126,
+                rfq_observed_at_ms: None,
             },
         ];
 
