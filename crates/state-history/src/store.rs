@@ -31,6 +31,24 @@ const BLOCK_TIME_UPSERT: &str = r#"
         > (bt.source_generation, bt.source_message_seq)
 "#;
 
+// A NULL floor under a known ceiling means the writer could not observe where the loss started.
+// Lost messages come after the last complete checkpoint in stream order, so that checkpoint's
+// cursor bounds them from below. That assumes a reorg never rewinds past a checkpointed block, the
+// same assumption a floor observed at request time makes. A ceiling under the checkpoint means the
+// stream went backwards, and with no checkpoint there is nothing older to protect, so both fall
+// back to 0. The migration that fixed the older zero floors applies the same rule.
+const UNKNOWN_FLOOR_QUERY: &str = r#"
+    SELECT
+        CASE WHEN c.block_number <= $4::bigint THEN c.block_number ELSE 0 END,
+        CASE WHEN c.rfq_observed_at_ms <= $5::bigint THEN c.rfq_observed_at_ms ELSE 0 END
+    FROM state_history.checkpoints c
+    WHERE c.chain_id = $1
+      AND c.status = 'complete'
+      AND (c.generation, c.message_seq) < ($2, $3)
+    ORDER BY c.generation DESC, c.message_seq DESC
+    LIMIT 1
+"#;
+
 pub static STATE_HISTORY_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 pub const STATE_HISTORY_WRITER_ROLE: &str = "state_history_writer";
@@ -370,6 +388,7 @@ impl StateHistoryStore {
     }
 
     pub async fn record_gap(conn: &mut sqlx::PgConnection, gap: &GapRecord) -> anyhow::Result<()> {
+        let gap = with_resolved_floors(conn, gap).await?;
         sqlx::query(
             "INSERT INTO state_history.gaps
                 (chain_id, generation, from_message_seq, to_message_seq, reason,
@@ -747,6 +766,47 @@ async fn upsert_block_times(
     Ok(())
 }
 
+/// Fills a floor the writer could not observe, using [`UNKNOWN_FLOOR_QUERY`]. A gap with no unknown
+/// floor never reads the checkpoints, so it still records when checkpoint storage is failing.
+async fn with_resolved_floors(
+    conn: &mut sqlx::PgConnection,
+    gap: &GapRecord,
+) -> anyhow::Result<GapRecord> {
+    let unknown_block_floor = gap.from_block_number.is_none() && gap.to_block_number.is_some();
+    let unknown_time_floor = gap.from_observed_at_ms.is_none() && gap.to_observed_at_ms.is_some();
+    let mut resolved = gap.clone();
+    if !unknown_block_floor && !unknown_time_floor {
+        return Ok(resolved);
+    }
+    let floor: Option<(i64, i64)> = sqlx::query_as(UNKNOWN_FLOOR_QUERY)
+        .bind(db_i64(gap.chain_id, "gap chain_id")?)
+        .bind(db_i64(gap.generation, "gap generation")?)
+        .bind(db_i64(gap.from_message_seq, "gap from_message_seq")?)
+        .bind(
+            gap.to_block_number
+                .map(|value| db_i64(value, "gap to_block_number"))
+                .transpose()?,
+        )
+        .bind(
+            gap.to_observed_at_ms
+                .map(|value| db_i64(value, "gap to_observed_at_ms"))
+                .transpose()?,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .context("failed to derive an unknown state history gap floor")?;
+    let (block_floor, time_floor) = floor.unwrap_or((0, 0));
+    if unknown_block_floor {
+        resolved.from_block_number =
+            Some(u64::try_from(block_floor).context("derived gap block floor is negative")?);
+    }
+    if unknown_time_floor {
+        resolved.from_observed_at_ms =
+            Some(u64::try_from(time_floor).context("derived gap time floor is negative")?);
+    }
+    Ok(resolved)
+}
+
 fn db_i64(value: u64, field: &str) -> anyhow::Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} exceeds PostgreSQL BIGINT"))
 }
@@ -770,7 +830,7 @@ mod tests {
             .filter(|migration| migration.migration_type.is_up_migration())
             .collect::<Vec<_>>();
 
-        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations.len(), 3);
         assert_eq!(migrations[0].version, 20_260_728_000_100);
         assert_eq!(migrations[0].description, "create state history");
         assert_eq!(
@@ -782,6 +842,8 @@ mod tests {
             migrations[1].description,
             "add delta payload format version"
         );
+        assert_eq!(migrations[2].version, 20_261_023_000_100);
+        assert_eq!(migrations[2].description, "derive unknown slip floors");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1176,6 +1238,211 @@ mod tests {
              FROM state_history.block_times
              WHERE chain_id = 8453 AND block_number = 100",
         )
+        .fetch_one(pool)
+        .await?)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn unknown_slip_floor_comes_from_the_latest_complete_checkpoint_before_it(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        seed_floor_checkpoints(&pool).await?;
+        let mut conn = pool.acquire().await?;
+        StateHistoryStore::record_gap(&mut conn, &slip_gap(3, 2, 54, Some(300), Some(300_000)))
+            .await?;
+
+        assert_eq!(
+            gap_bounds(&pool, 3).await?,
+            (Some(150), Some(300), Some(150_000), Some(300_000))
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn unknown_slip_floor_stays_zero_without_usable_evidence(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        seed_floor_checkpoints(&pool).await?;
+        let mut conn = pool.acquire().await?;
+        // Ceiling under the earlier checkpoint: the stream went backwards.
+        StateHistoryStore::record_gap(&mut conn, &slip_gap(3, 2, 54, Some(140), Some(140_000)))
+            .await?;
+        // Nothing complete before generation 1, message 0.
+        StateHistoryStore::record_gap(&mut conn, &slip_gap(0, 2, 5, Some(90), Some(90_000)))
+            .await?;
+        // The latest earlier checkpoint carries no RFQ cursor.
+        StateHistoryStore::record_gap(&mut conn, &slip_gap(5, 2, 9, Some(600), Some(600_000)))
+            .await?;
+
+        assert_eq!(
+            gap_bounds(&pool, 3).await?,
+            (Some(0), Some(140), Some(0), Some(140_000))
+        );
+        assert_eq!(
+            gap_bounds(&pool, 0).await?,
+            (Some(0), Some(90), Some(0), Some(90_000))
+        );
+        assert_eq!(
+            gap_bounds(&pool, 5).await?,
+            (Some(500), Some(600), Some(0), Some(600_000))
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn gap_insert_keeps_known_and_cursorless_bounds(pool: PgPool) -> anyhow::Result<()> {
+        seed_floor_checkpoints(&pool).await?;
+        let mut conn = pool.acquire().await?;
+        let mut known = slip_gap(3, 2, 54, Some(300), Some(300_000));
+        known.from_block_number = Some(290);
+        known.from_observed_at_ms = Some(290_000);
+        StateHistoryStore::record_gap(&mut conn, &known).await?;
+        StateHistoryStore::record_gap(
+            &mut conn,
+            &test_gap(8453, 4, 1, 1, GapReason::CheckpointFailed),
+        )
+        .await?;
+
+        assert_eq!(
+            gap_bounds(&pool, 3).await?,
+            (Some(290), Some(300), Some(290_000), Some(300_000))
+        );
+        assert_eq!(gap_bounds(&pool, 4).await?, (None, None, None, None));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn zero_floor_migration_matches_the_gap_insert_and_reruns_cleanly(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        seed_floor_checkpoints(&pool).await?;
+        for (generation, ceiling) in [(3, 300), (6, 140)] {
+            sqlx::query(
+                "INSERT INTO state_history.gaps
+                    (chain_id, generation, from_message_seq, to_message_seq, reason,
+                     from_block_number, to_block_number, from_observed_at_ms, to_observed_at_ms)
+                 VALUES (8453, $1, 2, 54, 'boundary_slip', 0, $2, 0, $3)",
+            )
+            .bind(generation)
+            .bind(ceiling)
+            .bind(ceiling * 1_000)
+            .execute(&pool)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO state_history.gaps
+                (chain_id, generation, from_message_seq, to_message_seq, reason,
+                 from_block_number, to_block_number)
+             VALUES (8453, 7, 2, 2, 'queue_overflow', 0, 700)",
+        )
+        .execute(&pool)
+        .await?;
+
+        let migration = include_str!("../migrations/20261023000100_derive_unknown_slip_floors.sql");
+        sqlx::raw_sql(migration).execute(&pool).await?;
+
+        assert_eq!(
+            gap_bounds(&pool, 3).await?,
+            (Some(150), Some(300), Some(150_000), Some(300_000))
+        );
+        assert_eq!(
+            gap_bounds(&pool, 6).await?,
+            (Some(0), Some(140), Some(0), Some(140_000))
+        );
+        assert_eq!(
+            gap_bounds(&pool, 7).await?,
+            (Some(0), Some(700), None, None)
+        );
+
+        // Recording the same slip again lands on the migrated row's identity, so the insert
+        // derived the same floor.
+        let mut conn = pool.acquire().await?;
+        StateHistoryStore::record_gap(&mut conn, &slip_gap(3, 2, 54, Some(300), Some(300_000)))
+            .await?;
+        drop(conn);
+        assert_eq!(count_gaps(&pool).await?, 3);
+
+        sqlx::raw_sql(migration).execute(&pool).await?;
+        assert_eq!(
+            gap_bounds(&pool, 3).await?,
+            (Some(150), Some(300), Some(150_000), Some(300_000))
+        );
+        assert_eq!(
+            gap_bounds(&pool, 6).await?,
+            (Some(0), Some(140), Some(0), Some(140_000))
+        );
+        Ok(())
+    }
+
+    // Generation 1 has a boundary at 100 and an interval at 150, both with RFQ cursors. A failed
+    // checkpoint in generation 2 must not count. Generation 4 has a native-only checkpoint at 500.
+    async fn seed_floor_checkpoints(pool: &PgPool) -> anyhow::Result<()> {
+        for (generation, message_seq, kind, block, rfq, status) in [
+            (
+                1_i64,
+                0_i64,
+                "boundary",
+                100_i64,
+                Some(100_000_i64),
+                "complete",
+            ),
+            (1, 50, "interval", 150, Some(150_000), "complete"),
+            (2, 0, "boundary", 200, Some(200_000), "failed"),
+            (3, 54, "boundary", 300, Some(300_000), "complete"),
+            (4, 0, "boundary", 500, None, "complete"),
+        ] {
+            sqlx::query(
+                "INSERT INTO state_history.checkpoints
+                    (chain_id, generation, message_seq, kind, block_number, rfq_observed_at_ms,
+                     backends, status)
+                 VALUES (8453, $1, $2, $3, $4, $5, ARRAY['native', 'rfq'], $6)",
+            )
+            .bind(generation)
+            .bind(message_seq)
+            .bind(kind)
+            .bind(block)
+            .bind(rfq)
+            .bind(status)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn slip_gap(
+        generation: u64,
+        from_message_seq: u64,
+        to_message_seq: u64,
+        to_block_number: Option<u64>,
+        to_observed_at_ms: Option<u64>,
+    ) -> GapRecord {
+        GapRecord {
+            to_block_number,
+            to_observed_at_ms,
+            ..test_gap(
+                8453,
+                generation,
+                from_message_seq,
+                to_message_seq,
+                GapReason::BoundarySlip,
+            )
+        }
+    }
+
+    async fn gap_bounds(
+        pool: &PgPool,
+        generation: i64,
+    ) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
+        Ok(sqlx::query_as(
+            "SELECT from_block_number, to_block_number, from_observed_at_ms, to_observed_at_ms
+             FROM state_history.gaps
+             WHERE chain_id = 8453 AND generation = $1",
+        )
+        .bind(generation)
         .fetch_one(pool)
         .await?)
     }

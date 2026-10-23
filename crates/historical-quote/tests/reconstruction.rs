@@ -11,7 +11,7 @@ use simulator_replay::{
     acquire_vm_world_lease, decode_token_map, DecoderConfig, ExactPoolQuote, ReplayBackend,
     ReplayDecoder, ReplayWorld,
 };
-use state_history::ReadLimits;
+use state_history::{RangeGap, RangeGapKind, ReadLimits, StreamPosition};
 use tokio_util::sync::CancellationToken;
 
 use support::{native_quote_request, rfq_quote_request, FixtureSource};
@@ -138,6 +138,120 @@ async fn only_target_crossing_gap_is_unavailable() -> Result<(), Box<dyn std::er
             ..
         }
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn older_quote_survives_a_later_generation_slip() -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native()?;
+    // Production checkpoints carry an RFQ cursor even for a native quote.
+    source.target_plan.legs[0].checkpoint.rfq_observed_at_ms = Some(1_000);
+    source.target_plan.gaps.push(slip_gap(
+        5,
+        (2, 54),
+        (Some(800), Some(900)),
+        (Some(800_000), Some(900_000)),
+    ));
+    let result = executor(Arc::new(source))
+        .execute(&one_lag_request(100), &CancellationToken::new(), &())
+        .await?;
+
+    assert!(matches!(
+        result.results[0].start_outcome,
+        QuoteOutcome::Ok { .. }
+    ));
+    assert!(matches!(
+        result.results[0].targets[0].outcome,
+        QuoteOutcome::Ok { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_later_generation_still_blocks_the_target() -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native()?;
+    source
+        .target_plan
+        .gaps
+        .push(slip_gap(2, (1, 9), (Some(101), Some(101)), (None, None)));
+    let result = executor(Arc::new(source))
+        .execute(&one_lag_request(100), &CancellationToken::new(), &())
+        .await?;
+
+    assert!(matches!(
+        result.results[0].start_outcome,
+        QuoteOutcome::Ok { .. }
+    ));
+    assert!(matches!(
+        result.results[0].targets[0].outcome,
+        QuoteOutcome::Unavailable {
+            reason: UnavailableReason::Gap,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_block_loss_after_the_anchor_is_unavailable() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut source = FixtureSource::native()?;
+    // The anchor sits at message 1, block 100. Message 2 lost another block 100 update.
+    source.target_plan.legs[0].deltas[0].position = support::position(3);
+    source
+        .target_plan
+        .gaps
+        .push(slip_gap(1, (2, 2), (Some(100), Some(100)), (None, None)));
+    let result = executor(Arc::new(source))
+        .execute(&one_lag_request(100), &CancellationToken::new(), &())
+        .await?;
+
+    assert!(matches!(
+        result.results[0].start_outcome,
+        QuoteOutcome::Unavailable {
+            reason: UnavailableReason::Gap,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_at_the_gap_end_quotes_its_own_block() -> Result<(), Box<dyn std::error::Error>>
+{
+    let gap_end = StreamPosition {
+        generation: 2,
+        message_seq: 54,
+    };
+    let mut source = FixtureSource::native_with_second_leg(gap_end, 102)?;
+    source
+        .target_plan
+        .gaps
+        .push(slip_gap(2, (2, 54), (Some(101), Some(102)), (None, None)));
+    let executor = executor(Arc::new(source));
+
+    let before = executor
+        .execute(&one_lag_request(101), &CancellationToken::new(), &())
+        .await?;
+    assert!(matches!(
+        before.results[0].start_outcome,
+        QuoteOutcome::Unavailable {
+            reason: UnavailableReason::Gap,
+            ..
+        }
+    ));
+    let at_checkpoint = executor
+        .execute(&one_lag_request(102), &CancellationToken::new(), &())
+        .await?;
+    let QuoteOutcome::Ok { provenance, .. } = &at_checkpoint.results[0].start_outcome else {
+        return Err(format!(
+            "block 102 must quote from the checkpoint that ends the gap: {:?}",
+            at_checkpoint.results[0].start_outcome
+        )
+        .into());
+    };
+    assert_eq!(provenance.anchor_checkpoint_position.generation, 2);
+    assert_eq!(provenance.anchor_checkpoint_position.message_seq, 54);
     Ok(())
 }
 
@@ -546,6 +660,40 @@ fn assert_quote_amounts_match(
         }
     }
     Ok(())
+}
+
+fn one_lag_request(start: u64) -> historical_quote::api::QuoteJobRequest {
+    let mut request = native_quote_request(start, start);
+    request.lags = vec![1];
+    request.amounts_in = vec![support::amount("1000000")];
+    request
+}
+
+fn slip_gap(
+    generation: u64,
+    (from_message_seq, to_message_seq): (u64, u64),
+    (from_block, to_block_inclusive): (Option<u64>, Option<u64>),
+    (from_observed_at_ms, to_observed_at_ms): (Option<u64>, Option<u64>),
+) -> RangeGap {
+    RangeGap {
+        kind: RangeGapKind::Recorded,
+        generation: Some(generation),
+        from_message_seq: Some(from_message_seq),
+        to_message_seq: Some(to_message_seq),
+        from_position: Some(StreamPosition {
+            generation,
+            message_seq: from_message_seq,
+        }),
+        to_position: Some(StreamPosition {
+            generation,
+            message_seq: to_message_seq,
+        }),
+        from_block,
+        to_block_inclusive,
+        from_observed_at_ms,
+        to_observed_at_ms,
+        reason: "boundary_slip".to_owned(),
+    }
 }
 
 fn executor(source: Arc<FixtureSource>) -> HistoricalQuoteExecutor<FixtureSource> {

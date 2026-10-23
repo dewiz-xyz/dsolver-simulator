@@ -1270,10 +1270,15 @@ impl GapAccumulator {
             {
                 last.from_message_seq = last.from_message_seq.min(gap.from_message_seq);
                 last.to_message_seq = last.to_message_seq.max(gap.to_message_seq);
-                last.from_block_number = option_min(last.from_block_number, gap.from_block_number);
+                last.from_block_number = merged_floor(
+                    (last.from_block_number, last.to_block_number),
+                    (gap.from_block_number, gap.to_block_number),
+                );
                 last.to_block_number = option_max(last.to_block_number, gap.to_block_number);
-                last.from_observed_at_ms =
-                    option_min(last.from_observed_at_ms, gap.from_observed_at_ms);
+                last.from_observed_at_ms = merged_floor(
+                    (last.from_observed_at_ms, last.to_observed_at_ms),
+                    (gap.from_observed_at_ms, gap.to_observed_at_ms),
+                );
                 last.to_observed_at_ms = option_max(last.to_observed_at_ms, gap.to_observed_at_ms);
                 return;
             }
@@ -1325,6 +1330,21 @@ fn is_permanent_persistence_error(error: &anyhow::Error) -> bool {
     ) || database_error
         .code()
         .is_some_and(|code| code.starts_with("23"))
+}
+
+/// Merges the lower edges of two `(floor, ceiling)` bounds. A floor left unknown under a known
+/// ceiling stays unknown, because the store derives it and a neighbour's floor would understate
+/// what the lost messages could reach.
+fn merged_floor(
+    left: (Option<u64>, Option<u64>),
+    right: (Option<u64>, Option<u64>),
+) -> Option<u64> {
+    let unknown_floor =
+        |(floor, ceiling): (Option<u64>, Option<u64>)| floor.is_none() && ceiling.is_some();
+    if unknown_floor(left) || unknown_floor(right) {
+        return None;
+    }
+    option_min(left.0, right.0)
 }
 
 fn option_min(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -1409,6 +1429,33 @@ mod tests {
             acc.merge(second);
 
             assert_eq!(acc.drain().len(), 2);
+        }
+    }
+
+    #[test]
+    fn gap_accumulator_keeps_an_unknown_floor_when_merging_a_bounded_neighbour() {
+        let mut unknown_floor = test_gap(8453, 3, 10, 10, GapReason::BoundarySlip);
+        unknown_floor.to_block_number = Some(120);
+        unknown_floor.to_observed_at_ms = Some(120_000);
+        let mut bounded = test_gap(8453, 3, 11, 11, GapReason::BoundarySlip);
+        bounded.from_block_number = Some(115);
+        bounded.to_block_number = Some(118);
+        bounded.from_observed_at_ms = Some(115_000);
+        bounded.to_observed_at_ms = Some(118_000);
+        for (first, second) in [
+            (unknown_floor.clone(), bounded.clone()),
+            (bounded, unknown_floor),
+        ] {
+            let mut acc = GapAccumulator::default();
+            acc.merge(first);
+            acc.merge(second);
+            let pending = acc.drain();
+
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].from_block_number, None);
+            assert_eq!(pending[0].to_block_number, Some(120));
+            assert_eq!(pending[0].from_observed_at_ms, None);
+            assert_eq!(pending[0].to_observed_at_ms, Some(120_000));
         }
     }
 
