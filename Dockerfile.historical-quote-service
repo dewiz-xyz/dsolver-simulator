@@ -8,14 +8,14 @@ set -eu
 rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
 cat > /etc/apt/sources.list.d/debian.sources <<'SOURCES'
 Types: deb
-URIs: https://snapshot.debian.org/archive/debian/20260908T000000Z
+URIs: https://snapshot.debian.org/archive/debian/20261023T000000Z
 Suites: bookworm bookworm-updates
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 Check-Valid-Until: no
 
 Types: deb
-URIs: https://snapshot.debian.org/archive/debian-security/20260908T000000Z
+URIs: https://snapshot.debian.org/archive/debian-security/20261023T000000Z
 Suites: bookworm-security
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
