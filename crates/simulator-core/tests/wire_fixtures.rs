@@ -60,6 +60,45 @@ fn rfq_update_written_before_the_bebop_origin_fields_still_reads() -> Result<()>
     Ok(())
 }
 
+/// Readers check every protocol name in an update while deserializing it, so a protocol the
+/// reader's build does not know fails the whole message. Every consumer has to run a build that
+/// knows a protocol before the broadcaster publishes it.
+#[test]
+fn update_reads_only_protocols_this_build_knows() -> Result<()> {
+    let header = block_header(19_000_001, 0x12);
+    let update = BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::with_messages(
+        BroadcasterBackend::Native,
+        19_000_001,
+        vec![protocol_message(
+            "aerodrome_v1",
+            SynchronizerState::Ready(header.clone()),
+            empty_state_sync_message(header.clone()),
+        )],
+        BTreeMap::from([(
+            "aerodrome_v1".to_string(),
+            BroadcasterProtocolSyncStatus::from_synchronizer_state(&SynchronizerState::Ready(
+                header,
+            )),
+        )]),
+    )])?;
+    let json = serde_json::to_string(&envelope(1, BroadcasterPayload::Update(update)))?;
+
+    let decoded: BroadcasterEnvelope = serde_json::from_str(&json)?;
+    assert_eq!(serde_json::to_string(&decoded)?, json);
+
+    let unknown = json.replace("aerodrome_v1", "future_protocol");
+    let error = serde_json::from_str::<BroadcasterEnvelope>(&unknown)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an unknown protocol must fail the read"))?;
+    assert!(
+        error
+            .to_string()
+            .contains("future_protocol could not be classified"),
+        "{error}"
+    );
+    Ok(())
+}
+
 #[test]
 fn heartbeat_matches_wire_fixture() -> Result<()> {
     let heartbeat = BroadcasterHeartbeat::new(

@@ -48,6 +48,10 @@ id = "aerodrome_slipstreams"
 backend = "native"
 
 [[protocols]]
+id = "aerodrome_v1"
+backend = "native"
+
+[[protocols]]
 id = "vm:curve"
 backend = "vm"
 
@@ -158,6 +162,9 @@ native_protocols = [
     "pancakeswap_v3",
     "aerodrome_slipstreams",
 ]
+# The broadcaster carries these for DSolver V2, which encodes them itself. Our execution fork has no
+# encoder for them, so the simulator does not route them.
+broadcaster_only_native_protocols = ["aerodrome_v1"]
 vm_protocols = []
 rfq_protocols = ["rfq:bebop"]
 route_policy = "base"

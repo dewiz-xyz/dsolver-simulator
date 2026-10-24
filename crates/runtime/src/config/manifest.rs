@@ -53,6 +53,7 @@ struct ChainRegistryEntry {
     hashflow_filename: String,
     liquorice_url: Option<String>,
     native_protocols: Vec<ProtocolKind>,
+    broadcaster_only_native_protocols: Vec<ProtocolKind>,
     vm_protocols: Vec<ProtocolKind>,
     rfq_protocols: Vec<ProtocolKind>,
     stream_initialization_timeout_secs: u64,
@@ -119,6 +120,9 @@ struct RawChain {
     #[serde(default)]
     liquorice_url: Option<String>,
     native_protocols: Vec<String>,
+    /// Native protocols only the broadcaster subscribes to. Their consumers bring an encoder.
+    #[serde(default)]
+    broadcaster_only_native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
     stream_initialization_timeout_secs: NonZeroU64,
@@ -184,6 +188,7 @@ pub(crate) fn resolve_chain_config(
         chain_profile: ChainProfile {
             chain: chain_from_id(chain.chain_id)?,
             native_protocols: chain.native_protocols.clone(),
+            broadcaster_only_native_protocols: chain.broadcaster_only_native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
             stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs,
@@ -397,18 +402,23 @@ fn validate_chains(
         let native_protocols = validate_backend_protocol_refs(
             chain.chain_id,
             BackendKind::Native,
+            "native_protocols",
             &chain.native_protocols,
             protocols,
         )?;
+        let broadcaster_only_native_protocols =
+            validate_broadcaster_only_native_protocols(chain, &native_protocols, protocols)?;
         let vm_protocols = validate_backend_protocol_refs(
             chain.chain_id,
             BackendKind::Vm,
+            "vm_protocols",
             &chain.vm_protocols,
             protocols,
         )?;
         let rfq_protocols = validate_backend_protocol_refs(
             chain.chain_id,
             BackendKind::Rfq,
+            "rfq_protocols",
             &chain.rfq_protocols,
             protocols,
         )?;
@@ -424,6 +434,7 @@ fn validate_chains(
                 hashflow_filename: hashflow_filename.to_string(),
                 liquorice_url,
                 native_protocols,
+                broadcaster_only_native_protocols,
                 vm_protocols,
                 rfq_protocols,
                 stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs.get(),
@@ -448,9 +459,34 @@ fn validate_chains(
     Ok(registry)
 }
 
+fn validate_broadcaster_only_native_protocols(
+    chain: &RawChain,
+    native_protocols: &[ProtocolKind],
+    protocols: &HashMap<ProtocolKind, BackendKind>,
+) -> Result<Vec<ProtocolKind>> {
+    let broadcaster_only_native_protocols = validate_backend_protocol_refs(
+        chain.chain_id,
+        BackendKind::Native,
+        "broadcaster_only_native_protocols",
+        &chain.broadcaster_only_native_protocols,
+        protocols,
+    )?;
+    if let Some(protocol) = broadcaster_only_native_protocols
+        .iter()
+        .find(|protocol| native_protocols.contains(protocol))
+    {
+        bail!(
+            "chain {} lists protocol {protocol} in both native_protocols and broadcaster_only_native_protocols",
+            chain.chain_id
+        );
+    }
+    Ok(broadcaster_only_native_protocols)
+}
+
 fn validate_backend_protocol_refs(
     chain_id: u64,
     backend: BackendKind,
+    field: &str,
     protocol_ids: &[String],
     protocols: &HashMap<ProtocolKind, BackendKind>,
 ) -> Result<Vec<ProtocolKind>> {
@@ -459,10 +495,7 @@ fn validate_backend_protocol_refs(
     // Chains can only point at globally declared protocols for the matching backend. That keeps a
     // typo or copy/paste mixup from silently turning into a weird runtime config.
     for protocol_id in protocol_ids {
-        let protocol_id = required_string(
-            &format!("chains[{chain_id}].{}_protocols", backend.label()),
-            protocol_id,
-        )?;
+        let protocol_id = required_string(&format!("chains[{chain_id}].{field}"), protocol_id)?;
         let protocol_kind = parse_protocol_id(protocol_id)?;
         if !seen.insert(protocol_kind) {
             bail!(
@@ -589,8 +622,14 @@ mod tests {
         ]);
         let references = [" uniswap_v3 ".to_string(), "uniswap_v2".to_string()];
         assert_eq!(
-            validate_backend_protocol_refs(1, BackendKind::Native, &references, &declared)
-                .unwrap_or_else(|error| unreachable!("valid references: {error}")),
+            validate_backend_protocol_refs(
+                1,
+                BackendKind::Native,
+                "native_protocols",
+                &references,
+                &declared,
+            )
+            .unwrap_or_else(|error| unreachable!("valid references: {error}")),
             vec![ProtocolKind::UniswapV3, ProtocolKind::UniswapV2],
         );
         for references in [
@@ -604,10 +643,14 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            assert!(
-                validate_backend_protocol_refs(1, BackendKind::Native, &references, &declared)
-                    .is_err()
-            );
+            assert!(validate_backend_protocol_refs(
+                1,
+                BackendKind::Native,
+                "native_protocols",
+                &references,
+                &declared,
+            )
+            .is_err());
         }
     }
 }

@@ -33,6 +33,9 @@ const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
 pub struct ChainProfile {
     pub chain: Chain,
     pub native_protocols: Vec<ProtocolKind>,
+    /// Native protocols the broadcaster publishes but the standalone simulator does not
+    /// route, because its encoder cannot build them. DSolver V2 encodes them itself.
+    pub broadcaster_only_native_protocols: Vec<ProtocolKind>,
     pub vm_protocols: Vec<ProtocolKind>,
     pub rfq_protocols: Vec<ProtocolKind>,
     /// Per-operation bound for replay snapshot requests, incomplete replay recovery,
@@ -55,6 +58,17 @@ pub struct ChainProfile {
     pub native_token_protocol_allowlist: Vec<ProtocolKind>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
     pub erc4626_pair_policies: Vec<Erc4626PairPolicy>,
+}
+
+impl ChainProfile {
+    /// Every native protocol the broadcaster subscribes to and requires in a complete snapshot.
+    pub fn broadcaster_native_protocols(&self) -> Vec<ProtocolKind> {
+        self.native_protocols
+            .iter()
+            .chain(&self.broadcaster_only_native_protocols)
+            .copied()
+            .collect()
+    }
 }
 
 pub fn load_config() -> AppConfig {
@@ -1156,6 +1170,10 @@ mod tests {
             60
         );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
+        assert!(chain
+            .chain_profile
+            .broadcaster_only_native_protocols
+            .is_empty());
         assert!(!chain
             .chain_profile
             .native_protocols
@@ -1221,6 +1239,20 @@ mod tests {
             .chain_profile
             .native_protocols
             .contains(&ProtocolKind::AerodromeSlipstreams));
+        assert!(!chain
+            .chain_profile
+            .native_protocols
+            .contains(&ProtocolKind::AerodromeV1));
+        assert_eq!(
+            chain.chain_profile.broadcaster_only_native_protocols,
+            vec![ProtocolKind::AerodromeV1]
+        );
+        let mut broadcaster_native_protocols = chain.chain_profile.native_protocols.clone();
+        broadcaster_native_protocols.push(ProtocolKind::AerodromeV1);
+        assert_eq!(
+            chain.chain_profile.broadcaster_native_protocols(),
+            broadcaster_native_protocols
+        );
         assert!(chain.chain_profile.vm_protocols.is_empty());
         assert!(chain
             .chain_profile
@@ -1290,6 +1322,86 @@ route_policy = "default"
         };
 
         assert!(err.to_string().contains("duplicate protocol id"));
+    }
+
+    #[test]
+    fn parse_manifest_validates_broadcaster_only_native_protocols() {
+        let manifest_with = |broadcaster_only: &str| {
+            format!(
+                r#"
+[[protocols]]
+id = "uniswap_v2"
+backend = "native"
+
+[[protocols]]
+id = "aerodrome_v1"
+backend = "native"
+
+[[protocols]]
+id = "vm:curve"
+backend = "vm"
+
+[[route_policies]]
+id = "default"
+native_token_protocol_allowlist = []
+reset_allowance_tokens = []
+
+[[chains]]
+chain_id = 8453
+stream_initialization_timeout_secs = 10
+chain_head_poll_interval_ms = 500
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 5
+tycho_initial_bootstrap_timeout_secs = 300
+tycho_head_mismatch_recovery_timeout_secs = 60
+recovery_max_buffered_native_blocks = 64
+token_max_days_since_last_trade = 1
+tycho_url = "tycho"
+bebop_url = "bebop"
+hashflow_filename = "./hashflow.csv"
+native_protocols = ["uniswap_v2"]
+broadcaster_only_native_protocols = {broadcaster_only}
+vm_protocols = []
+rfq_protocols = []
+route_policy = "default"
+"#
+            )
+        };
+
+        let registries = manifest::parse_manifest_registries(&manifest_with(r#"["aerodrome_v1"]"#))
+            .unwrap_or_else(|error| unreachable!("valid broadcaster only protocols: {error:#}"));
+        let chain = resolve_chain_config(&registries, 8453, None)
+            .unwrap_or_else(|error| unreachable!("expected chain 8453: {error:#}"));
+        assert_eq!(
+            chain.chain_profile.native_protocols,
+            vec![ProtocolKind::UniswapV2]
+        );
+        assert_eq!(
+            chain.chain_profile.broadcaster_native_protocols(),
+            vec![ProtocolKind::UniswapV2, ProtocolKind::AerodromeV1]
+        );
+
+        for (broadcaster_only, expected) in [
+            (
+                r#"["uniswap_v2"]"#,
+                "in both native_protocols and broadcaster_only_native_protocols",
+            ),
+            (r#"["aerodrome_v1", "aerodrome_v1"]"#, "more than once"),
+            (r#"["vm:curve"]"#, "manifest declares vm"),
+            (r#"["aerodrome_slipstreams"]"#, "unknown protocol"),
+            (
+                r#"[" "]"#,
+                "chains[8453].broadcaster_only_native_protocols must not be empty",
+            ),
+        ] {
+            let error = manifest::parse_manifest_registries(&manifest_with(broadcaster_only))
+                .err()
+                .unwrap_or_else(|| unreachable!("{broadcaster_only} must be rejected"));
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{broadcaster_only}: {error:#}"
+            );
+        }
     }
 
     #[test]
