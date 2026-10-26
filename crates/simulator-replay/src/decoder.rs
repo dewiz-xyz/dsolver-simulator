@@ -9,6 +9,7 @@ use tycho_simulation::{
         engine_db::tycho_db::PreCachedDB,
         protocol::{
             aerodrome_slipstreams::state::AerodromeSlipstreamsState,
+            aerodrome_v1::state::AerodromeV1State,
             ekubo::state::EkuboState,
             ekubo_v3::state::EkuboV3State,
             erc4626::state::ERC4626State,
@@ -55,6 +56,7 @@ pub const RETAINED_TOKEN_QUALITY_V1: u32 = 0;
 
 const RETAINED_NATIVE_PROTOCOLS_V1: &[ProtocolKind] = &[
     ProtocolKind::AerodromeSlipstreams,
+    ProtocolKind::AerodromeV1,
     ProtocolKind::EkuboV2,
     ProtocolKind::EkuboV3,
     ProtocolKind::ERC4626,
@@ -606,6 +608,9 @@ fn register_native_decoder(
         ProtocolKind::AerodromeSlipstreams => {
             decoder.register_decoder::<AerodromeSlipstreamsState>(protocol.as_str())
         }
+        ProtocolKind::AerodromeV1 => {
+            decoder.register_decoder::<AerodromeV1State>(protocol.as_str())
+        }
         ProtocolKind::ERC4626 => {
             decoder.register_decoder::<ERC4626State>(protocol.as_str());
             decoder.register_filter(protocol.as_str(), erc4626_filter);
@@ -653,6 +658,7 @@ mod tests {
             canonical_names(ReplayBackend::Native),
             [
                 "aerodrome_slipstreams",
+                "aerodrome_v1",
                 "ekubo_v2",
                 "ekubo_v3",
                 "erc4626",
@@ -729,6 +735,144 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["Uniswap_V2", "future_protocol", "uniswap_v2"]);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_profile_quotes_aerodrome_v1_volatile_and_stable_pools() -> anyhow::Result<()>
+    {
+        use alloy_primitives::U256;
+
+        use crate::{ExactPoolQuote, ReplayWorld};
+
+        let token_a = Token::new(
+            &Bytes::from([0x11; 20]),
+            "TOKEN_A",
+            18,
+            0,
+            &[Some(50_000)],
+            Chain::Base,
+            100,
+        );
+        let token_b = Token::new(
+            &Bytes::from([0x22; 20]),
+            "TOKEN_B",
+            18,
+            0,
+            &[Some(50_000)],
+            Chain::Base,
+            100,
+        );
+        let tokens = HashMap::from([
+            (token_a.address.clone(), token_a.clone()),
+            (token_b.address.clone(), token_b.clone()),
+        ]);
+        let message = aerodrome_v1_message(&token_a, &token_b);
+
+        let decoder = ReplayDecoder::new(DecoderConfig::retained_v1(), tokens.clone()).await?;
+        let (update, heads) = decoder
+            .decode_protocol_messages(ReplayBackend::Native, vec![message.clone()])
+            .await?;
+        let update =
+            update.ok_or_else(|| anyhow::anyhow!("aerodrome_v1 snapshot did not decode"))?;
+        assert_eq!(update.states.len(), 2);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].protocol, ProtocolKind::AerodromeV1);
+
+        let mut world = ReplayWorld::new(tokens, None);
+        assert!(!world.apply(update).has_anomalies());
+        let point = world.pin();
+        let quote = |component_id: &str| {
+            point.quote(&ExactPoolQuote {
+                backend: ReplayBackend::Native,
+                protocol: "aerodrome_v1".to_owned(),
+                component_id: component_id.to_owned(),
+                token_in: token_a.address.clone(),
+                token_out: token_b.address.clone(),
+                amount_in: U256::from(10_u64.pow(18)),
+            })
+        };
+        let volatile = quote("0x01")?;
+        let stable = quote("0x02")?;
+        assert!(volatile > U256::ZERO);
+        // Equal reserves price near one on the stable curve, so it beats the volatile pair only
+        // when `is_stable` survived decoding.
+        assert!(stable > volatile);
+
+        // The quoter simulator does not select V1, so it skips the message.
+        let quoter = ReplayDecoder::new(
+            DecoderConfig::for_backend(
+                ReplayBackend::Native,
+                vec![ProtocolKind::AerodromeSlipstreams],
+                0,
+            ),
+            HashMap::new(),
+        )
+        .await?;
+        let (update, heads) = quoter
+            .decode_protocol_messages(ReplayBackend::Native, vec![message])
+            .await?;
+        assert!(update.is_none());
+        assert!(heads.is_empty());
+        Ok(())
+    }
+
+    fn aerodrome_v1_message(token_a: &Token, token_b: &Token) -> BroadcasterProtocolMessage {
+        use alloy_primitives::U256;
+        use tycho_simulation::tycho_client::feed::{
+            synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+            SynchronizerState,
+        };
+        use tycho_simulation::tycho_common::models::protocol::{
+            ProtocolComponent, ProtocolComponentState,
+        };
+
+        let reserve = Bytes::from(U256::from(10_u128.pow(21)).to_be_bytes::<32>().to_vec());
+        let pool = |id: &str, is_stable: bool| ComponentWithState {
+            state: ProtocolComponentState::new(
+                id,
+                HashMap::from([
+                    ("reserve0".to_string(), reserve.clone()),
+                    ("reserve1".to_string(), reserve.clone()),
+                ]),
+                HashMap::new(),
+            ),
+            component: ProtocolComponent {
+                id: id.to_string(),
+                protocol_system: "aerodrome_v1".to_string(),
+                tokens: vec![token_a.address.clone(), token_b.address.clone()],
+                static_attributes: HashMap::from([(
+                    "is_stable".to_string(),
+                    Bytes::from(vec![u8::from(is_stable)]),
+                )]),
+                ..Default::default()
+            },
+            component_tvl: None,
+            entrypoints: Vec::new(),
+        };
+        let header = BlockHeader {
+            number: 123,
+            hash: Bytes::from([1; 32]),
+            parent_hash: Bytes::from([0; 32]),
+            revert: false,
+            timestamp: 1230,
+            partial_block_index: None,
+        };
+        BroadcasterProtocolMessage::new(
+            "aerodrome_v1",
+            SynchronizerState::Ready(header.clone()),
+            StateSyncMessage {
+                header,
+                snapshots: Snapshot {
+                    states: HashMap::from([
+                        ("0x01".to_string(), pool("0x01", false)),
+                        ("0x02".to_string(), pool("0x02", true)),
+                    ]),
+                    vm_storage: HashMap::new(),
+                },
+                deltas: None,
+                removed_components: HashMap::new(),
+            },
+        )
     }
 
     fn raw_message(protocol: &str) -> BroadcasterProtocolMessage {

@@ -403,7 +403,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     )
     .with_chain_head_observer(
         chain_head_observer.clone(),
-        config.chain_profile.native_protocols.clone(),
+        config.chain_profile.broadcaster_native_protocols(),
         config.chain_profile.vm_protocols.clone(),
     );
     let raw_health = Arc::new(StreamHealth::new());
@@ -610,7 +610,7 @@ async fn build_redis_publisher(
         writer,
     )
     .with_required_protocols(
-        config.chain_profile.native_protocols.clone(),
+        config.chain_profile.broadcaster_native_protocols(),
         config.chain_profile.vm_protocols.clone(),
     );
     let publisher = match state_history {
@@ -658,7 +658,8 @@ async fn load_token_store(config: &BroadcasterConfig) -> Result<Arc<TokenStore>>
 
 fn raw_configured_backends(config: &BroadcasterConfig) -> Vec<BroadcasterBackend> {
     let mut backends = Vec::new();
-    if !config.chain_profile.native_protocols.is_empty() {
+    let native_protocols = config.chain_profile.broadcaster_native_protocols();
+    if !native_protocols.is_empty() {
         backends.push(BroadcasterBackend::Native);
     }
     if !config.chain_profile.vm_protocols.is_empty() {
@@ -706,7 +707,7 @@ fn spawn_broadcaster_stream_task(
     let tvl_threshold = config.tvl_threshold;
     let tvl_keep_threshold = config.tvl_keep_threshold;
     let protocols = BroadcasterProtocols {
-        native: config.chain_profile.native_protocols.clone(),
+        native: config.chain_profile.broadcaster_native_protocols(),
         vm: config.chain_profile.vm_protocols.clone(),
     };
     let recovery_config = BroadcasterRecoveryConfig {
@@ -1177,6 +1178,7 @@ mod tests {
             chain_profile: ChainProfile {
                 chain: Chain::Ethereum,
                 native_protocols: vec![ProtocolKind::UniswapV2],
+                broadcaster_only_native_protocols: Vec::new(),
                 vm_protocols: Vec::new(),
                 rfq_protocols: vec![ProtocolKind::Bebop],
                 stream_initialization_timeout_secs: 25,
@@ -1236,6 +1238,18 @@ mod tests {
     #[test]
     fn raw_configured_backends_omit_rfq_when_effective() {
         let config = test_config();
+
+        assert_eq!(
+            raw_configured_backends(&config),
+            vec![BroadcasterBackend::Native]
+        );
+    }
+
+    #[test]
+    fn raw_configured_backends_keep_native_for_broadcaster_only_protocols() {
+        let mut config = test_config();
+        config.chain_profile.native_protocols = Vec::new();
+        config.chain_profile.broadcaster_only_native_protocols = vec![ProtocolKind::AerodromeV1];
 
         assert_eq!(
             raw_configured_backends(&config),

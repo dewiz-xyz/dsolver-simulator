@@ -287,7 +287,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("test manifest must resolve chain {chain_id}: {err}"));
 
         (
-            resolved.chain_profile.native_protocols,
+            resolved.chain_profile.broadcaster_native_protocols(),
             resolved.chain_profile.vm_protocols,
         )
     }
