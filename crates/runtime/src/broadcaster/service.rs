@@ -2210,9 +2210,9 @@ fn record_boundary_slip_gap_if_any(
     let Some(message_seq) = requested.position.message_seq.checked_add(1) else {
         return;
     };
-    // A half-bounded gap never matches the reader's overlap checks, and the capture
-    // cursor would understate the window, so an unknown request-time cursor becomes
-    // zero: unbounded below, matching every earlier range conservatively.
+    // Right after a promotion the request-time cursor can still be unknown. The capture
+    // cursor would understate the window, so the floor stays unknown here and the store
+    // derives it from the last complete checkpoint before the gap.
     handle.record_boundary_slip_gap(
         chain_id,
         StreamPosition {
@@ -2220,14 +2220,9 @@ fn record_boundary_slip_gap_if_any(
             message_seq,
         },
         capture.position,
+        (requested.block_number, capture.block_number),
         (
-            Some(requested.block_number.unwrap_or(0)),
-            capture.block_number,
-        ),
-        (
-            capture
-                .rfq_observed_at_ms
-                .map(|_| requested.rfq_observed_at_ms.unwrap_or(0)),
+            capture.rfq_observed_at_ms.and(requested.rfq_observed_at_ms),
             capture.rfq_observed_at_ms,
         ),
     );
@@ -3838,7 +3833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_history_slip_gap_with_unknown_request_cursors_is_unbounded_below() {
+    async fn state_history_slip_gap_with_unknown_request_cursors_leaves_the_floor_unknown() {
         let (state_history, probe) = test_state_history_runtime(8);
         super::record_boundary_slip_gap_if_any(
             &state_history.handle,
@@ -3865,9 +3860,9 @@ mod tests {
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].from_message_seq, 6);
         assert_eq!(gaps[0].to_message_seq, 8);
-        assert_eq!(gaps[0].from_block_number, Some(0));
+        assert_eq!(gaps[0].from_block_number, None);
         assert_eq!(gaps[0].to_block_number, Some(120));
-        assert_eq!(gaps[0].from_observed_at_ms, Some(0));
+        assert_eq!(gaps[0].from_observed_at_ms, None);
         assert_eq!(gaps[0].to_observed_at_ms, Some(9_000));
     }
 

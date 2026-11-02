@@ -612,6 +612,12 @@ pub(crate) fn gap_affects_interval(
     start_observed_at_ms: Option<u64>,
     end_observed_at_ms: Option<u64>,
 ) -> bool {
+    // The start state already holds whatever the lost messages did, so a gap ending at or
+    // before its position cannot change what is replayed from there. Checking this first lets
+    // the block reach include the start block itself, where a same-block loss can hide.
+    if gap.to_position.is_some_and(|to| to <= start_position) {
+        return false;
+    }
     let position_overlap = gap
         .from_position
         .zip(gap.to_position)
@@ -619,7 +625,7 @@ pub(crate) fn gap_affects_interval(
     let block_overlap = gap
         .from_block
         .zip(gap.to_block_inclusive)
-        .is_some_and(|(from, to)| to > start_block && from <= end_block);
+        .is_some_and(|(from, to)| to >= start_block && from <= end_block);
     let time_overlap = gap
         .from_observed_at_ms
         .zip(gap.to_observed_at_ms)
