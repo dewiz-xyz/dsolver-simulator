@@ -1233,7 +1233,7 @@ mod tests {
                 .tycho_head_mismatch_recovery_timeout_secs,
             60
         );
-        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 64);
+        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 512);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
             .chain_profile

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use super::{
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
 use crate::broadcaster::state_history::test_state_history_runtime;
+use crate::config::{load_manifest_registries, resolve_chain_config};
 use simulator_core::broadcaster::{
     BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
     BroadcasterMessageKind, BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolMessage,
@@ -865,6 +867,85 @@ async fn startup_handoff_overflow_discards_private_work_and_allows_retry() -> Re
         publisher.deployment_admission_snapshot().phase,
         BroadcasterDeploymentPhase::CandidateBuilding
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn base_manifest_startup_handoff_retains_25_seconds_of_blocks() -> Result<()> {
+    let cache = BroadcasterSnapshotCache::new(Chain::Base.id(), vec![BroadcasterBackend::Native]);
+    let writer = FakeRedisWriter::default();
+    let publisher =
+        BroadcasterRedisPublisher::new(base_publisher_config()?, Arc::new(writer.clone()));
+    let handoff_id = publisher.begin_startup_handoff().await?;
+
+    // Production snapshot builds take up to 25s while Base produces a block every 200ms,
+    // so the handoff has to hold 125 blocks. A 64 block cap cancelled it before promotion.
+    for block_number in 11..=135 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let message = cache
+            .apply_update(&update(
+                BroadcasterBackend::Native,
+                block_number,
+                "native-1",
+            ))
+            .await?;
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(message))
+            .await?;
+    }
+    assert!(writer.appends().await.is_empty());
+
+    let handoff = publisher.freeze_startup_handoff(handoff_id).await?;
+    publisher
+        .promote(
+            vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 10)],
+            "startup_handoff",
+        )
+        .await?;
+    publisher.drain_startup_handoff(handoff).await?;
+    publisher.admit_deployment();
+
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends.len(),
+        126,
+        "one promotion marker plus every buffered block"
+    );
+    assert_eq!(
+        appends
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        (1..=126).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        appends
+            .iter()
+            .filter(|append| append.entry.kind == BroadcasterMessageKind::Update)
+            .map(|append| append.entry.block_number)
+            .collect::<Vec<_>>(),
+        (11..=135).map(Some).collect::<Vec<_>>()
+    );
+    assert!(publisher.deployment_admission_snapshot().admitted);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn base_manifest_startup_handoff_still_expires_after_60_seconds() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher =
+        BroadcasterRedisPublisher::new(base_publisher_config()?, Arc::new(writer.clone()));
+    let handoff_id = publisher.begin_startup_handoff().await?;
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+
+    assert!(publisher.freeze_startup_handoff(handoff_id).await.is_err());
+    assert_eq!(
+        publisher.mode().await,
+        BroadcasterRedisPublisherMode::Passive
+    );
+    assert!(!publisher.deployment_admission_snapshot().admitted);
+    assert!(writer.appends().await.is_empty());
     Ok(())
 }
 
@@ -3006,6 +3087,17 @@ fn publisher_config() -> BroadcasterRedisPublisherConfig {
         writer_lease_ttl: Duration::from_secs(30),
         recovery_max_buffered_native_blocks: 64,
     }
+}
+
+fn base_publisher_config() -> Result<BroadcasterRedisPublisherConfig> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../simulator-manifest.toml");
+    let registries = load_manifest_registries(&manifest)?;
+    let base = resolve_chain_config(&registries, Chain::Base.id(), None)?;
+    Ok(BroadcasterRedisPublisherConfig {
+        chain_id: base.chain_profile.chain.id(),
+        recovery_max_buffered_native_blocks: base.chain_profile.recovery_max_buffered_native_blocks,
+        ..publisher_config()
+    })
 }
 
 fn base_heads<const N: usize>(backends: [BroadcasterBackend; N]) -> Vec<BroadcasterBackendHead> {
