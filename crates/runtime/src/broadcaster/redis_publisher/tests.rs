@@ -294,6 +294,87 @@ async fn startup_handoff_overflow_discards_private_work_and_allows_retry() -> Re
     Ok(())
 }
 
+// Original regression coverage for the 2026-11-06 Base startup incident, using
+// this module's existing cache and Redis writer fixtures.
+#[tokio::test(start_paused = true)]
+async fn base_manifest_startup_handoff_retains_25_seconds_of_blocks() -> Result<()> {
+    let cache = BroadcasterSnapshotCache::new(Chain::Base.id(), vec![BroadcasterBackend::Native]);
+    let writer = FakeRedisWriter::default();
+    let publisher =
+        BroadcasterRedisPublisher::new(base_publisher_config()?, Arc::new(writer.clone()));
+    let handoff_id = publisher.begin_startup_handoff().await?;
+
+    // Production snapshot builds took up to 24.6 seconds while Base advanced
+    // five complete blocks per second. The former 64-block cap lost this tail.
+    for block_number in 11..=135 {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let message = cache
+            .apply_update(&update(
+                BroadcasterBackend::Native,
+                block_number,
+                "native-1",
+            ))
+            .await?;
+        publisher
+            .publish_accepted_payload(BroadcasterPayload::Update(message))
+            .await?;
+    }
+    assert!(writer.appends().await.is_empty());
+
+    let handoff = publisher.freeze_startup_handoff(handoff_id).await?;
+    publisher
+        .promote(
+            vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 10)],
+            "startup_handoff",
+        )
+        .await?;
+    publisher.drain_startup_handoff(handoff).await?;
+    publisher.admit_deployment();
+
+    let appends = writer.appends().await;
+    assert_eq!(
+        appends.len(),
+        126,
+        "one promotion marker plus every buffered block"
+    );
+    assert_eq!(
+        appends
+            .iter()
+            .map(|append| append.entry.message_seq)
+            .collect::<Vec<_>>(),
+        (1..=126).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        appends
+            .iter()
+            .filter(|append| append.entry.kind == BroadcasterMessageKind::Update)
+            .map(|append| append.entry.block_number)
+            .collect::<Vec<_>>(),
+        (11..=135).map(Some).collect::<Vec<_>>()
+    );
+    assert!(publisher.deployment_admission_snapshot().admitted);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn base_manifest_startup_handoff_still_expires_after_60_seconds() -> Result<()> {
+    let writer = FakeRedisWriter::default();
+    let publisher =
+        BroadcasterRedisPublisher::new(base_publisher_config()?, Arc::new(writer.clone()));
+    let handoff_id = publisher.begin_startup_handoff().await?;
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+
+    assert!(publisher.freeze_startup_handoff(handoff_id).await.is_err());
+    assert_eq!(
+        publisher.mode().await,
+        BroadcasterRedisPublisherMode::Passive
+    );
+    assert!(!publisher.deployment_admission_snapshot().admitted);
+    assert!(writer.appends().await.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn admission_latches_through_recoverable_failure_and_closes_for_shutdown() -> Result<()> {
     let cache = ready_cache(BroadcasterBackend::Native, 10, "native-1").await?;
@@ -2378,6 +2459,18 @@ fn publisher_config() -> BroadcasterRedisPublisherConfig {
         writer_lease_ttl: Duration::from_secs(30),
         recovery_max_buffered_native_blocks: 64,
     }
+}
+
+fn base_publisher_config() -> Result<BroadcasterRedisPublisherConfig> {
+    let manifest =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../simulator-manifest.toml");
+    let registries = crate::config::load_manifest_registries(&manifest)?;
+    let base = crate::config::resolve_chain_config(&registries, Chain::Base.id(), None)?;
+    Ok(BroadcasterRedisPublisherConfig {
+        chain_id: base.chain_profile.chain.id(),
+        recovery_max_buffered_native_blocks: base.chain_profile.recovery_max_buffered_native_blocks,
+        ..publisher_config()
+    })
 }
 
 fn base_heads<const N: usize>(backends: [BroadcasterBackend; N]) -> Vec<BroadcasterBackendHead> {

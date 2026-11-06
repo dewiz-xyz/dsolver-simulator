@@ -1078,7 +1078,7 @@ mod tests {
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
         assert_eq!(chain.chain_profile.native_progress_lease_secs, 10);
-        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 64);
+        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 512);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
             .chain_profile

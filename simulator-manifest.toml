@@ -134,7 +134,10 @@ route_policy = "ethereum"
 [[chains]]
 chain_id = 8453
 native_progress_lease_secs = 10
-recovery_max_buffered_native_blocks = 64
+# Base advances five complete blocks/second. Leave room for the 60-second
+# startup handoff window (300 blocks) and catch-up bursts; 64 blocks cancelled
+# the handoff before production snapshots could finish their 23–25 second build.
+recovery_max_buffered_native_blocks = 512
 tycho_url = "tycho-base-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/base/v3/tokens"
 hashflow_filename = "./hashflow_supported_tokens.csv"
