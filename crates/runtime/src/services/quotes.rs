@@ -1918,6 +1918,10 @@ impl PoolSimulationRunner {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "per-pool aggregation consumes the complete failure context without a separate allocation"
+)]
 async fn simulate_pool(input: SimulatePoolInput) -> Result<PoolSimOutcome, QuoteFailure> {
     let SimulatePoolInput {
         descriptor,

@@ -58,6 +58,10 @@ impl QuoteService {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the timeout arm constructs the complete QuoteResult returned unchanged by quote"
+    )]
     async fn run_quote_computation(
         &self,
         request: &AmountOutRequest,

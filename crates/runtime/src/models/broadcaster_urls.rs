@@ -57,10 +57,7 @@ fn prefixed_path(prefix: &str, relative_path: &str) -> String {
 }
 
 fn broadcaster_path_prefix(url: &reqwest::Url) -> &str {
-    match url.path().trim_end_matches('/') {
-        "" => "",
-        path => path,
-    }
+    url.path().trim_end_matches('/')
 }
 
 #[cfg(test)]
