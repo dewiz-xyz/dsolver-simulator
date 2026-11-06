@@ -895,13 +895,7 @@ mod tests {
                 if !state.snapshot_delay.is_zero() {
                     tokio::time::sleep(state.snapshot_delay).await;
                 }
-                if state
-                    .snapshot_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
+                if consume_planned_response(&state.snapshot_failures) {
                     return write_http_response(
                         &mut stream,
                         "503 Service Unavailable",
@@ -909,13 +903,7 @@ mod tests {
                     )
                     .await;
                 }
-                if state
-                    .truncated_snapshot_responses
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
+                if consume_planned_response(&state.truncated_snapshot_responses) {
                     return write_http_response_with_content_length(
                         &mut stream,
                         "200 OK",
@@ -950,6 +938,20 @@ mod tests {
         };
 
         write_http_response(&mut stream, status, &body).await
+    }
+
+    // Preserve the checked atomic decrement on the workspace's minimum Rust
+    // version without the fetch_update API deprecated by newer toolchains.
+    fn consume_planned_response(remaining: &AtomicUsize) -> bool {
+        let mut current = remaining.load(Ordering::SeqCst);
+        while let Some(next) = current.checked_sub(1) {
+            match remaining.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+        false
     }
 
     fn build_test_config(
