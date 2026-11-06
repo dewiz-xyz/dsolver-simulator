@@ -150,7 +150,10 @@ chain_head_rpc_request_timeout_ms = 2000
 chain_head_observation_max_age_secs = 5
 tycho_initial_bootstrap_timeout_secs = 300
 tycho_head_mismatch_recovery_timeout_secs = 60
-recovery_max_buffered_native_blocks = 64
+# Base produces a block every 200ms, so a 60s startup or recovery handoff can buffer about
+# 300 blocks. Stay above that so the time limit ends a slow handoff, not a block cap that
+# expires before a 14-25s snapshot build finishes.
+recovery_max_buffered_native_blocks = 512
 token_max_days_since_last_trade = 1
 tycho_url = "tycho-base-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/base/v3/tokens"
