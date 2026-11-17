@@ -1085,7 +1085,7 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         104,
         BroadcasterPayload::RecoveryStart(BroadcasterRecoveryStart::new(manifest)?),
     )?;
-    let request_generation_before_recovery = controls.native_state_store.request_generation().await;
+    let head_revision_before_recovery = controls.native_state_store.pin().await.head_revision();
     apply_replay_batch(&mut prepared, &mut checkpoint, vec![start])
         .await
         .map_err(|exit| anyhow!(exit.message))?;
@@ -1098,7 +1098,7 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         .applied_head()
         .is_none());
     assert!(
-        controls.native_state_store.request_generation().await > request_generation_before_recovery,
+        controls.native_state_store.pin().await.head_revision() > head_revision_before_recovery,
         "RecoveryStart must fence requests before assembling private replacement state"
     );
     assert!(

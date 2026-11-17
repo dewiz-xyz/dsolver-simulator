@@ -4,8 +4,6 @@ use super::protocol::ProtocolKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Erc4626PairPolicy {
-    pub asset_symbol: String,
-    pub share_symbol: String,
     pub asset: Bytes,
     pub share: Bytes,
     pub allow_asset_to_share: bool,
@@ -79,24 +77,18 @@ mod tests {
     fn pair_policies() -> Vec<Erc4626PairPolicy> {
         vec![
             Erc4626PairPolicy {
-                asset_symbol: "USDS".to_string(),
-                share_symbol: "sUSDS".to_string(),
                 asset: known_address("0xdC035D45d973E3EC169d2276DDab16f1e407384F"),
                 share: known_address("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"),
                 allow_asset_to_share: true,
                 allow_share_to_asset: true,
             },
             Erc4626PairPolicy {
-                asset_symbol: "USDC".to_string(),
-                share_symbol: "sUSDC".to_string(),
                 asset: known_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
                 share: known_address("0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE"),
                 allow_asset_to_share: true,
                 allow_share_to_asset: true,
             },
             Erc4626PairPolicy {
-                asset_symbol: "PYUSD".to_string(),
-                share_symbol: "spPYUSD".to_string(),
                 asset: known_address("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"),
                 share: known_address("0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354"),
                 allow_asset_to_share: true,

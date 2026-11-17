@@ -8,13 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-alloy-primitives.workspace = true
 anyhow.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
 axum.workspace = true
 jemallocator.workspace = true
-num-bigint.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -37,8 +35,7 @@ path = "src/bin/state-history-migrate.rs"
 [dev-dependencies]
 runtime = { path = "../runtime", features = ["test-util"] }
 chrono.workspace = true
-futures.workspace = true
-jemalloc-ctl.workspace = true
+num-bigint.workspace = true
 num-traits.workspace = true
 tower.workspace = true
 typetag.workspace = true

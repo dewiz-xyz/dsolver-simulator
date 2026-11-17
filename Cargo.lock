@@ -46,7 +46,6 @@ dependencies = [
  "alloy-eips",
  "alloy-json-rpc",
  "alloy-network",
- "alloy-node-bindings",
  "alloy-provider",
  "alloy-rpc-client",
  "alloy-rpc-types",
@@ -221,32 +220,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloy-genesis"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbf9480307b09d22876efb67d30cadd9013134c21f3a17ec9f93fd7536d38024"
-dependencies = [
- "alloy-eips",
- "alloy-primitives 1.7.3",
- "alloy-serde",
- "alloy-trie",
- "serde",
-]
-
-[[package]]
-name = "alloy-hardforks"
-version = "0.2.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3165210652f71dfc094b051602bafd691f506c54050a174b1cba18fb5ef706a3"
-dependencies = [
- "alloy-chains",
- "alloy-eip2124",
- "alloy-primitives 1.7.3",
- "auto_impl",
- "dyn-clone",
-]
-
-[[package]]
 name = "alloy-json-abi"
 version = "1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,28 +286,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloy-node-bindings"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9b2fda91b56bb08907cd44c5068130360e027e46a8c17612d386869fa7940be"
-dependencies = [
- "alloy-genesis",
- "alloy-hardforks",
- "alloy-network",
- "alloy-primitives 1.7.3",
- "alloy-signer",
- "alloy-signer-local",
- "k256",
- "libc",
- "rand 0.8.6",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "alloy-primitives"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -398,10 +349,8 @@ dependencies = [
  "alloy-json-rpc",
  "alloy-network",
  "alloy-network-primitives",
- "alloy-node-bindings",
  "alloy-primitives 1.7.3",
  "alloy-rpc-client",
- "alloy-rpc-types-anvil",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-trace",
@@ -484,18 +433,6 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-trace",
- "alloy-serde",
- "serde",
-]
-
-[[package]]
-name = "alloy-rpc-types-anvil"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47df51bedb3e6062cb9981187a51e86d0d64a4de66eb0855e9efe6574b044ddf"
-dependencies = [
- "alloy-primitives 1.7.3",
- "alloy-rpc-types-eth",
  "alloy-serde",
  "serde",
 ]
@@ -890,14 +827,11 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "apps"
 version = "0.1.0"
 dependencies = [
- "alloy-primitives 1.7.3",
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
  "axum 0.7.9",
  "chrono",
- "futures 0.3.32",
- "jemalloc-ctl",
  "jemallocator",
  "num-bigint",
  "num-traits",
@@ -5891,9 +5825,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
- "futures-util",
  "h2 0.4.13",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -6241,7 +6173,6 @@ dependencies = [
  "serde_json",
  "simulator-core",
  "tokio",
- "tokio-util",
  "tower",
  "tracing",
  "tycho-simulation",
@@ -6351,7 +6282,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "tycho-common",
- "tycho-execution",
  "tycho-simulation",
  "typetag",
 ]
@@ -8124,30 +8054,6 @@ dependencies = [
  "tracing",
  "tycho-common",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "tycho-execution"
-version = "0.525.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa1bbb6812ae863e679505991ea713e7baade53880c2bf447df541838b1cda8c"
-dependencies = [
- "alloy",
- "chrono",
- "clap",
- "dotenvy",
- "hex",
- "metrics",
- "num-bigint",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "strum",
- "strum_macros",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tycho-common",
 ]
 
 [[package]]

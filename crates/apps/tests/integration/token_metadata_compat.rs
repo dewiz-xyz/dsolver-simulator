@@ -1,6 +1,6 @@
 use runtime::chain_head::ChainHeadObserver;
 use simulator_core::broadcaster::BlockIdentity;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,6 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
-use runtime::models::protocol::ProtocolKind;
 use runtime::models::state::{
     AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
 };
@@ -275,7 +274,6 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
     Ok(AppState {
         chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: token_store.chain(),
-        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -300,7 +298,6 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(Vec::new()),
-        reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
     })
 }
 

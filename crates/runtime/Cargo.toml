@@ -33,11 +33,9 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
-typetag.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tycho-common.workspace = true
-tycho-execution.workspace = true
 tycho-simulation.workspace = true
 broadcaster_replay_client = { package = "broadcaster-replay-client", path = "../broadcaster-replay-client" }
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
@@ -47,6 +45,7 @@ state_history = { package = "state-history", path = "../state-history" }
 [dev-dependencies]
 chrono.workspace = true
 sha2.workspace = true
+typetag.workspace = true
 state_history = { package = "state-history", path = "../state-history", features = ["test-util"] }
 
 [lints]

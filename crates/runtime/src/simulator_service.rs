@@ -468,9 +468,6 @@ fn build_app_state(
                 config.chain_profile.chain_head_observation_max_age_secs,
             ),
         })),
-        native_token_protocol_allowlist: Arc::new(
-            config.chain_profile.native_token_protocol_allowlist.clone(),
-        ),
         tokens,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
@@ -495,7 +492,6 @@ fn build_app_state(
         slippage: config.slippage,
         erc4626_deposits_enabled: config.rpc_url.is_some(),
         erc4626_pair_policies: Arc::clone(&config.erc4626_pair_policies),
-        reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
     }
 }
 
@@ -769,7 +765,7 @@ fn rfq_broadcaster_subscription_controls(
 #[cfg(test)]
 mod tests {
     use simulator_core::models::protocol::ProtocolKind;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -985,18 +981,12 @@ mod tests {
         enable_rfq_pools: bool,
         rpc_url: Option<&str>,
     ) -> AppConfig {
-        let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
         let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
 
         AppConfig {
             chain_profile,
             tycho_broadcaster_url: "http://127.0.0.1:3001".to_string(),
-            bebop_url: "https://example.com/bebop".to_string(),
-            hashflow_filename: "./hashflow.csv".to_string(),
-            liquorice_url: Some("https://example.com/liquorice".to_string()),
             rpc_url: rpc_url.map(str::to_string),
-            tvl_threshold: 100.0,
-            tvl_keep_threshold: 20.0,
             port: 3000,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             request_timeout_ms: 4_500,
@@ -1004,7 +994,6 @@ mod tests {
             token_refresh_timeout_ms: 1_000,
             enable_vm_pools,
             enable_rfq_pools,
-            reset_allowance_tokens,
             erc4626_pair_policies,
             stream_stale_secs: 120,
             stream_missing_block_burst: 3,
@@ -1060,16 +1049,11 @@ mod tests {
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 64,
             token_max_days_since_last_trade: 1,
-            native_token_protocol_allowlist: Vec::new(),
-            reset_allowance_tokens: HashMap::new(),
             erc4626_pair_policies: Vec::new(),
         }
     }
 
     fn ethereum_chain_profile() -> ChainProfile {
-        let mut reset_allowance_tokens = HashMap::new();
-        reset_allowance_tokens.insert(1, HashSet::from([Bytes::from([7_u8; 20])]));
-
         ChainProfile {
             chain: Chain::Ethereum,
             native_protocols: vec![
@@ -1088,8 +1072,6 @@ mod tests {
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 8,
             token_max_days_since_last_trade: 1,
-            native_token_protocol_allowlist: vec![ProtocolKind::Rocketpool],
-            reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
         }
     }
@@ -1310,8 +1292,6 @@ mod tests {
         assert_eq!(app_state.chain, Chain::Base);
         assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
-        assert!(app_state.native_token_protocol_allowlist.is_empty());
-        assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(
@@ -1401,11 +1381,6 @@ mod tests {
         assert_eq!(app_state.chain, Chain::Ethereum);
         assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
-        assert_eq!(
-            app_state.native_token_protocol_allowlist.as_ref(),
-            &vec![ProtocolKind::Rocketpool]
-        );
-        assert!(app_state.reset_allowance_tokens.contains_key(&1));
         assert!(app_state.erc4626_deposits_enabled);
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(

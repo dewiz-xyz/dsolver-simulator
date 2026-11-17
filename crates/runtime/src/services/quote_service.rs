@@ -562,7 +562,6 @@ mod tests {
                 hash: Bytes::from(vec![1; 32]),
             })),
             chain: Chain::Ethereum,
-            native_token_protocol_allowlist: Arc::new(Vec::new()),
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -587,7 +586,6 @@ mod tests {
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
         }
     }
 

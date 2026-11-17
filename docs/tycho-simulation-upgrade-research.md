@@ -2,7 +2,7 @@
 
 The corrected `feat/update-tycho-deps` branch targets the agreed **0.525.0** migration. Its original 0.526.0 commit was based on the obsolete `97a2d50` simulator and was not a compatible dependency for current dsolver.
 
-The correction merges simulator master `45a984c4fd78fdc091e65a8fb313b4b2cd83de8a`, which includes dsolver's required baseline `c94491de6a9a8b48d5dc9e2e0933091d009b3da7`. This retains the current bootstrap API, raw snapshot reassembly, lifecycle cancellation, chain-head/freshness checks, historical services, and Base replay buffer settings. Tycho simulation, common, and the published execution crate are pinned exactly to `=0.525.0`; the lockfile also resolves client and ethereum to 0.525.0.
+The correction merges simulator master `45a984c4fd78fdc091e65a8fb313b4b2cd83de8a`, which includes dsolver's required baseline `c94491de6a9a8b48d5dc9e2e0933091d009b3da7`. This retains the current bootstrap API, raw snapshot reassembly, lifecycle cancellation, chain-head/freshness checks, historical services, and Base replay buffer settings. Tycho simulation and common are pinned exactly to `=0.525.0`; the lockfile also resolves client and ethereum to 0.525.0. The agreed execution version remains a workspace pin, with no runtime dependency after encoding removal.
 
 ## Client compatibility
 
@@ -35,18 +35,22 @@ The removed upstream `RFQStreamBuilder` is replaced with public provider feed bu
 
 `POST /encode` is removed and returns `404 Not Found`. Its service, request/response models, firm-quote hydration, route-only state fences, calldata fixtures, and analyzer probes are removed. `/simulate`, `/status`, `/ready`, and broadcaster contracts remain supported. The analyzer writes schema version 8 without encode inspection fields.
 
-The workspace uses the published `tycho-execution = "=0.525.0"` dependency. The private execution fork, vendored source, Cargo patch, and private Git credential plumbing in CI/Docker builds are removed. The historical service builds directly against the shared lockfile. Consumers are responsible for settlement encoding; no executor or router deployment is included.
+The workspace retains `tycho-execution = "=0.525.0"` as the agreed compatibility pin. No package depends on it after removing encoding, so it and its otherwise-unused transitive dependencies are absent from the build graph and lockfile. The private execution fork, vendored source, Cargo patch, and private Git credential plumbing in CI/Docker builds are removed. The historical service builds directly against the shared lockfile. Consumers are responsible for settlement encoding; no executor or router deployment is included.
+
+The cleanup also removes encoder-only allowance resets, native-token permissions, ERC4626 display labels, and the unused publication generation counter. Simulator configuration no longer stores unused provider URLs, and simulator startup no longer validates broadcaster TVL settings. Broadcaster credential and TVL validation remain intact.
+
+Use the updated `simulator-manifest.toml` when deploying. Custom manifests must remove `reset_allowance_tokens` and `native_token_protocol_allowlist` from route policies, and `asset_symbol`/`share_symbol` from ERC4626 pairs; strict unknown-field validation is retained. Addresses and direction permissions still control ERC4626 quote eligibility.
 
 ## Verification
 
-Validated after removing `/encode` on 2026-11-17 with Rust 1.95.0:
+Validated after removing `/encode` and cleaning up its remaining dependencies/configuration on 2026-11-17 with Rust 1.95.0:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`: passed.
-- `cargo nextest run --locked --workspace --no-fail-fast --test-threads 4`: **924 passed, 102 skipped**. Includes the removed endpoint's 404 contract, RFQ-enabled simulator startup without provider credentials on Base/Ethereum, and broadcaster/replay coverage. One passing quote test was flagged for a lingering process; its isolated rerun passed without that flag.
-- `cargo test --locked --workspace --doc`: passed (no doctests defined).
-- Lockfile inspection: execution/simulation/common/client/ethereum each resolve once to crates.io `0.525.0`; no Git dependency or local execution patch remains.
-- `cargo build --locked --workspace --bins --release`: blocked by local disk exhaustion (`No space left on device`), including after removing this checkout's generated debug artifacts. Test-profile binaries compiled and all active tests passed; the release build still needs CI validation.
+- `cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4`: **926 passed, 102 skipped**. Includes the removed endpoint's 404 contract, RFQ-enabled simulator startup without provider credentials on Base/Ethereum, independent broadcaster TVL validation, and broadcaster/replay coverage.
+- `cargo test --locked --workspace --all-features --doc`: passed (no doctests defined).
+- Lockfile inspection: simulation/common/client/ethereum each resolve once to crates.io `0.525.0`; no execution package, Git dependency, or local execution patch remains.
+- The earlier `cargo build --locked --workspace --bins --release` attempt was blocked by local disk exhaustion (`No space left on device`), including after removing this checkout's generated debug artifacts. Test-profile binaries compiled and all active tests passed; the release build still needs CI validation.
 
 Additional verification recorded before the encoding removal for the broadcasting upgrade:
 

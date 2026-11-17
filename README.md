@@ -45,8 +45,9 @@ and exposes HTTP endpoints for quotes and readiness. It uses `tycho-simulation` 
 The local analyzer records readiness, latency, and request evidence.
 
 `POST /encode` has been removed and returns `404 Not Found`. Consumers generate settlement
-calldata themselves. The workspace pins the published `tycho-execution = "=0.525.0"` crate;
-the private fork and vendored patch have been removed.
+calldata themselves. The workspace retains the agreed `tycho-execution = "=0.525.0"` pin,
+but the simulator and broadcaster no longer build it. The private fork and vendored patch
+have been removed.
 
 ## At A Glance
 

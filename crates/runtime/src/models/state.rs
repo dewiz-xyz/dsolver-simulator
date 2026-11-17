@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,6 @@ fn native_token_address() -> Bytes {
 pub struct AppState {
     pub chain: Chain,
     pub chain_head_observer: Arc<ChainHeadObserver>,
-    pub native_token_protocol_allowlist: Arc<Vec<ProtocolKind>>,
     pub tokens: Arc<TokenStore>,
     pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
@@ -60,7 +59,6 @@ pub struct AppState {
     pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
-    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1086,7 +1084,6 @@ struct PublishedStateStore {
     applied_head: Option<BlockIdentity>,
     protocol_heads: ProtocolStateHeads,
     head_revision: u64,
-    request_generation: u64,
     requests_allowed: bool,
     point: StatePoint,
     ready: bool,
@@ -1103,7 +1100,6 @@ impl PublishedStateStore {
             applied_head: None,
             protocol_heads: ProtocolStateHeads::new(required_protocols),
             head_revision: 0,
-            request_generation: 0,
             requests_allowed: false,
             point: ReplayWorld::new(tokens, wrapped_native_token).pin(),
             ready: false,
@@ -1227,11 +1223,6 @@ impl StateStore {
 
     pub(crate) async fn state_version(&self) -> u64 {
         self.published.read().await.version
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn request_generation(&self) -> u64 {
-        self.published.read().await.request_generation
     }
 
     pub(crate) async fn fence_requests(&self) {
@@ -1400,7 +1391,6 @@ impl StateStore {
         } else {
             replacement.head_revision = replacement.head_revision.max(current.head_revision);
         }
-        replacement.request_generation = current.request_generation.saturating_add(1);
         let ready = replacement.ready;
         let previous_ready = current.ready;
         *self.published.write().await = Arc::new(replacement);
@@ -1499,6 +1489,7 @@ impl StateStore {
 mod tests {
     use super::*;
     use std::any::Any;
+    use std::collections::HashSet;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1700,7 +1691,6 @@ mod tests {
         AppState {
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_block_head(1, 1))),
             chain: Chain::Ethereum,
-            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: stores.token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -1725,7 +1715,6 @@ mod tests {
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
         }
     }
 

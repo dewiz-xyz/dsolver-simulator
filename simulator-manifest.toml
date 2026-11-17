@@ -106,29 +106,24 @@ backend = "rfq"
 # Route policies hold the routing nuances that do not belong in the plain chain protocol lists.
 [[route_policies]]
 id = "ethereum"
-native_token_protocol_allowlist = ["rocketpool"]
-reset_allowance_tokens = ["0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 
 # ERC4626 is the one case where direction really matters, so it stays explicit here.
+# USDS / sUSDS
 [[route_policies.erc4626_pairs]]
-asset_symbol = "USDS"
-share_symbol = "sUSDS"
 asset = "0xdC035D45d973E3EC169d2276DDab16f1e407384F"
 share = "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"
 allow_asset_to_share = true
 allow_share_to_asset = true
 
+# USDC / sUSDC
 [[route_policies.erc4626_pairs]]
-asset_symbol = "USDC"
-share_symbol = "sUSDC"
 asset = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 share = "0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE"
 allow_asset_to_share = true
 allow_share_to_asset = true
 
+# PYUSD / spPYUSD
 [[route_policies.erc4626_pairs]]
-asset_symbol = "PYUSD"
-share_symbol = "spPYUSD"
 asset = "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"
 share = "0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354"
 allow_asset_to_share = true
@@ -136,8 +131,6 @@ allow_share_to_asset = true
 
 [[route_policies]]
 id = "base"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 # Chain entries stay intentionally small: endpoints, enabled protocol sets, and the route policy to use.
 # Stream initialization bounds individual replay/bootstrap operations and the first RFQ update.
