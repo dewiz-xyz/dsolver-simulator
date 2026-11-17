@@ -1,0 +1,183 @@
+{
+  "aerodrome_slipstreams": {
+    "state": {
+      "component_id": "aerodrome-slipstreams-baseline",
+      "attributes": {
+        "dfc_baseFee": "0x01f4",
+        "dfc_feeCap": "0x2710",
+        "dfc_scalingFactor": "0x00",
+        "liquidity": "0x0de0b6b3a7640000",
+        "observationCardinality": "0x0001",
+        "observationIndex": "0x0000",
+        "observations/0": "0x0100000000000000000000000000000000000000000000000000000000000000",
+        "sqrt_price_x96": "0x01000000000000000000000000",
+        "tick": "0x00000000",
+        "ticks/-10/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-100/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-1000/net-liquidity": "0xfffffffffffffffffd39750f44ec0000",
+        "ticks/-10000/net-liquidity": "0x0de0b6b3a7640000",
+        "ticks/10000/net-liquidity": "0xf21f494c589c0000"
+      },
+      "balances": {}
+    },
+    "component": {
+      "id": "aerodrome-slipstreams-baseline",
+      "protocol_system": "aerodrome_slipstreams",
+      "protocol_type_name": "aerodrome_slipstreams_pool",
+      "chain": "base",
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+      ],
+      "contract_ids": [],
+      "static_attributes": {
+        "default_fee": "0x01f4",
+        "tick_spacing": "0x00000001"
+      },
+      "change": "Creation",
+      "creation_tx": "0x00",
+      "created_at": "2024-01-01T00:00:00"
+    },
+    "component_tvl": null,
+    "entrypoints": []
+  },
+  "pancakeswap_v3": {
+    "state": {
+      "component_id": "pancakeswap-v3-baseline",
+      "attributes": {
+        "liquidity": "0x0de0b6b3a7640000",
+        "sqrt_price_x96": "0x01000000000000000000000000",
+        "tick": "0x00000000",
+        "ticks/-10/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-100/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-1000/net-liquidity": "0xfffffffffffffffffd39750f44ec0000",
+        "ticks/-10000/net-liquidity": "0x0de0b6b3a7640000",
+        "ticks/10000/net-liquidity": "0xf21f494c589c0000"
+      },
+      "balances": {}
+    },
+    "component": {
+      "id": "pancakeswap-v3-baseline",
+      "protocol_system": "pancakeswap_v3",
+      "protocol_type_name": "pancakeswap_v3_pool",
+      "chain": "base",
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+      ],
+      "contract_ids": [],
+      "static_attributes": {
+        "fee": "0x01f4",
+        "tick_spacing": "0x0a"
+      },
+      "change": "Creation",
+      "creation_tx": "0x00",
+      "created_at": "2024-01-01T00:00:00"
+    },
+    "component_tvl": null,
+    "entrypoints": []
+  },
+  "uniswap_v2": {
+    "state": {
+      "component_id": "uniswap-v2-baseline",
+      "attributes": {
+        "reserve0": "0x056bc75e2d63100000",
+        "reserve1": "0x056bc75e2d63100000"
+      },
+      "balances": {}
+    },
+    "component": {
+      "id": "uniswap-v2-baseline",
+      "protocol_system": "uniswap_v2",
+      "protocol_type_name": "uniswap_v2_pool",
+      "chain": "base",
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+      ],
+      "contract_ids": [],
+      "static_attributes": {
+        "fee": "0x1e"
+      },
+      "change": "Creation",
+      "creation_tx": "0x00",
+      "created_at": "2024-01-01T00:00:00"
+    },
+    "component_tvl": null,
+    "entrypoints": []
+  },
+  "uniswap_v3": {
+    "state": {
+      "component_id": "uniswap-v3-baseline",
+      "attributes": {
+        "liquidity": "0x0de0b6b3a7640000",
+        "sqrt_price_x96": "0x01000000000000000000000000",
+        "tick": "0x00000000",
+        "ticks/-10/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-100/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-1000/net-liquidity": "0xfffffffffffffffffd39750f44ec0000",
+        "ticks/-10000/net-liquidity": "0x0de0b6b3a7640000",
+        "ticks/10000/net-liquidity": "0xf21f494c589c0000"
+      },
+      "balances": {}
+    },
+    "component": {
+      "id": "uniswap-v3-baseline",
+      "protocol_system": "uniswap_v3",
+      "protocol_type_name": "uniswap_v3_pool",
+      "chain": "base",
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+      ],
+      "contract_ids": [],
+      "static_attributes": {
+        "fee": "0x01f4",
+        "tick_spacing": "0x0a"
+      },
+      "change": "Creation",
+      "creation_tx": "0x00",
+      "created_at": "2024-01-01T00:00:00"
+    },
+    "component_tvl": null,
+    "entrypoints": []
+  },
+  "uniswap_v4": {
+    "state": {
+      "component_id": "uniswap-v4-baseline",
+      "attributes": {
+        "liquidity": "0x0de0b6b3a7640000",
+        "protocol_fees/one2zero": "0x00",
+        "protocol_fees/zero2one": "0x00",
+        "sqrt_price_x96": "0x01000000000000000000000000",
+        "tick": "0x00000000",
+        "ticks/-60/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-120/net-liquidity": "0xfffffffffffffffffe9cba87a2760000",
+        "ticks/-1200/net-liquidity": "0xfffffffffffffffffd39750f44ec0000",
+        "ticks/-12000/net-liquidity": "0x0de0b6b3a7640000",
+        "ticks/12000/net-liquidity": "0xf21f494c589c0000"
+      },
+      "balances": {}
+    },
+    "component": {
+      "id": "uniswap-v4-baseline",
+      "protocol_system": "uniswap_v4",
+      "protocol_type_name": "uniswap_v4_pool",
+      "chain": "base",
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+      ],
+      "contract_ids": [],
+      "static_attributes": {
+        "key_lp_fee": "0x01f4",
+        "tick_spacing": "0x0000003c"
+      },
+      "change": "Creation",
+      "creation_tx": "0x00",
+      "created_at": "2024-01-01T00:00:00"
+    },
+    "component_tvl": null,
+    "entrypoints": []
+  }
+}

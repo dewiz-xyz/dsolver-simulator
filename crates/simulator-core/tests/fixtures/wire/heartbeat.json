@@ -1,0 +1,1 @@
+{"stream_id":"wire-fixture-stream","message_seq":3,"kind":"heartbeat","chainId":8453,"snapshotId":"wire-fixture-snapshot","backendHeads":[{"backend":"native","blockNumber":19000000},{"backend":"vm","blockNumber":19000001},{"backend":"rfq","blockNumber":1710000000}]}

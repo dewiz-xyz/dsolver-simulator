@@ -25,6 +25,7 @@ use simulator_core::models::messages::{
     PoolSwapDraft, QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 use self::presets::{
     balanced_profile, chain_label, resolve_token, BalancedProfilePreset, EncodeRouteKind,
@@ -216,7 +217,7 @@ struct SelectedPool {
 #[derive(Clone, Copy)]
 enum PoolSelection<'a> {
     Best,
-    RequiredProtocol(&'a str),
+    RequiredProtocol(ProtocolKind),
     ExcludeProtocolPrefix(&'a str),
 }
 
@@ -831,7 +832,7 @@ async fn run_bebop_partial_fill_encode_route(
         &second_request,
         &format!("{}-hop-2", preset.label),
         &format!("{} prep hop 2 Bebop", preset.label),
-        PoolSelection::RequiredProtocol("rfq:bebop"),
+        PoolSelection::RequiredProtocol(ProtocolKind::Bebop),
     )
     .await?;
     prep_evidence_files.extend(second_hop.report.evidence_files.clone());
@@ -1165,7 +1166,7 @@ async fn run_encode_prep_hop(
                         selection.label()
                     ));
                     if let PoolSelection::RequiredProtocol(protocol) = selection {
-                        degrade_report_for_missing_required_pool(&mut report, protocol);
+                        degrade_report_for_missing_required_pool(&mut report, protocol.as_str());
                     }
                     None
                 }
@@ -2106,8 +2107,11 @@ fn select_best_pool(quote: &QuoteResult) -> Option<SelectedPool> {
     select_best_pool_matching(quote, |_| true)
 }
 
-fn select_best_pool_by_protocol(quote: &QuoteResult, protocol: &str) -> Option<SelectedPool> {
-    select_best_pool_matching(quote, |candidate| candidate == protocol)
+fn select_best_pool_by_protocol(
+    quote: &QuoteResult,
+    protocol: ProtocolKind,
+) -> Option<SelectedPool> {
+    select_best_pool_matching(quote, |candidate| candidate == protocol.as_str())
 }
 
 fn select_best_pool_excluding_prefix(quote: &QuoteResult, prefix: &str) -> Option<SelectedPool> {
@@ -2141,7 +2145,6 @@ fn usable_pool_entry(entry: &AmountOutResponse) -> bool {
         .amounts_out
         .first()
         .is_some_and(|amount| amount != "0")
-        && entry.amounts_out.iter().any(|amount| amount != "0")
 }
 
 fn protocol_for_quote_entry(quote: &QuoteResult, entry: &AmountOutResponse) -> String {
@@ -2171,37 +2174,41 @@ fn protocols_from_quote(quote: &QuoteResult) -> Vec<String> {
     protocols.into_iter().collect()
 }
 
-fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<&'static str> {
+fn canonical_protocol_from_pool_name(pool_name: &str) -> Option<ProtocolKind> {
     let protocol = pool_name
         .split_once("::")
         .map(|(protocol, _)| protocol)
         .unwrap_or(pool_name);
     match protocol {
-        "uniswap_v2" | "UniswapV2" => Some("uniswap_v2"),
-        "uniswap_v3" | "UniswapV3" => Some("uniswap_v3"),
-        "uniswap_v4" | "UniswapV4" => Some("uniswap_v4"),
-        "aerodrome_slipstreams" | "AerodromeSlipstreams" => Some("aerodrome_slipstreams"),
-        "ekubo_v2" | "EkuboV2" => Some("ekubo_v2"),
-        "ekubo_v3" | "EkuboV3" => Some("ekubo_v3"),
-        "sushiswap_v2" | "SushiswapV2" => Some("sushiswap_v2"),
-        "pancakeswap_v2" | "PancakeswapV2" | "PancakeSwapV2" => Some("pancakeswap_v2"),
-        "pancakeswap_v3" | "PancakeswapV3" | "PancakeSwapV3" => Some("pancakeswap_v3"),
-        "fluid_v1" | "FluidV1" => Some("fluid_v1"),
-        "rocketpool" | "RocketPool" => Some("rocketpool"),
-        "erc4626" | "ERC4626" => Some("erc4626"),
-        "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some("rfq:hashflow"),
-        "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some("rfq:bebop"),
-        "rfq:liquorice" | "Liquorice" | "liquorice" | "liquorice_pool" => Some("rfq:liquorice"),
-        "vm:curve" | "Curve" => Some("vm:curve"),
-        "vm:balancer_v2" | "BalancerV2" => Some("vm:balancer_v2"),
-        "vm:maverick_v2" | "MaverickV2" => Some("vm:maverick_v2"),
+        "uniswap_v2" | "UniswapV2" => Some(ProtocolKind::UniswapV2),
+        "uniswap_v3" | "UniswapV3" => Some(ProtocolKind::UniswapV3),
+        "uniswap_v4" | "UniswapV4" => Some(ProtocolKind::UniswapV4),
+        "aerodrome_slipstreams" | "AerodromeSlipstreams" => {
+            Some(ProtocolKind::AerodromeSlipstreams)
+        }
+        "ekubo_v2" | "EkuboV2" => Some(ProtocolKind::EkuboV2),
+        "ekubo_v3" | "EkuboV3" => Some(ProtocolKind::EkuboV3),
+        "sushiswap_v2" | "SushiswapV2" => Some(ProtocolKind::SushiswapV2),
+        "pancakeswap_v2" | "PancakeswapV2" | "PancakeSwapV2" => Some(ProtocolKind::PancakeswapV2),
+        "pancakeswap_v3" | "PancakeswapV3" | "PancakeSwapV3" => Some(ProtocolKind::PancakeswapV3),
+        "fluid_v1" | "FluidV1" => Some(ProtocolKind::FluidV1),
+        "rocketpool" | "RocketPool" => Some(ProtocolKind::Rocketpool),
+        "erc4626" | "ERC4626" => Some(ProtocolKind::ERC4626),
+        "rfq:hashflow" | "Hashflow" | "hashflow" | "hashflow_pool" => Some(ProtocolKind::Hashflow),
+        "rfq:bebop" | "Bebop" | "bebop" | "bebop_pool" => Some(ProtocolKind::Bebop),
+        "rfq:liquorice" | "Liquorice" | "liquorice" | "liquorice_pool" => {
+            Some(ProtocolKind::Liquorice)
+        }
+        "vm:curve" | "Curve" => Some(ProtocolKind::Curve),
+        "vm:balancer_v2" | "BalancerV2" => Some(ProtocolKind::BalancerV2),
+        "vm:maverick_v2" | "MaverickV2" => Some(ProtocolKind::MaverickV2),
         _ => None,
     }
 }
 
 fn protocol_from_pool_name(pool_name: &str) -> String {
     canonical_protocol_from_pool_name(pool_name)
-        .map(str::to_string)
+        .map(|protocol| protocol.to_string())
         .unwrap_or_else(|| {
             pool_name
                 .split_once("::")
@@ -2367,13 +2374,9 @@ fn wait_for_readiness(
 
 async fn wait_for_native_readiness(client: &Client, status_url: &str, chain_id: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS);
-    #[expect(unused_assignments)]
-    let mut last_observation = String::new();
-    #[expect(unused_assignments)]
-    let mut saw_observation = false;
 
     loop {
-        match fetch_readiness_snapshot(client, status_url).await {
+        let last_observation = match fetch_readiness_snapshot(client, status_url).await {
             Ok(snapshot) => {
                 if snapshot.chain_id != chain_id {
                     bail!(
@@ -2386,29 +2389,20 @@ async fn wait_for_native_readiness(client: &Client, status_url: &str, chain_id: 
                 if snapshot_native_ready(&snapshot) {
                     return Ok(());
                 }
-                last_observation = format!(
+                format!(
                     "status={} native={}",
                     snapshot.status,
                     snapshot.native_status().unwrap_or("unknown")
-                );
-                saw_observation = true;
+                )
             }
-            Err(err) => {
-                last_observation = err.to_string();
-                saw_observation = true;
-            }
-        }
+            Err(err) => err.to_string(),
+        };
 
         if Instant::now() >= deadline {
-            let suffix = if saw_observation {
-                format!(": last observation {last_observation}")
-            } else {
-                String::new()
-            };
             bail!(
-                "timed out waiting for native readiness at {}{}",
+                "timed out waiting for native readiness at {}: last observation {}",
                 status_url,
-                suffix
+                last_observation
             );
         }
 
@@ -2989,7 +2983,7 @@ mod tests {
         CliArgs, HttpJsonResponse, ObservationClass, PreparedEncodeHop, PreparedEncodeRoute,
         PreparedEncodeSegment, ScriptPaths, SelectedPool, BEBOP_SPLIT_BPS, DEFAULT_SLIPPAGE_BPS,
     };
-    use crate::sim_analysis::presets::{balanced_profile, EncodeRouteKind};
+    use crate::sim_analysis::presets::EncodeRouteKind;
     use reqwest::Client;
     use reqwest::StatusCode;
     use serde_json::json;
@@ -2997,6 +2991,7 @@ mod tests {
         AmountOutResponse, Interaction, InteractionKind, PoolOutcomeKind, PoolSimulationOutcome,
         QuoteMeta, QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeResponse, SwapKind,
     };
+    use simulator_core::models::protocol::ProtocolKind;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3320,6 +3315,22 @@ mod tests {
     }
 
     #[test]
+    fn required_protocol_selection_preserves_exact_metadata_matching() {
+        let quote = quote_with_protocol_pools(&[
+            ("unknown-pool", "unknown", "500"),
+            ("uppercase-pool", "RFQ:BEBOP", "400"),
+            ("type-name-pool", "bebop_pool", "300"),
+            ("bebop-pool", "rfq:bebop", "100"),
+        ]);
+        let selected = select_best_pool_by_protocol(&quote, ProtocolKind::Bebop);
+        assert_eq!(
+            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+            Some("bebop-pool")
+        );
+        assert!(select_best_pool_by_protocol(&quote, ProtocolKind::Hashflow).is_none());
+    }
+
+    #[test]
     fn select_best_pool_by_protocol_prefers_bebop_over_other_protocols() {
         let quote = quote_with_protocol_pools(&[
             ("hashflow-pool", "rfq:hashflow", "120"),
@@ -3327,7 +3338,7 @@ mod tests {
             ("bebop-pool", "rfq:bebop", "100"),
         ]);
 
-        let selected = select_best_pool_by_protocol(&quote, "rfq:bebop");
+        let selected = select_best_pool_by_protocol(&quote, ProtocolKind::Bebop);
 
         assert_eq!(
             selected.as_ref().map(|pool| pool.quote.pool.as_str()),
@@ -3808,323 +3819,63 @@ mod tests {
     }
 
     #[test]
-    fn select_best_pool_uses_canonical_protocol_from_quote_metadata() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "UniswapV3::DAI/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: None,
-                rfq_update_timestamp: None,
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: vec![PoolSimulationOutcome {
-                    pool: "pool-1".to_string(),
-                    pool_name: "UniswapV3::DAI/USDC".to_string(),
-                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                    protocol: "uniswap_v3".to_string(),
-                    outcome: PoolOutcomeKind::PartialOutput,
-                    reported_steps: 1,
-                    expected_steps: 1,
-                    reason: None,
-                }],
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
+    fn select_best_pool_preserves_protocol_from_quote_metadata() {
+        for (protocol, pool_name, vm_block_number, rfq_update_timestamp) in [
+            ("uniswap_v3", "UniswapV3::DAI/USDC", None, None),
+            ("vm:curve", "Curve::USDC/USDT", Some(2), Some(2)),
+            ("rfq:hashflow", "Hashflow::WETH/USDC", None, Some(2)),
+            ("rfq:bebop", "Bebop::WETH/USDC", None, Some(2)),
+            ("rfq:bebop", "UniswapV3::DAI/USDC", None, Some(1)),
+        ] {
+            let mut quote = quote_with_protocol_pools(&[("pool-1", protocol, "10")]);
+            quote.data[0].pool_name = pool_name.to_string();
+            quote.meta.pool_results[0].pool_name = pool_name.to_string();
+            quote.meta.vm_block_number = vm_block_number;
+            quote.meta.rfq_update_timestamp = rfq_update_timestamp;
+            quote.meta.total_pools = None;
 
-        let selected = select_best_pool(&quote);
+            let selected = select_best_pool(&quote);
 
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("uniswap_v3")
-        );
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.quote.pool.as_str()),
-            Some("pool-1")
-        );
+            assert_eq!(
+                selected.as_ref().map(|pool| pool.protocol.as_str()),
+                Some(protocol),
+                "metadata {protocol} for {pool_name}"
+            );
+            assert_eq!(
+                selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+                Some("pool-1"),
+                "selected pool for {protocol} / {pool_name}"
+            );
+        }
     }
 
     #[test]
-    fn select_best_pool_falls_back_to_known_pool_name_prefixes() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "UniswapV3::DAI/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: None,
-                rfq_update_timestamp: None,
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: Vec::new(),
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
+    fn select_best_pool_falls_back_to_pool_name_without_metadata() {
+        for (pool_name, protocol, vm_block_number, rfq_update_timestamp) in [
+            ("UniswapV3::DAI/USDC", "uniswap_v3", None, None),
+            ("Curve::USDC/USDT", "vm:curve", Some(2), Some(2)),
+            ("UnknownProtocol::DAI/USDC", "unknownprotocol", None, None),
+        ] {
+            let mut quote = quote_with_protocol_pools(&[("pool-1", protocol, "10")]);
+            quote.data[0].pool_name = pool_name.to_string();
+            quote.meta.pool_results.clear();
+            quote.meta.vm_block_number = vm_block_number;
+            quote.meta.rfq_update_timestamp = rfq_update_timestamp;
+            quote.meta.total_pools = None;
 
-        let selected = select_best_pool(&quote);
+            let selected = select_best_pool(&quote);
 
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("uniswap_v3")
-        );
-    }
-
-    #[test]
-    fn select_best_pool_preserves_vm_protocol_from_quote_metadata() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "Curve::USDC/USDT".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: Some(2),
-                rfq_update_timestamp: Some(2),
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: vec![PoolSimulationOutcome {
-                    pool: "pool-1".to_string(),
-                    pool_name: "Curve::USDC/USDT".to_string(),
-                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                    protocol: "vm:curve".to_string(),
-                    outcome: PoolOutcomeKind::PartialOutput,
-                    reported_steps: 1,
-                    expected_steps: 1,
-                    reason: None,
-                }],
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
-
-        let selected = select_best_pool(&quote);
-
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("vm:curve")
-        );
-    }
-
-    #[test]
-    fn select_best_pool_preserves_rfq_protocol_from_quote_metadata() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "Hashflow::WETH/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: None,
-                rfq_update_timestamp: Some(2),
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: vec![PoolSimulationOutcome {
-                    pool: "pool-1".to_string(),
-                    pool_name: "Hashflow::WETH/USDC".to_string(),
-                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                    protocol: "rfq:hashflow".to_string(),
-                    outcome: PoolOutcomeKind::PartialOutput,
-                    reported_steps: 1,
-                    expected_steps: 1,
-                    reason: None,
-                }],
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
-
-        let selected = select_best_pool(&quote);
-
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("rfq:hashflow")
-        );
-    }
-
-    #[test]
-    fn select_best_pool_preserves_bebop_protocol_from_quote_metadata() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "Bebop::WETH/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: None,
-                rfq_update_timestamp: Some(2),
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: vec![PoolSimulationOutcome {
-                    pool: "pool-1".to_string(),
-                    pool_name: "Bebop::WETH/USDC".to_string(),
-                    pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                    protocol: "rfq:bebop".to_string(),
-                    outcome: PoolOutcomeKind::PartialOutput,
-                    reported_steps: 1,
-                    expected_steps: 1,
-                    reason: None,
-                }],
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
-
-        let selected = select_best_pool(&quote);
-
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("rfq:bebop")
-        );
-    }
-
-    #[test]
-    fn select_best_pool_falls_back_to_vm_protocol_from_pool_name() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "Curve::USDC/USDT".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: Some(2),
-                rfq_update_timestamp: Some(2),
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: Vec::new(),
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
-
-        let selected = select_best_pool(&quote);
-
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("vm:curve")
-        );
-    }
-
-    #[test]
-    fn select_best_pool_falls_back_to_normalized_pool_name_prefix() {
-        let quote = QuoteResult {
-            request_id: "req-1".to_string(),
-            data: vec![AmountOutResponse {
-                pool: "pool-1".to_string(),
-                pool_name: "UnknownProtocol::DAI/USDC".to_string(),
-                pool_address: "0x0000000000000000000000000000000000000001".to_string(),
-                amounts_out: vec!["10".to_string()],
-                gas_used: vec![1],
-                slippage: Vec::new(),
-                limit_max_in: None,
-                block_number: 1,
-            }],
-            meta: QuoteMeta {
-                status: QuoteStatus::Ready,
-                result_quality: QuoteResultQuality::Complete,
-                partial_kind: None,
-                block_number: 1,
-                vm_block_number: None,
-                rfq_update_timestamp: None,
-                matching_pools: 1,
-                candidate_pools: 1,
-                total_pools: None,
-                auction_id: None,
-                pool_results: Vec::new(),
-                vm_unavailable: false,
-                rfq_unavailable: false,
-                failures: Vec::new(),
-            },
-        };
-
-        let selected = select_best_pool(&quote);
-
-        assert_eq!(
-            selected.as_ref().map(|pool| pool.protocol.as_str()),
-            Some("unknownprotocol")
-        );
+            assert_eq!(
+                selected.as_ref().map(|pool| pool.protocol.as_str()),
+                Some(protocol),
+                "fallback for {pool_name}"
+            );
+            assert_eq!(
+                selected.as_ref().map(|pool| pool.quote.pool.as_str()),
+                Some("pool-1"),
+                "selected pool for {protocol} / {pool_name}"
+            );
+        }
     }
 
     #[test]
@@ -4141,28 +3892,5 @@ mod tests {
         assert_eq!(protocol_from_pool_name("hashflow_pool"), "rfq:hashflow");
         assert_eq!(protocol_from_pool_name("bebop_pool"), "rfq:bebop");
         assert_eq!(protocol_from_pool_name("liquorice_pool"), "rfq:liquorice");
-    }
-
-    #[test]
-    fn balanced_profile_marks_base_and_ethereum_scenarios_as_rfq_targeted() {
-        let ethereum_profile_result = balanced_profile(1, false);
-        assert!(ethereum_profile_result.is_ok());
-        let Some(ethereum_profile) = ethereum_profile_result.ok() else {
-            return;
-        };
-        assert!(ethereum_profile
-            .simulate_scenarios
-            .iter()
-            .any(|scenario| scenario.expect_rfq_visibility));
-
-        let base_profile_result = balanced_profile(8453, false);
-        assert!(base_profile_result.is_ok());
-        let Some(base_profile) = base_profile_result.ok() else {
-            return;
-        };
-        assert!(base_profile
-            .simulate_scenarios
-            .iter()
-            .any(|scenario| scenario.expect_rfq_visibility));
     }
 }

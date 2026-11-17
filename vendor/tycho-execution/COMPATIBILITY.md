@@ -2,9 +2,9 @@
 
 Source: `dewiz-xyz/dsolver-execution` commit `f4d444414c43d2cecf626139fd1749e11d15cba6` (MIT, as declared by its Cargo manifest).
 
-This source snapshot preserves the project's existing router and executor behavior while updating the broadcaster/simulator to Tycho 0.526.0. The fork does not yet compile with that common version. Local changes are limited to:
+This source snapshot preserves the project's existing router and executor behavior while updating the broadcaster/simulator to Tycho 0.525.0. The fork does not yet compile with that common version. Local changes are limited to:
 
-- Pin `tycho-common` to 0.526.0, avoiding multiple incompatible common types.
+- Pin `tycho-common` to 0.525.0, avoiding multiple incompatible common types.
 - Handle chains without a wrapped native token using the existing encoding error type.
 - Initialize the added quote `origin` field to `None`, preserving the prior behavior.
 

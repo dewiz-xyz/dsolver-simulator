@@ -3,8 +3,10 @@ use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use simulator_core::broadcaster::BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES;
+use simulator_core::models::protocol::ProtocolKind;
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 mod logging;
@@ -12,6 +14,13 @@ mod manifest;
 mod memory;
 use crate::models::erc4626::Erc4626PairPolicy;
 pub use logging::init_logging;
+
+/// Installs aws-lc-rs as the process rustls provider unless one is installed already. Cargo
+/// enables both rustls providers, and Redis over `rediss://` builds its TLS config from the
+/// process default, which panics until one is installed.
+pub fn install_tls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
 pub(crate) use manifest::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
 pub use memory::MemoryConfig;
 
@@ -23,16 +32,43 @@ const DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS: &str = "5000";
 #[derive(Clone, Debug)]
 pub struct ChainProfile {
     pub chain: Chain,
-    pub native_protocols: Vec<String>,
-    pub vm_protocols: Vec<String>,
-    pub rfq_protocols: Vec<String>,
-    /// Only a strictly newer complete native block renews this lease.
-    pub native_progress_lease_secs: u64,
+    pub native_protocols: Vec<ProtocolKind>,
+    /// Native protocols the broadcaster publishes but the standalone simulator does not
+    /// route, because its encoder cannot build them. DSolver V2 encodes them itself.
+    pub broadcaster_only_native_protocols: Vec<ProtocolKind>,
+    pub vm_protocols: Vec<ProtocolKind>,
+    pub rfq_protocols: Vec<ProtocolKind>,
+    /// Per-operation bound for replay snapshot requests, incomplete replay recovery,
+    /// and the first RFQ update. This is separate from overall Tycho bootstrap and serving freshness.
+    pub stream_initialization_timeout_secs: u64,
+    /// Interval between independent observations of the configured chain's latest block.
+    pub chain_head_poll_interval_ms: u64,
+    /// Timeout for each JSON-RPC request used to observe the chain head.
+    pub chain_head_rpc_request_timeout_ms: u64,
+    /// Maximum age of a successful observation that may still justify serving state.
+    pub chain_head_observation_max_age_secs: u64,
+    /// Time from starting Tycho construction until all configured chain state is complete.
+    pub tycho_initial_bootstrap_timeout_secs: u64,
+    /// Time an established feed may remain behind the observed chain before process exit.
+    pub tycho_head_mismatch_recovery_timeout_secs: u64,
     pub recovery_max_buffered_native_blocks: usize,
+    /// How many days back a token must have last traded for the broadcaster to load it.
+    pub token_max_days_since_last_trade: u64,
     /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
-    pub native_token_protocol_allowlist: Vec<String>,
+    pub native_token_protocol_allowlist: Vec<ProtocolKind>,
     pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
     pub erc4626_pair_policies: Vec<Erc4626PairPolicy>,
+}
+
+impl ChainProfile {
+    /// Every native protocol the broadcaster subscribes to and requires in a complete snapshot.
+    pub fn broadcaster_native_protocols(&self) -> Vec<ProtocolKind> {
+        self.native_protocols
+            .iter()
+            .chain(&self.broadcaster_only_native_protocols)
+            .copied()
+            .collect()
+    }
 }
 
 pub fn load_config() -> AppConfig {
@@ -69,28 +105,12 @@ pub fn load_config() -> AppConfig {
     let timeouts = load_timeout_config();
     let stream = load_stream_config();
     let slippage = load_slippage_config();
-    // Keep the rest of the runtime on the same AppConfig shape. The manifest is just the new
-    // source of truth for the chain-specific slice.
-    let chain_profile = ChainProfile {
-        chain: resolved_chain.chain_profile.chain,
-        native_protocols: resolved_chain.chain_profile.native_protocols,
-        vm_protocols: resolved_chain.chain_profile.vm_protocols,
-        rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
-        native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
-        recovery_max_buffered_native_blocks: resolved_chain
-            .chain_profile
-            .recovery_max_buffered_native_blocks,
-        native_token_protocol_allowlist: resolved_chain
-            .chain_profile
-            .native_token_protocol_allowlist,
-        reset_allowance_tokens: resolved_chain.chain_profile.reset_allowance_tokens,
-        erc4626_pair_policies: resolved_chain.chain_profile.erc4626_pair_policies,
-    };
+    let chain_profile = resolved_chain.chain_profile;
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
     let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
-    let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+    let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
         load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     AppConfig {
@@ -123,7 +143,6 @@ pub fn load_config() -> AppConfig {
         slippage,
         memory,
         bebop_key,
-        bebop_user,
         hashflow_key,
         hashflow_user,
         liquorice_key,
@@ -165,37 +184,26 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     let stream = load_stream_config();
     let memory = MemoryConfig::from_env();
     let tuning = load_broadcaster_tuning();
-    let chain_profile = ChainProfile {
-        chain: resolved_chain.chain_profile.chain,
-        native_protocols: resolved_chain.chain_profile.native_protocols,
-        vm_protocols: resolved_chain.chain_profile.vm_protocols,
-        rfq_protocols: resolved_chain.chain_profile.rfq_protocols,
-        native_progress_lease_secs: resolved_chain.chain_profile.native_progress_lease_secs,
-        recovery_max_buffered_native_blocks: resolved_chain
-            .chain_profile
-            .recovery_max_buffered_native_blocks,
-        native_token_protocol_allowlist: resolved_chain
-            .chain_profile
-            .native_token_protocol_allowlist,
-        reset_allowance_tokens: resolved_chain.chain_profile.reset_allowance_tokens,
-        erc4626_pair_policies: resolved_chain.chain_profile.erc4626_pair_policies,
-    };
+    let chain_profile = resolved_chain.chain_profile;
     let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
-    let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+    let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
         load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
-    let native_key = load_single_provider_key(
-        rfq_enabled && rfq_protocol_enabled(&chain_profile.rfq_protocols, "rfq:native"),
+    let native_key = load_enabled_provider_key(
+        rfq_enabled
+            && chain_profile
+                .rfq_protocols
+                .contains(&ProtocolKind::NativeRfq),
         "NATIVE_API_KEY",
     );
-    let metric_key = load_single_provider_key(
-        rfq_enabled && rfq_protocol_enabled(&chain_profile.rfq_protocols, "rfq:metric"),
+    let metric_key = load_enabled_provider_key(
+        rfq_enabled && chain_profile.rfq_protocols.contains(&ProtocolKind::Metric),
         "METRIC_API_KEY",
     );
     let rfq_min_tvl_usd: f64 = parse_env_or_default("RFQ_MIN_TVL_USD", "100");
     assert!(
         rfq_min_tvl_usd.is_finite() && rfq_min_tvl_usd >= 0.0,
-        "RFQ_MIN_TVL_USD must be a finite non-negative number"
+        "RFQ_MIN_TVL_USD must be finite and non-negative"
     );
 
     BroadcasterConfig {
@@ -208,6 +216,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         hashflow_filename: resolved_chain.hashflow_filename,
         liquorice_url: resolved_chain.liquorice_url,
         api_key,
+        rpc_url: network.rpc_url,
         tvl_threshold: network.tvl_threshold,
         tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
@@ -226,7 +235,6 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         memory,
         tuning,
         bebop_key,
-        bebop_user,
         hashflow_key,
         hashflow_user,
         liquorice_key,
@@ -234,7 +242,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     }
 }
 
-fn load_single_provider_key(enabled: bool, key: &str) -> String {
+fn load_enabled_provider_key(enabled: bool, key: &str) -> String {
     if enabled {
         require_trimmed_env(key)
     } else {
@@ -252,8 +260,8 @@ fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile)
 )]
 fn load_rfq_credentials(
     rfq_enabled: bool,
-    rfq_protocols: &[String],
-) -> (String, String, String, String, String, String) {
+    rfq_protocols: &[ProtocolKind],
+) -> (String, String, String, String, String) {
     match try_load_rfq_credentials(rfq_enabled, rfq_protocols) {
         Ok(credentials) => credentials,
         Err(message) => {
@@ -264,30 +272,25 @@ fn load_rfq_credentials(
 
 fn try_load_rfq_credentials(
     rfq_enabled: bool,
-    rfq_protocols: &[String],
-) -> Result<(String, String, String, String, String, String), String> {
+    rfq_protocols: &[ProtocolKind],
+) -> Result<(String, String, String, String, String), String> {
     if !rfq_enabled || rfq_protocols.is_empty() {
         return Ok(empty_rfq_credentials());
     }
 
-    let (bebop_user, bebop_key) = load_provider_credentials(
-        rfq_protocol_enabled(rfq_protocols, "rfq:bebop"),
-        "BEBOP_USER",
-        "BEBOP_KEY",
-    )?;
+    let bebop_key = load_provider_key(rfq_protocols.contains(&ProtocolKind::Bebop), "BEBOP_KEY")?;
     let (hashflow_user, hashflow_key) = load_provider_credentials(
-        rfq_protocol_enabled(rfq_protocols, "rfq:hashflow"),
+        rfq_protocols.contains(&ProtocolKind::Hashflow),
         "HASHFLOW_USER",
         "HASHFLOW_KEY",
     )?;
     let (liquorice_user, liquorice_key) = load_provider_credentials(
-        rfq_protocol_enabled(rfq_protocols, "rfq:liquorice"),
+        rfq_protocols.contains(&ProtocolKind::Liquorice),
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
     )?;
 
     Ok((
-        bebop_user,
         bebop_key,
         hashflow_user,
         hashflow_key,
@@ -296,15 +299,22 @@ fn try_load_rfq_credentials(
     ))
 }
 
-fn empty_rfq_credentials() -> (String, String, String, String, String, String) {
+fn empty_rfq_credentials() -> (String, String, String, String, String) {
     (
         String::new(),
         String::new(),
         String::new(),
         String::new(),
         String::new(),
-        String::new(),
     )
+}
+
+fn load_provider_key(enabled: bool, auth_key: &str) -> Result<String, String> {
+    if !enabled {
+        return Ok(String::new());
+    }
+
+    required_trimmed_env(auth_key)
 }
 
 fn load_provider_credentials(
@@ -320,10 +330,6 @@ fn load_provider_credentials(
     let key = required_trimmed_env(auth_key)?;
 
     Ok((user, key))
-}
-
-fn rfq_protocol_enabled(protocols: &[String], protocol: &str) -> bool {
-    protocols.iter().any(|configured| configured == protocol)
 }
 
 struct NetworkConfig {
@@ -352,6 +358,20 @@ struct StreamConfig {
     stream_restart_backoff_min_ms: u64,
     stream_restart_backoff_max_ms: u64,
     stream_restart_backoff_jitter_pct: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateHistoryConfig {
+    pub database_url: String,
+    pub s3_bucket: String,
+    pub s3_prefix: String,
+    pub s3_region: String,
+    pub s3_endpoint_url: Option<String>,
+    pub s3_force_path_style: bool,
+    pub checkpoint_block_interval: u64,
+    pub checkpoint_poll_interval: Duration,
+    pub queue_capacity: usize,
+    pub retry_window: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -506,6 +526,67 @@ fn load_stream_config() -> StreamConfig {
     }
 }
 
+pub fn load_state_history_config() -> Option<StateHistoryConfig> {
+    let enabled: bool = parse_env_or_default("STATE_HISTORY_ENABLED", "false");
+    if !enabled {
+        return None;
+    }
+
+    let database_url = require_trimmed_env("STATE_HISTORY_DATABASE_URL");
+    let s3_bucket = require_trimmed_env("STATE_HISTORY_S3_BUCKET");
+    let s3_prefix =
+        optional_trimmed_env("STATE_HISTORY_S3_PREFIX").unwrap_or_else(|| "state-history".into());
+    let s3_prefix = s3_prefix
+        .strip_suffix('/')
+        .unwrap_or(&s3_prefix)
+        .to_string();
+    let s3_region =
+        optional_trimmed_env("STATE_HISTORY_S3_REGION").unwrap_or_else(|| "eu-central-1".into());
+    let s3_endpoint_url = optional_trimmed_env("STATE_HISTORY_S3_ENDPOINT_URL");
+    let s3_force_path_style = parse_env_or_default("STATE_HISTORY_S3_FORCE_PATH_STYLE", "false");
+    let checkpoint_block_interval = parse_value_or_panic(
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        &require_trimmed_env("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL"),
+    );
+    let checkpoint_poll_interval_secs =
+        parse_env_or_default("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "30");
+    let queue_capacity = parse_env_or_default("STATE_HISTORY_QUEUE_CAPACITY", "8192");
+    let retry_window_ms = parse_env_or_default("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "30000");
+
+    assert!(
+        checkpoint_block_interval > 0,
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"
+    );
+    assert!(
+        checkpoint_poll_interval_secs > 0,
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"
+    );
+    assert!(
+        queue_capacity > 0,
+        "STATE_HISTORY_QUEUE_CAPACITY must be > 0"
+    );
+    assert!(
+        retry_window_ms > 0,
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"
+    );
+
+    let checkpoint_poll_interval = Duration::from_secs(checkpoint_poll_interval_secs);
+    let retry_window = Duration::from_millis(retry_window_ms);
+
+    Some(StateHistoryConfig {
+        database_url,
+        s3_bucket,
+        s3_prefix,
+        s3_region,
+        s3_endpoint_url,
+        s3_force_path_style,
+        checkpoint_block_interval,
+        checkpoint_poll_interval,
+        queue_capacity,
+        retry_window,
+    })
+}
+
 pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
     dotenv::dotenv().ok();
 
@@ -523,7 +604,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         DEFAULT_BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS,
     );
-    let maxlen = Some(parse_env_or_default("BROADCASTER_REDIS_MAXLEN", "5000"));
+    let maxlen = parse_env_or_default("BROADCASTER_REDIS_MAXLEN", "5000");
 
     assert_valid_redis_url(&redis_url);
     assert!(block_ms > 0, "BROADCASTER_REDIS_BLOCK_MS must be > 0");
@@ -532,9 +613,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         append_retry_window_ms > 0,
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS must be > 0"
     );
-    if let Some(maxlen) = maxlen {
-        assert!(maxlen > 0, "BROADCASTER_REDIS_MAXLEN must be > 0");
-    }
+    assert!(maxlen > 0, "BROADCASTER_REDIS_MAXLEN must be > 0");
 
     BroadcasterRedisConfig {
         redis_url,
@@ -542,7 +621,7 @@ pub fn load_broadcaster_redis_config() -> BroadcasterRedisConfig {
         block_ms,
         read_count,
         append_retry_window_ms,
-        maxlen,
+        maxlen: Some(maxlen),
     }
 }
 
@@ -701,7 +780,6 @@ pub struct AppConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub slippage: SlippageConfig,
     pub memory: MemoryConfig,
-    pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
@@ -720,6 +798,7 @@ pub struct BroadcasterConfig {
     pub hashflow_filename: String,
     pub liquorice_url: Option<String>,
     pub api_key: String,
+    pub rpc_url: Option<String>,
     pub tvl_threshold: f64,
     pub tvl_keep_threshold: f64,
     pub port: u16,
@@ -737,7 +816,6 @@ pub struct BroadcasterConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub memory: MemoryConfig,
     pub tuning: BroadcasterTuning,
-    pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
@@ -826,7 +904,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -853,15 +931,25 @@ mod tests {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         "BROADCASTER_REDIS_MAXLEN",
     ];
-    const RFQ_CREDENTIAL_ENV_KEYS: [&str; 8] = [
-        "BEBOP_USER",
+    const RFQ_CREDENTIAL_ENV_KEYS: [&str; 5] = [
         "BEBOP_KEY",
         "HASHFLOW_USER",
         "HASHFLOW_KEY",
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
-        "NATIVE_API_KEY",
-        "METRIC_API_KEY",
+    ];
+    const STATE_HISTORY_ENV_KEYS: [&str; 11] = [
+        "STATE_HISTORY_ENABLED",
+        "STATE_HISTORY_DATABASE_URL",
+        "STATE_HISTORY_S3_BUCKET",
+        "STATE_HISTORY_S3_PREFIX",
+        "STATE_HISTORY_S3_REGION",
+        "STATE_HISTORY_S3_ENDPOINT_URL",
+        "STATE_HISTORY_S3_FORCE_PATH_STYLE",
+        "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        "STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS",
+        "STATE_HISTORY_QUEUE_CAPACITY",
+        "STATE_HISTORY_WRITE_RETRY_WINDOW_MS",
     ];
 
     fn clear_slippage_env() {
@@ -934,22 +1022,54 @@ mod tests {
         }
     }
 
-    const CONFIG_TEST_ENV_KEYS: [&str; 15] = [
+    fn with_isolated_state_history_env<T>(test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved_env: Vec<_> = STATE_HISTORY_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in STATE_HISTORY_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+
+        let result = test();
+
+        for (key, value) in saved_env {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        result
+    }
+
+    fn set_required_state_history_env() {
+        std::env::set_var("STATE_HISTORY_ENABLED", "true");
+        std::env::set_var(
+            "STATE_HISTORY_DATABASE_URL",
+            "postgres://state-history:test@localhost/state_history",
+        );
+        std::env::set_var("STATE_HISTORY_S3_BUCKET", "state-history-test");
+        std::env::set_var("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL", "300");
+    }
+
+    const CONFIG_TEST_ENV_KEYS: [&str; 14] = [
         "CHAIN_ID",
         "ENABLE_RFQ_POOLS",
         "HASHFLOW_FILENAME_CSV",
         "TOKEN_SNAPSHOT_TIMEOUT_MS",
+        "NATIVE_API_KEY",
+        "METRIC_API_KEY",
+        "RFQ_MIN_TVL_USD",
         "TYCHO_API_KEY",
         "TYCHO_BROADCASTER_URL",
-        "BEBOP_USER",
         "BEBOP_KEY",
         "HASHFLOW_USER",
         "HASHFLOW_KEY",
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
-        "NATIVE_API_KEY",
-        "METRIC_API_KEY",
-        "RFQ_MIN_TVL_USD",
     ];
 
     fn manifest_path() -> std::path::PathBuf {
@@ -999,13 +1119,15 @@ mod tests {
             .unwrap_or_else(|_| unreachable!("expected isolated test dir creation to succeed"));
         copy_manifest_to(&isolated_dir);
 
-        std::env::remove_var("RFQ_MIN_TVL_USD");
         std::env::set_var("CHAIN_ID", "1");
         std::env::set_var("ENABLE_RFQ_POOLS", "false");
         std::env::set_var("TYCHO_API_KEY", "test-api-key");
         std::env::remove_var("HASHFLOW_FILENAME_CSV");
         std::env::remove_var("TOKEN_SNAPSHOT_TIMEOUT_MS");
         clear_broadcaster_redis_env();
+        for key in ["NATIVE_API_KEY", "METRIC_API_KEY", "RFQ_MIN_TVL_USD"] {
+            std::env::remove_var(key);
+        }
         match broadcaster_base_url {
             Some(value) => std::env::set_var("TYCHO_BROADCASTER_URL", value),
             None => std::env::remove_var("TYCHO_BROADCASTER_URL"),
@@ -1063,34 +1185,56 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Ethereum);
+        assert_eq!(chain.chain_profile.token_max_days_since_last_trade, 42);
         assert_eq!(chain.tycho_url, "tycho-beta.propellerheads.xyz");
         assert_eq!(
             chain.bebop_url,
             "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
         );
         assert_eq!(chain.hashflow_filename, "./hashflow_supported_tokens.csv");
-        assert_eq!(chain.chain_profile.native_progress_lease_secs, 25);
+        assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 25);
+        assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 1000);
+        assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
+        assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 15);
+        assert_eq!(
+            chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
+            900
+        );
+        assert_eq!(
+            chain
+                .chain_profile
+                .tycho_head_mismatch_recovery_timeout_secs,
+            60
+        );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
+        assert!(chain
+            .chain_profile
+            .broadcaster_only_native_protocols
+            .is_empty());
         assert!(!chain
             .chain_profile
             .native_protocols
-            .contains(&"uniswap_v4".to_string()));
+            .contains(&ProtocolKind::UniswapV4));
         assert!(chain
             .chain_profile
             .native_protocols
-            .contains(&"rocketpool".to_string()));
+            .contains(&ProtocolKind::Rocketpool));
         assert_eq!(
             chain.chain_profile.vm_protocols,
-            vec!["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
+            vec![
+                ProtocolKind::Curve,
+                ProtocolKind::BalancerV2,
+                ProtocolKind::MaverickV2
+            ]
         );
         assert!(chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:bebop".to_string()));
+            .contains(&ProtocolKind::Bebop));
         assert!(!chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:liquorice".to_string()));
+            .contains(&ProtocolKind::Liquorice));
         assert_eq!(
             chain.liquorice_url.as_deref(),
             Some("https://api.liquorice.tech/v1/solver/supported-tokens")
@@ -1098,7 +1242,7 @@ mod tests {
         assert!(chain
             .chain_profile
             .native_token_protocol_allowlist
-            .contains(&"rocketpool".to_string()));
+            .contains(&ProtocolKind::Rocketpool));
         assert!(chain.chain_profile.reset_allowance_tokens.contains_key(&1));
         assert_eq!(chain.chain_profile.erc4626_pair_policies.len(), 3);
     }
@@ -1111,22 +1255,64 @@ mod tests {
         };
 
         assert_eq!(chain.chain_profile.chain, Chain::Base);
-        assert_eq!(chain.chain_profile.native_progress_lease_secs, 10);
-        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 64);
+        assert_eq!(chain.chain_profile.token_max_days_since_last_trade, 1);
+        assert_eq!(chain.chain_profile.stream_initialization_timeout_secs, 10);
+        assert_eq!(chain.chain_profile.chain_head_poll_interval_ms, 500);
+        assert_eq!(chain.chain_profile.chain_head_rpc_request_timeout_ms, 2000);
+        assert_eq!(chain.chain_profile.chain_head_observation_max_age_secs, 5);
+        assert_eq!(
+            chain.chain_profile.tycho_initial_bootstrap_timeout_secs,
+            300
+        );
+        assert_eq!(
+            chain
+                .chain_profile
+                .tycho_head_mismatch_recovery_timeout_secs,
+            60
+        );
+        assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 512);
         assert_eq!(chain.tycho_url, "tycho-base-beta.propellerheads.xyz");
         assert!(chain
             .chain_profile
             .native_protocols
-            .contains(&"aerodrome_slipstreams".to_string()));
+            .contains(&ProtocolKind::AerodromeSlipstreams));
+        assert!(!chain
+            .chain_profile
+            .native_protocols
+            .contains(&ProtocolKind::AerodromeV1));
+        assert_eq!(
+            chain.chain_profile.broadcaster_only_native_protocols,
+            vec![
+                ProtocolKind::AerodromeV1,
+                ProtocolKind::SushiswapV2,
+                ProtocolKind::AeroBasic,
+                ProtocolKind::AeroCl,
+                ProtocolKind::PancakeswapInfinityCl,
+                ProtocolKind::LunarBase,
+                ProtocolKind::EkuboV3
+            ]
+        );
+        let mut broadcaster_native_protocols = chain.chain_profile.native_protocols.clone();
+        broadcaster_native_protocols.extend(
+            chain
+                .chain_profile
+                .broadcaster_only_native_protocols
+                .iter()
+                .copied(),
+        );
+        assert_eq!(
+            chain.chain_profile.broadcaster_native_protocols(),
+            broadcaster_native_protocols
+        );
         assert!(chain.chain_profile.vm_protocols.is_empty());
         assert!(chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:bebop".to_string()));
+            .contains(&ProtocolKind::Bebop));
         assert!(!chain
             .chain_profile
             .rfq_protocols
-            .contains(&"rfq:liquorice".to_string()));
+            .contains(&ProtocolKind::Liquorice));
         assert!(chain.liquorice_url.is_none());
         assert!(chain
             .chain_profile
@@ -1165,8 +1351,14 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1184,7 +1376,87 @@ route_policy = "default"
     }
 
     #[test]
-    fn parse_manifest_requires_native_progress_lease() {
+    fn parse_manifest_validates_broadcaster_only_native_protocols() {
+        let manifest_with = |broadcaster_only: &str| {
+            format!(
+                r#"
+[[protocols]]
+id = "uniswap_v2"
+backend = "native"
+
+[[protocols]]
+id = "aerodrome_v1"
+backend = "native"
+
+[[protocols]]
+id = "vm:curve"
+backend = "vm"
+
+[[route_policies]]
+id = "default"
+native_token_protocol_allowlist = []
+reset_allowance_tokens = []
+
+[[chains]]
+chain_id = 8453
+stream_initialization_timeout_secs = 10
+chain_head_poll_interval_ms = 500
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 5
+tycho_initial_bootstrap_timeout_secs = 300
+tycho_head_mismatch_recovery_timeout_secs = 60
+recovery_max_buffered_native_blocks = 64
+token_max_days_since_last_trade = 1
+tycho_url = "tycho"
+bebop_url = "bebop"
+hashflow_filename = "./hashflow.csv"
+native_protocols = ["uniswap_v2"]
+broadcaster_only_native_protocols = {broadcaster_only}
+vm_protocols = []
+rfq_protocols = []
+route_policy = "default"
+"#
+            )
+        };
+
+        let registries = manifest::parse_manifest_registries(&manifest_with(r#"["aerodrome_v1"]"#))
+            .unwrap_or_else(|error| unreachable!("valid broadcaster only protocols: {error:#}"));
+        let chain = resolve_chain_config(&registries, 8453, None)
+            .unwrap_or_else(|error| unreachable!("expected chain 8453: {error:#}"));
+        assert_eq!(
+            chain.chain_profile.native_protocols,
+            vec![ProtocolKind::UniswapV2]
+        );
+        assert_eq!(
+            chain.chain_profile.broadcaster_native_protocols(),
+            vec![ProtocolKind::UniswapV2, ProtocolKind::AerodromeV1]
+        );
+
+        for (broadcaster_only, expected) in [
+            (
+                r#"["uniswap_v2"]"#,
+                "in both native_protocols and broadcaster_only_native_protocols",
+            ),
+            (r#"["aerodrome_v1", "aerodrome_v1"]"#, "more than once"),
+            (r#"["vm:curve"]"#, "manifest declares vm"),
+            (r#"["aerodrome_slipstreams"]"#, "unknown protocol"),
+            (
+                r#"[" "]"#,
+                "chains[8453].broadcaster_only_native_protocols must not be empty",
+            ),
+        ] {
+            let error = manifest::parse_manifest_registries(&manifest_with(broadcaster_only))
+                .err()
+                .unwrap_or_else(|| unreachable!("{broadcaster_only} must be rejected"));
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{broadcaster_only}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_manifest_requires_stream_initialization_timeout() {
         let manifest = r#"
 [[protocols]]
 id = "uniswap_v2"
@@ -1198,6 +1470,7 @@ reset_allowance_tokens = []
 [[chains]]
 chain_id = 1
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1209,9 +1482,48 @@ route_policy = "default"
 
         let error = manifest::parse_manifest_registries(manifest)
             .err()
-            .unwrap_or_else(|| unreachable!("missing native progress lease must fail"));
+            .unwrap_or_else(|| unreachable!("missing stream initialization timeout must fail"));
 
-        assert!(format!("{error:#}").contains("native_progress_lease_secs"));
+        assert!(format!("{error:#}").contains("stream_initialization_timeout_secs"));
+    }
+
+    #[test]
+    fn parse_manifest_rejects_missing_or_invalid_chain_timing() {
+        let manifest = fs::read_to_string(manifest_path())
+            .unwrap_or_else(|_| unreachable!("expected checked-in manifest"));
+        for field in [
+            "stream_initialization_timeout_secs",
+            "chain_head_poll_interval_ms",
+            "chain_head_rpc_request_timeout_ms",
+            "chain_head_observation_max_age_secs",
+            "tycho_initial_bootstrap_timeout_secs",
+            "tycho_head_mismatch_recovery_timeout_secs",
+        ] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(field))
+                .unwrap_or_else(|| unreachable!("manifest contains timing field"));
+            let invalid = manifest.replacen(line, &format!("{field} = 0"), 1);
+            let error = manifest::parse_manifest_registries(&invalid)
+                .err()
+                .unwrap_or_else(|| unreachable!("zero timing must fail"));
+            assert!(format!("{error:#}").contains(field));
+
+            let missing = manifest.replacen(line, "", 1);
+            let error = manifest::parse_manifest_registries(&missing)
+                .err()
+                .unwrap_or_else(|| unreachable!("missing timing must fail"));
+            assert!(format!("{error:#}").contains(field));
+        }
+        let invalid = manifest.replacen(
+            "chain_head_observation_max_age_secs = 15",
+            "chain_head_observation_max_age_secs = 1",
+            1,
+        );
+        let error = manifest::parse_manifest_registries(&invalid)
+            .err()
+            .unwrap_or_else(|| unreachable!("observation would expire before the next poll"));
+        assert!(format!("{error:#}").contains("observation maximum age"));
     }
 
     #[test]
@@ -1246,8 +1558,14 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1278,8 +1596,14 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1310,8 +1634,14 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 999999
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1352,8 +1682,14 @@ allow_share_to_asset = false
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = "tycho"
 bebop_url = "bebop"
 hashflow_filename = "./hashflow.csv"
@@ -1388,8 +1724,14 @@ reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 1
 tycho_url = " tycho "
 bebop_url = " https://api.bebop.xyz/pmm/ethereum/v3/tokens "
 hashflow_filename = " ./hashflow.csv "
@@ -1412,12 +1754,15 @@ route_policy = " default "
             "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
         );
         assert_eq!(chain.hashflow_filename, "./hashflow.csv");
-        assert_eq!(chain.chain_profile.native_protocols, vec!["uniswap_v2"]);
+        assert_eq!(
+            chain.chain_profile.native_protocols,
+            vec![ProtocolKind::UniswapV2]
+        );
         assert!(chain.chain_profile.vm_protocols.is_empty());
-        assert_eq!(chain.chain_profile.rfq_protocols, vec!["rfq:bebop"]);
+        assert_eq!(chain.chain_profile.rfq_protocols, vec![ProtocolKind::Bebop]);
         assert_eq!(
             chain.chain_profile.native_token_protocol_allowlist,
-            vec!["uniswap_v2"]
+            vec![ProtocolKind::UniswapV2]
         );
     }
 
@@ -1430,28 +1775,6 @@ route_policy = " default "
         let base = resolve_chain_config(&registries, 8453, None)
             .unwrap_or_else(|_| unreachable!("expected base manifest entry"))
             .chain_profile;
-        let ethereum = ChainProfile {
-            chain: ethereum.chain,
-            native_protocols: ethereum.native_protocols,
-            vm_protocols: ethereum.vm_protocols,
-            rfq_protocols: ethereum.rfq_protocols,
-            native_progress_lease_secs: ethereum.native_progress_lease_secs,
-            recovery_max_buffered_native_blocks: ethereum.recovery_max_buffered_native_blocks,
-            native_token_protocol_allowlist: ethereum.native_token_protocol_allowlist,
-            reset_allowance_tokens: ethereum.reset_allowance_tokens,
-            erc4626_pair_policies: ethereum.erc4626_pair_policies,
-        };
-        let base = ChainProfile {
-            chain: base.chain,
-            native_protocols: base.native_protocols,
-            vm_protocols: base.vm_protocols,
-            rfq_protocols: base.rfq_protocols,
-            native_progress_lease_secs: base.native_progress_lease_secs,
-            recovery_max_buffered_native_blocks: base.recovery_max_buffered_native_blocks,
-            native_token_protocol_allowlist: base.native_token_protocol_allowlist,
-            reset_allowance_tokens: base.reset_allowance_tokens,
-            erc4626_pair_policies: base.erc4626_pair_policies,
-        };
 
         assert!(rfq_effectively_enabled(true, &ethereum));
         assert!(!rfq_effectively_enabled(false, &ethereum));
@@ -1461,10 +1784,9 @@ route_policy = " default "
 
     #[test]
     fn load_rfq_credentials_skips_env_when_disabled() {
-        let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
+        let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
             load_rfq_credentials(false, &[]);
 
-        assert!(bebop_user.is_empty());
         assert!(bebop_key.is_empty());
         assert!(hashflow_user.is_empty());
         assert!(hashflow_key.is_empty());
@@ -1483,7 +1805,7 @@ route_policy = " default "
             }
         });
 
-        assert!(message.contains("BEBOP_USER"));
+        assert!(message.contains("BEBOP_KEY"));
     }
 
     #[test]
@@ -1499,7 +1821,7 @@ route_policy = " default "
             }
         });
 
-        assert!(message.contains("BEBOP_USER"));
+        assert!(message.contains("BEBOP_KEY"));
     }
 
     #[test]
@@ -1507,7 +1829,6 @@ route_policy = " default "
         let config = with_isolated_config_env(None, || {
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
-            std::env::set_var("BEBOP_USER", "bebop-user");
             std::env::set_var("BEBOP_KEY", "bebop-key");
             load_broadcaster_config()
         });
@@ -1525,7 +1846,6 @@ route_policy = " default "
         });
 
         assert!(!config.enable_rfq_pools);
-        assert!(config.bebop_user.is_empty());
         assert!(config.bebop_key.is_empty());
         assert!(config.hashflow_user.is_empty());
         assert!(config.hashflow_key.is_empty());
@@ -1538,7 +1858,6 @@ route_policy = " default "
         let config = with_isolated_config_env(None, || {
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
-            std::env::set_var("BEBOP_USER", "bebop-user");
             std::env::set_var("BEBOP_KEY", "bebop-key");
             load_broadcaster_config()
         });
@@ -1556,7 +1875,6 @@ route_policy = " default "
             config.liquorice_url.as_deref(),
             Some("https://api.liquorice.tech/v1/solver/supported-tokens")
         );
-        assert_eq!(config.bebop_user, "bebop-user");
         assert_eq!(config.bebop_key, "bebop-key");
         assert!(config.hashflow_user.is_empty());
         assert!(config.hashflow_key.is_empty());
@@ -1567,31 +1885,25 @@ route_policy = " default "
     #[test]
     fn base_broadcaster_requires_native_and_metric_keys_only_when_enabled() {
         with_isolated_config_env(None, || {
-            clear_rfq_credential_env();
             std::env::set_var("CHAIN_ID", "8453");
             let disabled = load_broadcaster_config();
-            assert!(disabled.native_key.is_empty());
-            assert!(disabled.metric_key.is_empty());
+            assert!(disabled.native_key.is_empty() && disabled.metric_key.is_empty());
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
-            std::env::set_var("BEBOP_USER", "bebop-user");
-            std::env::set_var("BEBOP_KEY", "bebop-key");
-            for (key, value) in [
-                ("NATIVE_API_KEY", "native-key"),
-                ("METRIC_API_KEY", "metric-key"),
-            ] {
-                let error = std::panic::catch_unwind(load_broadcaster_config)
-                    .err()
-                    .unwrap_or_else(|| unreachable!("missing provider key must fail"));
-                assert!(panic_message(error).contains(key));
-                std::env::set_var(key, format!(" {value} "));
+            std::env::set_var("BEBOP_KEY", "fixture-bebop");
+            for key in ["NATIVE_API_KEY", "METRIC_API_KEY"] {
+                let result = std::panic::catch_unwind(load_broadcaster_config);
+                assert!(result.is_err());
+                if let Err(error) = result {
+                    assert!(panic_message(error).contains(key));
+                }
+                std::env::set_var(key, "  fixture-key  ");
             }
-            std::env::set_var("RFQ_MIN_TVL_USD", "250");
             let enabled = load_broadcaster_config();
-            assert_eq!(enabled.native_key, "native-key");
-            assert_eq!(enabled.metric_key, "metric-key");
-            assert_eq!(enabled.rfq_min_tvl_usd, 250.0);
-            for invalid in ["NaN", "inf", "-1"] {
-                std::env::set_var("RFQ_MIN_TVL_USD", invalid);
+            assert_eq!(enabled.native_key, "fixture-key");
+            assert_eq!(enabled.metric_key, "fixture-key");
+            assert_eq!(enabled.rfq_min_tvl_usd, 100.0);
+            for value in ["NaN", "inf", "-1"] {
+                std::env::set_var("RFQ_MIN_TVL_USD", value);
                 assert!(std::panic::catch_unwind(load_broadcaster_config).is_err());
             }
         });
@@ -1623,13 +1935,12 @@ route_policy = " default "
         std::env::set_var("HASHFLOW_USER", "hashflow-user");
         std::env::set_var("HASHFLOW_KEY", "hashflow-key");
 
-        let Ok((bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key)) =
-            try_load_rfq_credentials(true, &["rfq:hashflow".to_string()])
+        let Ok((bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key)) =
+            try_load_rfq_credentials(true, &[ProtocolKind::Hashflow])
         else {
             unreachable!("expected hashflow-only credentials to load");
         };
 
-        assert!(bebop_user.is_empty());
         assert!(bebop_key.is_empty());
         assert_eq!(hashflow_user, "hashflow-user");
         assert_eq!(hashflow_key, "hashflow-key");
@@ -1646,7 +1957,7 @@ route_policy = " default "
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_rfq_credential_env();
 
-        let Err(err) = try_load_rfq_credentials(true, &["rfq:liquorice".to_string()]) else {
+        let Err(err) = try_load_rfq_credentials(true, &[ProtocolKind::Liquorice]) else {
             unreachable!("expected missing Liquorice credentials to fail");
         };
 
@@ -1662,7 +1973,7 @@ route_policy = " default "
         std::env::set_var("HASHFLOW_USER", "  ");
         std::env::set_var("HASHFLOW_KEY", "hashflow-key");
 
-        let Err(err) = try_load_rfq_credentials(true, &["rfq:hashflow".to_string()]) else {
+        let Err(err) = try_load_rfq_credentials(true, &[ProtocolKind::Hashflow]) else {
             unreachable!("expected blank Hashflow user to fail");
         };
 
@@ -2003,5 +2314,128 @@ route_policy = " default "
         });
 
         assert!(message.contains("TOKEN_SNAPSHOT_TIMEOUT_MS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_disabled_reads_nothing() {
+        let config = with_isolated_state_history_env(|| {
+            for key in STATE_HISTORY_ENV_KEYS
+                .iter()
+                .copied()
+                .filter(|key| *key != "STATE_HISTORY_ENABLED")
+            {
+                std::env::set_var(key, "garbage");
+            }
+
+            load_state_history_config()
+        });
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn state_history_enabled_requires_database_url_bucket_interval() {
+        let messages = with_isolated_state_history_env(|| {
+            [
+                "STATE_HISTORY_DATABASE_URL",
+                "STATE_HISTORY_S3_BUCKET",
+                "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+            ]
+            .map(|missing| {
+                set_required_state_history_env();
+                std::env::remove_var(missing);
+                match std::panic::catch_unwind(load_state_history_config) {
+                    Ok(_) => unreachable!("enabled state history should require {missing}"),
+                    Err(panic) => panic_message(panic),
+                }
+            })
+        });
+
+        for (message, key) in messages.into_iter().zip([
+            "STATE_HISTORY_DATABASE_URL",
+            "STATE_HISTORY_S3_BUCKET",
+            "STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL",
+        ]) {
+            assert!(message.contains(key), "expected {key} in `{message}`");
+        }
+    }
+
+    #[test]
+    fn state_history_rejects_zero_checkpoint_block_interval() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("checkpoint block interval must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_checkpoint_poll_interval() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("checkpoint poll interval must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_CHECKPOINT_POLL_INTERVAL_SECS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_queue_capacity() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_QUEUE_CAPACITY", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("state history queue capacity must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_QUEUE_CAPACITY must be > 0"));
+    }
+
+    #[test]
+    fn state_history_rejects_zero_write_retry_window() {
+        let message = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            std::env::set_var("STATE_HISTORY_WRITE_RETRY_WINDOW_MS", "0");
+            match std::panic::catch_unwind(load_state_history_config) {
+                Ok(_) => unreachable!("state history write retry window must be positive"),
+                Err(panic) => panic_message(panic),
+            }
+        });
+
+        assert!(message.contains("STATE_HISTORY_WRITE_RETRY_WINDOW_MS must be > 0"));
+    }
+
+    #[test]
+    fn state_history_defaults() {
+        let (defaults, trimmed_prefix) = with_isolated_state_history_env(|| {
+            set_required_state_history_env();
+            let defaults = load_state_history_config()
+                .unwrap_or_else(|| unreachable!("state history should be enabled"));
+            std::env::set_var("STATE_HISTORY_S3_PREFIX", "foo/");
+            let trimmed_prefix = load_state_history_config()
+                .unwrap_or_else(|| unreachable!("state history should be enabled"))
+                .s3_prefix;
+            (defaults, trimmed_prefix)
+        });
+
+        assert_eq!(defaults.s3_prefix, "state-history");
+        assert_eq!(trimmed_prefix, "foo");
+        assert_eq!(defaults.s3_region, "eu-central-1");
+        assert_eq!(defaults.s3_endpoint_url, None);
+        assert!(!defaults.s3_force_path_style);
+        assert_eq!(defaults.checkpoint_poll_interval, Duration::from_secs(30));
+        assert_eq!(defaults.queue_capacity, 8_192);
+        assert_eq!(defaults.retry_window, Duration::from_millis(30_000));
     }
 }

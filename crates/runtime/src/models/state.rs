@@ -2,18 +2,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use simulator_core::broadcaster::BroadcasterRedisReplayBoundary;
+use simulator_core::broadcaster::{
+    BlockIdentity, BroadcasterRedisReplayBoundary, ProtocolHeadUpdate, ProtocolStateHeads,
+};
+use simulator_replay::{ApplyReport, PoolEntry, ReplayWorld, StatePoint};
 use tokio::sync::{watch, Mutex, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
 use tycho_simulation::{
-    protocol::models::{ProtocolComponent, Update},
+    protocol::models::Update,
     tycho_common::{
         models::{token::Token, Chain},
-        simulation::protocol_sim::ProtocolSim,
         Bytes,
     },
 };
 
+use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
+use crate::chain_tip_telemetry::Observation;
 use crate::config::SlippageConfig;
 
 use super::{
@@ -21,10 +25,11 @@ use super::{
     tokens::TokenStore,
 };
 
-const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
+#[cfg(test)]
 const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
 const READINESS_POLL_INTERVAL_MS: u64 = 50;
 
+#[cfg(test)]
 fn native_token_address() -> Bytes {
     Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
 }
@@ -32,8 +37,9 @@ fn native_token_address() -> Bytes {
 #[derive(Clone)]
 pub struct AppState {
     pub chain: Chain,
+    pub chain_head_observer: Arc<ChainHeadObserver>,
     pub rfq_client_config: Arc<RfqClientConfig>,
-    pub native_token_protocol_allowlist: Arc<Vec<String>>,
+    pub native_token_protocol_allowlist: Arc<Vec<ProtocolKind>>,
     pub tokens: Arc<TokenStore>,
     pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
@@ -48,7 +54,6 @@ pub struct AppState {
     pub configured_backends: ConfiguredBackends,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
-    pub native_progress_lease: Duration,
     pub optional_backend_stale: Duration,
     pub request_timeout: Duration,
     pub vm_simulation_rebuild_gate: Arc<RwLock<()>>,
@@ -62,7 +67,6 @@ pub struct AppState {
 #[derive(Clone, Default)]
 pub struct RfqClientConfig {
     pub tvl_threshold: f64,
-    pub bebop_user: String,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
@@ -151,6 +155,11 @@ pub struct BroadcasterSubscriptionSnapshot {
 }
 
 impl BroadcasterSubscriptionStatus {
+    #[cfg(test)]
+    pub(crate) async fn hold_readiness_for_test(&self) -> impl Drop + Send {
+        Arc::clone(&self.inner).write_owned().await
+    }
+
     pub async fn mark_connected(&self) {
         let mut guard = self.inner.write().await;
         guard.connected = true;
@@ -480,6 +489,10 @@ pub struct SimulatorBackendStatusSnapshot {
     pub readiness: SimulatorBackendReadiness,
     pub reason: Option<SimulatorReadinessReason>,
     pub block_number: Option<u64>,
+    pub applied_head: Option<BlockIdentity>,
+    pub observed_chain_head: Option<BlockIdentity>,
+    pub observation_age_ms: Option<u64>,
+    pub chain_head_agreement: Option<ChainHeadAgreement>,
     pub update_timestamp: Option<u64>,
     pub pool_count: usize,
     pub restart_count: u64,
@@ -522,6 +535,25 @@ pub enum EncodeAvailability {
     RfqStale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeFenceStatus {
+    Current,
+    Changed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRouteFenceCheck {
+    pub(crate) status: NativeFenceStatus,
+    pub(crate) current_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativePoolFenceStatus {
+    Available(HashSet<String>),
+    Unavailable,
+}
+
 impl EncodeAvailability {
     pub const fn availability_message(self) -> Option<&'static str> {
         match self {
@@ -548,7 +580,170 @@ impl EncodeAvailability {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BackendFreshnessFence {
+    backend: SimulatorBackendKind,
+    observer_revision: u64,
+    head_revision: u64,
+}
+
+struct BackendAssessment {
+    readiness: SimulatorBackendReadiness,
+    observed_chain_head: Option<BlockIdentity>,
+    observation_age: Option<Duration>,
+    chain_head_agreement: ChainHeadAgreement,
+}
+
 impl AppState {
+    fn backend_store(&self, backend: SimulatorBackendKind) -> &StateStore {
+        match backend {
+            SimulatorBackendKind::Native => &self.native_state_store,
+            SimulatorBackendKind::Vm => &self.vm_state_store,
+            SimulatorBackendKind::Rfq => &self.rfq_state_store,
+        }
+    }
+
+    async fn backend_assessment_for_pin(
+        &self,
+        backend: SimulatorBackendKind,
+        pinned: &PublishedStatePin,
+    ) -> BackendAssessment {
+        let state_ready = pinned.state.ready && pinned.state.requests_allowed;
+        let readiness = match backend {
+            SimulatorBackendKind::Native => {
+                if state_ready && self.native_broadcaster_bootstrap_ready().await {
+                    SimulatorBackendReadiness::Ready
+                } else {
+                    SimulatorBackendReadiness::WarmingUp
+                }
+            }
+            SimulatorBackendKind::Vm => {
+                if !self.enable_vm_pools {
+                    SimulatorBackendReadiness::Disabled
+                } else if self.vm_rebuilding().await {
+                    SimulatorBackendReadiness::Rebuilding
+                } else if state_ready && self.vm_broadcaster_bootstrap_ready().await {
+                    SimulatorBackendReadiness::Ready
+                } else {
+                    SimulatorBackendReadiness::WarmingUp
+                }
+            }
+            SimulatorBackendKind::Rfq => SimulatorBackendReadiness::Disabled,
+        };
+        let observation = self.chain_head_observer.snapshot();
+        let chain_head_agreement = observation.agreement(pinned.applied_head());
+        let readiness = if readiness == SimulatorBackendReadiness::Ready
+            && chain_head_agreement != ChainHeadAgreement::Matches
+        {
+            SimulatorBackendReadiness::Stale
+        } else {
+            readiness
+        };
+        BackendAssessment {
+            readiness,
+            observed_chain_head: observation.observed_head,
+            observation_age: observation.observation_age,
+            chain_head_agreement,
+        }
+    }
+
+    pub(crate) fn chain_tip_backends(&self) -> impl Iterator<Item = SimulatorBackendKind> {
+        [
+            Some(SimulatorBackendKind::Native),
+            (self.configured_backends.vm && self.enable_vm_pools)
+                .then_some(SimulatorBackendKind::Vm),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub(crate) async fn chain_tip_observation(&self, backend: SimulatorBackendKind) -> Observation {
+        let pinned = self.backend_store(backend).pin().await;
+        let assessment = self.backend_assessment_for_pin(backend, &pinned).await;
+        Observation {
+            local: pinned.applied_head().cloned(),
+            observed: assessment.observed_chain_head,
+            agreement: assessment.chain_head_agreement,
+            unavailable_reason: None,
+            readiness: Some(assessment.readiness.label()),
+        }
+    }
+
+    pub(crate) async fn backend_freshness_fence(
+        &self,
+        backend: SimulatorBackendKind,
+        pinned: &PublishedStatePin,
+    ) -> Option<BackendFreshnessFence> {
+        let revision = self.chain_head_observer.snapshot().revision;
+        if self
+            .backend_assessment_for_pin(backend, pinned)
+            .await
+            .readiness
+            != SimulatorBackendReadiness::Ready
+        {
+            return None;
+        }
+        let current = self.backend_store(backend).published.try_read().ok()?;
+        let observation = self.chain_head_observer.snapshot();
+        if current.head_revision != pinned.head_revision()
+            || !current.ready
+            || !current.requests_allowed
+            || observation.revision != revision
+            || observation.agreement(current.applied_head.as_ref()) != ChainHeadAgreement::Matches
+        {
+            return None;
+        }
+        Some(BackendFreshnessFence {
+            backend,
+            observer_revision: observation.revision,
+            head_revision: current.head_revision,
+        })
+    }
+
+    pub(crate) async fn backend_freshness_fences_valid(
+        &self,
+        fences: &[&BackendFreshnessFence],
+    ) -> Vec<bool> {
+        let mut eligible = Vec::with_capacity(fences.len());
+        for fence in fences {
+            let pinned = self.backend_store(fence.backend).pin().await;
+            eligible.push(
+                self.backend_assessment_for_pin(fence.backend, &pinned)
+                    .await
+                    .readiness
+                    == SimulatorBackendReadiness::Ready,
+            );
+        }
+        // Hold all participating publications through the final observation. No backend can
+        // close and reopen while another backend's final check is still waiting.
+        let publications = fences
+            .iter()
+            .map(|fence| self.backend_store(fence.backend).published.try_read().ok())
+            .collect::<Vec<_>>();
+        let observation = self.chain_head_observer.snapshot();
+        fences
+            .iter()
+            .zip(publications.iter())
+            .zip(eligible)
+            .map(|((fence, current), eligible)| {
+                eligible
+                    && current.as_ref().is_some_and(|current| {
+                        current.ready
+                            && current.requests_allowed
+                            && current.head_revision == fence.head_revision
+                            && observation.revision == fence.observer_revision
+                            && observation.agreement(current.applied_head.as_ref())
+                                == ChainHeadAgreement::Matches
+                    })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    async fn backend_freshness_fence_valid(&self, fence: &BackendFreshnessFence) -> bool {
+        self.backend_freshness_fences_valid(&[fence]).await[0]
+    }
+
     async fn native_broadcaster_bootstrap_ready(&self) -> bool {
         let subscription = self.native_broadcaster_subscription.snapshot().await;
         subscription_readiness_reason(&subscription).is_none()
@@ -589,14 +784,11 @@ impl AppState {
         let last_update_age_ms = self.native_update_age_ms().await;
         let stream_restart_count = self.native_stream_health.restart_count().await;
         let stream_last_error = self.native_stream_health.last_error().await;
-        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
-        let readiness = if subscription_reason.is_some() || !state_ready || !requests_allowed {
-            SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.native_progress_lease_ms()) {
-            SimulatorBackendReadiness::Stale
-        } else {
-            SimulatorBackendReadiness::Ready
-        };
+        let pinned = self.native_state_store.pin().await;
+        let assessment = self
+            .backend_assessment_for_pin(SimulatorBackendKind::Native, &pinned)
+            .await;
+        let readiness = assessment.readiness;
         let reason = match readiness {
             SimulatorBackendReadiness::WarmingUp => {
                 subscription_reason.or(Some(SimulatorReadinessReason::StateWarmingUp))
@@ -612,7 +804,11 @@ impl AppState {
             enabled: true,
             readiness,
             reason,
-            block_number: Some(self.current_block().await),
+            block_number: Some(pinned.current_block()),
+            applied_head: pinned.applied_head().cloned(),
+            observed_chain_head: assessment.observed_chain_head,
+            observation_age_ms: assessment.observation_age.map(|age| age.as_millis() as u64),
+            chain_head_agreement: Some(assessment.chain_head_agreement),
             update_timestamp: None,
             pool_count: self.native_state_store.total_states().await,
             restart_count: stream_restart_count,
@@ -629,17 +825,11 @@ impl AppState {
         let subscription_reason = subscription_readiness_reason(&subscription);
         let stream_status = self.vm_stream.read().await.clone();
         let last_update_age_ms = self.vm_update_age_ms().await;
-        let readiness = if !self.enable_vm_pools {
-            SimulatorBackendReadiness::Disabled
-        } else if stream_status.rebuilding {
-            SimulatorBackendReadiness::Rebuilding
-        } else if subscription_reason.is_some() || !self.vm_state_store.is_ready() {
-            SimulatorBackendReadiness::WarmingUp
-        } else if is_update_stale(last_update_age_ms, self.optional_backend_stale_ms()) {
-            SimulatorBackendReadiness::Stale
-        } else {
-            SimulatorBackendReadiness::Ready
-        };
+        let pinned = self.vm_state_store.pin().await;
+        let assessment = self
+            .backend_assessment_for_pin(SimulatorBackendKind::Vm, &pinned)
+            .await;
+        let readiness = assessment.readiness;
         let reason = match readiness {
             SimulatorBackendReadiness::Disabled => Some(SimulatorReadinessReason::DisabledByConfig),
             SimulatorBackendReadiness::Rebuilding => Some(SimulatorReadinessReason::Rebuilding),
@@ -655,7 +845,11 @@ impl AppState {
             enabled: self.enable_vm_pools,
             readiness,
             reason,
-            block_number: self.enable_vm_pools.then_some(self.vm_block().await),
+            block_number: self.enable_vm_pools.then_some(pinned.current_block()),
+            applied_head: pinned.applied_head().cloned(),
+            observed_chain_head: assessment.observed_chain_head,
+            observation_age_ms: assessment.observation_age.map(|age| age.as_millis() as u64),
+            chain_head_agreement: Some(assessment.chain_head_agreement),
             update_timestamp: None,
             pool_count: self.vm_pools().await,
             restart_count: stream_status.restart_count,
@@ -709,6 +903,10 @@ impl AppState {
             readiness,
             reason,
             block_number: None,
+            applied_head: None,
+            observed_chain_head: None,
+            observation_age_ms: None,
+            chain_head_agreement: None,
             update_timestamp,
             pool_count: self.rfq_pools().await,
             restart_count: subscription.restart_count,
@@ -753,10 +951,6 @@ impl AppState {
         self.optional_backend_stale.as_millis() as u64
     }
 
-    pub fn native_progress_lease_ms(&self) -> u64 {
-        self.native_progress_lease.as_millis() as u64
-    }
-
     pub async fn native_update_age_ms(&self) -> Option<u64> {
         self.native_stream_health.last_update_age_ms().await
     }
@@ -770,64 +964,69 @@ impl AppState {
     }
 
     pub async fn native_readiness(&self) -> NativeReadiness {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return NativeReadiness::WarmingUp;
-        }
-
-        let (state_ready, requests_allowed, _) = self.native_state_store.request_snapshot().await;
-        if !state_ready || !requests_allowed {
-            return NativeReadiness::WarmingUp;
-        }
-
-        if is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        ) {
-            NativeReadiness::Stale
-        } else {
-            NativeReadiness::Ready
+        let pinned = self.native_state_store.pin().await;
+        match self
+            .backend_assessment_for_pin(SimulatorBackendKind::Native, &pinned)
+            .await
+            .readiness
+        {
+            SimulatorBackendReadiness::Ready => NativeReadiness::Ready,
+            SimulatorBackendReadiness::Stale => NativeReadiness::Stale,
+            _ => NativeReadiness::WarmingUp,
         }
     }
 
-    pub(crate) async fn native_request_is_current(&self, pinned_generation: u64) -> bool {
-        if !self.native_broadcaster_bootstrap_ready().await {
-            return false;
+    pub(crate) async fn native_route_fence_status(
+        &self,
+        pinned: &PublishedStatePin,
+        pool_ids: &HashSet<String>,
+    ) -> NativeRouteFenceCheck {
+        let current = self.native_state_store.pin().await;
+        let status = match self
+            .native_pool_fence_status(pinned, &current, pool_ids)
+            .await
+        {
+            NativePoolFenceStatus::Available(changed_pool_ids) if changed_pool_ids.is_empty() => {
+                NativeFenceStatus::Current
+            }
+            NativePoolFenceStatus::Available(_) => NativeFenceStatus::Changed,
+            NativePoolFenceStatus::Unavailable => NativeFenceStatus::Unavailable,
+        };
+        NativeRouteFenceCheck {
+            status,
+            current_generation: current.request_generation(),
         }
-        if is_update_stale(
-            self.native_update_age_ms().await,
-            self.native_progress_lease_ms(),
-        ) {
-            return false;
+    }
+
+    pub(crate) async fn native_pool_fence_status(
+        &self,
+        pinned: &PublishedStatePin,
+        current: &PublishedStatePin,
+        pool_ids: &HashSet<String>,
+    ) -> NativePoolFenceStatus {
+        if self
+            .backend_assessment_for_pin(SimulatorBackendKind::Native, current)
+            .await
+            .readiness
+            != SimulatorBackendReadiness::Ready
+        {
+            return NativePoolFenceStatus::Unavailable;
         }
-        let (state_ready, requests_allowed, current_generation) =
-            self.native_state_store.request_snapshot().await;
-        state_ready && requests_allowed && current_generation == pinned_generation
+        NativePoolFenceStatus::Available(pinned.changed_pool_ids(current, pool_ids))
     }
 
     pub async fn vm_readiness(&self) -> VmReadiness {
-        if !self.enable_vm_pools {
-            return VmReadiness::Disabled;
-        }
-
-        if self.vm_rebuilding().await {
-            return VmReadiness::Rebuilding;
-        }
-
-        if !self.vm_broadcaster_bootstrap_ready().await {
-            return VmReadiness::WarmingUp;
-        }
-
-        if !self.vm_state_store.is_ready() {
-            return VmReadiness::WarmingUp;
-        }
-
-        if is_update_stale(
-            self.vm_update_age_ms().await,
-            self.optional_backend_stale_ms(),
-        ) {
-            VmReadiness::Stale
-        } else {
-            VmReadiness::Ready
+        let pinned = self.vm_state_store.pin().await;
+        match self
+            .backend_assessment_for_pin(SimulatorBackendKind::Vm, &pinned)
+            .await
+            .readiness
+        {
+            SimulatorBackendReadiness::Ready => VmReadiness::Ready,
+            SimulatorBackendReadiness::Stale => VmReadiness::Stale,
+            SimulatorBackendReadiness::Rebuilding => VmReadiness::Rebuilding,
+            SimulatorBackendReadiness::Disabled => VmReadiness::Disabled,
+            _ => VmReadiness::WarmingUp,
         }
     }
 
@@ -1108,41 +1307,42 @@ pub struct VmStreamStatus {
     pub rebuild_started_at: Option<Instant>,
 }
 
-pub(crate) type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
-
 #[derive(Clone)]
 struct PublishedStateStore {
     version: u64,
+    applied_head: Option<BlockIdentity>,
+    protocol_heads: ProtocolStateHeads,
+    head_revision: u64,
     request_generation: u64,
     requests_allowed: bool,
-    shards: HashMap<ProtocolKind, HashMap<String, PoolEntry>>,
-    id_to_kind: HashMap<String, ProtocolKind>,
-    token_index: HashMap<Bytes, HashSet<String>>,
-    tokens: HashMap<Bytes, Token>,
-    wrapped_native_token: Option<Bytes>,
-    block_number: u64,
+    point: StatePoint,
     ready: bool,
 }
 
 impl PublishedStateStore {
-    fn empty(tokens: HashMap<Bytes, Token>, wrapped_native_token: Option<Bytes>) -> Self {
-        let mut shards = HashMap::new();
-        for kind in ProtocolKind::ALL {
-            shards.insert(kind, HashMap::new());
-        }
-
+    fn empty(
+        tokens: HashMap<Bytes, Token>,
+        wrapped_native_token: Option<Bytes>,
+        required_protocols: Vec<ProtocolKind>,
+    ) -> Self {
         Self {
             version: 0,
+            applied_head: None,
+            protocol_heads: ProtocolStateHeads::new(required_protocols),
+            head_revision: 0,
             request_generation: 0,
             requests_allowed: false,
-            shards,
-            id_to_kind: HashMap::new(),
-            token_index: HashMap::new(),
-            tokens,
-            wrapped_native_token,
-            block_number: 0,
+            point: ReplayWorld::new(tokens, wrapped_native_token).pin(),
             ready: false,
         }
+    }
+}
+
+fn align_published_block(publication: &mut PublishedStateStore) {
+    if let Some(head) = &publication.applied_head {
+        let mut world = ReplayWorld::from_point(&publication.point);
+        world.set_current_block(head.number);
+        publication.point = world.pin();
     }
 }
 
@@ -1152,6 +1352,14 @@ pub(crate) struct PublishedStatePin {
 }
 
 impl PublishedStatePin {
+    pub(crate) fn applied_head(&self) -> Option<&BlockIdentity> {
+        self.state.applied_head.as_ref()
+    }
+
+    pub(crate) fn head_revision(&self) -> u64 {
+        self.state.head_revision
+    }
+
     #[cfg(test)]
     pub(crate) fn version(&self) -> u64 {
         self.state.version
@@ -1162,15 +1370,15 @@ impl PublishedStatePin {
     }
 
     pub(crate) fn current_block(&self) -> u64 {
-        self.state.block_number
+        self.state.point.current_block()
     }
 
     pub(crate) fn total_states(&self) -> usize {
-        self.state.id_to_kind.len()
+        self.state.point.total_states()
     }
 
     pub(crate) fn token(&self, address: &Bytes) -> Option<Token> {
-        self.state.tokens.get(address).cloned()
+        self.state.point.token(address)
     }
 
     pub(crate) fn matching_pools_by_addresses(
@@ -1178,57 +1386,31 @@ impl PublishedStatePin {
         token_in: &Bytes,
         token_out: &Bytes,
     ) -> Vec<(String, PoolEntry)> {
-        matching_pools_from_published(&self.state, token_in, token_out)
+        self.state
+            .point
+            .matching_pools_by_addresses(token_in, token_out)
     }
 
     pub(crate) fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
-        pool_by_id_from_published(&self.state, id)
+        self.state.point.pool_by_id(id)
+    }
+
+    /// Pointer identity is a valid fence because updates replace state and component Arcs instead
+    /// of mutating them. `get_amount_out` borrows state and returns a separate state after the
+    /// swap, while delta application requires `&mut self` upstream. Native protocol states do not
+    /// use interior mutability, which the invariant test below enforces with a real implementation.
+    pub(crate) fn changed_pool_ids(
+        &self,
+        current: &Self,
+        pool_ids: &HashSet<String>,
+    ) -> HashSet<String> {
+        self.state
+            .point
+            .changed_pool_ids(&current.state.point, pool_ids)
     }
 }
 
-pub struct UpdateMetrics {
-    pub block_number: u64,
-    pub updated_states: usize,
-    pub new_pairs: usize,
-    pub removed_pairs: usize,
-    pub total_pairs: usize,
-    pub new_pairs_missing_state: usize,
-    pub unknown_protocol_new_pairs: usize,
-    pub updates_for_unknown_pair: usize,
-    pub states_missing_in_shard: usize,
-    pub removed_unknown_pair: usize,
-    pub anomaly_samples: Vec<String>,
-}
-
-impl UpdateMetrics {
-    pub fn has_anomalies(&self) -> bool {
-        self.new_pairs_missing_state > 0
-            || self.unknown_protocol_new_pairs > 0
-            || self.updates_for_unknown_pair > 0
-            || self.states_missing_in_shard > 0
-            || self.removed_unknown_pair > 0
-    }
-}
-
-#[derive(Default)]
-struct UpdateAccumulator {
-    new_pairs_count: usize,
-    new_pairs_missing_state: usize,
-    unknown_protocol_new_pairs: usize,
-    updated_states: usize,
-    updates_for_unknown_pair: usize,
-    states_missing_in_shard: usize,
-    removed_pairs_count: usize,
-    removed_unknown_pair: usize,
-    anomaly_samples: Vec<String>,
-    tokens_to_cache: Vec<Token>,
-}
-
-impl UpdateAccumulator {
-    fn record_anomaly(&mut self, kind: &str, value: &str) {
-        add_anomaly_sample(&mut self.anomaly_samples, kind, value);
-    }
-}
+pub type UpdateMetrics = ApplyReport;
 
 pub struct StateStore {
     tokens: Arc<TokenStore>,
@@ -1241,26 +1423,36 @@ pub struct StateStore {
 impl StateStore {
     pub fn new(tokens: Arc<TokenStore>) -> Self {
         let initial_tokens = tokens.initial_snapshot();
-        Self::new_with_token_publication(tokens, initial_tokens, true)
+        Self::new_with_token_publication(tokens, initial_tokens, true, Vec::new())
+    }
+
+    pub fn new_with_protocols(
+        tokens: Arc<TokenStore>,
+        required_protocols: Vec<ProtocolKind>,
+    ) -> Self {
+        let initial_tokens = tokens.initial_snapshot();
+        Self::new_with_token_publication(tokens, initial_tokens, true, required_protocols)
     }
 
     #[cfg(test)]
     pub(crate) fn new_private(tokens: Arc<TokenStore>) -> Self {
         let initial_tokens = tokens.initial_snapshot();
-        Self::new_with_token_publication(tokens, initial_tokens, false)
+        Self::new_with_token_publication(tokens, initial_tokens, false, Vec::new())
     }
 
     pub(crate) fn new_private_with_snapshot(
         tokens: Arc<TokenStore>,
         initial_tokens: HashMap<Bytes, Token>,
+        required_protocols: Vec<ProtocolKind>,
     ) -> Self {
-        Self::new_with_token_publication(tokens, initial_tokens, false)
+        Self::new_with_token_publication(tokens, initial_tokens, false, required_protocols)
     }
 
     fn new_with_token_publication(
         tokens: Arc<TokenStore>,
         initial_tokens: HashMap<Bytes, Token>,
         publish_tokens_to_store: bool,
+        required_protocols: Vec<ProtocolKind>,
     ) -> Self {
         let wrapped_native_token = tokens.wrapped_native_token();
         let (ready_tx, _) = watch::channel(false);
@@ -1270,6 +1462,7 @@ impl StateStore {
             published: RwLock::new(Arc::new(PublishedStateStore::empty(
                 initial_tokens,
                 wrapped_native_token,
+                required_protocols,
             ))),
             update_guard: Mutex::new(()),
             ready_tx,
@@ -1296,16 +1489,8 @@ impl StateStore {
         let current = Arc::clone(&*self.published.read().await);
         let mut replacement = (*current).clone();
         replacement.requests_allowed = false;
+        replacement.head_revision = replacement.head_revision.saturating_add(1);
         self.publish(replacement).await;
-    }
-
-    async fn request_snapshot(&self) -> (bool, bool, u64) {
-        let current = self.published.read().await;
-        (
-            current.ready,
-            current.requests_allowed,
-            current.request_generation,
-        )
     }
 
     pub(crate) async fn align_bootstrap_state_version(&self, state_version: u64) {
@@ -1320,11 +1505,15 @@ impl StateStore {
     pub async fn reset(&self) {
         let _guard = self.update_guard.lock().await;
         let current = Arc::clone(&*self.published.read().await);
-        let mut replacement = PublishedStateStore::empty(
-            current.tokens.clone(),
-            current.wrapped_native_token.clone(),
-        );
+        let mut world = ReplayWorld::from_point(&current.point);
+        world.clear();
+        let mut replacement = (*current).clone();
+        replacement.point = world.pin();
+        replacement.applied_head = None;
+        replacement.protocol_heads.clear();
         replacement.version = current.version.saturating_add(1);
+        replacement.ready = false;
+        replacement.requests_allowed = false;
         self.publish(replacement).await;
     }
 
@@ -1340,112 +1529,127 @@ impl StateStore {
 
         let _guard = self.update_guard.lock().await;
         let current = Arc::clone(&*self.published.read().await);
-        let mut replacement = (*current).clone();
-        let mut any_cleared = false;
-        for kind in protocols {
-            if let Some(shard) = replacement.shards.get_mut(kind) {
-                shard.clear();
-                any_cleared = true;
-            }
-        }
-
-        if !any_cleared {
+        let mut world = ReplayWorld::from_point(&current.point);
+        if !world.reset_protocols(protocols) {
             return;
         }
-
-        rebuild_indexes(&mut replacement);
+        let mut replacement = (*current).clone();
+        replacement.point = world.pin();
+        replacement.applied_head = None;
+        replacement.protocol_heads.clear();
         replacement.version = current.version.saturating_add(1);
-        replacement.ready = !replacement.id_to_kind.is_empty();
+        replacement.ready = replacement.point.total_states() > 0;
         replacement.requests_allowed = replacement.ready;
         self.publish(replacement).await;
     }
 
-    pub async fn apply_update(&self, mut update: Update) -> UpdateMetrics {
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn apply_update(&self, update: Update) -> UpdateMetrics {
+        self.apply_update_with_head(update, None).await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn apply_update_with_head(
+        &self,
+        update: Update,
+        applied_head: Option<BlockIdentity>,
+    ) -> UpdateMetrics {
         let _guard = self.update_guard.lock().await;
-        let current = Arc::clone(&*self.published.read().await);
-        let state_version = current.version.saturating_add(1);
-        self.apply_update_locked(&mut update, current, state_version)
+        let mut replacement = (**self.published.read().await).clone();
+        let state_version = replacement.version.saturating_add(1);
+        replacement.protocol_heads.clear();
+        replacement.applied_head = applied_head;
+        self.apply_update_locked(update, replacement, state_version)
             .await
     }
 
-    pub(crate) async fn apply_update_at_version(
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn set_applied_head(&self, applied_head: Option<BlockIdentity>) {
+        let _guard = self.update_guard.lock().await;
+        let mut replacement = (**self.published.read().await).clone();
+        replacement.protocol_heads.clear();
+        replacement.applied_head = applied_head;
+        align_published_block(&mut replacement);
+        self.publish(replacement).await;
+    }
+
+    pub(crate) async fn apply_update_with_protocol_heads(
         &self,
-        mut update: Update,
+        update: Update,
+        head_updates: &[ProtocolHeadUpdate],
+    ) -> UpdateMetrics {
+        let _guard = self.update_guard.lock().await;
+        let mut replacement = (**self.published.read().await).clone();
+        let state_version = replacement.version.saturating_add(1);
+        replacement.protocol_heads.apply_updates(head_updates);
+        replacement.applied_head = replacement.protocol_heads.complete_head();
+        self.apply_update_locked(update, replacement, state_version)
+            .await
+    }
+
+    pub(crate) async fn apply_update_at_version_with_protocol_heads(
+        &self,
+        update: Update,
+        head_updates: &[ProtocolHeadUpdate],
         state_version: u64,
     ) -> anyhow::Result<UpdateMetrics> {
         let _guard = self.update_guard.lock().await;
-        let current = Arc::clone(&*self.published.read().await);
+        let mut replacement = (**self.published.read().await).clone();
         anyhow::ensure!(
-            state_version > current.version,
+            state_version > replacement.version,
             "state version {state_version} must be newer than published version {}",
-            current.version
+            replacement.version
         );
+        replacement.protocol_heads.apply_updates(head_updates);
+        replacement.applied_head = replacement.protocol_heads.complete_head();
         Ok(self
-            .apply_update_locked(&mut update, current, state_version)
+            .apply_update_locked(update, replacement, state_version)
             .await)
+    }
+
+    pub(crate) async fn apply_protocol_heads(&self, head_updates: &[ProtocolHeadUpdate]) {
+        if head_updates.is_empty() {
+            return;
+        }
+        let _guard = self.update_guard.lock().await;
+        let mut replacement = (**self.published.read().await).clone();
+        replacement.protocol_heads.apply_updates(head_updates);
+        replacement.applied_head = replacement.protocol_heads.complete_head();
+        align_published_block(&mut replacement);
+        self.publish(replacement).await;
     }
 
     async fn apply_update_locked(
         &self,
-        update: &mut Update,
-        current: Arc<PublishedStateStore>,
+        mut update: Update,
+        mut replacement: PublishedStateStore,
         state_version: u64,
     ) -> UpdateMetrics {
-        let mut replacement = (*current).clone();
-        replacement.version = state_version;
-        let block_number = update.block_number;
-        replacement.block_number = block_number;
-        let mut stats = UpdateAccumulator::default();
-
-        apply_new_pairs(
-            &mut replacement,
-            std::mem::take(&mut update.new_pairs),
-            &mut update.states,
-            &mut stats,
-        );
-        apply_state_updates(
-            &mut replacement,
-            std::mem::take(&mut update.states),
-            &mut stats,
-        );
-        apply_removed_pairs(
-            &mut replacement,
-            std::mem::take(&mut update.removed_pairs),
-            &mut stats,
-        );
-        if self.publish_tokens_to_store && !stats.tokens_to_cache.is_empty() {
+        if let Some(head) = &replacement.applied_head {
+            update.block_number = head.number;
+        }
+        let mut world = ReplayWorld::from_point(&replacement.point);
+        let report = world.apply(update);
+        if self.publish_tokens_to_store && !report.tokens_to_cache().is_empty() {
             self.tokens
-                .insert_batch(stats.tokens_to_cache.iter().cloned())
+                .insert_batch(report.tokens_to_cache().iter().cloned())
                 .await;
         }
-        for token in stats.tokens_to_cache.drain(..) {
-            replacement
-                .tokens
-                .entry(token.address.clone())
-                .or_insert(token);
-        }
-        let total_pairs = replacement.id_to_kind.len();
-        replacement.ready = total_pairs > 0;
+        replacement.version = state_version;
+        replacement.point = world.pin();
+        replacement.ready = report.total_pairs > 0;
         replacement.requests_allowed = replacement.ready;
         self.publish(replacement).await;
-
-        UpdateMetrics {
-            block_number,
-            updated_states: stats.updated_states,
-            new_pairs: stats.new_pairs_count,
-            removed_pairs: stats.removed_pairs_count,
-            total_pairs,
-            new_pairs_missing_state: stats.new_pairs_missing_state,
-            unknown_protocol_new_pairs: stats.unknown_protocol_new_pairs,
-            updates_for_unknown_pair: stats.updates_for_unknown_pair,
-            states_missing_in_shard: stats.states_missing_in_shard,
-            removed_unknown_pair: stats.removed_unknown_pair,
-            anomaly_samples: stats.anomaly_samples,
-        }
+        report
     }
 
     async fn publish(&self, mut replacement: PublishedStateStore) {
         let current = Arc::clone(&*self.published.read().await);
+        if replacement.applied_head != current.applied_head {
+            replacement.head_revision = current.head_revision.saturating_add(1);
+        } else {
+            replacement.head_revision = replacement.head_revision.max(current.head_revision);
+        }
         replacement.request_generation = current.request_generation.saturating_add(1);
         let ready = replacement.ready;
         let previous_ready = current.ready;
@@ -1469,22 +1673,22 @@ impl StateStore {
         let mut replacement = (*candidate.state).clone();
         replacement.version = target_version;
         replacement.requests_allowed = replacement.ready;
-        let tokens = replacement.tokens.values().cloned().collect::<Vec<_>>();
+        let tokens = replacement.point.tokens().into_values().collect::<Vec<_>>();
         self.publish(replacement).await;
         self.tokens.insert_batch(tokens).await;
         Ok(())
     }
 
     pub async fn current_block(&self) -> u64 {
-        self.published.read().await.block_number
+        self.published.read().await.point.current_block()
     }
 
     pub async fn total_states(&self) -> usize {
-        self.published.read().await.id_to_kind.len()
+        self.published.read().await.point.total_states()
     }
 
     pub async fn has_pool(&self, id: &str) -> bool {
-        self.published.read().await.id_to_kind.contains_key(id)
+        self.published.read().await.point.pool_by_id(id).is_some()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1532,213 +1736,12 @@ impl StateStore {
 
     #[cfg(test)]
     pub(crate) async fn pool_ids_by_protocol_system(&self, protocol_system: &str) -> Vec<String> {
-        let published = self.published.read().await;
-        let mut ids = Vec::new();
-        for shard in published.shards.values() {
-            for (id, (_state, component)) in shard {
-                if component.protocol_system == protocol_system {
-                    ids.push(id.clone());
-                }
-            }
-        }
-        ids.sort_unstable();
-        ids
+        self.published
+            .read()
+            .await
+            .point
+            .pool_ids_by_protocol_system(protocol_system)
     }
-}
-
-fn apply_new_pairs(
-    published: &mut PublishedStateStore,
-    new_pairs: HashMap<String, ProtocolComponent>,
-    states: &mut HashMap<String, Box<dyn ProtocolSim>>,
-    stats: &mut UpdateAccumulator,
-) {
-    for (id, component) in new_pairs {
-        let Some(kind) = ProtocolKind::from_component(&component) else {
-            stats.unknown_protocol_new_pairs += 1;
-            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
-            continue;
-        };
-        let Some(state) = states.remove(&id) else {
-            stats.new_pairs_missing_state += 1;
-            stats.record_anomaly("new_pairs_missing_state", id.as_str());
-            continue;
-        };
-        let Some(shard) = published.shards.get_mut(&kind) else {
-            stats.unknown_protocol_new_pairs += 1;
-            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
-            continue;
-        };
-
-        let component = Arc::new(component);
-        published.id_to_kind.insert(id.clone(), kind);
-        stats
-            .tokens_to_cache
-            .extend(component.tokens.iter().cloned());
-        for token in &component.tokens {
-            published
-                .token_index
-                .entry(token.address.clone())
-                .or_default()
-                .insert(id.clone());
-        }
-        shard.insert(id, (Arc::from(state), component));
-        stats.new_pairs_count += 1;
-    }
-}
-
-fn apply_state_updates(
-    published: &mut PublishedStateStore,
-    states: HashMap<String, Box<dyn ProtocolSim>>,
-    stats: &mut UpdateAccumulator,
-) {
-    for (id, state) in states {
-        let Some(kind) = published.id_to_kind.get(&id).copied() else {
-            stats.updates_for_unknown_pair += 1;
-            stats.record_anomaly("updates_for_unknown_pair", id.as_str());
-            continue;
-        };
-        let Some(shard) = published.shards.get_mut(&kind) else {
-            stats.states_missing_in_shard += 1;
-            stats.record_anomaly("states_missing_in_shard", id.as_str());
-            continue;
-        };
-        if let Some((existing_state, _)) = shard.get_mut(&id) {
-            *existing_state = Arc::from(state);
-            stats.updated_states += 1;
-        } else {
-            stats.states_missing_in_shard += 1;
-            stats.record_anomaly("states_missing_in_shard", id.as_str());
-        }
-    }
-}
-
-fn apply_removed_pairs(
-    published: &mut PublishedStateStore,
-    removed_pairs: HashMap<String, ProtocolComponent>,
-    stats: &mut UpdateAccumulator,
-) {
-    for (id, component) in removed_pairs {
-        for token in &component.tokens {
-            if let Some(pool_ids) = published.token_index.get_mut(&token.address) {
-                pool_ids.remove(&id);
-                if pool_ids.is_empty() {
-                    published.token_index.remove(&token.address);
-                }
-            }
-        }
-
-        if let Some(kind) = published.id_to_kind.remove(&id) {
-            if let Some(shard) = published.shards.get_mut(&kind) {
-                shard.remove(&id);
-                stats.removed_pairs_count += 1;
-            }
-        } else {
-            stats.removed_unknown_pair += 1;
-            stats.record_anomaly("removed_unknown_pair", id.as_str());
-        }
-    }
-}
-
-fn rebuild_indexes(published: &mut PublishedStateStore) {
-    published.id_to_kind.clear();
-    published.token_index.clear();
-    for (kind, shard) in &published.shards {
-        for (id, (_state, component)) in shard {
-            published.id_to_kind.insert(id.clone(), *kind);
-            for token in &component.tokens {
-                published
-                    .token_index
-                    .entry(token.address.clone())
-                    .or_default()
-                    .insert(id.clone());
-            }
-        }
-    }
-}
-
-fn ids_for_token(published: &PublishedStateStore, token: &Bytes) -> Option<HashSet<String>> {
-    let native_address = native_token_address();
-    let needs_native = published.wrapped_native_token.as_ref() == Some(token);
-    let needs_wrapped = *token == native_address;
-    let mut ids = published
-        .token_index
-        .get(token)
-        .cloned()
-        .unwrap_or_default();
-    if needs_native {
-        if let Some(native_ids) = published.token_index.get(&native_address) {
-            ids.extend(native_ids.iter().cloned());
-        }
-    }
-    if needs_wrapped {
-        if let Some(wrapped_address) = published.wrapped_native_token.as_ref() {
-            if let Some(wrapped_ids) = published.token_index.get(wrapped_address) {
-                ids.extend(wrapped_ids.iter().cloned());
-            }
-        }
-    }
-    (!ids.is_empty()).then_some(ids)
-}
-
-fn intersect_pool_ids(left: HashSet<String>, right: HashSet<String>) -> Vec<String> {
-    let (smaller, larger) = if left.len() <= right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-    smaller
-        .into_iter()
-        .filter(|id| larger.contains(id))
-        .collect()
-}
-
-fn pool_entries_for_ids(
-    published: &PublishedStateStore,
-    ids: Vec<String>,
-) -> Vec<(String, PoolEntry)> {
-    ids.into_iter()
-        .filter_map(|id| pool_by_id_from_published(published, &id).map(|entry| (id, entry)))
-        .collect()
-}
-
-fn matching_pools_from_published(
-    published: &PublishedStateStore,
-    token_in: &Bytes,
-    token_out: &Bytes,
-) -> Vec<(String, PoolEntry)> {
-    if let (Some(token_in_ids), Some(token_out_ids)) = (
-        published.token_index.get(token_in).cloned(),
-        published.token_index.get(token_out).cloned(),
-    ) {
-        let exact =
-            pool_entries_for_ids(published, intersect_pool_ids(token_in_ids, token_out_ids));
-        if !exact.is_empty() {
-            return exact;
-        }
-    }
-
-    match (
-        ids_for_token(published, token_in),
-        ids_for_token(published, token_out),
-    ) {
-        (Some(token_in_ids), Some(token_out_ids)) => {
-            pool_entries_for_ids(published, intersect_pool_ids(token_in_ids, token_out_ids))
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn pool_by_id_from_published(published: &PublishedStateStore, id: &str) -> Option<PoolEntry> {
-    let kind = published.id_to_kind.get(id)?;
-    let (state, component) = published.shards.get(kind)?.get(id)?;
-    Some((Arc::clone(state), Arc::clone(component)))
-}
-
-fn add_anomaly_sample(samples: &mut Vec<String>, kind: &str, value: &str) {
-    if samples.len() >= UPDATE_ANOMALY_SAMPLE_CAP {
-        return;
-    }
-    samples.push(format!("{kind}:{value}"));
 }
 
 #[cfg(test)]
@@ -1751,7 +1754,12 @@ mod tests {
 
     use num_bigint::BigUint;
     use tycho_simulation::{
-        protocol::models::ProtocolComponent,
+        evm::protocol::uniswap_v2::state::UniswapV2State,
+        protocol::models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        tycho_client::feed::{
+            dto::ComponentWithState as DtoComponentWithState, synchronizer::ComponentWithState,
+            BlockHeader,
+        },
         tycho_common::{
             dto::ProtocolStateDelta,
             models::{token::Token, Chain},
@@ -1939,9 +1947,10 @@ mod tests {
 
     fn build_test_app_state(stores: TestAppStateStores, flags: PoolFlags) -> AppState {
         AppState {
+            chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_block_head(1, 1))),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: stores.token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -1959,7 +1968,6 @@ mod tests {
             },
             enable_vm_pools: flags.enable_vm_pools,
             enable_rfq_pools: flags.enable_rfq_pools,
-            native_progress_lease: Duration::from_secs(120),
             optional_backend_stale: Duration::from_secs(120),
             request_timeout: Duration::from_millis(1000),
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),
@@ -1989,11 +1997,14 @@ mod tests {
             vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
         );
         native_state_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                native_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    native_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         build_test_app_state(
@@ -2015,16 +2026,19 @@ mod tests {
         state.native_stream_health.record_update(1).await;
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    38,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(39, "TKNA"), mk_token(40, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        38,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(39, "TKNA"), mk_token(40, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
             .rfq_state_store
@@ -2084,6 +2098,177 @@ mod tests {
             backend_snapshot.reason,
             Some(SimulatorReadinessReason::RedisReplayGap)
         );
+    }
+
+    fn test_block_head(number: u64, hash: u8) -> BlockIdentity {
+        BlockIdentity {
+            number,
+            hash: Bytes::from(vec![hash; 32]),
+        }
+    }
+
+    async fn expire_chain_observation(state: &mut AppState) {
+        let head = test_block_head(1, 1);
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        state
+            .native_state_store
+            .set_applied_head(Some(head.clone()))
+            .await;
+        state.vm_state_store.set_applied_head(Some(head)).await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+    }
+
+    async fn observed_ready_state() -> AppState {
+        let mut state = build_ready_state_with_vm_and_rfq().await;
+        let head = test_block_head(1, 1);
+        state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+        state
+            .native_state_store
+            .set_applied_head(Some(head.clone()))
+            .await;
+        state.vm_state_store.set_applied_head(Some(head)).await;
+        state
+    }
+
+    #[tokio::test]
+    async fn chain_tip_telemetry_keeps_applied_backend_heads_and_readiness_separate() {
+        let state = observed_ready_state().await;
+        let native_head = test_block_head(1, 1);
+        let vm_head = test_block_head(2, 2);
+        state
+            .vm_state_store
+            .set_applied_head(Some(vm_head.clone()))
+            .await;
+        state.chain_head_observer.observe_for_test(vm_head.clone());
+        state
+            .vm_broadcaster_subscription
+            .mark_redis_gap("test_gap")
+            .await;
+
+        let native = state
+            .chain_tip_observation(SimulatorBackendKind::Native)
+            .await;
+        let vm = state.chain_tip_observation(SimulatorBackendKind::Vm).await;
+        assert_eq!(native.local, Some(native_head));
+        assert_eq!(native.agreement, ChainHeadAgreement::ObserverAhead);
+        assert_eq!(native.readiness, Some("stale"));
+        assert_eq!(vm.local, Some(vm_head.clone()));
+        assert_eq!(vm.observed, Some(vm_head));
+        assert_eq!(vm.agreement, ChainHeadAgreement::Matches);
+        assert_eq!(vm.readiness, Some("warming_up"));
+        assert_eq!(vm.unavailable_reason, None);
+    }
+
+    #[tokio::test]
+    async fn chain_tip_telemetry_omits_disabled_and_unconfigured_vm() {
+        let mut state = observed_ready_state().await;
+        assert_eq!(
+            state.chain_tip_backends().collect::<Vec<_>>(),
+            vec![SimulatorBackendKind::Native, SimulatorBackendKind::Vm],
+        );
+        state.enable_vm_pools = false;
+        assert_eq!(
+            state.chain_tip_backends().collect::<Vec<_>>(),
+            vec![SimulatorBackendKind::Native],
+        );
+        state.enable_vm_pools = true;
+        state.configured_backends.vm = false;
+        assert_eq!(
+            state.chain_tip_backends().collect::<Vec<_>>(),
+            vec![SimulatorBackendKind::Native],
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_agreement_gates_native_and_vm_independently() {
+        let mut state = observed_ready_state().await;
+        state.optional_backend_stale = Duration::ZERO;
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+
+        state
+            .vm_state_store
+            .set_applied_head(Some(test_block_head(1, 2)))
+            .await;
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+        assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
+        assert_eq!(
+            state.encode_availability(true, false, false).await,
+            EncodeAvailability::Ready
+        );
+        assert_eq!(
+            state.encode_availability(true, true, false).await,
+            EncodeAvailability::VmStale
+        );
+
+        state
+            .vm_state_store
+            .set_applied_head(Some(test_block_head(1, 1)))
+            .await;
+        state.native_state_store.set_applied_head(None).await;
+        assert_eq!(state.native_readiness().await, NativeReadiness::Stale);
+        assert_eq!(
+            state.encode_availability(false, true, false).await,
+            EncodeAvailability::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_fences_remember_observation_and_application_discontinuities(
+    ) -> Result<(), &'static str> {
+        let state = observed_ready_state().await;
+        let native_pin = state.native_state_store.pin().await;
+        let native_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Native, &native_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        state
+            .chain_head_observer
+            .observe_for_test(test_block_head(2, 2));
+        state
+            .chain_head_observer
+            .observe_for_test(test_block_head(1, 1));
+        assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
+        assert!(!state.backend_freshness_fence_valid(&native_fence).await);
+
+        let vm_pin = state.vm_state_store.pin().await;
+        let vm_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Vm, &vm_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        state.vm_state_store.set_applied_head(None).await;
+        state
+            .vm_state_store
+            .set_applied_head(Some(test_block_head(1, 1)))
+            .await;
+        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
+        assert!(!state.backend_freshness_fence_valid(&vm_fence).await);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_freshness_batch_rechecks_expiry_after_waiting_for_another_backend(
+    ) -> Result<(), &'static str> {
+        let state = observed_ready_state().await;
+        let native_pin = state.native_state_store.pin().await;
+        let vm_pin = state.vm_state_store.pin().await;
+        let native_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Native, &native_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        let vm_fence = state
+            .backend_freshness_fence(SimulatorBackendKind::Vm, &vm_pin)
+            .await
+            .ok_or("ready backend should issue a freshness fence")?;
+        let fences = [&native_fence, &vm_fence];
+        let vm_status = state.vm_stream.write().await;
+        let validation = state.backend_freshness_fences_valid(&fences);
+        tokio::pin!(validation);
+        assert!(futures::poll!(validation.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(121)).await;
+        drop(vm_status);
+        assert_eq!(validation.await, vec![false, false]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2196,7 +2381,7 @@ mod tests {
             .unwrap_or_else(|| unreachable!("status snapshot must include {kind:?} backend"))
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn native_readiness_distinguishes_ready_stale_and_warming_up() {
         let warming_up_state = {
             let token_store = Arc::new(TokenStore::new(
@@ -2231,7 +2416,7 @@ mod tests {
         ready_state.native_stream_health.record_update(1).await;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Ready);
 
-        ready_state.native_progress_lease = Duration::ZERO;
+        expire_chain_observation(&mut ready_state).await;
         assert_eq!(ready_state.native_readiness().await, NativeReadiness::Stale);
     }
 
@@ -2269,41 +2454,6 @@ mod tests {
             .await;
         assert!(state.is_ready().await);
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
-    }
-
-    #[tokio::test]
-    async fn native_request_generation_survives_wire_version_realignment() {
-        let state = build_readiness_test_state(false, false).await;
-        state.native_stream_health.record_update(1).await;
-        let pinned = state.native_state_store.pin().await;
-        let wire_version = pinned.version();
-
-        assert!(
-            state
-                .native_request_is_current(pinned.request_generation())
-                .await
-        );
-
-        state.native_state_store.fence_requests().await;
-        assert!(!state.is_ready().await);
-        assert!(
-            !state
-                .native_request_is_current(pinned.request_generation())
-                .await
-        );
-
-        state
-            .native_state_store
-            .align_bootstrap_state_version(wire_version)
-            .await;
-        assert_eq!(state.native_state_store.state_version().await, wire_version);
-        assert!(state.is_ready().await);
-        assert!(
-            !state
-                .native_request_is_current(pinned.request_generation())
-                .await,
-            "realigning to the same wire version must not recreate an old request fence"
-        );
     }
 
     #[tokio::test]
@@ -2476,7 +2626,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rfq_and_vm_readiness_distinguishes_disabled_warming_up_ready_and_stale() {
         let disabled_state = build_readiness_test_state(false, false).await;
         assert_eq!(disabled_state.vm_readiness().await, VmReadiness::Disabled);
@@ -2500,11 +2650,14 @@ mod tests {
         );
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                vm_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    vm_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
             .rfq_state_store
@@ -2531,6 +2684,7 @@ mod tests {
             vm_status.rebuilding = false;
         }
         state.optional_backend_stale = Duration::ZERO;
+        expire_chain_observation(&mut state).await;
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
     }
@@ -2549,16 +2703,19 @@ mod tests {
 
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    41,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(42, "TKNA"), mk_token(43, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        41,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(42, "TKNA"), mk_token(43, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
@@ -2723,16 +2880,19 @@ mod tests {
             },
         );
         vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    31,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        31,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         native_warming_vm_ready
             .vm_stream_health
@@ -2759,22 +2919,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pool_by_id_only_exposes_encode_ready_vm_and_rfq_entries() {
         let mut state = build_readiness_test_state(true, true).await;
 
         state
             .vm_state_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    36,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        36,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         state
             .rfq_state_store
@@ -2820,6 +2983,7 @@ mod tests {
         assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
 
         state.optional_backend_stale = Duration::ZERO;
+        expire_chain_observation(&mut state).await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
         assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
@@ -2831,146 +2995,6 @@ mod tests {
             state.pool_by_id("pool-rfq").await,
             Err(EncodeAvailability::RfqStale)
         ));
-    }
-
-    #[tokio::test]
-    async fn apply_update_tracks_anomaly_counters_and_samples() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let token_a = mk_token(20, "TKNA");
-        let token_b = mk_token(21, "TKNB");
-
-        let missing_state_component = mk_component(
-            30,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![token_a.clone(), token_b.clone()],
-        );
-        let unknown_protocol_component = mk_component(
-            31,
-            "mystery_exchange",
-            "mystery_pool",
-            vec![token_a.clone(), token_b.clone()],
-        );
-        let removed_unknown_component =
-            mk_component(32, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
-
-        let mut inconsistent = (*store.published.read().await).as_ref().clone();
-        inconsistent
-            .id_to_kind
-            .insert("stale-shard".to_string(), ProtocolKind::UniswapV2);
-        store.publish(inconsistent).await;
-
-        let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
-        states.insert("unknown-update".to_string(), Box::new(DummySim));
-        states.insert("stale-shard".to_string(), Box::new(DummySim));
-
-        let mut new_pairs = HashMap::new();
-        new_pairs.insert("missing-state".to_string(), missing_state_component);
-        new_pairs.insert("unknown-proto".to_string(), unknown_protocol_component);
-
-        let mut removed_pairs = HashMap::new();
-        removed_pairs.insert("missing-removal".to_string(), removed_unknown_component);
-
-        let metrics = store
-            .apply_update(Update::new(2, states, new_pairs).set_removed_pairs(removed_pairs))
-            .await;
-
-        assert_eq!(metrics.new_pairs_missing_state, 1);
-        assert_eq!(metrics.unknown_protocol_new_pairs, 1);
-        assert_eq!(metrics.updates_for_unknown_pair, 1);
-        assert_eq!(metrics.states_missing_in_shard, 1);
-        assert_eq!(metrics.removed_unknown_pair, 1);
-        assert!(metrics.has_anomalies());
-
-        assert_eq!(metrics.anomaly_samples.len(), 5);
-        assert!(metrics
-            .anomaly_samples
-            .iter()
-            .any(|sample| sample == "new_pairs_missing_state:missing-state"));
-        assert!(metrics
-            .anomaly_samples
-            .iter()
-            .any(|sample| sample.starts_with("unknown_protocol_new_pairs:")));
-        assert!(metrics
-            .anomaly_samples
-            .iter()
-            .any(|sample| sample == "updates_for_unknown_pair:unknown-update"));
-        assert!(metrics
-            .anomaly_samples
-            .iter()
-            .any(|sample| sample == "states_missing_in_shard:stale-shard"));
-        assert!(metrics
-            .anomaly_samples
-            .iter()
-            .any(|sample| sample == "removed_unknown_pair:missing-removal"));
-    }
-
-    #[tokio::test]
-    async fn apply_update_caps_anomaly_samples() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let mut states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
-        for idx in 0..10 {
-            states.insert(format!("unknown-{idx}"), Box::new(DummySim));
-        }
-
-        let metrics = store
-            .apply_update(Update::new(7, states, HashMap::new()))
-            .await;
-
-        assert_eq!(metrics.updates_for_unknown_pair, 10);
-        assert_eq!(metrics.anomaly_samples.len(), UPDATE_ANOMALY_SAMPLE_CAP);
-        assert!(metrics
-            .anomaly_samples
-            .iter()
-            .all(|sample| sample.starts_with("updates_for_unknown_pair:")));
-    }
-
-    #[tokio::test]
-    async fn apply_update_without_anomalies_has_zero_counters() {
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_secs(1),
-        ));
-        let store = StateStore::new(token_store);
-
-        let token_a = mk_token(40, "TKNA");
-        let token_b = mk_token(41, "TKNB");
-        let component = mk_component(42, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
-
-        let metrics = store
-            .apply_update(mk_update(vec![(
-                "pool-1".to_string(),
-                component,
-                Box::new(DummySim),
-            )]))
-            .await;
-
-        assert_eq!(metrics.new_pairs_missing_state, 0);
-        assert_eq!(metrics.unknown_protocol_new_pairs, 0);
-        assert_eq!(metrics.updates_for_unknown_pair, 0);
-        assert_eq!(metrics.states_missing_in_shard, 0);
-        assert_eq!(metrics.removed_unknown_pair, 0);
-        assert!(metrics.anomaly_samples.is_empty());
-        assert!(!metrics.has_anomalies());
     }
 
     #[tokio::test]
@@ -3083,18 +3107,24 @@ mod tests {
         let vm_component = mk_component(21, "vm:curve", "curve_pool", vec![token_a, token_b]);
 
         native_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                native_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    native_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         vm_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                vm_component,
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    vm_component,
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         let app_state = build_test_app_state(
@@ -3128,28 +3158,34 @@ mod tests {
         let rfq_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         native_store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                mk_component(
-                    34,
-                    "uniswap_v2",
-                    "uniswap_v2_pool",
-                    vec![mk_token(19, "TKNA"), mk_token(20, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    mk_component(
+                        34,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![mk_token(19, "TKNA"), mk_token(20, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
         vm_store
-            .apply_update(mk_update(vec![(
-                "pool-vm".to_string(),
-                mk_component(
-                    35,
-                    "vm:curve",
-                    "curve_pool",
-                    vec![mk_token(21, "TKNA"), mk_token(22, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-vm".to_string(),
+                    mk_component(
+                        35,
+                        "vm:curve",
+                        "curve_pool",
+                        vec![mk_token(21, "TKNA"), mk_token(22, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
             .await;
 
         let app_state = build_test_app_state(
@@ -3306,60 +3342,351 @@ mod tests {
         }
     }
 
+    async fn build_native_identity_fence_state() -> AppState {
+        let state = build_readiness_test_state(false, false).await;
+        state
+            .native_state_store
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-b".to_string(),
+                    mk_component(
+                        31,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![mk_token(32, "TKNC"), mk_token(33, "TKND")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
+            .await;
+        state
+    }
+
     #[tokio::test]
-    async fn matching_pools_falls_back_to_alias_when_exact_ids_are_stale() {
+    async fn native_route_fence_tracks_touched_pool_identity_only() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let (pinned_a_state, pinned_a_component) = pinned
+            .pool_by_id("pool-native")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let (pinned_b_state, pinned_b_component) = pinned
+            .pool_by_id("pool-b")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+
+        state
+            .native_state_store
+            .apply_update_with_head(
+                Update::new(
+                    1,
+                    HashMap::from([(
+                        "pool-native".to_string(),
+                        Box::new(DummySim) as Box<dyn ProtocolSim>,
+                    )]),
+                    HashMap::new(),
+                ),
+                Some(test_block_head(1, 1)),
+            )
+            .await;
+
+        let current = state.native_state_store.pin().await;
+        let (current_a_state, current_a_component) = current
+            .pool_by_id("pool-native")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let (current_b_state, current_b_component) = current
+            .pool_by_id("pool-b")
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        assert!(!Arc::ptr_eq(&pinned_a_state, &current_a_state));
+        assert!(Arc::ptr_eq(&pinned_a_component, &current_a_component));
+        assert!(Arc::ptr_eq(&pinned_b_state, &current_b_state));
+        assert!(Arc::ptr_eq(&pinned_b_component, &current_b_component));
+
+        let pool_a = HashSet::from(["pool-native".to_string()]);
+        let pool_b = HashSet::from(["pool-b".to_string()]);
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &pool_a)
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &pool_b)
+                .await
+                .status,
+            NativeFenceStatus::Current
+        );
+        assert_eq!(
+            state
+                .native_pool_fence_status(
+                    &pinned,
+                    &current,
+                    &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
+                )
+                .await,
+            NativePoolFenceStatus::Available(HashSet::from(["pool-native".to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_amount_out_preserves_published_pool_identity_and_result() {
+        const SNAPSHOTS_JSON: &str =
+            include_str!("../../tests/fixtures/simulation_baseline_snapshots.json");
+        const POOL_ID: &str = "uniswap-v2-baseline";
+
+        let mut snapshots: HashMap<String, DtoComponentWithState> =
+            serde_json::from_str(SNAPSHOTS_JSON)
+                .unwrap_or_else(|error| unreachable!("valid simulation snapshots: {error}"));
+        let snapshot: ComponentWithState = snapshots
+            .remove("uniswap_v2")
+            .unwrap_or_else(|| unreachable!("Uniswap V2 snapshot exists"))
+            .into();
+        let tokens = snapshot
+            .component
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                Token::new(
+                    address,
+                    &format!("TOKEN{index}"),
+                    18,
+                    0,
+                    &[Some(10_000)],
+                    Chain::Base,
+                    100,
+                )
+            })
+            .collect::<Vec<_>>();
+        let token_in = tokens[0].clone();
+        let token_out = tokens[1].clone();
+        let all_tokens = tokens
+            .iter()
+            .cloned()
+            .map(|token| (token.address.clone(), token))
+            .collect::<HashMap<_, _>>();
+        let component = ProtocolComponent::new(
+            address(42),
+            snapshot.component.protocol_system.clone(),
+            snapshot.component.protocol_type_name.clone(),
+            snapshot.component.chain,
+            tokens.clone(),
+            snapshot.component.contract_addresses.clone(),
+            snapshot.component.static_attributes.clone(),
+            snapshot.component.creation_tx.clone(),
+            snapshot.component.created_at,
+        );
+        let pool_state = UniswapV2State::try_from_with_header(
+            snapshot,
+            BlockHeader {
+                number: 20_000_000,
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            },
+            &HashMap::new(),
+            &all_tokens,
+            &DecoderContext::new(),
+        )
+        .await
+        .unwrap_or_else(|error| unreachable!("valid Uniswap V2 snapshot: {error}"));
+
         let token_store = Arc::new(TokenStore::new(
             HashMap::new(),
             "http://localhost".to_string(),
             "test".to_string(),
-            Chain::Ethereum,
+            Chain::Base,
             Duration::from_secs(1),
         ));
         let store = StateStore::new(token_store);
-
-        let wrapped_address = known_address("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
-        let native_address = native_token_address();
-        let token_x = mk_token(12, "TKNX");
-        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
-
-        // Keep one live native-only pool so alias fallback has a valid target.
         store
-            .apply_update(mk_update(vec![(
-                "pool-native".to_string(),
-                mk_component(
-                    22,
-                    "rocketpool",
-                    "rocketpool",
-                    vec![native_token, token_x.clone()],
-                ),
-                Box::new(DummySim),
-            )]))
+            .apply_update(Update::new(
+                20_000_000,
+                HashMap::from([(
+                    POOL_ID.to_string(),
+                    Box::new(pool_state) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(POOL_ID.to_string(), component)]),
+            ))
             .await;
 
-        // Inject stale exact IDs that no longer exist in id_to_kind.
-        let mut inconsistent = (*store.published.read().await).as_ref().clone();
-        inconsistent.token_index = HashMap::from([
-            (
-                wrapped_address.clone(),
-                HashSet::from(["pool-stale".to_string()]),
-            ),
-            (
-                native_address.clone(),
-                HashSet::from(["pool-native".to_string()]),
-            ),
-            (
-                token_x.address.clone(),
-                HashSet::from(["pool-stale".to_string(), "pool-native".to_string()]),
-            ),
-        ]);
-        store.publish(inconsistent).await;
+        let pinned = store.pin().await;
+        let (pinned_state, _) = pinned
+            .pool_by_id(POOL_ID)
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let amount_in = BigUint::from(1_000_000_000_000u64);
+        let first = pinned_state
+            .get_amount_out(amount_in.clone(), &token_in, &token_out)
+            .unwrap_or_else(|error| unreachable!("fixture swap succeeds: {error}"));
 
-        let matches = store
-            .matching_pools_by_addresses(&wrapped_address, &token_x.address)
+        let published = store.pin().await;
+        let (published_state, _) = published
+            .pool_by_id(POOL_ID)
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        assert!(Arc::ptr_eq(&pinned_state, &published_state));
+
+        let repeated = pinned_state
+            .get_amount_out(amount_in, &token_in, &token_out)
+            .unwrap_or_else(|error| unreachable!("repeated fixture swap succeeds: {error}"));
+        assert_eq!(first.amount, repeated.amount);
+        assert_eq!(first.gas, repeated.gas);
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_distinguishes_missing_removed_and_added_pools() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let removed_component = pinned
+            .pool_by_id("pool-native")
+            .map(|(_, component)| component.as_ref().clone())
+            .unwrap_or_else(|| unreachable!("fixture pool exists"));
+        let added_component = mk_component(
+            34,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![mk_token(35, "TKNE"), mk_token(36, "TKNF")],
+        );
+
+        state
+            .native_state_store
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-added".to_string(),
+                    added_component,
+                    Box::new(DummySim),
+                )])
+                .set_removed_pairs(HashMap::from([(
+                    "pool-native".to_string(),
+                    removed_component,
+                )])),
+                Some(test_block_head(1, 1)),
+            )
             .await;
-        let ids: HashSet<String> = matches.into_iter().map(|(id, _)| id).collect();
 
-        assert_eq!(ids, HashSet::from(["pool-native".to_string()]));
+        let missing_pool = HashSet::from(["pool-missing".to_string()]);
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &missing_pool)
+                .await
+                .status,
+            NativeFenceStatus::Current
+        );
+        let current = state.native_state_store.pin().await;
+        assert_eq!(
+            state
+                .native_pool_fence_status(&pinned, &current, &missing_pool)
+                .await,
+            NativePoolFenceStatus::Available(HashSet::new())
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-added".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn native_pool_identity_marks_full_reset_changed() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+
+        state.native_state_store.reset().await;
+        let current = state.native_state_store.pin().await;
+
+        assert_eq!(
+            pinned.changed_pool_ids(
+                &current,
+                &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
+            ),
+            HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_ignores_bootstrap_version_alignment() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+
+        state
+            .native_state_store
+            .align_bootstrap_state_version(pinned.version())
+            .await;
+
+        let current = state.native_state_store.pin().await;
+        assert_ne!(
+            pinned.request_generation(),
+            current.request_generation(),
+            "alignment should still advance the request generation"
+        );
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_marks_recovery_candidate_changed() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+        let candidate_store = StateStore::new_private(Arc::clone(&state.tokens));
+        candidate_store
+            .apply_update_with_head(
+                mk_update(vec![(
+                    "pool-native".to_string(),
+                    mk_component(
+                        28,
+                        "uniswap_v2",
+                        "uniswap_v2_pool",
+                        vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
+                    ),
+                    Box::new(DummySim),
+                )]),
+                Some(test_block_head(1, 1)),
+            )
+            .await;
+        let candidate = candidate_store.pin().await;
+
+        state
+            .native_state_store
+            .publish_candidate(candidate, pinned.version().saturating_add(1))
+            .await
+            .unwrap_or_else(|error| unreachable!("newer candidate publishes: {error}"));
+
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_fence_reports_fenced_requests_unavailable() {
+        let state = build_native_identity_fence_state().await;
+        let pinned = state.native_state_store.pin().await;
+
+        state.native_state_store.fence_requests().await;
+
+        assert_eq!(
+            state
+                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
+                .await
+                .status,
+            NativeFenceStatus::Unavailable
+        );
     }
 
     #[tokio::test]

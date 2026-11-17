@@ -42,7 +42,7 @@ impl QuoteService {
 
         let computation = match self.run_quote_computation(&request, started_at).await {
             Ok(computation) => computation,
-            Err(timeout_result) => return timeout_result,
+            Err(timeout_result) => return *timeout_result,
         };
 
         let latency_ms = started_at.elapsed().as_millis() as u64;
@@ -62,16 +62,17 @@ impl QuoteService {
         &self,
         request: &AmountOutRequest,
         started_at: Instant,
-    ) -> Result<QuoteComputation, QuoteResult> {
+    ) -> Result<QuoteComputation, Box<QuoteResult>> {
         let cancel_token = CancellationToken::new();
         let mut cancel_guard = CancelOnDrop::new(cancel_token.clone());
         let request_timeout = self.state.request_timeout();
         let computation = get_amounts_out(self.state.clone(), request.clone(), Some(cancel_token));
 
         let Ok(computation) = tokio::time::timeout(request_timeout, computation).await else {
-            return Err(self
-                .build_request_guard_timeout_result(request, started_at, request_timeout)
-                .await);
+            return Err(Box::new(
+                self.build_request_guard_timeout_result(request, started_at, request_timeout)
+                    .await,
+            ));
         };
 
         cancel_guard.disarm();
@@ -186,116 +187,60 @@ struct CompletionEvent<'a> {
 }
 
 macro_rules! log_completion_event {
-    ($event:expr, $token_in:expr, $token_out:expr, $simulation_runs:expr) => {
-        if $event.timed_out {
-            tracing::event!(
-                tracing::Level::WARN,
-                scope = $event.scope,
-                request_id = $event.request.request_id.as_str(),
-                auction_id = $event.request.auction_id.as_deref(),
-                latency_ms = $event.latency_ms,
-                quote_status = quote_status_label($event.computation.meta.status),
-                quote_result_quality =
-                    quote_result_quality_label($event.computation.meta.result_quality),
-                partial_kind = $event
-                    .computation
-                    .meta
-                    .partial_kind
-                    .map(quote_partial_kind_label),
-                vm_unavailable = $event.computation.meta.vm_unavailable,
-                rfq_unavailable = $event.computation.meta.rfq_unavailable,
-                responses = $event.computation.responses.len(),
-                failures = $event.computation.meta.failures.len(),
-                pool_results = $event.computation.meta.pool_results.len(),
-                scheduled_native_pools = $event.computation.metrics.scheduled_native_pools,
-                scheduled_vm_pools = $event.computation.metrics.scheduled_vm_pools,
-                scheduled_rfq_pools = $event.computation.metrics.scheduled_rfq_pools,
-                simulation_runs = $simulation_runs,
-                skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
-                skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
-                vm_completed_pools = $event.computation.metrics.vm_completed_pools,
-                rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
-                vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
-                rfq_median_first_gas = $event.computation.metrics.rfq_median_first_gas,
-                vm_low_first_gas_count = $event.computation.metrics.vm_low_first_gas_count,
-                rfq_low_first_gas_count = $event.computation.metrics.rfq_low_first_gas_count,
-                vm_low_first_gas_ratio = $event.computation.metrics.vm_low_first_gas_ratio,
-                rfq_low_first_gas_ratio = $event.computation.metrics.rfq_low_first_gas_ratio,
-                vm_low_first_gas_samples = ?$event.computation.metrics.vm_low_first_gas_samples,
-                rfq_low_first_gas_samples = ?$event.computation.metrics.rfq_low_first_gas_samples,
-                token_in = $token_in.as_ref(),
-                token_out = $token_out.as_ref(),
-                amounts = $event.request.amounts.len(),
-                top_pool = $event.top_response.pool,
-                top_pool_name = $event.top_response.pool_name,
-                top_pool_address = $event.top_response.pool_address,
-                top_amount_out = $event.top_response.amount_out,
-                top_gas_used = $event.top_response.gas_used,
-                failure_kinds = ?$event.failure_summary.kind_counts,
-                failure_protocols = ?$event.failure_summary.protocol_counts,
-                failure_pool_kinds = ?$event.failure_summary.pool_kind_counts,
-                failure_samples = ?$event.failure_summary.samples,
-                outcome_kinds = ?$event.pool_outcome_summary.kind_counts,
-                outcome_protocols = ?$event.pool_outcome_summary.protocol_counts,
-                outcome_samples = ?$event.pool_outcome_summary.samples,
-                "{}",
-                $event.message
-            );
-        } else {
-            tracing::event!(
-                tracing::Level::INFO,
-                scope = $event.scope,
-                request_id = $event.request.request_id.as_str(),
-                auction_id = $event.request.auction_id.as_deref(),
-                latency_ms = $event.latency_ms,
-                quote_status = quote_status_label($event.computation.meta.status),
-                quote_result_quality =
-                    quote_result_quality_label($event.computation.meta.result_quality),
-                partial_kind = $event
-                    .computation
-                    .meta
-                    .partial_kind
-                    .map(quote_partial_kind_label),
-                vm_unavailable = $event.computation.meta.vm_unavailable,
-                rfq_unavailable = $event.computation.meta.rfq_unavailable,
-                responses = $event.computation.responses.len(),
-                failures = $event.computation.meta.failures.len(),
-                pool_results = $event.computation.meta.pool_results.len(),
-                scheduled_native_pools = $event.computation.metrics.scheduled_native_pools,
-                scheduled_vm_pools = $event.computation.metrics.scheduled_vm_pools,
-                scheduled_rfq_pools = $event.computation.metrics.scheduled_rfq_pools,
-                simulation_runs = $simulation_runs,
-                skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
-                skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
-                vm_completed_pools = $event.computation.metrics.vm_completed_pools,
-                rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
-                vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
-                rfq_median_first_gas = $event.computation.metrics.rfq_median_first_gas,
-                vm_low_first_gas_count = $event.computation.metrics.vm_low_first_gas_count,
-                rfq_low_first_gas_count = $event.computation.metrics.rfq_low_first_gas_count,
-                vm_low_first_gas_ratio = $event.computation.metrics.vm_low_first_gas_ratio,
-                rfq_low_first_gas_ratio = $event.computation.metrics.rfq_low_first_gas_ratio,
-                vm_low_first_gas_samples = ?$event.computation.metrics.vm_low_first_gas_samples,
-                rfq_low_first_gas_samples = ?$event.computation.metrics.rfq_low_first_gas_samples,
-                token_in = $token_in.as_ref(),
-                token_out = $token_out.as_ref(),
-                amounts = $event.request.amounts.len(),
-                top_pool = $event.top_response.pool,
-                top_pool_name = $event.top_response.pool_name,
-                top_pool_address = $event.top_response.pool_address,
-                top_amount_out = $event.top_response.amount_out,
-                top_gas_used = $event.top_response.gas_used,
-                failure_kinds = ?$event.failure_summary.kind_counts,
-                failure_protocols = ?$event.failure_summary.protocol_counts,
-                failure_pool_kinds = ?$event.failure_summary.pool_kind_counts,
-                failure_samples = ?$event.failure_summary.samples,
-                outcome_kinds = ?$event.pool_outcome_summary.kind_counts,
-                outcome_protocols = ?$event.pool_outcome_summary.protocol_counts,
-                outcome_samples = ?$event.pool_outcome_summary.samples,
-                "{}",
-                $event.message
-            );
-        }
+    ($level:expr, $event:expr, $token_in:expr, $token_out:expr, $simulation_runs:expr) => {
+        tracing::event!(
+            $level,
+            scope = $event.scope,
+            request_id = $event.request.request_id.as_str(),
+            auction_id = $event.request.auction_id.as_deref(),
+            latency_ms = $event.latency_ms,
+            quote_status = quote_status_label($event.computation.meta.status),
+            quote_result_quality =
+                quote_result_quality_label($event.computation.meta.result_quality),
+            partial_kind = $event
+                .computation
+                .meta
+                .partial_kind
+                .map(quote_partial_kind_label),
+            vm_unavailable = $event.computation.meta.vm_unavailable,
+            rfq_unavailable = $event.computation.meta.rfq_unavailable,
+            responses = $event.computation.responses.len(),
+            failures = $event.computation.meta.failures.len(),
+            pool_results = $event.computation.meta.pool_results.len(),
+            scheduled_native_pools = $event.computation.metrics.scheduled_native_pools,
+            scheduled_vm_pools = $event.computation.metrics.scheduled_vm_pools,
+            scheduled_rfq_pools = $event.computation.metrics.scheduled_rfq_pools,
+            simulation_runs = $simulation_runs,
+            skipped_vm_unavailable = $event.computation.metrics.skipped_vm_unavailable,
+            skipped_rfq_unavailable = $event.computation.metrics.skipped_rfq_unavailable,
+            vm_completed_pools = $event.computation.metrics.vm_completed_pools,
+            rfq_completed_pools = $event.computation.metrics.rfq_completed_pools,
+            vm_median_first_gas = $event.computation.metrics.vm_median_first_gas,
+            rfq_median_first_gas = $event.computation.metrics.rfq_median_first_gas,
+            vm_low_first_gas_count = $event.computation.metrics.vm_low_first_gas_count,
+            rfq_low_first_gas_count = $event.computation.metrics.rfq_low_first_gas_count,
+            vm_low_first_gas_ratio = $event.computation.metrics.vm_low_first_gas_ratio,
+            rfq_low_first_gas_ratio = $event.computation.metrics.rfq_low_first_gas_ratio,
+            vm_low_first_gas_samples = ?$event.computation.metrics.vm_low_first_gas_samples,
+            rfq_low_first_gas_samples = ?$event.computation.metrics.rfq_low_first_gas_samples,
+            token_in = $token_in.as_ref(),
+            token_out = $token_out.as_ref(),
+            amounts = $event.request.amounts.len(),
+            top_pool = $event.top_response.pool,
+            top_pool_name = $event.top_response.pool_name,
+            top_pool_address = $event.top_response.pool_address,
+            top_amount_out = $event.top_response.amount_out,
+            top_gas_used = $event.top_response.gas_used,
+            failure_kinds = ?$event.failure_summary.kind_counts,
+            failure_protocols = ?$event.failure_summary.protocol_counts,
+            failure_pool_kinds = ?$event.failure_summary.pool_kind_counts,
+            failure_samples = ?$event.failure_summary.samples,
+            outcome_kinds = ?$event.pool_outcome_summary.kind_counts,
+            outcome_protocols = ?$event.pool_outcome_summary.protocol_counts,
+            outcome_samples = ?$event.pool_outcome_summary.samples,
+            "{}",
+            $event.message
+        );
     };
 }
 
@@ -307,7 +252,23 @@ fn emit_completion_event(event: CompletionEvent<'_>) {
         + event.computation.metrics.scheduled_vm_pools
         + event.computation.metrics.scheduled_rfq_pools;
 
-    log_completion_event!(&event, token_in, token_out, simulation_runs);
+    if event.timed_out {
+        log_completion_event!(
+            tracing::Level::WARN,
+            &event,
+            token_in,
+            token_out,
+            simulation_runs
+        );
+    } else {
+        log_completion_event!(
+            tracing::Level::INFO,
+            &event,
+            token_in,
+            token_out,
+            simulation_runs
+        );
+    }
 }
 
 fn canonicalize_token_for_log(token: &str) -> Cow<'_, str> {
@@ -337,11 +298,7 @@ struct TopResponseSummary<'a> {
 
 impl<'a> TopResponseSummary<'a> {
     fn from_best(responses: &'a [AmountOutResponse]) -> Self {
-        let Some(best_response) = best_response(responses) else {
-            return Self::default();
-        };
-
-        Self::from(Some(best_response))
+        Self::from(best_response(responses))
     }
 }
 
@@ -545,12 +502,15 @@ impl Drop for CancelOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_head::ChainHeadObserver;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use simulator_core::broadcaster::BlockIdentity;
     use tokio::sync::RwLock;
     use tycho_simulation::tycho_common::models::Chain;
+    use tycho_simulation::tycho_common::Bytes;
 
     use crate::config::SlippageConfig;
     use crate::models::messages::{QuoteFailure, QuoteFailureKind};
@@ -598,6 +558,10 @@ mod tests {
         let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
 
         AppState {
+            chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(BlockIdentity {
+                number: 1,
+                hash: Bytes::from(vec![1; 32]),
+            })),
             chain: Chain::Ethereum,
             rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(Vec::new()),
@@ -618,7 +582,6 @@ mod tests {
             },
             enable_vm_pools: false,
             enable_rfq_pools: false,
-            native_progress_lease: Duration::from_secs(120),
             optional_backend_stale: Duration::from_secs(120),
             request_timeout,
             vm_simulation_rebuild_gate: Arc::new(RwLock::new(())),

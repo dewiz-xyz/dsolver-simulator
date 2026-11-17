@@ -8,6 +8,7 @@ use tycho_simulation::tycho_common::{
     models::protocol::ProtocolComponent as CommonProtocolComponent, Bytes,
 };
 
+use super::error::AttemptError;
 use super::model::ResimulatedRouteInternal;
 use super::wire::format_address;
 use super::EncodeError;
@@ -20,7 +21,7 @@ struct SplitStats {
 
 pub(super) fn build_route_swaps(
     resimulated: &ResimulatedRouteInternal,
-) -> Result<Vec<Swap>, EncodeError> {
+) -> Result<Vec<Swap>, AttemptError> {
     // Tycho split validation allows only one remainder per tokenIn, so depths must be consistent.
     ensure_token_in_single_depth(resimulated)?;
 
@@ -51,16 +52,18 @@ pub(super) fn build_route_swaps(
                 count: 0,
                 last_index: index,
             });
-        entry.total_amount += swap.amount_in.clone();
+        entry.total_amount += &swap.amount_in;
         entry.count += 1;
         entry.last_index = index;
     }
 
     let mut swaps = Vec::with_capacity(ordered_swaps.len());
     for (index, swap) in ordered_swaps.iter().enumerate() {
-        let stats = split_stats
-            .get(&swap.token_in)
-            .ok_or_else(|| EncodeError::internal("Missing split stats for swap tokenIn"))?;
+        let stats = split_stats.get(&swap.token_in).ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Missing split stats for swap tokenIn",
+            ))
+        })?;
         // Tycho split validation requires exactly one remainder (split=0) per tokenIn, and it must
         // be the last occurrence in order.
         let is_remainder = stats.count == 1 || stats.last_index == index;
@@ -88,20 +91,19 @@ pub(super) fn build_route_swaps(
     Ok(swaps)
 }
 
-fn ensure_token_in_single_depth(resimulated: &ResimulatedRouteInternal) -> Result<(), EncodeError> {
-    let mut token_depths: HashMap<Bytes, usize> = HashMap::new();
+fn ensure_token_in_single_depth(
+    resimulated: &ResimulatedRouteInternal,
+) -> Result<(), AttemptError> {
+    let mut token_depths: HashMap<&Bytes, usize> = HashMap::new();
     for segment in &resimulated.segments {
         for (hop_index, hop) in segment.hops.iter().enumerate() {
             for swap in &hop.swaps {
-                if let Some(existing_depth) = token_depths.get(&swap.token_in) {
-                    if *existing_depth != hop_index {
-                        return Err(EncodeError::invalid(format!(
-                            "tokenIn {} appears at multiple hop depths",
-                            format_address(&swap.token_in)
-                        )));
-                    }
-                } else {
-                    token_depths.insert(swap.token_in.clone(), hop_index);
+                let existing_depth = token_depths.entry(&swap.token_in).or_insert(hop_index);
+                if *existing_depth != hop_index {
+                    return Err(AttemptError::deterministic(EncodeError::invalid(format!(
+                        "tokenIn {} appears at multiple hop depths",
+                        format_address(&swap.token_in)
+                    ))));
                 }
             }
         }
@@ -115,32 +117,38 @@ pub(super) fn compute_split_fraction(
     is_remainder: bool,
     count: usize,
     token_in: &Bytes,
-) -> Result<f64, EncodeError> {
+) -> Result<f64, AttemptError> {
     if count <= 1 || is_remainder {
         return Ok(0.0);
     }
 
     if total_in.is_zero() {
-        return Err(EncodeError::invalid(
+        return Err(AttemptError::deterministic(EncodeError::invalid(
             "TokenIn total amount must be positive for split calculation",
-        ));
+        )));
     }
     if amount_in.is_zero() || amount_in >= total_in {
-        return Err(EncodeError::invalid(format!(
+        return Err(AttemptError::deterministic(EncodeError::invalid(format!(
             "Invalid split ratio for tokenIn {}",
             format_address(token_in)
-        )));
+        ))));
     }
 
     let amount_in = amount_in.to_f64().ok_or_else(|| {
-        EncodeError::invalid("Failed to convert swap amountIn for split calculation")
+        AttemptError::deterministic(EncodeError::invalid(
+            "Failed to convert swap amountIn for split calculation",
+        ))
     })?;
     let total_in = total_in.to_f64().ok_or_else(|| {
-        EncodeError::invalid("Failed to convert tokenIn total amount for split calculation")
+        AttemptError::deterministic(EncodeError::invalid(
+            "Failed to convert tokenIn total amount for split calculation",
+        ))
     })?;
     let mut split = amount_in / total_in;
     if !split.is_finite() {
-        return Err(EncodeError::invalid("Invalid split ratio for tokenIn"));
+        return Err(AttemptError::deterministic(EncodeError::invalid(
+            "Invalid split ratio for tokenIn",
+        )));
     }
     if split <= 0.0 {
         // Clamp away from 0 for very skewed splits that lose precision in f64.
@@ -606,6 +614,7 @@ mod tests {
         };
 
         let err = build_route_swaps(&resimulated).expect_err("rejects repeated token depth");
+        assert!(!err.is_state_dependent());
         assert!(
             err.message().contains("multiple hop depths"),
             "unexpected error: {err:?}"

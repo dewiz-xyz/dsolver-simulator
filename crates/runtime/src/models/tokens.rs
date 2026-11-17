@@ -45,6 +45,10 @@ enum TokenFetchSource {
 }
 
 impl TokenStore {
+    pub fn chain(&self) -> Chain {
+        self.chain
+    }
+
     pub fn new(
         initial: HashMap<Bytes, Token>,
         tycho_url: String,
@@ -113,10 +117,6 @@ impl TokenStore {
         self.tokens.read().await.get(address).cloned()
     }
 
-    pub fn chain(&self) -> Chain {
-        self.chain
-    }
-
     pub fn wrapped_native_token(&self) -> Option<Bytes> {
         let address = self.chain.wrapped_native_token()?.address;
         (address != native_token_address()).then_some(address)
@@ -142,25 +142,23 @@ impl TokenStore {
 
     async fn fetch_token(&self, address: &Bytes) -> Result<Option<Token>, TokenStoreError> {
         // Coalesce concurrent fetches for the same address using a watch channel.
-        {
-            let mut inflight = self.inflight.lock().await;
-            if let Some(rx) = inflight.get(address) {
-                let mut rx = rx.clone();
-                drop(inflight);
-                while rx.changed().await.is_ok() {
-                    if let Some(res) = rx.borrow().clone() {
-                        return res;
-                    }
+        let mut inflight = self.inflight.lock().await;
+        if let Some(rx) = inflight.get(address) {
+            let mut rx = rx.clone();
+            drop(inflight);
+            while rx.changed().await.is_ok() {
+                if let Some(res) = rx.borrow().clone() {
+                    return res;
                 }
-            } else {
-                let (tx, rx) = watch::channel(None);
-                inflight.insert(address.clone(), rx);
-                drop(inflight);
-                let res = self.fetch_token_inner(address, tx).await;
-                let mut inflight = self.inflight.lock().await;
-                inflight.remove(address);
-                return res;
             }
+        } else {
+            let (tx, rx) = watch::channel(None);
+            inflight.insert(address.clone(), rx);
+            drop(inflight);
+            let res = self.fetch_token_inner(address, tx).await;
+            let mut inflight = self.inflight.lock().await;
+            inflight.remove(address);
+            return res;
         }
 
         // If the watch channel closed unexpectedly, this caller becomes the new fetch owner.

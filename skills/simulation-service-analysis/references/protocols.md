@@ -1,81 +1,42 @@
-# Protocol feeds (what this server subscribes to)
+# Protocol feeds
 
-The service subscribes to chain-specific Tycho exchanges at startup (see
-`crates/runtime/src/config/mod.rs` and `crates/runtime/src/services/stream_builder.rs`).
+Do not maintain a second protocol inventory in this skill. The repository source
+of truth is `simulator-manifest.toml`:
 
-## Native feeds by chain
+- `[[protocols]]` declares every known protocol and its backend.
+- `[[chains]]` selects `native_protocols`, `vm_protocols`, and `rfq_protocols`
+  for each chain.
+- `[[route_policies]]` owns chain-specific routing details.
+- `crates/runtime/src/config/manifest.rs` validates those relationships and
+  builds the effective runtime configuration.
 
-### Ethereum (`CHAIN_ID=1`)
+Inspect the active sets directly:
 
-- `uniswap_v2`
-- `sushiswap_v2`
-- `pancakeswap_v2`
-- `uniswap_v3`
-- `pancakeswap_v3`
-- `uniswap_v4`
-- `ekubo_v2`
-- `fluid_v1`
-- `rocketpool`
-- `erc4626`
-- `ekubo_v3`
+```bash
+python3 - <<'PY'
+import tomllib
 
-### Base (`CHAIN_ID=8453`)
+with open("simulator-manifest.toml", "rb") as handle:
+    manifest = tomllib.load(handle)
 
-- `uniswap_v2`
-- `uniswap_v3`
-- `uniswap_v4`
-- `pancakeswap_v3`
-- `aerodrome_slipstreams`
+for chain in manifest["chains"]:
+    print(f"chain {chain['chain_id']}")
+    for backend in ("native", "vm", "rfq"):
+        print(f"  {backend}: {', '.join(chain[f'{backend}_protocols']) or '(none)'}")
+PY
+```
 
-## VM feeds by chain
+## Effective backend enablement
 
-### Ethereum (`CHAIN_ID=1`)
+- Native readiness is always evaluated for the selected chain.
+- VM is effective only when `ENABLE_VM_POOLS=true` and the selected chain's
+  `vm_protocols` is non-empty.
+- RFQ is effective only when `ENABLE_RFQ_POOLS=true` and the selected chain's
+  `rfq_protocols` is non-empty.
+- When RFQ is effective, startup requires the credential set associated with
+  every selected RFQ provider. Derive that mapping from runtime config and tests;
+  do not copy provider assumptions into this reference.
 
-- `vm:curve`
-- `vm:balancer_v2`
-- `vm:maverick_v2`
-
-### Base (`CHAIN_ID=8453`)
-
-- No VM protocols configured in this iteration.
-
-## RFQ feeds by chain
-
-### Ethereum (`CHAIN_ID=1`)
-
-- `rfq:bebop`
-
-> **NOTE:** Hashflow remains implemented but is disabled in the active chain profiles. Liquorice
-> simulation is wired in the quote, but encoding and full support will be introduced in the future.
-
-### Base (`CHAIN_ID=8453`)
-
-- `rfq:bebop`
-
-## Effective VM enablement
-
-- Runtime VM state is `effective_vm_enabled = ENABLE_VM_POOLS && vm_protocols_not_empty`.
-- This means Base omits `backends.vm` even if `ENABLE_VM_POOLS=true`.
-- The local analyzer waits for VM readiness automatically on Ethereum when VM pools are enabled.
-
-## Effective RFQ enablement
-
-- Runtime RFQ state is `effective_rfq_enabled = ENABLE_RFQ_POOLS && rfq_protocols_not_empty`.
-- Enabling RFQ analysis requires credentials for the providers on that chain. Ethereum and Base
-  currently use only the Bebop pair.
-- When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
-- The local analyzer waits for RFQ readiness automatically when RFQ pools are enabled on either chain.
-- On Base, RFQ-enabled analyzer runs include a Bebop partial-fill encode diagnostic. It is required only when RFQ is enabled and ready, and it reports degraded evidence if `rfq:bebop` or the non-RFQ comparison leg is not visible.
-
-## Notes that affect local analysis
-
-- Always pass chain context to the analyzer (`--chain-id` or env `CHAIN_ID`).
-- The analyzer uses representative pairs for native, stable, governance, VM-sensitive, and RFQ-targeted paths. Treat protocol visibility as evidence, not as a hard assertion that every protocol must surface on every run.
-- Ethereum or Base runs can take longer when RFQ pools are enabled. If the analyzer waits on that backend, that is expected on cold starts.
-- Base should keep Aerodrome visible somewhere in the balanced report, but absence is a finding to investigate rather than an automatic failure.
-- ERC4626 and other edge features are still highly state-sensitive. Use the analyzer report to decide whether you need deeper focused requests rather than baking every edge path into the default run.
-- TVL filtering matters: pools are included or removed based on `TVL_THRESHOLD` and `TVL_KEEP_RATIO`.
-  If a protocol disappears unexpectedly, lowering `TVL_THRESHOLD` may be worth testing in a follow-up run.
-- Protocol labels in the analyzer are inferred from returned pool data and `meta.pool_results`. They are useful for comparison and triage, but they are still downstream observations of live state.
-- RFQ-targeted simulate scenarios are meant to make RFQ visibility intentional on Ethereum and Base. If they do not surface any `rfq:*` protocols, treat that as a finding to investigate rather than an automatic failure.
-- On Base, RFQ-enabled analyzer runs include a Bebop partial-fill encode diagnostic. It is required only when RFQ is enabled and ready, and it reports degraded evidence if `rfq:bebop` or the non-RFQ comparison leg is not visible.
+Treat protocol visibility in analyzer output as observed live state, not a hard
+assertion that every configured protocol must quote in every run. TVL policy,
+token coverage, pool state, and backend readiness can all change what appears.

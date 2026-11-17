@@ -1,0 +1,38 @@
+use anyhow::Error as AnyError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum HistoricalError {
+    #[error("historical work was cancelled")]
+    Cancelled,
+    #[error("historical state read failed during {operation}")]
+    HistoryRead {
+        operation: &'static str,
+        #[source]
+        source: AnyError,
+    },
+    #[error("retained historical data is invalid: {0}")]
+    HistoricalDataInvalid(String),
+    #[error("historical state reconstruction failed: {0}")]
+    StateReconstructionFailed(String),
+    #[error("historical request selector is invalid: {0}")]
+    InvalidSelector(String),
+    #[error("historical state consistency check exceeds the checkpoint pair limit")]
+    CheckBudgetExceeded,
+    #[error("canonical VM comparison is unsupported")]
+    UnsupportedCanonicalVm,
+    #[error("the history has not stored the requested position yet")]
+    NotYetStored,
+    #[error("the history cannot give the requested data: {0}")]
+    HistoryUnavailable(String),
+    #[error("{operation} needs more data than one job may read")]
+    ReadLimitExceeded { operation: &'static str },
+}
+
+impl HistoricalError {
+    pub(crate) fn history_read(operation: &'static str, source: impl Into<AnyError>) -> Self {
+        Self::HistoryRead {
+            operation,
+            source: source.into(),
+        }
+    }
+}

@@ -1,0 +1,1 @@
+{"stream_id":"wire-fixture-stream","message_seq":9,"kind":"recovery_chunk","recoveryId":"wire-fixture-recovery","targetStateVersion":42,"backends":["native","vm"],"chunkIndex":0,"encodedBytes":128,"digest":"sha256:chunk-0","payloadFragment":"eyJwYXJ0aXRpb25zIjpbXX0="}

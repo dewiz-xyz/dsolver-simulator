@@ -7,9 +7,15 @@ license.workspace = true
 repository.workspace = true
 description = "DSolver simulator runtime assembly, state, streams, and services."
 
+[features]
+test-util = []
+
 [dependencies]
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
+alloy-provider.workspace = true
 alloy-sol-types.workspace = true
+alloy-transport.workspace = true
 anyhow.workspace = true
 csv.workspace = true
 dotenv.workspace = true
@@ -28,18 +34,21 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
+typetag.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-typetag.workspace = true
 tycho-common.workspace = true
 tycho-execution.workspace = true
 tycho-simulation.workspace = true
 broadcaster_replay_client = { package = "broadcaster-replay-client", path = "../broadcaster-replay-client" }
 simulator_core = { package = "simulator-core", path = "../simulator-core" }
+simulator_replay = { package = "simulator-replay", path = "../simulator-replay" }
+state_history = { package = "state-history", path = "../state-history" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
 chrono.workspace = true
+sha2.workspace = true
+state_history = { package = "state-history", path = "../state-history", features = ["test-util"] }
 
 [lints]
 workspace = true

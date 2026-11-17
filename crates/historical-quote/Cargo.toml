@@ -1,0 +1,49 @@
+[package]
+name = "historical-quote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["engine"]
+engine = [
+    "dep:alloy-primitives",
+    "dep:anyhow",
+    "dep:simulator-replay",
+    "dep:state-history",
+    "dep:tokio-util",
+    "dep:tycho-simulation",
+]
+
+[dependencies]
+alloy-primitives = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+chrono.workspace = true
+num-bigint.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+simulator-replay = { path = "../simulator-replay", optional = true }
+state-history = { path = "../state-history", optional = true }
+thiserror.workspace = true
+tokio-util = { workspace = true, optional = true }
+tycho-simulation = { workspace = true, optional = true }
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+hex.workspace = true
+nix = { version = "0.26.4", features = ["resource"] }
+simulator-core = { path = "../simulator-core" }
+tokio.workspace = true
+zstd.workspace = true
+
+[[bench]]
+name = "replay"
+harness = false
+
+[lints]
+workspace = true

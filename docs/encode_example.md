@@ -19,8 +19,6 @@ SimpleSwap uses one hop with one or more swaps where every swap is tokenA to tok
 - RFQ routes are supported when RFQ state is ready. The simulator adds its provider credentials to the request-scoped RFQ state and requests the firm signed quote while building calldata.
 - For server-side reporting, rely on the structured summary log emitted for each `/encode` request. Detailed resimulation traces are available at `debug`.
 
-The repo's encode smoke helper stays intentionally strict: it uses dedicated realistic amount presets for default routes on each supported chain, requires simulated hops to return usable quotes for every requested amount, and fails if any tested amount degrades to `"0"` on a required hop.
-
 ## Request body (shape)
 
 `estimatedAmountIn` is an optional top-level request field. RFQ routes still derive the actual per-swap estimated input internally from the route `amountIn` and split allocation.
@@ -32,8 +30,8 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
   "tokenOut": "0xdac17f958d2ee523a2206206994597c13d831ec7",
   "amountIn": "1000000000000000000",
   "minAmountOut": "9980000",
-  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41", // Cowswap's settlement contract on Ethereum mainnet
-  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35", // Tycho router contract on Ethereum mainnet
+  "settlementAddress": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41",
+  "tychoRouterAddress": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35",
   "swapKind": "MegaSwap",
   "segments": [
     {
@@ -121,6 +119,8 @@ The repo's encode smoke helper stays intentionally strict: it uses dedicated rea
   "estimatedAmountIn": "1000000000000000000"
 }
 ```
+
+The example uses the CoW settlement contract and Tycho router on Ethereum mainnet.
 
 ## Response body (shape)
 
@@ -215,3 +215,34 @@ Note: this validation is deterministic for the **first hop** (route `amountIn` a
 ### Local analysis note
 
 The repo-local analyzer uses a SimpleSwap, MultiSwap, and MegaSwap route matrix built from `/simulate` results and records how `/encode` behaves for those routes. It is meant to surface behavior, latency, and oddities in a standardized report, not to act like a strict pass/fail encode contract test.
+
+## Staleness and retry
+
+Each encode attempt pins native state at the start and resimulates its native pools from that pin.
+Before returning, the service compares the route's own native pools between the pinned and current
+published state by allocation identity. Updates that do not touch those pools do not trigger the
+identity check's retry. The pin always covers the whole native publication and the fence keys on
+the pools the attempt actually resolved as native, so a request protocol hint that mislabels a
+native pool as VM or RFQ does not bypass the fence.
+
+If the route's pools did change, the service re-pins and retries once internally, whether the first
+attempt produced a result or a state-dependent error. Both attempts share the request timeout, and
+the retry only starts when enough budget remains (an RFQ hop needs the firm quote window,
+native-only routes need a small floor). A second pool identity change returns 503 with "Native state
+changed while the route was being encoded". Unavailable native state cannot trigger this retry.
+
+Chain freshness is checked separately for every native or VM backend the route actually uses,
+including VM-only routes. Each backend needs complete state matching a fresh independent RPC
+observation before resimulation and again before returning. An expired observation, head change,
+or loss of readiness prevents the attempt from returning calldata even if state recovers before
+encoding finishes. A failed final freshness check returns 503 without the pool identity retry.
+RFQ keeps its own readiness and firm-quote checks; it does not use chain-head freshness.
+
+The 5-second Base and 15-second Ethereum observation age limits bound trust in the last successful
+RPC observation. They do not delay closing readiness when a fresh observation disagrees with the
+applied head. The separate 60-second broadcaster recovery window lets the existing Tycho stream
+catch up while affected state remains unavailable. RPC uncertainty alone does not restart it.
+
+Operators can follow this behavior in logs through the `encode_fence` and `encode_retry` scopes,
+keyed by request id (`/simulate` logs the `quote_fence` scope). Both attempts' resimulated amounts
+and the attempt count are logged per request.

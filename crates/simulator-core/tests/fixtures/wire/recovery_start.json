@@ -1,0 +1,1 @@
+{"stream_id":"wire-fixture-stream","message_seq":8,"kind":"recovery_start","manifest":{"recoveryId":"wire-fixture-recovery","targetStateVersion":42,"backends":["native","vm"],"chunkCount":1,"replacementEncodedBytes":128,"chunkEncodedBytes":[128],"chunkDigests":["sha256:chunk-0"],"replacementDigest":"sha256:replacement","bufferACount":1,"commitWatermark":19000001}}

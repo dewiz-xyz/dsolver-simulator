@@ -6,7 +6,9 @@ use std::time::Duration;
 use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
-use simulator_core::broadcaster::wire::{ComponentWithState, Snapshot, StateSyncMessage};
+use sha2::{Digest, Sha256};
+use simulator_core::broadcaster::RawSnapshotReassembly;
+use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
 use tokio::sync::RwLock;
 use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -14,9 +16,12 @@ use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
     protocol::{
         errors::InvalidSnapshotError,
-        models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
+        models::{DecoderContext, ProtocolComponent, TryFromWithBlock, Update},
     },
-    tycho_client::feed::{BlockHeader, SynchronizerState},
+    tycho_client::feed::{
+        synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+        BlockHeader, SynchronizerState,
+    },
     tycho_common::{
         dto::{
             Chain as DtoChain, ComponentBalance, EntryPoint,
@@ -32,7 +37,6 @@ use tycho_simulation::{
 use super::processor::{
     handle_subscription_reset, BroadcasterSubscriptionProcessor, PreparedRedisProcessor,
 };
-use super::snapshot::RawSnapshotReassembly;
 use super::{
     apply_recovery_message, apply_replay_batch, committed_recovery_complete_native_block,
     mark_redis_replay_checkpoints, mark_redis_transport_failed,
@@ -43,6 +47,7 @@ use super::{
     SubscriptionExitReason, VmBroadcasterSubscriptionControls,
 };
 use crate::broadcaster::state::BroadcasterSnapshotCache;
+use crate::chain_head::{ChainHeadAgreement, ChainHeadObserver};
 use crate::config::MemoryConfig;
 use crate::models::state::{BroadcasterSubscriptionStatus, StateStore, VmStreamStatus};
 use crate::models::stream_health::StreamHealth;
@@ -52,14 +57,33 @@ use broadcaster_replay_client::{
     BroadcasterReplayClientError, ReplayBatch, ReplayCheckpoint, ReplayMessage, ReplayPoll,
 };
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
-    BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
-    BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk, BroadcasterRecoveryCommit,
-    BroadcasterRecoveryManifest, BroadcasterRecoveryStart, BroadcasterRedisReplayBoundary,
-    BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-    BroadcasterStateEntry, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+    BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
+    BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
+    BroadcasterProtocolSyncStatus, BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk,
+    BroadcasterRecoveryCommit, BroadcasterRecoveryManifest, BroadcasterRecoveryStart,
+    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterSnapshotChunk,
+    BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+    BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterTokenDto, BroadcasterUpdateMessage,
+    BroadcasterUpdatePartition, ProtocolHeadUpdate,
 };
+use simulator_core::models::protocol::ProtocolKind;
+
+const NATIVE_CHECKPOINT_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/native_checkpoint_v1.json"
+));
+const NATIVE_DELTA_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/native_delta_v1.json"
+));
+const RFQ_CHECKPOINT_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/rfq_checkpoint_v1.json"
+));
+const RFQ_DELTA_V1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../simulator-replay/tests/fixtures/rfq_delta_v1.json"
+));
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DummySim(u8);
@@ -125,16 +149,11 @@ impl ProtocolSim for DummySim {
     }
 }
 
-impl
-    TryFromWithBlock<
-        tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
-        BlockHeader,
-    > for DummySim
-{
+impl TryFromWithBlock<ComponentWithState, BlockHeader> for DummySim {
     type Error = InvalidSnapshotError;
 
     async fn try_from_with_header(
-        _snapshot: tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
+        _snapshot: ComponentWithState,
         _block: BlockHeader,
         _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
         _all_tokens: &HashMap<Bytes, Token>,
@@ -214,16 +233,11 @@ impl ProtocolSim for StatefulSim {
     }
 }
 
-impl
-    TryFromWithBlock<
-        tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
-        BlockHeader,
-    > for StatefulSim
-{
+impl TryFromWithBlock<ComponentWithState, BlockHeader> for StatefulSim {
     type Error = InvalidSnapshotError;
 
     async fn try_from_with_header(
-        snapshot: tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
+        snapshot: ComponentWithState,
         block: BlockHeader,
         _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
         _all_tokens: &HashMap<Bytes, Token>,
@@ -276,8 +290,14 @@ impl TestControls {
             native_subscription: BroadcasterSubscriptionStatus::default(),
             vm_subscription: BroadcasterSubscriptionStatus::default(),
             rfq_subscription: BroadcasterSubscriptionStatus::default(),
-            native_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
-            vm_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
+            native_state_store: Arc::new(StateStore::new_with_protocols(
+                Arc::clone(&token_store),
+                vec![ProtocolKind::UniswapV2],
+            )),
+            vm_state_store: Arc::new(StateStore::new_with_protocols(
+                Arc::clone(&token_store),
+                vec![ProtocolKind::Curve],
+            )),
             rfq_state_store: Arc::new(StateStore::new(Arc::clone(&token_store))),
             native_stream_health: Arc::new(StreamHealth::new()),
             vm_stream_health: Arc::new(StreamHealth::new()),
@@ -294,7 +314,7 @@ impl TestControls {
             state_store: Arc::clone(&self.native_state_store),
             stream_health: Arc::clone(&self.native_stream_health),
             tokens: Arc::clone(&self.token_store),
-            protocols: vec!["uniswap_v2".to_string()],
+            protocols: vec![ProtocolKind::UniswapV2],
         })
     }
 
@@ -304,7 +324,7 @@ impl TestControls {
             state_store: Arc::clone(&self.vm_state_store),
             stream_health: Arc::clone(&self.vm_stream_health),
             tokens: Arc::clone(&self.token_store),
-            protocols: vec!["vm:curve".to_string()],
+            protocols: vec![ProtocolKind::Curve],
             vm_stream: Arc::clone(&self.vm_stream),
             simulation_rebuild_gate: Arc::clone(&self.vm_simulation_rebuild_gate),
             wire_backend: BroadcasterBackend::Vm,
@@ -318,9 +338,246 @@ impl TestControls {
             state_store: Arc::clone(&self.rfq_state_store),
             stream_health: Arc::clone(&self.rfq_stream_health),
             tokens: Arc::clone(&self.token_store),
-            protocols: vec!["rfq:hashflow".to_string()],
+            protocols: vec![ProtocolKind::Hashflow],
             simulation_rebuild_gate: Arc::clone(&self.rfq_simulation_rebuild_gate),
         })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveParityCheckpoint {
+    chain_id: u64,
+    tokens: Vec<BroadcasterTokenDto>,
+    partition: BroadcasterSnapshotPartition,
+    quote: LiveParityQuote,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveParityDelta {
+    applicable_backends: Vec<BroadcasterBackend>,
+    update: BroadcasterUpdateMessage,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveParityQuote {
+    backend: BroadcasterBackend,
+    protocol: String,
+    component_id: String,
+    token_in: Bytes,
+    token_out: Bytes,
+    amount_in: String,
+}
+
+struct LiveParityObservation {
+    state_digest: String,
+    amount_out: String,
+    block_number: u64,
+    state_count: usize,
+}
+
+#[tokio::test]
+async fn native_and_bebop_fixtures_characterize_current_live_path() -> Result<()> {
+    let native = run_current_live_fixture(NATIVE_CHECKPOINT_V1, NATIVE_DELTA_V1).await?;
+    assert_eq!(native.block_number, 101);
+    assert_eq!(native.state_count, 1);
+    assert_eq!(native.amount_out, "1660562");
+    assert_eq!(
+        native.state_digest,
+        "2ced602b273a04c50000edb041a94f9df77862c2889cbce5ca76438adf4596e3"
+    );
+
+    let rfq = run_current_live_fixture(RFQ_CHECKPOINT_V1, RFQ_DELTA_V1).await?;
+    assert_eq!(rfq.block_number, 1_710_000_005);
+    assert_eq!(rfq.state_count, 1);
+    assert_eq!(rfq.amount_out, "1995000000");
+    assert_eq!(
+        rfq.state_digest,
+        "e23c543028cd884cb3687027a66abe10d636989107fa9e3525d52a0b9b4c77a3"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_apply_anomaly_report_is_characterized() {
+    let controls = TestControls::new();
+    let update = Update::new(
+        102,
+        HashMap::new(),
+        HashMap::from([("missing-state".to_string(), native_component())]),
+    );
+
+    let report = controls.native_state_store.apply_update(update).await;
+
+    assert_eq!(report.block_number, 102);
+    assert_eq!(report.new_pairs_missing_state, 1);
+    assert_eq!(report.total_pairs, 0);
+    assert_eq!(
+        report.anomaly_samples,
+        vec!["new_pairs_missing_state:missing-state"]
+    );
+    assert!(report.has_anomalies());
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the characterization keeps one complete runtime replay path visible"
+)]
+async fn run_current_live_fixture(
+    checkpoint_json: &str,
+    delta_json: &str,
+) -> Result<LiveParityObservation> {
+    let checkpoint: LiveParityCheckpoint = serde_json::from_str(checkpoint_json)?;
+    let delta: LiveParityDelta = serde_json::from_str(delta_json)?;
+    let chain = Chain::Base;
+    if checkpoint.chain_id != chain.id() {
+        return Err(anyhow!(
+            "fixture chain mismatch: expected {}, got {}",
+            chain.id(),
+            checkpoint.chain_id
+        ));
+    }
+    if checkpoint.partition.backend != checkpoint.quote.backend {
+        return Err(anyhow!("fixture checkpoint backend does not match quote"));
+    }
+    if !delta
+        .applicable_backends
+        .contains(&checkpoint.quote.backend)
+    {
+        return Err(anyhow!("fixture delta does not apply to the quote backend"));
+    }
+
+    let tokens = checkpoint
+        .tokens
+        .into_iter()
+        .map(|token| token.into_token(chain))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let initial_tokens = tokens
+        .into_iter()
+        .map(|token| (token.address.clone(), token))
+        .collect();
+    let token_store = Arc::new(TokenStore::new(
+        initial_tokens,
+        "http://localhost".to_string(),
+        "fixture".to_string(),
+        chain,
+        Duration::from_millis(10),
+    ));
+    let state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
+    let controls = fixture_subscription_controls(
+        checkpoint.quote.backend,
+        checkpoint.quote.protocol.clone(),
+        Arc::clone(&token_store),
+        Arc::clone(&state_store),
+    )?;
+    let mut processor = BroadcasterSubscriptionProcessor::new(chain.id(), controls, None);
+
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            1,
+            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
+                "fixture-snapshot",
+                chain.id(),
+                vec![checkpoint.quote.backend],
+                1,
+            )?),
+        ))
+        .await?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            2,
+            BroadcasterPayload::SnapshotChunk(BroadcasterSnapshotChunk::new(
+                "fixture-snapshot",
+                0,
+                vec![checkpoint.partition],
+            )?),
+        ))
+        .await?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            3,
+            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("fixture-snapshot")),
+        ))
+        .await?;
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "fixture-stream",
+            4,
+            BroadcasterPayload::Update(delta.update),
+        ))
+        .await?;
+
+    let pin = state_store.pin().await;
+    let (pool_state, component) = pin
+        .pool_by_id(&checkpoint.quote.component_id)
+        .ok_or_else(|| anyhow!("fixture pool was not published"))?;
+    if component.protocol_system != checkpoint.quote.protocol {
+        return Err(anyhow!("fixture protocol was not preserved"));
+    }
+    let token_in = pin
+        .token(&checkpoint.quote.token_in)
+        .ok_or_else(|| anyhow!("fixture input token was not published"))?;
+    let token_out = pin
+        .token(&checkpoint.quote.token_out)
+        .ok_or_else(|| anyhow!("fixture output token was not published"))?;
+    let amount_out = pool_state
+        .get_amount_out(checkpoint.quote.amount_in.parse()?, &token_in, &token_out)?
+        .amount
+        .to_string();
+    let canonical = serde_json::json!({
+        "blockNumber": pin.current_block(),
+        "component": serde_json::to_value(component.as_ref())?,
+        "state": serde_json::to_value(pool_state.as_ref())?,
+        "tokenIn": token_in,
+        "tokenOut": token_out,
+        "totalStates": pin.total_states(),
+    });
+    let state_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&canonical)?));
+
+    Ok(LiveParityObservation {
+        state_digest,
+        amount_out,
+        block_number: pin.current_block(),
+        state_count: pin.total_states(),
+    })
+}
+
+fn fixture_subscription_controls(
+    backend: BroadcasterBackend,
+    protocol: String,
+    tokens: Arc<TokenStore>,
+    state_store: Arc<StateStore>,
+) -> Result<BroadcasterSubscriptionControls> {
+    let protocol = ProtocolKind::from_canonical_protocol_system(&protocol)
+        .ok_or_else(|| anyhow!("unknown fixture protocol {protocol}"))?;
+    let broadcaster_subscription = BroadcasterSubscriptionStatus::default();
+    let stream_health = Arc::new(StreamHealth::new());
+    match backend {
+        BroadcasterBackend::Native => Ok(BroadcasterSubscriptionControls::Native(
+            NativeBroadcasterSubscriptionControls {
+                broadcaster_subscription,
+                state_store,
+                stream_health,
+                tokens,
+                protocols: vec![protocol],
+            },
+        )),
+        BroadcasterBackend::Rfq => Ok(BroadcasterSubscriptionControls::Rfq(
+            super::RfqBroadcasterSubscriptionControls {
+                broadcaster_subscription,
+                state_store,
+                stream_health,
+                tokens,
+                protocols: vec![protocol],
+                simulation_rebuild_gate: Arc::new(RwLock::new(())),
+            },
+        )),
+        BroadcasterBackend::Vm => Err(anyhow!("VM is outside the Phase 2 parity fixture set")),
     }
 }
 
@@ -447,6 +704,7 @@ enum FakeReplayPoll {
     TransportError,
     PermanentCommandError,
     Batch,
+    Pending,
     CaughtUp,
     DecodeError,
 }
@@ -529,6 +787,7 @@ impl ReplayPollSource for FakeReplayPollSource {
                     caught_up_after_batch: false,
                 }))
             }
+            FakeReplayPoll::Pending => Ok(ReplayPoll::Pending),
             FakeReplayPoll::CaughtUp => Ok(ReplayPoll::CaughtUp {
                 checkpoint: checkpoint.clone(),
             }),
@@ -598,7 +857,7 @@ impl RedisRetrySleeper for RecordingRetrySleeper {
 
 fn redis_test_supervisor_config() -> StreamSupervisorConfig {
     StreamSupervisorConfig {
-        readiness_stale: Duration::from_secs(120),
+        initialization_timeout: Duration::from_secs(120),
         stream_stale: Duration::from_secs(120),
         missing_block_burst: 3,
         missing_block_window: Duration::from_secs(60),
@@ -762,7 +1021,29 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         redis_boundary("stream-7", "snapshot-7", 7, 103)?,
         Chain::Ethereum.id(),
     );
-    let replacement = recovery_snapshot_json(80)?;
+    let mut snapshot: Vec<BroadcasterEnvelope> =
+        serde_json::from_str(&recovery_snapshot_json(80)?)?;
+    for envelope in &mut snapshot {
+        if let BroadcasterPayload::SnapshotChunk(chunk) = &mut envelope.payload {
+            for partition in chunk
+                .partitions
+                .iter_mut()
+                .filter(|partition| partition.backend == BroadcasterBackend::Native)
+            {
+                let header = raw_block_header(80, 80);
+                let mut message = raw_protocol_message_with_parts(
+                    header.clone(),
+                    SynchronizerState::Delayed(header),
+                    &[],
+                    &[],
+                    HashMap::new(),
+                );
+                message.protocol = "uniswap_v2".to_owned();
+                partition.messages = vec![message];
+            }
+        }
+    }
+    let replacement = serde_json::to_string(&snapshot)?;
     let digest = format!("{:x}", keccak256(replacement.as_bytes()));
     let target_state_version = 104;
     let mut chunk_encoded_bytes = 1_u64;
@@ -810,6 +1091,12 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         .map_err(|exit| anyhow!(exit.message))?;
 
     assert_eq!(controls.native_state_store.current_block().await, 70);
+    assert!(controls
+        .native_state_store
+        .pin()
+        .await
+        .applied_head()
+        .is_none());
     assert!(
         controls.native_state_store.request_generation().await > request_generation_before_recovery,
         "RecoveryStart must fence requests before assembling private replacement state"
@@ -838,6 +1125,12 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         .await
         .map_err(|exit| anyhow!(exit.message))?;
     assert_eq!(controls.native_state_store.current_block().await, 70);
+    assert!(controls
+        .native_state_store
+        .pin()
+        .await
+        .applied_head()
+        .is_none());
 
     let commit = recovery_replay_message(
         106,
@@ -855,6 +1148,15 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         .map_err(|exit| anyhow!(exit.message))?;
 
     assert_eq!(controls.native_state_store.current_block().await, 80);
+    assert_eq!(
+        controls
+            .native_state_store
+            .pin()
+            .await
+            .applied_head()
+            .map(|head| head.number),
+        Some(80)
+    );
     assert_eq!(
         controls.native_state_store.state_version().await,
         target_state_version
@@ -986,19 +1288,52 @@ async fn producer_crash_before_or_after_commit_is_replayed_on_consumer_restart()
 }
 
 #[tokio::test]
+async fn incomplete_recovery_times_out_only_when_polling_the_tail() -> Result<()> {
+    for (poll, expected_caught_up) in [
+        (FakeReplayPoll::Pending, false),
+        (FakeReplayPoll::CaughtUp, true),
+    ] {
+        let (controls, mut prepared) = prepared_native_replay_subscription().await?;
+        let (start, _, _) = recovery_messages(&prepared, "recovery-timeout", 104, 80, 104)?;
+        apply_recovery_message(&mut prepared, &start).await?;
+        let source = FakeReplayPollSource::new([poll]);
+        let mut cfg = redis_test_supervisor_config();
+        cfg.initialization_timeout = Duration::ZERO;
+        let (exit, _, caught_up_once) = process_broadcaster_redis_subscription(
+            &source,
+            prepared,
+            &cfg,
+            &RecordingRetrySleeper::default(),
+        )
+        .await;
+        assert!(exit
+            .message
+            .contains("remained incomplete at the Redis tail"));
+        assert_eq!(caught_up_once, expected_caught_up);
+        assert_eq!(source.observed_checkpoints(), vec!["7-103"]);
+        assert_eq!(controls.native_state_store.current_block().await, 70);
+        assert!(
+            !controls
+                .native_subscription
+                .snapshot()
+                .await
+                .bootstrap_complete
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn trimmed_recovery_transaction_forces_http_fallback_without_exposure() -> Result<()> {
     let (controls, prepared) = prepared_native_replay_subscription().await?;
     let (start, _, _) = recovery_messages(&prepared, "recovery-trimmed", 104, 80, 104)?;
     let source = RecoveryThenGapPollSource::new(start);
     let sleeper = RecordingRetrySleeper::default();
+    let mut cfg = redis_test_supervisor_config();
+    cfg.initialization_timeout = Duration::ZERO;
 
-    let (exit, mut rebuilds, caught_up_once) = process_broadcaster_redis_subscription(
-        &source,
-        prepared,
-        &redis_test_supervisor_config(),
-        &sleeper,
-    )
-    .await;
+    let (exit, mut rebuilds, caught_up_once) =
+        process_broadcaster_redis_subscription(&source, prepared, &cfg, &sleeper).await;
 
     assert_eq!(exit.reason, SubscriptionExitReason::RedisGap);
     assert!(subscription_exit_requires_rebuild(exit.reason));
@@ -1477,6 +1812,34 @@ fn update_envelope_for_stream(
     ))
 }
 
+fn native_header_update_envelope(
+    message_seq: u64,
+    protocol: &str,
+    header: BlockHeader,
+) -> Result<BroadcasterEnvelope> {
+    let block_number = header.number;
+    let mut message = raw_protocol_message_with_parts(
+        header.clone(),
+        SynchronizerState::Ready(header),
+        &[],
+        &[],
+        HashMap::new(),
+    );
+    message.protocol = protocol.to_owned();
+    Ok(BroadcasterEnvelope::new(
+        "stream-1",
+        message_seq,
+        BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+            BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                block_number,
+                vec![message],
+                BTreeMap::new(),
+            ),
+        ])?),
+    ))
+}
+
 fn partial_native_update_envelope(
     message_seq: u64,
     block_number: u64,
@@ -1618,16 +1981,22 @@ fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
     )
 }
 
-fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+fn raw_decoder() -> Arc<ReplayDecoder> {
     let mut decoder = TychoStreamDecoder::new(Chain::Ethereum);
     decoder.register_decoder::<DummySim>("vm:curve");
-    Arc::new(decoder)
+    Arc::new(ReplayDecoder::with_decoder(
+        DecoderConfig::for_backend(ReplayBackend::Vm, vec![ProtocolKind::Curve], 0),
+        Arc::new(decoder),
+    ))
 }
 
-fn stateful_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
+fn stateful_decoder() -> Arc<ReplayDecoder> {
     let mut decoder = TychoStreamDecoder::new(Chain::Ethereum);
     decoder.register_decoder::<StatefulSim>("vm:curve");
-    Arc::new(decoder)
+    Arc::new(ReplayDecoder::with_decoder(
+        DecoderConfig::for_backend(ReplayBackend::Vm, vec![ProtocolKind::Curve], 0),
+        Arc::new(decoder),
+    ))
 }
 
 #[test]
@@ -1866,7 +2235,7 @@ async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
             .insert(entrypoint_id, Default::default());
     }
     cache
-        .apply_feed_message(&simulator_core::broadcaster::wire::FeedMessage {
+        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
             state_msgs: HashMap::from([(
                 "vm:curve".to_string(),
                 StateSyncMessage {
@@ -1878,7 +2247,7 @@ async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
                         )]),
                         vm_storage: HashMap::new(),
                     },
-                    deltas: Some(changes),
+                    deltas: Some(changes.into()),
                     removed_components: HashMap::new(),
                 },
             )]),
@@ -1990,8 +2359,9 @@ fn stateful_compaction_fixture() -> StatefulCompactionFixture {
                 ("deleted".to_string(), Bytes::from([9u8; 32])),
             ]),
             balances: HashMap::from([(token.clone(), Bytes::from([10u8; 32]))]),
-        },
-        component: raw_dto_protocol_component(component_id),
+        }
+        .into(),
+        component: raw_dto_protocol_component(component_id).into(),
         component_tvl: Some(1.0),
         entrypoints: Vec::new(),
     };
@@ -2043,7 +2413,7 @@ async fn bootstrap_uncompacted_stateful(
                 )]),
                 vm_storage: HashMap::new(),
             },
-            deltas: Some(fixture.changes.clone()),
+            deltas: Some(fixture.changes.clone().into()),
             removed_components: HashMap::new(),
         },
     );
@@ -2078,7 +2448,7 @@ async fn bootstrap_uncompacted_stateful(
 async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Result<TestControls> {
     let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
     cache
-        .apply_feed_message(&simulator_core::broadcaster::wire::FeedMessage {
+        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
             state_msgs: HashMap::from([(
                 "vm:curve".to_string(),
                 StateSyncMessage {
@@ -2101,13 +2471,13 @@ async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Re
         })
         .await?;
     cache
-        .apply_feed_message(&simulator_core::broadcaster::wire::FeedMessage {
+        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
             state_msgs: HashMap::from([(
                 "vm:curve".to_string(),
                 StateSyncMessage {
                     header: fixture.final_header.clone(),
                     snapshots: Snapshot::default(),
-                    deltas: Some(fixture.changes.clone()),
+                    deltas: Some(fixture.changes.clone().into()),
                     removed_components: HashMap::new(),
                 },
             )]),
@@ -2315,7 +2685,7 @@ async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> R
     );
     processor.set_bootstrap_redis_replay_boundary(super::processor::default_test_redis_replay_boundary());
     let header = raw_block_header(21, 9);
-    let sync_state = SynchronizerState::Ready(header.clone());
+    let sync_state = SynchronizerState::Stale(header.clone());
 
     processor
         .observe(vm_only_snapshot_start_envelope(2)?)
@@ -2336,6 +2706,7 @@ async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> R
         .await?;
 
     assert!(!processor.bootstrap_complete());
+    assert!(controls.vm_state_store.pin().await.applied_head().is_none());
     assert!(
         !controls
             .vm_state_store
@@ -2361,6 +2732,7 @@ async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> R
         .await?;
 
     assert!(!processor.bootstrap_complete());
+    assert!(controls.vm_state_store.pin().await.applied_head().is_none());
     assert!(
         !controls
             .vm_state_store
@@ -2382,6 +2754,12 @@ async fn raw_snapshot_bootstrap_buffers_split_messages_until_snapshot_end() -> R
     assert!(snapshot.connected);
     assert!(snapshot.bootstrap_complete);
     assert!(processor.bootstrap_complete());
+    let applied = controls.vm_state_store.pin().await;
+    assert_eq!(applied.applied_head().map(|head| head.number), Some(21));
+    assert_eq!(
+        applied.applied_head().map(|head| &head.hash),
+        Some(&raw_block_header(21, 9).hash)
+    );
     assert!(
         controls
             .vm_state_store
@@ -2544,6 +2922,416 @@ async fn partial_and_unknown_native_updates_do_not_renew_consumer_progress() -> 
         BTreeMap::new(),
     );
     assert_eq!(unknown.complete_native_block(), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn applied_head_follows_partial_updates_hash_changes_and_rewinds() -> Result<()> {
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+    bootstrap(&mut processor).await?;
+    processor
+        .observe(native_header_update_envelope(
+            4,
+            "uniswap_v2",
+            raw_block_header(12, 12),
+        )?)
+        .await?;
+    let complete_pin = controls.native_state_store.pin().await;
+    assert_eq!(
+        complete_pin.applied_head().map(|head| head.number),
+        Some(12)
+    );
+    let mut partial_header = raw_block_header(13, 13);
+    partial_header.partial_block_index = Some(0);
+    processor
+        .observe(native_header_update_envelope(
+            5,
+            "uniswap_v2",
+            partial_header,
+        )?)
+        .await?;
+    assert!(controls
+        .native_state_store
+        .pin()
+        .await
+        .applied_head()
+        .is_none());
+    assert_eq!(
+        complete_pin.applied_head().map(|head| head.number),
+        Some(12)
+    );
+    processor
+        .observe(native_header_update_envelope(
+            6,
+            "uniswap_v2",
+            raw_block_header(12, 99),
+        )?)
+        .await?;
+    let replacement_pin = controls.native_state_store.pin().await;
+    assert_eq!(
+        replacement_pin.applied_head().map(|head| head.number),
+        Some(12)
+    );
+    assert_eq!(
+        replacement_pin.applied_head().map(|head| &head.hash),
+        Some(&raw_block_header(12, 99).hash)
+    );
+    processor
+        .observe(native_header_update_envelope(
+            7,
+            "uniswap_v2",
+            raw_block_header(11, 11),
+        )?)
+        .await?;
+    assert_eq!(
+        controls
+            .native_state_store
+            .pin()
+            .await
+            .applied_head()
+            .map(|head| head.number),
+        Some(11)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn applied_head_requires_every_protocol_in_the_serving_store() -> Result<()> {
+    let mut controls = TestControls::new();
+    controls.native_state_store = Arc::new(StateStore::new_with_protocols(
+        controls.token_store.clone(),
+        vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
+    ));
+    let BroadcasterSubscriptionControls::Native(mut native) = controls.native() else {
+        unreachable!("native controls expected");
+    };
+    native.protocols.push(ProtocolKind::UniswapV3);
+    let mut processor = BroadcasterSubscriptionProcessor::new(
+        Chain::Ethereum.id(),
+        BroadcasterSubscriptionControls::Native(native),
+        None,
+    );
+    bootstrap(&mut processor).await?;
+    processor
+        .observe(native_header_update_envelope(
+            4,
+            "uniswap_v2",
+            raw_block_header(12, 12),
+        )?)
+        .await?;
+    assert_eq!(controls.native_state_store.current_block().await, 12);
+    assert!(controls
+        .native_state_store
+        .pin()
+        .await
+        .applied_head()
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_wire_vm_store_compares_only_its_own_protocols() -> Result<()> {
+    let mut controls = TestControls::new();
+    controls.vm_state_store = Arc::new(StateStore::new_with_protocols(
+        controls.token_store.clone(),
+        vec![ProtocolKind::UniswapV4],
+    ));
+    let BroadcasterSubscriptionControls::Vm(mut vm) = controls.vm() else {
+        unreachable!("VM controls expected");
+    };
+    vm.wire_backend = BroadcasterBackend::Native;
+    vm.protocols = vec![ProtocolKind::UniswapV4];
+    let mut processor = BroadcasterSubscriptionProcessor::new(
+        Chain::Ethereum.id(),
+        BroadcasterSubscriptionControls::Vm(vm),
+        None,
+    );
+    bootstrap(&mut processor).await?;
+    let mut envelope = native_header_update_envelope(4, "uniswap_v4", raw_block_header(13, 13))?;
+    let BroadcasterPayload::Update(update) = &mut envelope.payload else {
+        return Err(anyhow!("expected update payload"));
+    };
+    update.partitions[0].sync_statuses.insert(
+        "uniswap_v2".to_owned(),
+        BroadcasterProtocolSyncStatus::from_synchronizer_state(&SynchronizerState::Ready(
+            raw_block_header(13, 13),
+        )),
+    );
+    processor.observe(envelope).await?;
+    assert_eq!(
+        controls
+            .vm_state_store
+            .pin()
+            .await
+            .applied_head()
+            .map(|head| head.number),
+        Some(13)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn serving_subset_uses_its_head_in_decoded_and_published_state() -> Result<()> {
+    let decoder = ReplayDecoder::with_decoder(
+        DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0),
+        Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+        )),
+    );
+    let mut envelope = update_envelope_for_stream("stream-1", 4, 101)?;
+    let BroadcasterPayload::Update(update) = &mut envelope.payload else {
+        return Err(anyhow!("expected update payload"));
+    };
+    let statuses = &mut update.partitions[0].sync_statuses;
+    statuses.insert(
+        "uniswap_v2".to_owned(),
+        BroadcasterProtocolSyncStatus::from_synchronizer_state(&SynchronizerState::Ready(
+            raw_block_header(100, 100),
+        )),
+    );
+    statuses.insert(
+        "uniswap_v4".to_owned(),
+        BroadcasterProtocolSyncStatus::from_synchronizer_state(&SynchronizerState::Ready(
+            raw_block_header(101, 101),
+        )),
+    );
+    let header = raw_block_header(100, 100);
+    let mut installed_message = raw_protocol_message_with_parts(
+        header.clone(),
+        SynchronizerState::Stale(header),
+        &[],
+        &[],
+        HashMap::new(),
+    );
+    installed_message.protocol = "uniswap_v2".to_owned();
+    let snapshot_partition = BroadcasterSnapshotPartition::with_messages(
+        BroadcasterBackend::Native,
+        101,
+        vec![installed_message.clone()],
+        statuses.clone(),
+    );
+    update.partitions[0].messages = vec![installed_message];
+    let decoded = decoder
+        .decode_live_delta(update.clone(), &[ReplayBackend::Native])
+        .await?;
+    assert_eq!(
+        decoded.protocol_head_updates,
+        vec![ProtocolHeadUpdate {
+            protocol: ProtocolKind::UniswapV2,
+            head: Some(BlockIdentity {
+                number: 100,
+                hash: raw_block_header(100, 100).hash
+            })
+        }]
+    );
+    assert_eq!(decoded.block_number, 100);
+    assert_eq!(
+        decoded.update.as_ref().map(|update| update.block_number),
+        Some(100)
+    );
+    let decoded_snapshot = decoder
+        .decode_snapshot_partition(snapshot_partition.clone())
+        .await?;
+    assert_eq!(decoded_snapshot.block_number, 100);
+    assert_eq!(
+        decoded_snapshot
+            .update
+            .as_ref()
+            .map(|update| update.block_number),
+        Some(100)
+    );
+
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+    processor.observe(snapshot_start_envelope()?).await?;
+    let mut snapshot_envelope = snapshot_chunk_envelope()?;
+    let BroadcasterPayload::SnapshotChunk(chunk) = &mut snapshot_envelope.payload else {
+        return Err(anyhow!("expected snapshot chunk fixture"));
+    };
+    chunk.partitions[0] = snapshot_partition;
+    processor.observe(snapshot_envelope).await?;
+    processor.observe(snapshot_end_envelope()).await?;
+    assert_eq!(controls.native_state_store.current_block().await, 100);
+    let published = controls.native_state_store.pin().await;
+    assert_eq!(published.applied_head().map(|head| head.number), Some(100));
+    processor.observe(envelope).await?;
+    assert_eq!(controls.native_state_store.current_block().await, 100);
+    let published = controls.native_state_store.pin().await;
+    assert_eq!(published.applied_head().map(|head| head.number), Some(100));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_chain_head_survives_metadata_only_delay_and_staleness() -> Result<()> {
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+    bootstrap(&mut processor).await?;
+    processor
+        .observe(native_header_update_envelope(
+            4,
+            "uniswap_v2",
+            raw_block_header(12, 12),
+        )?)
+        .await?;
+    let header = raw_block_header(12, 12);
+    let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
+        number: header.number,
+        hash: header.hash.clone(),
+    });
+    let installed_version = controls.native_state_store.state_version().await;
+    for (message_seq, sync_state) in [
+        (5, SynchronizerState::Delayed(header.clone())),
+        (6, SynchronizerState::Stale(header.clone())),
+    ] {
+        let mut unrelated = raw_protocol_message_with_parts(
+            raw_block_header(13, 13),
+            SynchronizerState::Ready(raw_block_header(13, 13)),
+            &[],
+            &[],
+            HashMap::new(),
+        );
+        unrelated.protocol = "uniswap_v4".to_owned();
+        let envelope = BroadcasterEnvelope::new(
+            "stream-1",
+            message_seq,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::with_messages(
+                    BroadcasterBackend::Native,
+                    13,
+                    vec![unrelated],
+                    BTreeMap::from([(
+                        "uniswap_v2".to_owned(),
+                        BroadcasterProtocolSyncStatus::from_synchronizer_state(&sync_state),
+                    )]),
+                ),
+            ])?),
+        );
+        let mut entry = redis_entry_for_scope(&envelope, "native");
+        entry.state_version = message_seq;
+        processor.observe_redis_delta(&entry, &envelope).await?;
+        let pin = controls.native_state_store.pin().await;
+        assert_eq!(
+            observer.snapshot().agreement(pin.applied_head()),
+            ChainHeadAgreement::Matches
+        );
+        assert_eq!(controls.native_state_store.current_block().await, 12);
+        assert_eq!(
+            controls.native_state_store.state_version().await,
+            installed_version
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn installed_protocol_heads_override_stale_status_metadata() -> Result<()> {
+    let mut controls = TestControls::new();
+    controls.native_state_store = Arc::new(StateStore::new_with_protocols(
+        controls.token_store.clone(),
+        vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
+    ));
+    let BroadcasterSubscriptionControls::Native(mut native) = controls.native() else {
+        unreachable!("native controls expected");
+    };
+    native.protocols.push(ProtocolKind::UniswapV3);
+    let mut processor = BroadcasterSubscriptionProcessor::new(
+        Chain::Ethereum.id(),
+        BroadcasterSubscriptionControls::Native(native),
+        None,
+    );
+    bootstrap(&mut processor).await?;
+    let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
+        number: 100,
+        hash: raw_block_header(100, 100).hash,
+    });
+    processor
+        .observe(native_header_update_envelope(
+            4,
+            "uniswap_v2",
+            raw_block_header(99, 99),
+        )?)
+        .await?;
+    processor
+        .observe(native_header_update_envelope(
+            5,
+            "uniswap_v3",
+            raw_block_header(100, 100),
+        )?)
+        .await?;
+    assert_eq!(
+        observer
+            .snapshot()
+            .agreement(controls.native_state_store.pin().await.applied_head()),
+        ChainHeadAgreement::AppliedStateIncomplete
+    );
+    let mut catch_up = native_header_update_envelope(6, "uniswap_v2", raw_block_header(100, 100))?;
+    let BroadcasterPayload::Update(update) = &mut catch_up.payload else {
+        return Err(anyhow!("expected update payload"));
+    };
+    update.partitions[0].sync_statuses.insert(
+        "uniswap_v3".to_owned(),
+        BroadcasterProtocolSyncStatus::from_synchronizer_state(&SynchronizerState::Stale(
+            raw_block_header(99, 99),
+        )),
+    );
+    processor.observe(catch_up).await?;
+    assert_eq!(
+        observer
+            .snapshot()
+            .agreement(controls.native_state_store.pin().await.applied_head()),
+        ChainHeadAgreement::Matches
+    );
+    assert!(controls.native_state_store.is_ready());
+    assert!(
+        controls
+            .native_subscription
+            .snapshot()
+            .await
+            .bootstrap_complete
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_only_staleness_does_not_invent_an_installed_head() -> Result<()> {
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.native(), None);
+    bootstrap(&mut processor).await?;
+    let header = raw_block_header(12, 12);
+    let observer = ChainHeadObserver::ready_for_test(BlockIdentity {
+        number: header.number,
+        hash: header.hash.clone(),
+    });
+    let envelope = BroadcasterEnvelope::new(
+        "stream-1",
+        4,
+        BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+            BroadcasterUpdatePartition::with_messages(
+                BroadcasterBackend::Native,
+                12,
+                Vec::new(),
+                BTreeMap::from([(
+                    "uniswap_v2".to_owned(),
+                    BroadcasterProtocolSyncStatus::from_synchronizer_state(
+                        &SynchronizerState::Stale(header),
+                    ),
+                )]),
+            ),
+        ])?),
+    );
+    processor.observe(envelope).await?;
+    assert_eq!(
+        observer
+            .snapshot()
+            .agreement(controls.native_state_store.pin().await.applied_head()),
+        ChainHeadAgreement::AppliedStateIncomplete
+    );
+    assert_eq!(controls.native_state_store.current_block().await, 10);
     Ok(())
 }
 
@@ -2906,7 +3694,10 @@ fn raw_protocol_message_with_parts(
                         )
                     })
                     .collect(),
-                vm_storage,
+                vm_storage: vm_storage
+                    .into_iter()
+                    .map(|(address, account)| (address, account.into()))
+                    .collect(),
             },
             deltas: None,
             removed_components: removal_ids
@@ -2914,7 +3705,7 @@ fn raw_protocol_message_with_parts(
                 .map(|component_id| {
                     (
                         (*component_id).to_string(),
-                        raw_dto_protocol_component(component_id),
+                        raw_dto_protocol_component(component_id).into(),
                     )
                 })
                 .collect(),
@@ -2928,8 +3719,9 @@ fn raw_component_with_state(component_id: &str) -> ComponentWithState {
             component_id: component_id.to_string(),
             attributes: HashMap::new(),
             balances: HashMap::new(),
-        },
-        component: raw_dto_protocol_component(component_id),
+        }
+        .into(),
+        component: raw_dto_protocol_component(component_id).into(),
         component_tvl: None,
         entrypoints: Vec::new(),
     }

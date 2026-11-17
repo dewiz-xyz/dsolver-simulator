@@ -1,0 +1,20 @@
+{
+  "requestId": "3bbd9a8c-d942-4f9d-b96d-7ee63b9308aa",
+  "apiRevision": 1,
+  "timeoutMs": 5000,
+  "chainId": 8453,
+  "pool": {
+    "backend": "native",
+    "protocol": "uniswap_v3",
+    "componentId": "pool-1",
+    "tokenIn": "0x1111111111111111111111111111111111111111",
+    "tokenOut": "0x2222222222222222222222222222222222222222"
+  },
+  "blocks": {
+    "start": 34100000,
+    "endInclusive": 34100000,
+    "step": 1
+  },
+  "lags": [1],
+  "amountsIn": ["1000000"]
+}

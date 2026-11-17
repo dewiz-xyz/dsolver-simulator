@@ -1,31 +1,42 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context, Result};
-use simulator_core::broadcaster::wire::{FeedMessage, Snapshot, StateSyncMessage};
+use state_history::WriterStatus;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
 use tycho_simulation::{
     protocol::models::Update as TychoUpdate,
-    tycho_client::feed::{BlockHeader, SynchronizerState},
+    tycho_client::feed::{
+        synchronizer::{Snapshot, StateSyncMessage},
+        BlockHeader, FeedMessage, SynchronizerState,
+    },
     tycho_common::{
-        dto::{
-            AccountBalance, AccountUpdate, BlockAggregatedChanges, ChangeType, ProtocolStateDelta,
-            ResponseAccount,
+        models::{
+            blockchain::BlockAggregatedChanges,
+            contract::{Account, AccountBalance, AccountDelta},
+            token::Token,
+            ChangeType,
         },
         Bytes,
     },
 };
 
+use crate::chain_head::{ChainHeadAgreement, ChainHeadSnapshot};
+use crate::models::tokens::TokenStore;
+
 use simulator_core::broadcaster::{
-    complete_broadcaster_partition_block, BroadcasterBackend, BroadcasterBackendHead,
-    BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProtocolMessage,
-    BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk, BroadcasterSnapshotEnd,
-    BroadcasterSnapshotPartition, BroadcasterSnapshotStart, BroadcasterStateDelta,
-    BroadcasterStateEntry, BroadcasterUpdateMessage,
+    apply_raw_protocol_messages, complete_broadcaster_partition_block,
+    complete_broadcaster_snapshot_head, fold_account_update_into_snapshot,
+    merge_shared_vm_accounts, raw_residue_entry_count, BlockIdentity, BroadcasterBackend,
+    BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload,
+    BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus, BroadcasterSnapshotChunk,
+    BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
+    BroadcasterStateDelta, BroadcasterStateEntry, BroadcasterUpdateMessage, ProtocolStateHeads,
+    RawResidueGrowth,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 use super::redis_publisher::{
     BroadcasterDeploymentAdmissionSnapshot, BroadcasterDeploymentPhase,
@@ -42,14 +53,16 @@ pub enum BroadcasterReadiness {
     UpstreamRecovering,
     SnapshotUnexportable,
     UpstreamDisconnected,
-    NativeProgressStale,
+    ChainHeadUnavailable,
+    ChainHeadMismatch,
 }
 
 impl BroadcasterReadiness {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UpstreamDisconnected => "upstream_disconnected",
-            Self::NativeProgressStale => "native_progress_stale",
+            Self::ChainHeadUnavailable => "chain_head_unavailable",
+            Self::ChainHeadMismatch => "chain_head_mismatch",
             Self::SnapshotWarmingUp => "snapshot_warming_up",
             Self::UpstreamRecovering | Self::SnapshotUnexportable => "degraded",
             Self::RedisPublisherPassive => "redis_publisher_passive",
@@ -71,6 +84,8 @@ pub struct BroadcasterStatusSnapshot {
     pub backends: BTreeMap<BroadcasterBackend, BroadcasterBackendStatus>,
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
     pub deployment_admission: BroadcasterDeploymentAdmissionSnapshot,
+    pub state_history: Option<WriterStatus>,
+    pub chain_head: Option<ChainHeadSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +164,9 @@ pub struct BroadcasterBackendStatus {
     pub block_number: Option<u64>,
     pub pool_count: usize,
     pub sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    pub complete_head: Option<BlockIdentity>,
+    pub published_head: Option<BlockIdentity>,
+    pub head_agreement: Option<ChainHeadAgreement>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +188,7 @@ pub(crate) struct BroadcasterSnapshotSource {
 pub(crate) struct BroadcasterStagedUpdate {
     message: Option<BroadcasterUpdateMessage>,
     apply_mode: BroadcasterStagedUpdateApplyMode,
+    new_tokens: Vec<Token>,
     replacement_ready: bool,
     recovery_id: Option<u64>,
 }
@@ -181,6 +200,13 @@ pub(crate) struct BroadcasterRecoverySource {
 }
 
 impl BroadcasterRecoverySource {
+    pub(crate) fn protocol_state_heads(
+        &self,
+        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
+    ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
+        partition_protocol_heads(&self.partitions, required_protocols)
+    }
+
     pub(crate) fn complete_native_block(&self) -> Option<u64> {
         let partition = self.partitions.get(&BroadcasterBackend::Native)?;
         complete_broadcaster_partition_block(
@@ -192,6 +218,18 @@ impl BroadcasterRecoverySource {
 }
 
 impl BroadcasterSnapshotSource {
+    pub(crate) fn protocol_state_heads(
+        &self,
+        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
+    ) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
+        partition_protocol_heads(&self.partitions, required_protocols)
+    }
+
+    pub(crate) fn relabel_generation(&mut self, chain_id: u64, generation: u64) {
+        self.stream_id = format_stream_id(chain_id, generation);
+        self.snapshot_id = format_snapshot_id(chain_id, generation);
+    }
+
     pub(crate) fn backend_heads(&self) -> Vec<BroadcasterBackendHead> {
         self.partitions
             .iter()
@@ -334,6 +372,13 @@ pub struct BroadcasterSnapshotCache {
     chain_id: u64,
     configured_backends: Vec<BroadcasterBackend>,
     inner: Arc<RwLock<BroadcasterSnapshotCacheData>>,
+    token_catalog: Option<BroadcasterTokenCatalog>,
+}
+
+#[derive(Debug, Clone)]
+struct BroadcasterTokenCatalog {
+    tokens: Arc<TokenStore>,
+    min_quality: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +388,8 @@ struct BroadcasterSnapshotCacheData {
     snapshot_id: String,
     partitions: BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     known_backends: HashMap<String, BroadcasterBackend>,
+    // Keep exact upstream feed keys: aliases can name separate synchronization streams.
+    // Recovery must wait for every stream rather than merge keys through normalization.
     expected_protocols: BTreeSet<String>,
     replacement: Option<UpstreamReplacementState>,
     next_recovery_id: u64,
@@ -365,13 +412,53 @@ struct BroadcasterPartitionState {
 
 impl BroadcasterSnapshotCache {
     pub fn new(chain_id: u64, configured_backends: Vec<BroadcasterBackend>) -> Self {
-        Self::new_with_initial_generation(chain_id, configured_backends, 1)
+        Self::new_with_initial_generation_and_token_catalog(chain_id, configured_backends, 1, None)
     }
 
+    pub fn with_token_catalog(
+        chain_id: u64,
+        configured_backends: Vec<BroadcasterBackend>,
+        tokens: Arc<TokenStore>,
+        min_quality: u32,
+    ) -> Self {
+        Self::new_with_initial_generation_and_token_catalog(
+            chain_id,
+            configured_backends,
+            1,
+            Some(BroadcasterTokenCatalog {
+                tokens,
+                min_quality,
+            }),
+        )
+    }
+
+    /// The store stream folds write into. Checkpoint captures must clone this
+    /// same store, or the snapshot superset guarantee silently splits in two.
+    pub fn token_catalog_store(&self) -> Option<Arc<TokenStore>> {
+        self.token_catalog
+            .as_ref()
+            .map(|catalog| Arc::clone(&catalog.tokens))
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_initial_generation(
+        chain_id: u64,
+        configured_backends: Vec<BroadcasterBackend>,
+        generation: u64,
+    ) -> Self {
+        Self::new_with_initial_generation_and_token_catalog(
+            chain_id,
+            configured_backends,
+            generation,
+            None,
+        )
+    }
+
+    fn new_with_initial_generation_and_token_catalog(
         chain_id: u64,
         mut configured_backends: Vec<BroadcasterBackend>,
         generation: u64,
+        token_catalog: Option<BroadcasterTokenCatalog>,
     ) -> Self {
         configured_backends.sort();
         configured_backends.dedup();
@@ -390,6 +477,7 @@ impl BroadcasterSnapshotCache {
                 replacement: None,
                 next_recovery_id: 1,
             })),
+            token_catalog,
         }
     }
 
@@ -457,6 +545,7 @@ impl BroadcasterSnapshotCache {
         guard.replacement = None;
     }
 
+    #[cfg(test)]
     pub(crate) async fn replacement_pending(&self) -> bool {
         self.inner.read().await.replacement.is_some()
     }
@@ -492,6 +581,7 @@ impl BroadcasterSnapshotCache {
         Ok(BroadcasterStagedUpdate {
             message: Some(message),
             apply_mode: BroadcasterStagedUpdateApplyMode::Decoded,
+            new_tokens: Vec::new(),
             replacement_ready: false,
             recovery_id: None,
         })
@@ -503,6 +593,11 @@ impl BroadcasterSnapshotCache {
     ) -> Result<BroadcasterStagedUpdate> {
         let message = BroadcasterUpdateMessage::from_tycho_feed_message(feed)?;
         ensure_configured_update_backends(&message, &self.configured_backends)?;
+        // Replacement compaction clears delta tokens, so retain them from the accepted input.
+        let new_tokens = self
+            .token_catalog
+            .as_ref()
+            .map_or_else(Vec::new, |_| raw_update_new_tokens(&message));
         let guard = self.inner.read().await;
         let mut expected_protocols = guard.expected_protocols.clone();
         expected_protocols.extend(feed.sync_states.keys().cloned());
@@ -534,6 +629,7 @@ impl BroadcasterSnapshotCache {
                         pending: None,
                         next_recovery_id,
                     },
+                    new_tokens,
                     replacement_ready: true,
                     recovery_id: Some(pending.id),
                 });
@@ -552,6 +648,7 @@ impl BroadcasterSnapshotCache {
                         pending: Some(pending),
                         next_recovery_id,
                     },
+                    new_tokens,
                     replacement_ready: false,
                     recovery_id: None,
                 });
@@ -565,16 +662,23 @@ impl BroadcasterSnapshotCache {
                 expected_protocols,
                 next_recovery_id,
             },
+            new_tokens,
             replacement_ready: false,
             recovery_id: None,
         })
     }
 
     pub(crate) async fn commit_staged_update(&self, staged: BroadcasterStagedUpdate) -> Result<()> {
+        let BroadcasterStagedUpdate {
+            message,
+            apply_mode,
+            new_tokens: accepted_new_tokens,
+            ..
+        } = staged;
         let mut guard = self.inner.write().await;
-        match staged.apply_mode {
+        match apply_mode {
             BroadcasterStagedUpdateApplyMode::Decoded => {
-                if let Some(message) = staged.message.as_ref() {
+                if let Some(message) = message.as_ref() {
                     apply_update_message(&mut guard, message);
                 }
             }
@@ -582,7 +686,7 @@ impl BroadcasterSnapshotCache {
                 expected_protocols,
                 next_recovery_id,
             } => {
-                if let Some(message) = staged.message.as_ref() {
+                if let Some(message) = message.as_ref() {
                     apply_raw_update_message(&mut guard.partitions, message)?;
                 }
                 guard.expected_protocols = expected_protocols;
@@ -600,6 +704,20 @@ impl BroadcasterSnapshotCache {
                 guard.next_recovery_id = next_recovery_id;
             }
         }
+        drop(guard);
+
+        if accepted_new_tokens.is_empty() {
+            return Ok(());
+        }
+        let Some(token_catalog) = &self.token_catalog else {
+            return Ok(());
+        };
+        // Match startup admission before exposing stream tokens through catalog snapshots.
+        let admitted_tokens = accepted_new_tokens
+            .into_iter()
+            .filter(|token| token.quality >= token_catalog.min_quality);
+        // Live publication releases the publisher lock before cache commit reaches this write.
+        token_catalog.tokens.insert_batch(admitted_tokens).await;
         Ok(())
     }
 
@@ -767,6 +885,20 @@ impl BroadcasterSnapshotCache {
         self.backend_heads_locked(&guard)
     }
 
+    pub(crate) async fn complete_backend_heads(
+        &self,
+        required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
+    ) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
+        let guard = self.inner.read().await;
+        if guard.replacement.is_some() {
+            return required_protocols
+                .keys()
+                .map(|backend| (*backend, None))
+                .collect();
+        }
+        complete_partition_heads(&guard.partitions, required_protocols)
+    }
+
     pub async fn is_ready(&self) -> bool {
         let guard = self.inner.read().await;
         self.is_ready_locked(&guard)
@@ -777,24 +909,15 @@ impl BroadcasterSnapshotCache {
         max_payload_bytes: usize,
         upstream: BroadcasterUpstreamSnapshot,
         snapshot_sessions: BroadcasterSnapshotSessionsSnapshot,
-        native_progress_lease: Duration,
     ) -> BroadcasterStatusSnapshot {
         let guard = self.inner.read().await;
         let ready = self.is_ready_locked(&guard);
-        let native_progress_stale = self
-            .configured_backends
-            .contains(&BroadcasterBackend::Native)
-            && upstream
-                .last_update_age_ms
-                .is_none_or(|age_ms| age_ms >= native_progress_lease.as_millis() as u64);
         let readiness = if !upstream.connected {
             BroadcasterReadiness::UpstreamDisconnected
         } else if guard.replacement.is_some() {
             BroadcasterReadiness::UpstreamRecovering
         } else if !ready {
             BroadcasterReadiness::SnapshotWarmingUp
-        } else if native_progress_stale {
-            BroadcasterReadiness::NativeProgressStale
         } else {
             BroadcasterReadiness::Ready
         };
@@ -810,6 +933,9 @@ impl BroadcasterSnapshotCache {
                         block_number: status.block_number,
                         pool_count: status.entry_count(),
                         sync_statuses: status.sync_statuses,
+                        complete_head: None,
+                        published_head: None,
+                        head_agreement: None,
                     },
                 )
             })
@@ -851,6 +977,8 @@ impl BroadcasterSnapshotCache {
                 phase: BroadcasterDeploymentPhase::Warming,
                 last_error: None,
             },
+            state_history: None,
+            chain_head: None,
         }
     }
 
@@ -1019,6 +1147,37 @@ fn collect_snapshot_export_parts(
     Ok(())
 }
 
+fn partition_protocol_heads(
+    partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
+    required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
+) -> BTreeMap<BroadcasterBackend, ProtocolStateHeads> {
+    required_protocols
+        .iter()
+        .map(|(backend, protocols)| {
+            let mut heads = ProtocolStateHeads::new(protocols.clone());
+            if let Some(partition) = partitions.get(backend) {
+                heads.apply_messages(&partition.messages);
+            }
+            (*backend, heads)
+        })
+        .collect()
+}
+
+fn complete_partition_heads(
+    partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
+    required_protocols: &BTreeMap<BroadcasterBackend, Vec<ProtocolKind>>,
+) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
+    required_protocols
+        .iter()
+        .map(|(backend, protocols)| {
+            let head = partitions.get(backend).and_then(|partition| {
+                complete_broadcaster_snapshot_head(&partition.messages, protocols)
+            });
+            (*backend, head)
+        })
+        .collect()
+}
+
 impl BroadcasterPartitionState {
     fn entry_count(&self) -> usize {
         if self.messages.is_empty() {
@@ -1040,17 +1199,34 @@ fn apply_raw_update_message(
         let partition_state = partitions.entry(partition.backend).or_default();
         partition_state.block_number = Some(partition.block_number);
         partition_state.sync_statuses = partition.sync_statuses.clone();
-        let mut messages = partition.messages.iter().collect::<Vec<_>>();
-        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
-        for message in messages {
-            merge_raw_message(&mut partition_state.messages, message.clone());
-            propagate_touched_vm_accounts(&mut partition_state.messages, message)?;
-        }
-        canonicalize_shared_vm_accounts(&mut partition_state.messages)?;
+        let growth =
+            apply_raw_protocol_messages(&mut partition_state.messages, &partition.messages)?;
+        log_raw_residue_growth(&growth);
     }
     Ok(())
 }
 
+fn log_raw_residue_growth(growth: &[RawResidueGrowth]) {
+    for growth in growth {
+        warn!(
+            event = "broadcaster_raw_cache_residue_growth",
+            protocol = %growth.protocol,
+            previous_count = growth.previous_count,
+            current_count = growth.stats.residual_entries,
+            folded_state_updates = growth.stats.folded_state_updates,
+            folded_component_balances = growth.stats.folded_component_balances,
+            folded_component_tvl = growth.stats.folded_component_tvl,
+            folded_account_updates = growth.stats.folded_account_updates,
+            folded_account_balances = growth.stats.folded_account_balances,
+            "Broadcaster raw cache residue grew after compaction"
+        );
+    }
+}
+
+#[expect(
+    clippy::excessive_nesting,
+    reason = "Backend, protocol and account reconciliation retains the conflicting peer identity in errors"
+)]
 fn validate_raw_update_message(
     partitions: &BTreeMap<BroadcasterBackend, BroadcasterPartitionState>,
     update: &BroadcasterUpdateMessage,
@@ -1076,23 +1252,24 @@ fn validate_raw_update_message(
                             && message.message.header.number == incoming.message.header.number
                     })
                 {
-                    if let Some(existing_account) =
+                    let Some(existing_account) =
                         existing.message.snapshots.vm_storage.get(&address)
-                    {
-                        projected = merge_projected_vm_accounts(
-                            projected,
-                            ProjectedVmAccount::Materialized(Some(existing_account.clone())),
-                            &address,
-                            incoming.message.header.number,
+                    else {
+                        continue;
+                    };
+                    projected = merge_projected_vm_accounts(
+                        projected,
+                        ProjectedVmAccount::Materialized(Some(existing_account.clone())),
+                        &address,
+                        incoming.message.header.number,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "while reconciling VM protocols {} and {}: {error:#}",
+                            incoming.protocol,
+                            existing.protocol
                         )
-                        .map_err(|error| {
-                            anyhow!(
-                                "while reconciling VM protocols {} and {}: {error:#}",
-                                incoming.protocol,
-                                existing.protocol
-                            )
-                        })?;
-                    }
+                    })?;
                 }
                 let key = (incoming.message.header.number, address.clone());
                 if let Some((protocol, previous)) = projected_by_block_and_address.get_mut(&key) {
@@ -1120,9 +1297,9 @@ fn validate_raw_update_message(
 
 #[derive(Debug, Clone, PartialEq)]
 enum ProjectedVmAccount {
-    Materialized(Option<ResponseAccount>),
+    Materialized(Option<Account>),
     Residual {
-        update: Option<AccountUpdate>,
+        update: Option<AccountDelta>,
         balances: HashMap<Bytes, AccountBalance>,
     },
 }
@@ -1153,49 +1330,6 @@ fn merge_projected_vm_accounts(
     }
 }
 
-#[expect(
-    deprecated,
-    reason = "creation_tx remains part of Tycho's account identity while it is on the wire"
-)]
-fn merge_shared_vm_accounts(
-    mut left: ResponseAccount,
-    right: ResponseAccount,
-    block_number: u64,
-) -> Result<ResponseAccount> {
-    let address = left.address.clone();
-    ensure!(
-        left.chain == right.chain
-            && left.address == right.address
-            && left.native_balance == right.native_balance
-            && left.code == right.code
-            && left.code_hash == right.code_hash
-            && left.balance_modify_tx == right.balance_modify_tx
-            && left.code_modify_tx == right.code_modify_tx
-            && left.creation_tx == right.creation_tx,
-        "conflicting VM account {address} values at block {block_number}"
-    );
-    merge_vm_account_map(&mut left.slots, right.slots);
-    merge_vm_account_map(&mut left.token_balances, right.token_balances);
-    left.title = deterministic_account_title(left.title, right.title);
-    Ok(left)
-}
-
-fn merge_vm_account_map(target: &mut HashMap<Bytes, Bytes>, incoming: HashMap<Bytes, Bytes>) {
-    // Tycho's protocol-local account views can disagree on an overlapping value.
-    // Sorted protocol order gives the shared VM database one stable winner.
-    for (key, value) in incoming {
-        target.entry(key).or_insert(value);
-    }
-}
-
-fn deterministic_account_title(left: String, right: String) -> String {
-    match (left.is_empty(), right.is_empty()) {
-        (true, false) => right,
-        (false, true) | (true, true) => left,
-        (false, false) => left.min(right),
-    }
-}
-
 fn touched_vm_addresses(message: &BroadcasterProtocolMessage) -> BTreeSet<Bytes> {
     let mut touched = message
         .message
@@ -1205,7 +1339,7 @@ fn touched_vm_addresses(message: &BroadcasterProtocolMessage) -> BTreeSet<Bytes>
         .cloned()
         .collect::<BTreeSet<_>>();
     if let Some(changes) = &message.message.deltas {
-        touched.extend(changes.account_updates.keys().cloned());
+        touched.extend(changes.account_deltas.keys().cloned());
         touched.extend(changes.account_balances.keys().cloned());
     }
     touched
@@ -1218,22 +1352,22 @@ fn project_vm_account(
     address: &Bytes,
 ) -> ProjectedVmAccount {
     let changes = incoming.message.deltas.as_ref();
-    let update = changes.and_then(|changes| changes.account_updates.get(address));
+    let update = changes.and_then(|changes| changes.account_deltas.get(address));
     let balances = changes
         .and_then(|changes| changes.account_balances.get(address))
         .cloned()
         .unwrap_or_default();
-    if update.is_some_and(|update| matches!(update.change, ChangeType::Deletion)) {
+    if update.is_some_and(|update| matches!(update.change_type(), ChangeType::Deletion)) {
         return ProjectedVmAccount::Materialized(None);
     }
-    if update.is_some_and(|update| matches!(update.change, ChangeType::Creation)) {
+    if update.is_some_and(|update| matches!(update.change_type(), ChangeType::Creation)) {
         return ProjectedVmAccount::Residual {
             update: update.cloned(),
             balances,
         };
     }
 
-    let mut account = incoming
+    let account = incoming
         .message
         .snapshots
         .vm_storage
@@ -1254,16 +1388,12 @@ fn project_vm_account(
                     })
             })
         });
-    if let Some(account) = account.as_mut() {
+    if let Some(mut account) = account {
         if let Some(update) = update.cloned() {
-            fold_account_update_into_snapshot(account, update);
+            fold_account_update_into_snapshot(&mut account, update);
         }
-        account.token_balances.extend(
-            balances
-                .into_iter()
-                .map(|(token, balance)| (token, balance.balance)),
-        );
-        ProjectedVmAccount::Materialized(Some(account.clone()))
+        account.token_balances.extend(balances);
+        ProjectedVmAccount::Materialized(Some(account))
     } else {
         ProjectedVmAccount::Residual {
             update: update.cloned(),
@@ -1325,13 +1455,9 @@ fn apply_replacement_feed_message(
         let candidate_partition = candidates.entry(partition.backend).or_default();
         candidate_partition.block_number = Some(partition.block_number);
         candidate_partition.sync_statuses = partition.sync_statuses.clone();
-        let mut messages = partition.messages.iter().collect::<Vec<_>>();
-        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
-        for incoming in messages {
-            merge_raw_message(&mut candidate_partition.messages, incoming.clone());
-            propagate_touched_vm_accounts(&mut candidate_partition.messages, incoming)?;
-        }
-        canonicalize_shared_vm_accounts(&mut candidate_partition.messages)?;
+        let growth =
+            apply_raw_protocol_messages(&mut candidate_partition.messages, &partition.messages)?;
+        log_raw_residue_growth(&growth);
     }
 
     for (protocol, sync_state) in &feed.sync_states {
@@ -1353,130 +1479,6 @@ fn apply_replacement_feed_message(
             .iter()
             .map(|message| message.message.header.number)
             .max();
-    }
-    Ok(())
-}
-
-fn propagate_touched_vm_accounts(
-    messages: &mut [BroadcasterProtocolMessage],
-    incoming: &BroadcasterProtocolMessage,
-) -> Result<()> {
-    let mut touched = incoming
-        .message
-        .snapshots
-        .vm_storage
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut deleted = BTreeSet::new();
-    if let Some(changes) = &incoming.message.deltas {
-        touched.extend(changes.account_updates.keys().cloned());
-        touched.extend(changes.account_balances.keys().cloned());
-        deleted.extend(
-            changes
-                .account_updates
-                .iter()
-                .filter_map(|(address, update)| {
-                    matches!(update.change, ChangeType::Deletion).then_some(address.clone())
-                }),
-        );
-    }
-
-    for address in touched {
-        if deleted.contains(&address) {
-            for message in messages.iter_mut() {
-                message.message.snapshots.vm_storage.remove(&address);
-            }
-            continue;
-        }
-        let mut same_block = messages
-            .iter()
-            .filter(|message| message.message.header.number == incoming.message.header.number)
-            .filter_map(|message| {
-                message
-                    .message
-                    .snapshots
-                    .vm_storage
-                    .get(&address)
-                    .cloned()
-                    .map(|account| (message.protocol.as_str(), account))
-            })
-            .collect::<Vec<_>>();
-        same_block.sort_by_key(|(protocol, _)| *protocol);
-        let canonical = same_block
-            .into_iter()
-            .map(|(_, account)| account)
-            .try_fold(None, |canonical, account| match canonical {
-                Some(canonical) => {
-                    merge_shared_vm_accounts(canonical, account, incoming.message.header.number)
-                        .map(Some)
-                }
-                None => Ok(Some(account)),
-            })?;
-        if let Some(canonical) = canonical {
-            for message in messages
-                .iter_mut()
-                .filter(|message| message.message.snapshots.vm_storage.contains_key(&address))
-            {
-                message
-                    .message
-                    .snapshots
-                    .vm_storage
-                    .insert(address.clone(), canonical.clone());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn canonicalize_shared_vm_accounts(messages: &mut [BroadcasterProtocolMessage]) -> Result<()> {
-    let addresses = messages
-        .iter()
-        .flat_map(|message| message.message.snapshots.vm_storage.keys().cloned())
-        .collect::<BTreeSet<_>>();
-    for address in addresses {
-        let latest_block = messages
-            .iter()
-            .filter(|message| message.message.snapshots.vm_storage.contains_key(&address))
-            .map(|message| message.message.header.number)
-            .max()
-            .unwrap_or_default();
-        let mut latest = messages
-            .iter()
-            .filter(|message| message.message.header.number == latest_block)
-            .filter_map(|message| {
-                message
-                    .message
-                    .snapshots
-                    .vm_storage
-                    .get(&address)
-                    .cloned()
-                    .map(|account| (message.protocol.as_str(), account))
-            })
-            .collect::<Vec<_>>();
-        latest.sort_by_key(|(protocol, _)| *protocol);
-        let canonical = latest.into_iter().map(|(_, account)| account).try_fold(
-            None,
-            |canonical, account| match canonical {
-                Some(canonical) => {
-                    merge_shared_vm_accounts(canonical, account, latest_block).map(Some)
-                }
-                None => Ok(Some(account)),
-            },
-        )?;
-        let Some(canonical) = canonical else {
-            continue;
-        };
-        for message in messages
-            .iter_mut()
-            .filter(|message| message.message.snapshots.vm_storage.contains_key(&address))
-        {
-            message
-                .message
-                .snapshots
-                .vm_storage
-                .insert(address.clone(), canonical.clone());
-        }
     }
     Ok(())
 }
@@ -1568,330 +1570,23 @@ fn validate_update_message_applicable(
     Ok(())
 }
 
-fn merge_raw_message(
-    messages: &mut Vec<BroadcasterProtocolMessage>,
-    mut incoming: BroadcasterProtocolMessage,
-) {
-    if let Some(existing_index) = messages
-        .iter_mut()
-        .position(|message| message.protocol == incoming.protocol)
-    {
-        // Moving the affected protocol out avoids cloning its full materialized state per block.
-        let mut existing = messages.remove(existing_index);
-        let previous_residue_count = raw_residue_entry_count(&existing.message);
-        existing.sync_state = incoming.sync_state;
-        let (incoming_new_tokens, incoming_dci_update) = incoming
-            .message
-            .deltas
-            .as_mut()
-            .map(|deltas| {
-                (
-                    std::mem::take(&mut deltas.new_tokens),
-                    std::mem::take(&mut deltas.dci_update),
-                )
-            })
-            .unwrap_or_default();
-        let incoming_account_lifecycle = incoming
-            .message
-            .deltas
-            .as_ref()
-            .map(|deltas| {
-                deltas
-                    .account_updates
+fn raw_update_new_tokens(message: &BroadcasterUpdateMessage) -> Vec<Token> {
+    let mut new_tokens = Vec::new();
+    for partition in &message.partitions {
+        let mut messages = partition.messages.iter().collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+        for message in messages {
+            new_tokens.extend(
+                message
+                    .message
+                    .deltas
                     .iter()
-                    .filter(|(_, update)| {
-                        matches!(update.change, ChangeType::Creation | ChangeType::Deletion)
-                    })
-                    .map(|(address, update)| (address.clone(), update.clone()))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
-        existing.message = existing.message.merge(incoming.message);
-        if let Some(deltas) = existing.message.deltas.as_mut() {
-            // BlockAggregatedChanges::merge omits new_tokens and dci_update, so preserve them explicitly.
-            deltas.new_tokens.extend(incoming_new_tokens);
-            for (component_id, entrypoints) in incoming_dci_update.new_entrypoints {
-                deltas
-                    .dci_update
-                    .new_entrypoints
-                    .entry(component_id)
-                    .or_default()
-                    .extend(entrypoints);
-            }
-            for (entrypoint_id, params) in incoming_dci_update.new_entrypoint_params {
-                deltas
-                    .dci_update
-                    .new_entrypoint_params
-                    .entry(entrypoint_id)
-                    .or_default()
-                    .extend(params);
-            }
-            deltas
-                .dci_update
-                .trace_results
-                .extend(incoming_dci_update.trace_results);
-            // Creation and deletion are lifecycle edges. The dependency's merge keeps an old
-            // creation forever, so the newest edge has to win before materialization.
-            deltas.account_updates.extend(incoming_account_lifecycle);
-        }
-        let stats = compact_raw_state_sync_message(&mut existing.message);
-        if stats.residual_entries > previous_residue_count {
-            warn!(
-                event = "broadcaster_raw_cache_residue_growth",
-                protocol = %existing.protocol,
-                previous_count = previous_residue_count,
-                current_count = stats.residual_entries,
-                folded_state_updates = stats.folded_state_updates,
-                folded_component_balances = stats.folded_component_balances,
-                folded_component_tvl = stats.folded_component_tvl,
-                folded_account_updates = stats.folded_account_updates,
-                folded_account_balances = stats.folded_account_balances,
-                "Broadcaster raw cache residue grew after compaction"
+                    .flat_map(|deltas| deltas.new_tokens.values())
+                    .cloned(),
             );
         }
-        messages.push(existing);
-    } else {
-        let previous_residue_count = 0;
-        let stats = compact_raw_state_sync_message(&mut incoming.message);
-        if stats.residual_entries > previous_residue_count {
-            warn!(
-                event = "broadcaster_raw_cache_residue_growth",
-                protocol = %incoming.protocol,
-                previous_count = previous_residue_count,
-                current_count = stats.residual_entries,
-                folded_state_updates = stats.folded_state_updates,
-                folded_component_balances = stats.folded_component_balances,
-                folded_component_tvl = stats.folded_component_tvl,
-                folded_account_updates = stats.folded_account_updates,
-                folded_account_balances = stats.folded_account_balances,
-                "Broadcaster raw cache residue grew after compaction"
-            );
-        }
-        messages.push(incoming);
     }
-    messages.sort_by(|left, right| left.protocol.cmp(&right.protocol));
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RawCompactionStats {
-    folded_state_updates: usize,
-    folded_component_balances: usize,
-    folded_component_tvl: usize,
-    folded_account_updates: usize,
-    folded_account_balances: usize,
-    residual_entries: usize,
-}
-
-fn compact_raw_state_sync_message(
-    message: &mut StateSyncMessage<BlockHeader>,
-) -> RawCompactionStats {
-    let removed_components = std::mem::take(&mut message.removed_components);
-    for component_id in removed_components.keys() {
-        message.snapshots.states.remove(component_id);
-        if let Some(deltas) = message.deltas.as_mut() {
-            deltas.state_updates.remove(component_id);
-            deltas.component_balances.remove(component_id);
-            deltas.component_tvl.remove(component_id);
-            deltas.new_protocol_components.remove(component_id);
-            deltas.deleted_protocol_components.remove(component_id);
-        }
-    }
-
-    let mut stats = message
-        .deltas
-        .as_mut()
-        .map(|deltas| fold_block_changes_into_snapshot(&mut message.snapshots, deltas))
-        .unwrap_or_default();
-    if message
-        .deltas
-        .as_ref()
-        .is_some_and(|deltas| !block_changes_has_bootstrap_residue(deltas))
-    {
-        message.deltas = None;
-    }
-    stats.residual_entries = raw_residue_entry_count(message);
-    stats
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the accumulator applies one BlockAggregatedChanges transaction in field order"
-)]
-fn fold_block_changes_into_snapshot(
-    snapshots: &mut Snapshot,
-    deltas: &mut BlockAggregatedChanges,
-) -> RawCompactionStats {
-    let mut stats = RawCompactionStats::default();
-
-    // Tokens come from /tokens/snapshot before the consumer builds its decoder.
-    deltas.new_tokens.clear();
-
-    let deleted_component_ids = deltas
-        .deleted_protocol_components
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    for component_id in &deleted_component_ids {
-        snapshots.states.remove(component_id);
-        deltas.state_updates.remove(component_id);
-        deltas.component_balances.remove(component_id);
-        deltas.component_tvl.remove(component_id);
-        deltas.new_protocol_components.remove(component_id);
-        deltas.dci_update.new_entrypoints.remove(component_id);
-    }
-    deltas.deleted_protocol_components.clear();
-    deltas
-        .new_protocol_components
-        .retain(|component_id, _| !snapshots.states.contains_key(component_id));
-
-    deltas.state_updates.retain(|component_id, delta| {
-        let Some(component) = snapshots.states.get_mut(component_id) else {
-            return true;
-        };
-        apply_protocol_delta_to_snapshot(component, std::mem::take(delta));
-        stats.folded_state_updates += 1;
-        false
-    });
-
-    deltas.component_balances.retain(|component_id, balances| {
-        let Some(component) = snapshots.states.get_mut(component_id) else {
-            return true;
-        };
-        component.state.balances.extend(
-            std::mem::take(&mut balances.0)
-                .into_iter()
-                .map(|(token, balance)| (token, balance.balance)),
-        );
-        stats.folded_component_balances += 1;
-        false
-    });
-
-    deltas.component_tvl.retain(|component_id, tvl| {
-        let Some(component) = snapshots.states.get_mut(component_id) else {
-            return true;
-        };
-        component.component_tvl = Some(*tvl);
-        stats.folded_component_tvl += 1;
-        false
-    });
-
-    let deleted_accounts = deltas
-        .account_updates
-        .iter()
-        .filter_map(|(address, update)| {
-            matches!(update.change, ChangeType::Deletion).then_some(address.clone())
-        })
-        .collect::<Vec<_>>();
-    for address in &deleted_accounts {
-        snapshots.vm_storage.remove(address);
-        deltas.account_balances.remove(address);
-    }
-    deltas.account_updates.retain(|address, update| {
-        if matches!(update.change, ChangeType::Deletion) {
-            stats.folded_account_updates += 1;
-            return false;
-        }
-        if matches!(update.change, ChangeType::Creation) {
-            // A creation has no title or code hashes, so keep the latest operation for bootstrap.
-            snapshots.vm_storage.remove(address);
-            return true;
-        }
-        let Some(account) = snapshots.vm_storage.get_mut(address) else {
-            return true;
-        };
-        fold_account_update_into_snapshot(account, update.clone());
-        stats.folded_account_updates += 1;
-        false
-    });
-
-    deltas.account_balances.retain(|address, balances| {
-        let Some(account) = snapshots.vm_storage.get_mut(address) else {
-            return true;
-        };
-        account.token_balances.extend(
-            std::mem::take(balances)
-                .into_iter()
-                .map(|(token, balance)| (token, balance.balance)),
-        );
-        stats.folded_account_balances += 1;
-        false
-    });
-
-    let active_entrypoint_ids = deltas
-        .dci_update
-        .new_entrypoints
-        .values()
-        .flat_map(|entrypoints| {
-            entrypoints
-                .iter()
-                .map(|entrypoint| entrypoint.external_id.clone())
-        })
-        .collect::<HashSet<_>>();
-    deltas
-        .dci_update
-        .new_entrypoint_params
-        .retain(|entrypoint_id, _| active_entrypoint_ids.contains(entrypoint_id));
-    deltas
-        .dci_update
-        .trace_results
-        .retain(|entrypoint_id, _| active_entrypoint_ids.contains(entrypoint_id));
-
-    stats
-}
-
-fn apply_protocol_delta_to_snapshot(
-    component: &mut simulator_core::broadcaster::wire::ComponentWithState,
-    delta: ProtocolStateDelta,
-) {
-    for attribute in delta.deleted_attributes {
-        component.state.attributes.remove(&attribute);
-    }
-    component.state.attributes.extend(delta.updated_attributes);
-}
-
-fn fold_account_update_into_snapshot(account: &mut ResponseAccount, update: AccountUpdate) {
-    account.slots.extend(update.slots);
-    if let Some(balance) = update.balance {
-        account.native_balance = balance;
-    }
-    if let Some(code) = update.code {
-        account.code = code;
-    }
-}
-
-fn block_changes_has_bootstrap_residue(deltas: &BlockAggregatedChanges) -> bool {
-    !deltas.new_tokens.is_empty()
-        || !deltas.account_updates.is_empty()
-        || !deltas.state_updates.is_empty()
-        || !deltas.new_protocol_components.is_empty()
-        || !deltas.deleted_protocol_components.is_empty()
-        || !deltas.component_balances.is_empty()
-        || !deltas.account_balances.is_empty()
-        || !deltas.component_tvl.is_empty()
-        || !deltas.dci_update.new_entrypoints.is_empty()
-        || !deltas.dci_update.new_entrypoint_params.is_empty()
-        || !deltas.dci_update.trace_results.is_empty()
-        || !deltas.paused_components.is_empty()
-        || !deltas.unpaused_components.is_empty()
-}
-
-fn raw_residue_entry_count(message: &StateSyncMessage<BlockHeader>) -> usize {
-    let delta_entries = message.deltas.as_ref().map_or(0, |deltas| {
-        deltas.new_tokens.len()
-            + deltas.account_updates.len()
-            + deltas.state_updates.len()
-            + deltas.new_protocol_components.len()
-            + deltas.deleted_protocol_components.len()
-            + deltas.component_balances.len()
-            + deltas.account_balances.len()
-            + deltas.component_tvl.len()
-            + deltas.dci_update.new_entrypoints.len()
-            + deltas.dci_update.new_entrypoint_params.len()
-            + deltas.dci_update.trace_results.len()
-            + deltas.paused_components.len()
-            + deltas.unpaused_components.len()
-    });
-    delta_entries + message.removed_components.len()
+    new_tokens
 }
 
 fn apply_update_message(
@@ -2170,16 +1865,16 @@ fn split_protocol_tail_for_snapshot(
         })?;
         builder.append_delta_entries(
             "state_updates",
-            &source.state_updates,
+            &source.state_deltas,
             |deltas, key, value| {
-                deltas.state_updates.insert(key, value);
+                deltas.state_deltas.insert(key, value);
             },
         )?;
         builder.append_delta_entries(
             "account_updates",
-            &source.account_updates,
+            &source.account_deltas,
             |deltas, key, value| {
-                deltas.account_updates.insert(key, value);
+                deltas.account_deltas.insert(key, value);
             },
         )?;
         builder.append_delta_entries(
@@ -2396,10 +2091,11 @@ fn empty_block_changes_fragment(source: &BlockAggregatedChanges) -> BlockAggrega
         chain: source.chain,
         block: source.block.clone(),
         finalized_block_height: source.finalized_block_height,
+        db_committed_block_height: source.db_committed_block_height,
         revert: source.revert,
         new_tokens: HashMap::new(),
-        account_updates: HashMap::new(),
-        state_updates: HashMap::new(),
+        account_deltas: HashMap::new(),
+        state_deltas: HashMap::new(),
         new_protocol_components: HashMap::new(),
         deleted_protocol_components: HashMap::new(),
         component_balances: HashMap::new(),
@@ -2407,8 +2103,6 @@ fn empty_block_changes_fragment(source: &BlockAggregatedChanges) -> BlockAggrega
         component_tvl: HashMap::new(),
         dci_update: Default::default(),
         partial_block_index: source.partial_block_index,
-        paused_components: source.paused_components.clone(),
-        unpaused_components: source.unpaused_components.clone(),
     }
 }
 
@@ -2469,7 +2163,7 @@ fn split_vm_storage_account_for_snapshot(
     message: &BroadcasterProtocolMessage,
     sync_statuses: &BTreeMap<String, BroadcasterProtocolSyncStatus>,
     address: Bytes,
-    account: &ResponseAccount,
+    account: &Account,
     include_sync_statuses: bool,
 ) -> Result<Vec<BroadcasterProtocolMessage>> {
     let mut slots = account
@@ -2574,22 +2268,15 @@ fn hex_json_string_size(bytes: &Bytes) -> usize {
 fn vm_storage_account_fragment_for_slot_range(
     message: &BroadcasterProtocolMessage,
     address: Bytes,
-    account: &ResponseAccount,
+    account: &Account,
     slots: &[(Bytes, Bytes)],
 ) -> BroadcasterProtocolMessage {
     let account = response_account_with_slots(account, slots.iter().cloned().collect());
     vm_storage_account_fragment(message, address, account)
 }
 
-#[expect(
-    deprecated,
-    reason = "creation_tx is deprecated but still part of the broadcaster wire DTO"
-)]
-fn response_account_with_slots(
-    account: &ResponseAccount,
-    slots: HashMap<Bytes, Bytes>,
-) -> ResponseAccount {
-    ResponseAccount::new(
+fn response_account_with_slots(account: &Account, slots: HashMap<Bytes, Bytes>) -> Account {
+    Account::new(
         account.chain,
         account.address.clone(),
         account.title.clone(),
@@ -2607,7 +2294,7 @@ fn response_account_with_slots(
 fn vm_storage_account_fragment(
     message: &BroadcasterProtocolMessage,
     address: Bytes,
-    account: ResponseAccount,
+    account: Account,
 ) -> BroadcasterProtocolMessage {
     let mut fragment = empty_protocol_fragment(message, false);
     fragment
@@ -2777,36 +2464,39 @@ fn format_snapshot_id(chain_id: u64, generation: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::{
-        BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterSnapshotExport,
-        BroadcasterSnapshotSessionsSnapshot, BroadcasterUpstreamState,
+        apply_raw_protocol_messages, BroadcasterReadiness, BroadcasterSnapshotCache,
+        BroadcasterSnapshotExport, BroadcasterSnapshotSessionsSnapshot, BroadcasterUpstreamState,
     };
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
-    use simulator_core::broadcaster::wire::{
-        ComponentWithState, FeedMessage, Snapshot, StateSyncMessage,
-    };
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk,
-        BroadcasterSubscriptionEvent, BroadcasterSubscriptionTracker,
+        BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk, BroadcasterSubscriptionEvent,
+        BroadcasterSubscriptionTracker,
     };
     use tycho_common::{
-        dto::{
-            AccountBalance, AccountUpdate, BlockAggregatedChanges, ChangeType, ComponentBalance,
-            ProtocolComponent as DtoProtocolComponent, ResponseAccount, ResponseProtocolState,
-            ResponseToken, TokenBalances,
+        dto::{ProtocolStateDelta as SimulationProtocolStateDelta, ResponseToken},
+        models::{
+            blockchain::BlockAggregatedChanges,
+            contract::{Account, AccountBalance, AccountDelta},
+            protocol::{
+                ProtocolComponent as DtoProtocolComponent, ProtocolComponentState,
+                ProtocolComponentStateDelta,
+            },
+            Chain as DtoChain, ChangeType,
         },
-        models::Chain as DtoChain,
         Bytes as DtoBytes,
     };
-    use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
-        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_client::feed::{
+            synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
+            BlockHeader, FeedMessage, SynchronizerState,
+        },
         tycho_common::{
             models::{token::Token, Chain},
             simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -2850,7 +2540,7 @@ mod tests {
 
         fn delta_transition(
             &mut self,
-            _delta: ProtocolStateDelta,
+            _delta: SimulationProtocolStateDelta,
             _tokens: &HashMap<Bytes, Token>,
             _balances: &Balances,
         ) -> Result<(), TransitionError> {
@@ -2963,7 +2653,7 @@ mod tests {
     fn vm_account_fragments<'a>(
         export: &'a BroadcasterSnapshotExport,
         account_address: &DtoBytes,
-    ) -> Vec<&'a ResponseAccount> {
+    ) -> Vec<&'a Account> {
         snapshot_chunks(export)
             .into_iter()
             .flat_map(|chunk| &chunk.partitions)
@@ -2986,7 +2676,7 @@ mod tests {
             .collect()
     }
 
-    fn account_metadata_without_slots(account: &ResponseAccount) -> ResponseAccount {
+    fn account_metadata_without_slots(account: &Account) -> Account {
         let mut metadata = account.clone();
         metadata.slots.clear();
         metadata
@@ -2995,7 +2685,7 @@ mod tests {
     fn assert_vm_storage_account_fragments_match(
         export: &BroadcasterSnapshotExport,
         account_address: &DtoBytes,
-        expected_account: &ResponseAccount,
+        expected_account: &Account,
     ) {
         let fragments = vm_account_fragments(export, account_address);
         assert!(fragments.len() > 1);
@@ -3334,373 +3024,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_cache_compacts_protocol_updates_into_snapshot() {
-        let component_id = "raw-1";
-        let token = DtoBytes::from([17u8; 20]);
-        let mut messages = Vec::new();
-        super::merge_raw_message(
-            &mut messages,
-            raw_protocol_message_with_changes(
-                "uniswap_v2",
-                1,
-                Snapshot {
-                    states: HashMap::from([(
-                        component_id.to_string(),
-                        raw_component_with_state(component_id, 1),
-                    )]),
-                    vm_storage: HashMap::new(),
-                },
-                None,
-                HashMap::new(),
-            ),
-        );
-
-        for block_number in 2..=20 {
-            let mut changes = BlockAggregatedChanges::default();
-            changes.state_updates.insert(
-                component_id.to_string(),
-                component_state_delta(
-                    component_id,
-                    [("version", DtoBytes::from([block_number as u8; 32]))],
-                    (block_number == 20).then_some("large"),
-                ),
-            );
-            changes.component_balances.insert(
-                component_id.to_string(),
-                TokenBalances(HashMap::from([(
-                    token.clone(),
-                    component_balance(component_id, token.clone(), block_number as u8),
-                )])),
-            );
-            changes
-                .component_tvl
-                .insert(component_id.to_string(), block_number as f64);
-            super::merge_raw_message(
-                &mut messages,
-                raw_protocol_message_with_changes(
-                    "uniswap_v2",
-                    block_number,
-                    Snapshot::default(),
-                    Some(changes),
-                    HashMap::new(),
-                ),
-            );
-        }
-
-        let message = &messages[0];
-        let component = &message.message.snapshots.states[component_id];
-        assert_eq!(
-            component.state.attributes["version"],
-            DtoBytes::from([20u8; 32])
-        );
-        assert!(!component.state.attributes.contains_key("large"));
-        assert_eq!(component.state.balances[&token], DtoBytes::from([20u8; 32]));
-        assert_eq!(component.component_tvl, Some(20.0));
-        assert!(message.message.deltas.is_none());
-        assert!(message.message.removed_components.is_empty());
-        assert_eq!(message.message.header.number, 20);
-        assert!(matches!(
-            message.sync_state,
-            SynchronizerState::Ready(ref header) if header.number == 20
-        ));
-    }
-
-    #[test]
-    fn raw_cache_keeps_unfoldable_component_residue() {
-        let component_id = "missing";
-        let token = DtoBytes::from([18u8; 20]);
-        let mut changes = BlockAggregatedChanges::default();
-        changes.state_updates.insert(
-            component_id.to_string(),
-            component_state_delta(component_id, [("version", DtoBytes::from([2u8; 32]))], []),
-        );
-        changes.component_balances.insert(
-            component_id.to_string(),
-            TokenBalances(HashMap::from([(
-                token.clone(),
-                component_balance(component_id, token, 2),
-            )])),
-        );
-        changes.component_tvl.insert(component_id.to_string(), 2.0);
-        let expected = changes.clone();
-        let mut message = raw_protocol_message_with_changes(
-            "uniswap_v2",
-            2,
-            Snapshot::default(),
-            Some(changes),
-            HashMap::new(),
-        );
-
-        let stats = super::compact_raw_state_sync_message(&mut message.message);
-
-        assert_eq!(message.message.deltas, Some(expected));
-        assert_eq!(stats.residual_entries, 3);
-    }
-
-    #[test]
-    fn raw_cache_drops_process_history_not_needed_by_bootstrap() {
-        let mut messages = Vec::new();
-        for block_number in 1..=2 {
-            let token_address = DtoBytes::from([block_number as u8; 20]);
-            let mut changes = BlockAggregatedChanges::default();
-            changes.new_tokens.insert(
-                token_address.clone(),
-                ResponseToken {
-                    chain: DtoChain::Ethereum.into(),
-                    address: token_address,
-                    symbol: format!("T{block_number}"),
-                    decimals: 18,
-                    tax: 0,
-                    gas: Vec::new(),
-                    quality: 100,
-                },
-            );
-            changes
-                .dci_update
-                .trace_results
-                .insert(format!("trace-{block_number}"), Default::default());
-            super::merge_raw_message(
-                &mut messages,
-                raw_protocol_message_with_changes(
-                    "vm:balancer_v2",
-                    block_number,
-                    Snapshot::default(),
-                    Some(changes),
-                    HashMap::new(),
-                ),
-            );
-        }
-
-        assert!(messages[0].message.deltas.is_none());
-    }
-
-    #[test]
-    fn raw_cache_compacts_vm_updates_into_snapshot() {
-        let address = DtoBytes::from([31u8; 20]);
-        let token = DtoBytes::from([32u8; 20]);
-        let mut message = raw_protocol_message_with_changes(
-            "vm:balancer_v2",
-            1,
-            Snapshot {
-                states: HashMap::new(),
-                vm_storage: HashMap::from([(
-                    address.clone(),
-                    raw_response_account(address.clone(), 0, 0),
-                )]),
-            },
-            None,
-            HashMap::new(),
-        );
-        let mut changes = BlockAggregatedChanges::default();
-        changes.account_updates.insert(
-            address.clone(),
-            account_update(
-                address.clone(),
-                ChangeType::Update,
-                7,
-                Some(DtoBytes::from([41u8; 32])),
-            ),
-        );
-        changes.account_balances.insert(
-            address.clone(),
-            HashMap::from([(
-                token.clone(),
-                account_balance(address.clone(), token.clone(), 42),
-            )]),
-        );
-        message.message.deltas = Some(changes);
-
-        super::compact_raw_state_sync_message(&mut message.message);
-
-        let account = &message.message.snapshots.vm_storage[&address];
-        assert_eq!(
-            account.slots[&DtoBytes::from([7u8; 32])],
-            DtoBytes::from([8u8; 32])
-        );
-        assert_eq!(account.native_balance, DtoBytes::from([41u8; 32]));
-        assert_eq!(account.token_balances[&token], DtoBytes::from([42u8; 32]));
-        assert!(message.message.deltas.is_none());
-    }
-
-    #[test]
-    fn raw_cache_keeps_vm_updates_with_distinct_engine_semantics() -> Result<()> {
-        let creation = DtoBytes::from([51u8; 20]);
-        let deletion = DtoBytes::from([52u8; 20]);
-        let unspecified = DtoBytes::from([53u8; 20]);
-        let absent = DtoBytes::from([54u8; 20]);
-        let mut vm_storage = HashMap::new();
-        for address in [&creation, &deletion, &unspecified] {
-            vm_storage.insert(address.clone(), raw_response_account(address.clone(), 0, 0));
-        }
-        let mut changes = BlockAggregatedChanges::default();
-        for (address, change, seed) in [
-            (creation.clone(), ChangeType::Creation, 1),
-            (deletion.clone(), ChangeType::Deletion, 2),
-            (unspecified.clone(), ChangeType::Unspecified, 3),
-            (absent.clone(), ChangeType::Update, 4),
-        ] {
-            changes
-                .account_updates
-                .insert(address.clone(), account_update(address, change, seed, None));
-        }
-        let expected = HashMap::from([
-            (creation.clone(), changes.account_updates[&creation].clone()),
-            (absent.clone(), changes.account_updates[&absent].clone()),
-        ]);
-        let mut message = raw_protocol_message_with_changes(
-            "vm:balancer_v2",
-            2,
-            Snapshot {
-                states: HashMap::new(),
-                vm_storage,
-            },
-            Some(changes),
-            HashMap::new(),
-        );
-
-        super::compact_raw_state_sync_message(&mut message.message);
-
-        let Some(deltas) = message.message.deltas else {
-            return Err(anyhow!("expected VM update residue"));
-        };
-        assert_eq!(deltas.account_updates, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn raw_cache_account_creation_then_deletion_does_not_resurrect_on_bootstrap() {
-        let address = DtoBytes::from([58u8; 20]);
-        let mut creation = BlockAggregatedChanges::default();
-        creation.account_updates.insert(
-            address.clone(),
-            account_update(address.clone(), ChangeType::Creation, 1, None),
-        );
-        let mut messages = Vec::new();
-        super::merge_raw_message(
-            &mut messages,
-            raw_protocol_message_with_changes(
-                "vm:curve",
-                10,
-                Snapshot::default(),
-                Some(creation),
-                HashMap::new(),
-            ),
-        );
-
-        let mut deletion = BlockAggregatedChanges::default();
-        deletion.account_updates.insert(
-            address.clone(),
-            account_update(address.clone(), ChangeType::Deletion, 2, None),
-        );
-        super::merge_raw_message(
-            &mut messages,
-            raw_protocol_message_with_changes(
-                "vm:curve",
-                11,
-                Snapshot::default(),
-                Some(deletion),
-                HashMap::new(),
-            ),
-        );
-
-        assert!(!messages[0]
-            .message
-            .snapshots
-            .vm_storage
-            .contains_key(&address));
-        assert!(messages[0].message.deltas.is_none());
-    }
-
-    #[test]
-    fn raw_cache_prunes_removed_components_for_fresh_bootstrap() {
-        let component_id = "removed";
-        let account_address = DtoBytes::from([61u8; 20]);
-        let mut changes = BlockAggregatedChanges::default();
-        changes.state_updates.insert(
-            component_id.to_string(),
-            component_state_delta(component_id, [("version", DtoBytes::from([2u8; 32]))], []),
-        );
-        changes
-            .component_balances
-            .insert(component_id.to_string(), TokenBalances::default());
-        changes.component_tvl.insert(component_id.to_string(), 2.0);
-        changes.new_protocol_components.insert(
-            component_id.to_string(),
-            raw_component(component_id, "uniswap_v2", 2),
-        );
-        changes.deleted_protocol_components.insert(
-            component_id.to_string(),
-            raw_component(component_id, "uniswap_v2", 2),
-        );
-        let mut message = raw_protocol_message_with_changes(
-            "uniswap_v2",
-            2,
-            Snapshot {
-                states: HashMap::from([(
-                    component_id.to_string(),
-                    raw_component_with_state(component_id, 1),
-                )]),
-                vm_storage: HashMap::from([(
-                    account_address.clone(),
-                    raw_response_account(account_address.clone(), 0, 0),
-                )]),
-            },
-            Some(changes),
-            HashMap::from([(
-                component_id.to_string(),
-                raw_component(component_id, "uniswap_v2", 2),
-            )]),
-        );
-
-        super::compact_raw_state_sync_message(&mut message.message);
-
-        assert!(!message.message.snapshots.states.contains_key(component_id));
-        assert!(message.message.deltas.is_none());
-        assert!(message.message.removed_components.is_empty());
-        assert!(message
-            .message
-            .snapshots
-            .vm_storage
-            .contains_key(&account_address));
-    }
-
-    #[test]
-    fn raw_cache_residue_count_does_not_grow_for_foldable_updates() {
-        let component_id = "raw-1";
-        let mut messages = Vec::new();
-        super::merge_raw_message(
-            &mut messages,
-            raw_protocol_message_with_states(HashMap::from([(
-                component_id.to_string(),
-                raw_component_with_state(component_id, 1),
-            )])),
-        );
-
-        for block_number in 11..=1_010 {
-            let mut changes = BlockAggregatedChanges::default();
-            changes.state_updates.insert(
-                component_id.to_string(),
-                component_state_delta(
-                    component_id,
-                    [("version", DtoBytes::from([(block_number % 255) as u8; 32]))],
-                    [],
-                ),
-            );
-            super::merge_raw_message(
-                &mut messages,
-                raw_protocol_message_with_changes(
-                    "uniswap_v2",
-                    block_number,
-                    Snapshot::default(),
-                    Some(changes),
-                    HashMap::new(),
-                ),
-            );
-            assert_eq!(super::raw_residue_entry_count(&messages[0].message), 0);
-        }
-    }
-
     #[tokio::test]
     async fn raw_cache_and_export_stay_bounded_after_100_000_fixed_key_updates() -> Result<()> {
         const KEY_COUNT: usize = 16;
@@ -3739,7 +3062,7 @@ mod tests {
             for update_index in 0..UPDATE_COUNT {
                 let component_id = format!("raw-{:02}", update_index as usize % KEY_COUNT);
                 let mut changes = BlockAggregatedChanges::default();
-                changes.state_updates.insert(
+                changes.state_deltas.insert(
                     component_id.clone(),
                     component_state_delta(
                         &component_id,
@@ -3750,16 +3073,16 @@ mod tests {
                         [],
                     ),
                 );
-                super::merge_raw_message(
+                apply_raw_protocol_messages(
                     &mut partition.messages,
-                    raw_protocol_message_with_changes(
+                    &[raw_protocol_message_with_changes(
                         "uniswap_v2",
                         update_index + 11,
                         Snapshot::default(),
                         Some(changes),
                         HashMap::new(),
-                    ),
-                );
+                    )],
+                )?;
             }
 
             assert_eq!(partition.messages.len(), 1);
@@ -3817,7 +3140,7 @@ mod tests {
 
         for block_number in 11..=510 {
             let mut changes = BlockAggregatedChanges::default();
-            changes.state_updates.insert(
+            changes.state_deltas.insert(
                 component_id.to_string(),
                 component_state_delta(
                     component_id,
@@ -3903,6 +3226,47 @@ mod tests {
     }
 
     #[test]
+    fn a_split_snapshot_message_joins_back_to_the_original() -> Result<()> {
+        use simulator_core::broadcaster::RawSnapshotReassembly;
+
+        let states = (0..24u8)
+            .map(|seed| {
+                let component_id = format!("pool-{seed:04}");
+                let state = raw_component_with_state(&component_id, seed);
+                (component_id, state)
+            })
+            .collect();
+        let account_address = DtoBytes::from([45u8; 20]);
+        let vm = raw_vm_protocol_message(
+            account_address.clone(),
+            raw_response_account(account_address, 48, 256),
+        );
+        for (message, backend) in [
+            (
+                raw_protocol_message_with_states(states),
+                BroadcasterBackend::Native,
+            ),
+            (residual_tail_message(24, 384), BroadcasterBackend::Native),
+            (vm, BroadcasterBackend::Vm),
+        ] {
+            let sizing_ctx = snapshot_chunk_build_context_for_backend(usize::MAX, backend);
+            let whole = sizing_ctx.raw_fragment_size(message.clone(), &BTreeMap::new(), false)?;
+            let ctx = snapshot_chunk_build_context_for_backend(whole / 3, backend);
+
+            let fragments =
+                super::split_protocol_message_for_snapshot(&ctx, &message, &BTreeMap::new())?;
+            assert!(fragments.len() > 1, "the cap forces a split");
+
+            let mut reassembly = RawSnapshotReassembly::default();
+            for fragment in fragments {
+                reassembly.push(fragment)?;
+            }
+            assert_eq!(reassembly.take_messages(), vec![message]);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn raw_cache_tail_preserves_unsplittable_delta_fields_and_wire_contract() -> Result<()> {
         let mut message = residual_tail_message(12, 256);
         let deltas = message
@@ -3922,7 +3286,8 @@ mod tests {
                     tax: 0,
                     gas: Vec::new(),
                     quality: 100,
-                },
+                }
+                .into(),
             );
             deltas
                 .dci_update
@@ -4223,7 +3588,6 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         let rfq_status = status
@@ -4249,7 +3613,6 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(status.readiness, BroadcasterReadiness::Ready);
@@ -4307,7 +3670,6 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(
@@ -4321,7 +3683,6 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(warming.readiness, BroadcasterReadiness::SnapshotWarmingUp);
@@ -4333,7 +3694,6 @@ mod tests {
                 500,
                 upstream_state.snapshot().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         assert_eq!(ready.readiness, BroadcasterReadiness::Ready);
@@ -4488,7 +3848,7 @@ mod tests {
 
     fn raw_vm_protocol_message(
         account_address: DtoBytes,
-        account: ResponseAccount,
+        account: Account,
     ) -> BroadcasterProtocolMessage {
         BroadcasterProtocolMessage::new(
             "vm:balancer_v2",
@@ -4529,22 +3889,22 @@ mod tests {
         component_id: &str,
         attributes: impl IntoIterator<Item = (&'static str, DtoBytes)>,
         deleted_attributes: impl IntoIterator<Item = &'static str>,
-    ) -> ProtocolStateDelta {
-        ProtocolStateDelta {
-            component_id: component_id.to_string(),
-            updated_attributes: attributes
+    ) -> ProtocolComponentStateDelta {
+        ProtocolComponentStateDelta::new(
+            component_id,
+            attributes
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value))
                 .collect(),
-            deleted_attributes: deleted_attributes.into_iter().map(str::to_string).collect(),
-        }
+            deleted_attributes.into_iter().map(str::to_string).collect(),
+        )
     }
 
     fn residual_tail_message(entry_count: usize, value_size: usize) -> BroadcasterProtocolMessage {
         let mut changes = BlockAggregatedChanges::default();
         for index in (0..entry_count).rev() {
             let component_id = format!("missing-{index:04}");
-            changes.state_updates.insert(
+            changes.state_deltas.insert(
                 component_id.clone(),
                 component_state_delta(
                     &component_id,
@@ -4567,28 +3927,18 @@ mod tests {
         change: ChangeType,
         slot_seed: u8,
         balance: Option<DtoBytes>,
-    ) -> AccountUpdate {
-        AccountUpdate::new(
+    ) -> AccountDelta {
+        AccountDelta::new(
+            DtoChain::Ethereum,
             address,
-            DtoChain::Ethereum.into(),
             HashMap::from([(
                 DtoBytes::from([slot_seed; 32]),
-                DtoBytes::from([slot_seed.saturating_add(1); 32]),
+                Some(DtoBytes::from([slot_seed.saturating_add(1); 32])),
             )]),
             balance,
             None,
             change,
         )
-    }
-
-    fn component_balance(component_id: &str, token: DtoBytes, balance: u8) -> ComponentBalance {
-        ComponentBalance {
-            token,
-            balance: DtoBytes::from([balance; 32]),
-            balance_float: f64::from(balance),
-            modify_tx: DtoBytes::from([balance; 32]),
-            component_id: component_id.to_string(),
-        }
     }
 
     fn account_balance(account: DtoBytes, token: DtoBytes, balance: u8) -> AccountBalance {
@@ -4650,7 +4000,7 @@ mod tests {
 
     fn raw_component_with_state(component_id: &str, seed: u8) -> ComponentWithState {
         ComponentWithState {
-            state: ResponseProtocolState {
+            state: ProtocolComponentState {
                 component_id: component_id.to_string(),
                 attributes: HashMap::from([(
                     "large".to_string(),
@@ -4669,9 +4019,9 @@ mod tests {
             id: component_id.to_string(),
             protocol_system: protocol.to_string(),
             protocol_type_name: protocol.to_string(),
-            chain: DtoChain::Ethereum.into(),
+            chain: DtoChain::Ethereum,
             tokens: vec![DtoBytes::from([seed; 20]), DtoBytes::from([seed + 1; 20])],
-            contract_ids: Vec::new(),
+            contract_addresses: Vec::new(),
             static_attributes: HashMap::new(),
             change: Default::default(),
             creation_tx: DtoBytes::from([seed; 32]),
@@ -4685,7 +4035,7 @@ mod tests {
         address: DtoBytes,
         slot_count: usize,
         slot_value_size: usize,
-    ) -> ResponseAccount {
+    ) -> Account {
         let mut slots = HashMap::new();
         for index in 0..slot_count {
             let seed = index as u8;
@@ -4697,8 +4047,8 @@ mod tests {
             );
         }
 
-        ResponseAccount::new(
-            DtoChain::Ethereum.into(),
+        Account::new(
+            DtoChain::Ethereum,
             address,
             "vm-account".to_string(),
             slots,
@@ -4780,7 +4130,7 @@ mod tests {
     ) -> StateSyncMessage<BlockHeader> {
         let mut message = raw_snapshot_message(protocol, header, component_seed);
         let mut changes = BlockAggregatedChanges::default();
-        changes.state_updates.insert(
+        changes.state_deltas.insert(
             "still-unresolved".to_string(),
             component_state_delta(
                 "still-unresolved",
@@ -4863,6 +4213,106 @@ mod tests {
                 .any(|message| message.message.header == block_12),
             _ => false,
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_recovery_rejects_unknown_protocol_before_staging() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let header = linked_header(10, 10, 9);
+        cache.begin_same_generation_recovery().await;
+        let result = cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", header.clone(), 1),
+                )],
+                vec![("uniswap_v2", header.clone()), ("future_protocol", header)],
+            ))
+            .await;
+        let Err(error) = result else {
+            return Err(anyhow!(
+                "unknown required feed protocols cannot be discarded to finish recovery"
+            ));
+        };
+        assert!(error.to_string().contains("future_protocol"));
+        assert!(cache.replacement_pending().await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_replacement_keeps_noncanonical_upstream_identities_distinct() -> Result<()> {
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]);
+        let protocols = ["uniswap_v2", "UNISWAP_V2"];
+        let block_10 = linked_header(10, 10, 9);
+        cache
+            .apply_feed_message(&raw_feed(
+                protocols
+                    .iter()
+                    .map(|protocol| {
+                        (
+                            *protocol,
+                            raw_snapshot_message(protocol, block_10.clone(), 1),
+                        )
+                    })
+                    .collect(),
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol, block_10.clone()))
+                    .collect(),
+            ))
+            .await?;
+        cache.begin_same_generation_recovery().await;
+
+        let block_12 = linked_header(12, 12, 11);
+        cache
+            .apply_feed_message(&raw_feed(
+                vec![(
+                    "uniswap_v2",
+                    raw_snapshot_message("uniswap_v2", block_12.clone(), 2),
+                )],
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol, block_12.clone()))
+                    .collect(),
+            ))
+            .await?;
+        assert!(
+            cache.replacement_pending().await,
+            "a canonical domain identity cannot replace other upstream keys"
+        );
+
+        cache
+            .apply_feed_message(&raw_feed(
+                protocols[1..]
+                    .iter()
+                    .map(|protocol| {
+                        (
+                            *protocol,
+                            raw_snapshot_message(protocol, block_12.clone(), 3),
+                        )
+                    })
+                    .collect(),
+                protocols
+                    .iter()
+                    .map(|protocol| (*protocol, block_12.clone()))
+                    .collect(),
+            ))
+            .await?;
+        assert!(!cache.replacement_pending().await);
+        let snapshot = cache.export_snapshot(8_388_608).await?;
+        let published_protocols = snapshot
+            .payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                BroadcasterPayload::SnapshotChunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .flat_map(|chunk| &chunk.partitions)
+            .flat_map(|partition| &partition.messages)
+            .map(|message| message.protocol.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(published_protocols, HashSet::from(protocols));
         Ok(())
     }
 
@@ -4962,7 +4412,6 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         assert!(first_status.snapshot.recovery_pending);
@@ -4974,7 +4423,6 @@ mod tests {
                 8_388_608,
                 connected_upstream().await,
                 BroadcasterSnapshotSessionsSnapshot::default(),
-                std::time::Duration::from_secs(5),
             )
             .await;
         assert!(second_status.snapshot.recovery_pending);
@@ -5275,7 +4723,7 @@ mod tests {
 
         let block_11 = linked_header(11, 11, 10);
         let mut changes = BlockAggregatedChanges::default();
-        changes.state_updates.insert(
+        changes.state_deltas.insert(
             "pool-0001".to_string(),
             component_state_delta("pool-0001", [("value", DtoBytes::from([77u8; 32]))], []),
         );
@@ -5319,13 +4767,17 @@ mod tests {
         first
             .slots
             .insert(first_slot.clone(), DtoBytes::from([11u8; 32]));
-        first
-            .token_balances
-            .insert(first_token.clone(), DtoBytes::from([12u8; 32]));
+        first.token_balances.insert(
+            first_token.clone(),
+            account_balance(address.clone(), first_token.clone(), 12),
+        );
         let mut second = first.clone();
         second.title = "Balancer token".to_string();
         second.slots = HashMap::from([(second_slot.clone(), DtoBytes::from([21u8; 32]))]);
-        second.token_balances = HashMap::from([(second_token.clone(), DtoBytes::from([22u8; 32]))]);
+        second.token_balances = HashMap::from([(
+            second_token.clone(),
+            account_balance(address.clone(), second_token.clone(), 22),
+        )]);
         let message = |account| StateSyncMessage {
             header: block.clone(),
             snapshots: Snapshot {
@@ -5362,11 +4814,17 @@ mod tests {
             );
             assert_eq!(account.token_balances.len(), 2);
             assert_eq!(
-                account.token_balances.get(&first_token),
+                account
+                    .token_balances
+                    .get(&first_token)
+                    .map(|balance| &balance.balance),
                 Some(&DtoBytes::from([12u8; 32]))
             );
             assert_eq!(
-                account.token_balances.get(&second_token),
+                account
+                    .token_balances
+                    .get(&second_token)
+                    .map(|balance| &balance.balance),
                 Some(&DtoBytes::from([22u8; 32]))
             );
         }
@@ -5480,13 +4938,15 @@ mod tests {
 
         let delta_message = |slot_value| {
             let mut update = account_update(address.clone(), ChangeType::Update, 7, None);
-            update.slots =
-                HashMap::from([(DtoBytes::from([7u8; 32]), DtoBytes::from([slot_value; 32]))]);
+            update.slots = HashMap::from([(
+                DtoBytes::from([7u8; 32]),
+                Some(DtoBytes::from([slot_value; 32])),
+            )]);
             StateSyncMessage {
                 header: block_11.clone(),
                 snapshots: Snapshot::default(),
                 deltas: Some(BlockAggregatedChanges {
-                    account_updates: HashMap::from([(address.clone(), update)]),
+                    account_deltas: HashMap::from([(address.clone(), update)]),
                     ..Default::default()
                 }),
                 removed_components: HashMap::new(),
@@ -5531,15 +4991,5 @@ mod tests {
                 Some("build_failed")
             );
         });
-    }
-
-    #[test]
-    fn sync_status_clone_keeps_repo_owned_shape() {
-        let status = BroadcasterProtocolSyncStatus {
-            kind: BroadcasterProtocolSyncStatusKind::Ready,
-            block: None,
-            reason: None,
-        };
-        assert_eq!(status.kind, BroadcasterProtocolSyncStatusKind::Ready);
     }
 }

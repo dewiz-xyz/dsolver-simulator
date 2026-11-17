@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,20 +10,26 @@ use futures::future::BoxFuture;
 use rand::Rng;
 use redis::streams::StreamRangeReply;
 use serde_json::Value;
+use state_history::StreamPosition;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
+use crate::broadcaster::state_history::{
+    delta_entry_from_update, StateHistoryRuntime, StateHistoryUpdateProjection,
+};
 use crate::config::BroadcasterRedisConfig;
 use crate::metrics::{
     emit_broadcaster_redis_append_failure, emit_broadcaster_writer_fence_failure,
 };
 use simulator_core::broadcaster::{
-    BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope, BroadcasterHeartbeat,
-    BroadcasterPayload, BroadcasterProgress, BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk,
-    BroadcasterRecoveryCommit, BroadcasterRecoveryManifest, BroadcasterRecoveryStart,
-    BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry, BroadcasterUpdateMessage,
+    BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
+    BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterRecoveryCatchUp,
+    BroadcasterRecoveryChunk, BroadcasterRecoveryCommit, BroadcasterRecoveryManifest,
+    BroadcasterRecoveryStart, BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry,
+    BroadcasterUpdateMessage, ProtocolStateHeads,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 const APPEND_EXHAUSTED_MESSAGE: &str = "Redis broadcaster stream append retry window exhausted";
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
@@ -256,6 +262,7 @@ pub(crate) struct BroadcasterRecoveryTransaction {
     pub(crate) recovery_id: String,
     pub(crate) backends: Vec<BroadcasterBackend>,
     pub(crate) replacement_json: String,
+    pub(crate) replacement_heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
     pub(crate) buffer_a: Vec<BroadcasterUpdateMessage>,
 }
 
@@ -264,6 +271,7 @@ pub(crate) struct BroadcasterRecoveryPublication {
     pub(crate) recovery_id: String,
     pub(crate) target_state_version: u64,
     pub(crate) commit_entry_id: String,
+    pub(crate) commit_position: StreamPosition,
     pub(crate) replay_boundary: BroadcasterRedisReplayBoundary,
     pub(crate) encoded_bytes: usize,
     pub(crate) chunk_count: usize,
@@ -678,6 +686,8 @@ pub struct BroadcasterRedisPublisher {
     feed_gate: watch::Sender<FeedGateState>,
     feed_pause_guard: Arc<Mutex<()>>,
     deployment_admission: watch::Sender<BroadcasterDeploymentAdmissionSnapshot>,
+    state_history: Option<Arc<StateHistoryRuntime>>,
+    published_heads: watch::Sender<BTreeMap<BroadcasterBackend, ProtocolStateHeads>>,
 }
 
 impl fmt::Debug for BroadcasterRedisPublisher {
@@ -891,6 +901,68 @@ impl BroadcasterRedisPublisher {
         Self::new_with_mode(config, writer, 1, BroadcasterRedisPublisherMode::Passive)
     }
 
+    pub fn with_required_protocols(self, native: Vec<ProtocolKind>, vm: Vec<ProtocolKind>) -> Self {
+        let heads = [
+            (BroadcasterBackend::Native, native),
+            (BroadcasterBackend::Vm, vm),
+        ]
+        .into_iter()
+        .filter(|(_, protocols)| !protocols.is_empty())
+        .map(|(backend, protocols)| (backend, ProtocolStateHeads::new(protocols)))
+        .collect();
+        self.published_heads.send_replace(heads);
+        self
+    }
+
+    /// Returns complete heads already available to consumers, without waiting on Redis I/O.
+    pub fn published_backend_heads(&self) -> BTreeMap<BroadcasterBackend, Option<BlockIdentity>> {
+        self.published_heads
+            .borrow()
+            .iter()
+            .map(|(backend, heads)| (*backend, heads.complete_head()))
+            .collect()
+    }
+
+    pub(crate) fn published_heads_for_telemetry(
+        &self,
+    ) -> Result<BTreeMap<BroadcasterBackend, Option<BlockIdentity>>, &'static str> {
+        // Redis writes hold this mutex across I/O. A busy publisher is an unknown sample,
+        // so telemetry never queues behind publication or combines heads from different modes.
+        let guard = self.inner.try_lock().map_err(|_| "publisher_busy")?;
+        if guard.mode != BroadcasterRedisPublisherMode::Active {
+            return Err(guard.mode.as_str());
+        }
+        Ok(self.published_backend_heads())
+    }
+
+    /// Install the frozen snapshot's heads after its artifact is available, before handoff drain.
+    pub(crate) async fn install_published_snapshot_heads(
+        &self,
+        heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
+    ) {
+        let _guard = self.inner.lock().await;
+        self.published_heads.send_replace(heads);
+    }
+
+    fn update_backend_heads(
+        heads: &mut BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
+        update: &BroadcasterUpdateMessage,
+    ) {
+        for partition in &update.partitions {
+            let Some(protocol_heads) = heads.get_mut(&partition.backend) else {
+                continue;
+            };
+            if !partition.messages.is_empty() {
+                protocol_heads.apply_messages(&partition.messages);
+            } else if !partition.new_pairs.is_empty()
+                || !partition.updated_states.is_empty()
+                || !partition.removed_pairs.is_empty()
+            {
+                protocol_heads.clear();
+            }
+        }
+    }
+
     pub(crate) fn recovery_max_buffered_native_blocks(&self) -> usize {
         self.config.recovery_max_buffered_native_blocks
     }
@@ -959,7 +1031,18 @@ impl BroadcasterRedisPublisher {
             feed_gate,
             feed_pause_guard: Arc::new(Mutex::new(())),
             deployment_admission,
+            state_history: None,
+            published_heads: watch::channel(BTreeMap::new()).0,
         }
+    }
+
+    pub fn with_state_history(mut self, state_history: Arc<StateHistoryRuntime>) -> Self {
+        self.state_history = Some(state_history);
+        self
+    }
+
+    pub(crate) fn state_history(&self) -> Option<Arc<StateHistoryRuntime>> {
+        self.state_history.as_ref().map(Arc::clone)
     }
 
     pub fn deployment_admission_snapshot(&self) -> BroadcasterDeploymentAdmissionSnapshot {
@@ -1065,21 +1148,21 @@ impl BroadcasterRedisPublisher {
         let append_failures_before = guard.append_failure_count;
         for payload in handoff.payloads {
             let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
-            if let Err(error) = self.append_live_payload_locked(&mut guard, payload).await {
-                let message = format!("{error:#}");
-                if is_stale_writer_error(&error) {
-                    guard.record_retired(message.clone());
-                    self.set_deployment_phase(BroadcasterDeploymentPhase::Retired, Some(message));
-                } else {
-                    if guard.append_failure_count > append_failures_before {
-                        guard.retry_exhaustion_count =
-                            guard.retry_exhaustion_count.saturating_add(1);
-                    }
-                    guard.record_retired(message.clone());
-                    self.set_deployment_phase(BroadcasterDeploymentPhase::Fatal, Some(message));
+            let Err(error) = self.append_live_payload_locked(&mut guard, payload).await else {
+                continue;
+            };
+            let message = format!("{error:#}");
+            let phase = if is_stale_writer_error(&error) {
+                BroadcasterDeploymentPhase::Retired
+            } else {
+                if guard.append_failure_count > append_failures_before {
+                    guard.retry_exhaustion_count = guard.retry_exhaustion_count.saturating_add(1);
                 }
-                return Err(error);
-            }
+                BroadcasterDeploymentPhase::Fatal
+            };
+            guard.record_retired(message.clone());
+            self.set_deployment_phase(phase, Some(message));
+            return Err(error);
         }
         guard.startup_handoff = None;
         Ok(())
@@ -1113,7 +1196,17 @@ impl BroadcasterRedisPublisher {
         recovery_id
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "recovery queuing and active append ordering stay in one publication path"
+    )]
     pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
+        let history_update = self.state_history.as_ref().and_then(|_| match &payload {
+            BroadcasterPayload::Update(update) => {
+                Some(StateHistoryUpdateProjection::from_update(update))
+            }
+            _ => None,
+        });
         let mut recovery_gate = self.recovery_gate.lock().await;
         if recovery_gate.open_recovery_id.is_some() {
             if matches!(payload, BroadcasterPayload::Heartbeat(_)) {
@@ -1121,14 +1214,16 @@ impl BroadcasterRedisPublisher {
                 // this later would publish stale backend heads.
                 return Ok(());
             }
-            if let Some(block_number) = complete_native_block(&payload) {
+            let complete_block = complete_native_block(&payload);
+            if let Some(block_number) = complete_block {
                 recovery_gate.complete_native_blocks.insert(block_number);
-                if recovery_gate.complete_native_blocks.len()
+            }
+            if complete_block.is_some()
+                && recovery_gate.complete_native_blocks.len()
                     >= self.config.recovery_max_buffered_native_blocks
-                {
-                    if let Some(cancelled) = &recovery_gate.cancelled {
-                        cancelled.store(true, Ordering::Release);
-                    }
+            {
+                if let Some(cancelled) = &recovery_gate.cancelled {
+                    cancelled.store(true, Ordering::Release);
                 }
             }
             anyhow::ensure!(
@@ -1194,7 +1289,12 @@ impl BroadcasterRedisPublisher {
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
         match self.append_live_payload_locked(&mut guard, payload).await {
-            Ok(_) => Ok(()),
+            Ok((entry, _)) => {
+                if let (Some(state_history), Some(update)) = (&self.state_history, history_update) {
+                    enqueue_state_history_update(state_history, &guard, entry, update);
+                }
+                Ok(())
+            }
             Err(error) => {
                 if error.downcast_ref::<OversizedRedisEntry>().is_some() {
                     return Err(error);
@@ -1380,13 +1480,36 @@ impl BroadcasterRedisPublisher {
         let commit_entry_id =
             commit_entry_id.ok_or_else(|| anyhow!("Redis recovery committed no entries"))?;
         guard.committed_state_version = target_state_version;
+        self.published_heads.send_modify(|heads| {
+            for backend in &transaction.backends {
+                let Some(current) = heads.get_mut(backend) else {
+                    continue;
+                };
+                if let Some(replacement) = transaction.replacement_heads.get(backend) {
+                    *current = replacement.clone();
+                } else {
+                    current.clear();
+                }
+            }
+            // Buffer A becomes visible with the commit, in its original application order.
+            for update in &transaction.buffer_a {
+                Self::update_backend_heads(heads, update);
+            }
+        });
         self.drain_pending_payloads_locked(&mut guard).await?;
+        if let Some(state_history) = &self.state_history {
+            state_history.reset_rfq_high_water();
+        }
         let replay_boundary = self.replay_boundary_locked(&guard)?;
 
         Ok(BroadcasterRecoveryPublication {
             recovery_id,
             target_state_version,
             commit_entry_id,
+            commit_position: StreamPosition {
+                generation: guard.generation,
+                message_seq: commit_watermark,
+            },
             replay_boundary,
             encoded_bytes,
             chunk_count,
@@ -1814,6 +1937,15 @@ impl BroadcasterRedisPublisher {
                 guard.mode.as_str()
             ));
         }
+        // A promotion that started before a feed fatal or shutdown can still get here.
+        // Consumers reset on every new generation, so a writer that is exiting must not start one.
+        let phase = self.deployment_admission.borrow().phase;
+        if phase.is_terminal() {
+            return Err(anyhow!(
+                "Redis broadcaster publisher cannot promote a writer generation while {}",
+                phase.as_str()
+            ));
+        }
         let normal_marker_fields =
             generation_marker_template_fields(self.config.chain_id, backends, reason.clone())?;
         let expected_writer_token = recovering.then_some(self.writer_token.as_str());
@@ -1852,6 +1984,14 @@ impl BroadcasterRedisPublisher {
         };
 
         guard.activate_generation(self.config.chain_id, promotion.generation);
+        self.published_heads.send_modify(|heads| {
+            for protocol_heads in heads.values_mut() {
+                protocol_heads.clear();
+            }
+        });
+        if let Some(state_history) = &self.state_history {
+            state_history.reset_rfq_high_water();
+        }
         warn!(
             event = "redis_writer_promoted",
             stream_id = guard.stream_id.as_str(),
@@ -1895,6 +2035,10 @@ impl BroadcasterRedisPublisher {
         };
         ensure_redis_entry_size(&self.config, &entry, limit)?;
         let entry_id = self.append_entry_locked(guard, entry.clone()).await?;
+        if let BroadcasterPayload::Update(update) = &envelope.payload {
+            self.published_heads
+                .send_modify(|heads| Self::update_backend_heads(heads, update));
+        }
         if advances_state {
             guard.committed_state_version = state_version;
         }
@@ -2128,6 +2272,48 @@ fn normalize_live_payload(
         | BroadcasterPayload::RecoveryCommit(_) => Err(anyhow!(
             "Redis broadcaster live payload cannot be a snapshot or recovery message"
         )),
+    }
+}
+
+fn enqueue_state_history_update(
+    state_history: &StateHistoryRuntime,
+    publisher: &BroadcasterRedisPublisherState,
+    entry: BroadcasterRedisStreamEntry,
+    update: Result<StateHistoryUpdateProjection>,
+) {
+    let result = update.and_then(|update| {
+        state_history.observe_rfq_update(&update);
+        delta_entry_from_update(
+            entry.chain_id,
+            publisher.generation,
+            entry.message_seq,
+            entry.published_at_ms,
+            update,
+            entry.payload_json,
+        )
+    });
+    match result {
+        Ok(Some(delta)) => {
+            state_history.handle.enqueue_delta(delta);
+        }
+        Err(error) => {
+            state_history.handle.record_delta_preparation_failure_gap(
+                entry.chain_id,
+                StreamPosition {
+                    generation: publisher.generation,
+                    message_seq: entry.message_seq,
+                },
+            );
+            warn!(
+                event = "state_history_delta_prepare_failed",
+                chain_id = entry.chain_id,
+                generation = publisher.generation,
+                message_seq = entry.message_seq,
+                %error,
+                "State history delta could not be prepared"
+            );
+        }
+        Ok(None) => {}
     }
 }
 

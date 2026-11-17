@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -66,19 +67,21 @@ struct EncodeRequestSummary {
 pub(super) fn compute_expected_total(resimulated: &ResimulatedRouteInternal) -> BigUint {
     let mut expected_total = BigUint::zero();
     for segment in &resimulated.segments {
-        expected_total += segment.expected_amount_out.clone();
+        expected_total += &segment.expected_amount_out;
     }
     expected_total
 }
 
 pub(super) fn log_resimulation_amounts(
     request_id: Option<&str>,
+    attempt: u8,
     resimulated: &ResimulatedRouteInternal,
 ) {
     // Keep the hop-by-hop trace available for debugging without making it the primary signal.
     for (segment_index, segment) in resimulated.segments.iter().enumerate() {
         debug!(
             request_id,
+            attempt,
             segment_index,
             share_bps = segment.share_bps,
             amount_in = %segment.amount_in,
@@ -89,6 +92,7 @@ pub(super) fn log_resimulation_amounts(
         for (hop_index, hop) in segment.hops.iter().enumerate() {
             debug!(
                 request_id,
+                attempt,
                 segment_index,
                 hop_index,
                 token_in = %format_address(&hop.token_in),
@@ -101,6 +105,7 @@ pub(super) fn log_resimulation_amounts(
             for (swap_index, swap) in hop.swaps.iter().enumerate() {
                 debug!(
                     request_id,
+                    attempt,
                     segment_index,
                     hop_index,
                     swap_index,
@@ -135,11 +140,94 @@ pub fn log_success(request: &RouteEncodeRequest, computation: &EncodeComputation
         min_amount_out = summary.min_amount_out.as_str(),
         is_native_input = summary.is_native_input,
         reset_approval = computation.reset_approval,
+        attempts = computation.attempts,
+        first_attempt_expected_amount_out =
+            computation.first_attempt_expected_amount_out.as_deref(),
         expected_amount_out = computation.expected_amount_out.as_str(),
         amount_out_delta = computation.amount_out_delta.as_str(),
         interactions = computation.response.interactions.len(),
         block_number = response_block_number(&computation.response),
         "Encode request completed"
+    );
+}
+
+pub(super) fn log_retry_fired(
+    request_id: Option<&str>,
+    trigger: &str,
+    first_error_kind: Option<EncodeErrorKind>,
+    first_error_message: Option<&str>,
+    first_expected_amount_out: Option<&str>,
+    elapsed: Duration,
+    route_uses_rfq: bool,
+) {
+    info!(
+        scope = "encode_retry",
+        outcome = "retry_fired",
+        request_id,
+        trigger,
+        first_error_kind = first_error_kind.map(encode_error_kind_label),
+        first_error_message,
+        first_expected_amount_out,
+        elapsed_ms = elapsed.as_millis() as u64,
+        route_uses_rfq,
+        "Retrying encode against current native state"
+    );
+}
+
+pub(super) fn log_fence_evaluation(
+    request_id: Option<&str>,
+    attempt: u8,
+    generation_moved: bool,
+    identity_changed: bool,
+    native_pool_count: usize,
+    outcome: &str,
+) {
+    info!(
+        scope = "encode_fence",
+        request_id,
+        attempt,
+        generation_moved,
+        identity_changed,
+        native_pool_count,
+        outcome,
+        "Evaluated encode native-state fence"
+    );
+}
+
+pub(super) fn log_retry_skipped_budget(
+    request_id: Option<&str>,
+    remaining: Duration,
+    elapsed: Duration,
+    route_uses_rfq: bool,
+) {
+    warn!(
+        scope = "encode_retry",
+        outcome = "retry_skipped_budget",
+        request_id,
+        remaining_ms = remaining.as_millis() as u64,
+        elapsed_ms = elapsed.as_millis() as u64,
+        route_uses_rfq,
+        "Encode retry skipped because the request budget is too low"
+    );
+}
+
+pub(super) fn log_second_trip_abort(
+    request_id: Option<&str>,
+    provisional_outcome: &str,
+    provisional_error_message: Option<&str>,
+    provisional_expected_amount_out: Option<&str>,
+    elapsed: Duration,
+) {
+    warn!(
+        scope = "encode_retry",
+        outcome = "second_trip_abort",
+        request_id,
+        attempts = 2,
+        provisional_outcome,
+        provisional_error_message,
+        provisional_expected_amount_out,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "Encode aborted after native state changed during both attempts"
     );
 }
 
@@ -376,7 +464,8 @@ mod tests {
     use super::*;
     use crate::models::messages::{PoolRef, PoolSwapDraft, SegmentDraft};
     use crate::services::encode::fixtures::{
-        test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
+        fixture_head, test_app_state, test_state_stores, token_store_with_tokens,
+        TestAppStateConfig,
     };
 
     fn test_request(request_id: Option<&str>) -> RouteEncodeRequest {
@@ -471,7 +560,10 @@ mod tests {
             test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
-            .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
+            .apply_update_with_head(
+                Update::new(42, HashMap::new(), HashMap::new()),
+                Some(fixture_head(42)),
+            )
             .await;
 
         let state = test_app_state(
@@ -479,7 +571,10 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            TestAppStateConfig::default(),
+            TestAppStateConfig {
+                observed_head: fixture_head(42),
+                ..TestAppStateConfig::default()
+            },
         );
 
         let request = test_request(None);
@@ -494,7 +589,10 @@ mod tests {
             test_state_stores(Arc::clone(&tokens_store));
 
         native_state_store
-            .apply_update(Update::new(42, HashMap::new(), HashMap::new()))
+            .apply_update_with_head(
+                Update::new(42, HashMap::new(), HashMap::new()),
+                Some(fixture_head(42)),
+            )
             .await;
 
         let state = test_app_state(
@@ -502,7 +600,10 @@ mod tests {
             native_state_store,
             vm_state_store,
             rfq_state_store,
-            TestAppStateConfig::default(),
+            TestAppStateConfig {
+                observed_head: fixture_head(42),
+                ..TestAppStateConfig::default()
+            },
         );
 
         let request = test_request(Some("req-1"));

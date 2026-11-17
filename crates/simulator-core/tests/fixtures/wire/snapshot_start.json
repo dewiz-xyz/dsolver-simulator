@@ -1,0 +1,1 @@
+{"stream_id":"wire-fixture-stream","message_seq":5,"kind":"snapshot_start","snapshotId":"wire-fixture-snapshot","chainId":8453,"backends":["native","vm","rfq"],"totalChunks":1}

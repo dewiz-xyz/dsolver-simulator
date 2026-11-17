@@ -1,0 +1,1 @@
+{"stream_id":"wire-fixture-stream","message_seq":4,"kind":"progress","chainId":8453,"snapshotId":"wire-fixture-snapshot","backends":["native","vm"],"reason":"snapshot assembly in progress"}

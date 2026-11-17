@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use alloy_primitives::hex::encode_prefixed;
 use num_bigint::BigUint;
 use tycho_simulation::tycho_common::Bytes;
 
@@ -23,24 +24,11 @@ pub(super) fn parse_address(value: &str) -> Result<Bytes, EncodeError> {
 }
 
 pub(super) fn format_address(bytes: &Bytes) -> String {
-    format_0x_hex(&format!("{bytes:x}"))
-}
-
-fn format_0x_hex(raw: &str) -> String {
-    let raw = raw.trim();
-    let stripped = raw
-        .strip_prefix("0x")
-        .or_else(|| raw.strip_prefix("0X"))
-        .unwrap_or(raw);
-    let mut output = String::with_capacity(2 + stripped.len());
-    output.push_str("0x");
-    output.extend(stripped.chars().map(|ch| ch.to_ascii_lowercase()));
-    output
+    bytes.to_string()
 }
 
 pub(super) fn format_calldata(data: &[u8]) -> String {
-    let bytes = Bytes::from(data.to_vec());
-    format_0x_hex(&format!("{bytes:x}"))
+    encode_prefixed(data)
 }
 
 pub(super) fn biguint_to_u256_checked(

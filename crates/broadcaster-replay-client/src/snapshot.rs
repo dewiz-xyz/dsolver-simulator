@@ -2,14 +2,17 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
-use simulator_core::broadcaster::{BroadcasterEnvelope, BroadcasterSnapshotSessionResponse};
+use simulator_core::broadcaster::{
+    BroadcasterEnvelope, BroadcasterSnapshotSessionResponse, BroadcasterTokenSnapshotResponse,
+};
 
 use crate::error::{BroadcasterReplayClientError, Result};
 use crate::url::derive_broadcaster_http_url;
 
 pub(crate) const BROADCASTER_SNAPSHOT_SESSIONS_PATH: &str = "snapshot-sessions";
+const BROADCASTER_TOKEN_SNAPSHOT_PATH: &str = "tokens/snapshot";
 const SNAPSHOT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 pub(crate) async fn create_broadcaster_snapshot_session(
@@ -19,43 +22,39 @@ pub(crate) async fn create_broadcaster_snapshot_session(
 ) -> Result<BroadcasterSnapshotSessionResponse> {
     let snapshot_sessions_url =
         derive_broadcaster_http_url(broadcaster_url, BROADCASTER_SNAPSHOT_SESSIONS_PATH)?;
-    let operation = "create broadcaster snapshot session";
-    let response = client
-        .post(&snapshot_sessions_url)
-        .timeout(request_timeout)
-        .send()
-        .await
-        .map_err(|error| {
-            BroadcasterReplayClientError::http_request(
-                operation,
-                &snapshot_sessions_url,
-                error.to_string(),
-            )
-        })?;
-    decode_success_json(response, &snapshot_sessions_url, operation).await
+    request_json(
+        client.post(&snapshot_sessions_url).timeout(request_timeout),
+        &snapshot_sessions_url,
+        "create broadcaster snapshot session",
+    )
+    .await
 }
 
 pub(crate) async fn fetch_broadcaster_snapshot_payload(
     client: &Client,
     broadcaster_url: &str,
-    session: &BroadcasterSnapshotSessionResponse,
+    session_id: u64,
     index: u32,
     request_timeout: Duration,
 ) -> Result<BroadcasterEnvelope> {
     let payload_url = derive_broadcaster_http_url(
         broadcaster_url,
-        &broadcaster_snapshot_payload_path(session.session_id, index),
+        &broadcaster_snapshot_payload_path(session_id, index),
     )?;
-    let operation = "fetch broadcaster snapshot payload";
-    let response = client
-        .get(&payload_url)
-        .timeout(request_timeout)
-        .send()
-        .await
-        .map_err(|error| {
-            BroadcasterReplayClientError::http_request(operation, &payload_url, error.to_string())
-        })?;
-    decode_success_json(response, &payload_url, operation).await
+    request_json(
+        client.get(&payload_url).timeout(request_timeout),
+        &payload_url,
+        "fetch broadcaster snapshot payload",
+    )
+    .await
+    .map_err(|error| match error {
+        BroadcasterReplayClientError::HttpStatus { url, status, .. }
+            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE =>
+        {
+            BroadcasterReplayClientError::snapshot_session_lost(session_id, url, status)
+        }
+        other => other,
+    })
 }
 
 pub(crate) fn fetch_broadcaster_snapshot_payloads<'a>(
@@ -65,8 +64,14 @@ pub(crate) fn fetch_broadcaster_snapshot_payloads<'a>(
     request_timeout: Duration,
 ) -> impl Stream<Item = Result<BroadcasterEnvelope>> + 'a {
     ordered_payload_fetches(session.payload_count, move |index| async move {
-        fetch_broadcaster_snapshot_payload(client, broadcaster_url, session, index, request_timeout)
-            .await
+        fetch_broadcaster_snapshot_payload(
+            client,
+            broadcaster_url,
+            session.session_id,
+            index,
+            request_timeout,
+        )
+        .await
     })
 }
 
@@ -83,18 +88,37 @@ where
         .buffered(SNAPSHOT_DOWNLOAD_CONCURRENCY)
 }
 
+pub(crate) async fn fetch_broadcaster_token_snapshot(
+    client: &Client,
+    broadcaster_url: &str,
+    request_timeout: Duration,
+) -> Result<BroadcasterTokenSnapshotResponse> {
+    let url = derive_broadcaster_http_url(broadcaster_url, BROADCASTER_TOKEN_SNAPSHOT_PATH)?;
+    request_json(
+        client.get(&url).timeout(request_timeout),
+        &url,
+        "fetch broadcaster token snapshot",
+    )
+    .await
+}
+
 fn broadcaster_snapshot_payload_path(session_id: u64, index: u32) -> String {
     format!("{BROADCASTER_SNAPSHOT_SESSIONS_PATH}/{session_id}/payloads/{index}")
 }
 
-async fn decode_success_json<T>(
-    response: reqwest::Response,
+/// Sends `request` and decodes a successful response body as `T`, naming the operation and
+/// the URL in every failure.
+async fn request_json<T>(
+    request: reqwest::RequestBuilder,
     url: &str,
     operation: &'static str,
 ) -> Result<T>
 where
     T: DeserializeOwned,
 {
+    let response = request.send().await.map_err(|error| {
+        BroadcasterReplayClientError::http_request(operation, url, error.to_string())
+    })?;
     let status = response.status();
     if !status.is_success() {
         return Err(BroadcasterReplayClientError::http_status(
@@ -113,68 +137,153 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
     use std::time::Duration;
 
-    use anyhow::{anyhow, Result};
-    use futures::StreamExt;
+    use anyhow::{Error, Result};
+    use futures::TryStreamExt;
+
+    use crate::error::BroadcasterReplayClientError;
     use tokio::sync::Notify;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn ordered_payload_fetches_overlap_and_yield_in_order() -> Result<()> {
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let max_in_flight = Arc::new(AtomicUsize::new(0));
-        let first_pair_started = Arc::new(AtomicUsize::new(0));
-        let first_pair_ready = Arc::new(Notify::new());
-
-        let mut payloads = super::ordered_payload_fetches(2, {
-            let in_flight = Arc::clone(&in_flight);
-            let max_in_flight = Arc::clone(&max_in_flight);
-            let first_pair_started = Arc::clone(&first_pair_started);
-            let first_pair_ready = Arc::clone(&first_pair_ready);
-            move |index| {
-                let in_flight = Arc::clone(&in_flight);
-                let max_in_flight = Arc::clone(&max_in_flight);
-                let first_pair_started = Arc::clone(&first_pair_started);
-                let first_pair_ready = Arc::clone(&first_pair_ready);
-                async move {
-                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    max_in_flight.fetch_max(active, Ordering::SeqCst);
-                    if first_pair_started.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
-                        first_pair_ready.notify_waiters();
-                    } else {
-                        first_pair_ready.notified().await;
-                    }
-                    if index == 0 {
-                        sleep(Duration::from_millis(50)).await;
-                    }
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, anyhow::Error>(index)
-                }
+        let second_payload_ready = &Notify::new();
+        // Payload 0 waits for payload 1, so fetching sequentially cannot finish.
+        let payloads = super::ordered_payload_fetches(2, |index| async move {
+            if index == 0 {
+                second_payload_ready.notified().await;
+            } else {
+                second_payload_ready.notify_one();
             }
+            Ok::<_, Error>(index)
         });
+        let indices = timeout(Duration::from_secs(2), payloads.try_collect::<Vec<_>>()).await??;
 
-        let first = next_payload(&mut payloads).await?;
-        let second = next_payload(&mut payloads).await?;
-
-        assert_eq!([first, second], [0, 1]);
-        assert!(
-            max_in_flight.load(Ordering::SeqCst) >= 2,
-            "payload fetches should overlap"
-        );
+        assert_eq!(indices, vec![0, 1]);
         Ok(())
     }
 
-    async fn next_payload<T>(
-        payloads: &mut (impl futures::Stream<Item = std::result::Result<T, anyhow::Error>> + Unpin),
-    ) -> Result<T> {
-        timeout(Duration::from_secs(2), payloads.next())
-            .await
-            .map_err(|_| anyhow!("timed out waiting for concurrent snapshot payload fetch"))?
-            .ok_or_else(|| anyhow!("snapshot payload stream ended early"))?
+    #[tokio::test]
+    async fn the_token_catalog_is_fetched_from_the_broadcaster() -> Result<()> {
+        let body = serde_json::json!({
+            "chainId": 8453,
+            "tokens": [{
+                "address": "0x4200000000000000000000000000000000000006",
+                "symbol": "WETH",
+                "decimals": 18,
+                "tax": 0,
+                "gas": [null],
+                "chainId": 8453,
+                "quality": 100,
+            }],
+        });
+        let app = axum::Router::new().route(
+            "/tokens/snapshot",
+            axum::routing::get(move || async move { axum::Json(body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let catalog = super::fetch_broadcaster_token_snapshot(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        assert_eq!(catalog.chain_id, 8453);
+        assert_eq!(catalog.tokens.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_status_or_an_undecodable_body_is_a_typed_error() -> Result<()> {
+        let app = axum::Router::new()
+            .route(
+                "/failing/tokens/snapshot",
+                axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/garbled/tokens/snapshot",
+                axum::routing::get(|| async { "not json" }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let fetch = |base: &'static str| {
+            let url = format!("http://{address}/{base}");
+            async move {
+                super::fetch_broadcaster_token_snapshot(
+                    &reqwest::Client::new(),
+                    &url,
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        };
+
+        assert!(matches!(
+            fetch("failing").await,
+            Err(BroadcasterReplayClientError::HttpStatus { status: 500, .. })
+        ));
+        assert!(matches!(
+            fetch("garbled").await,
+            Err(BroadcasterReplayClientError::JsonDecode { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_payload_status_is_a_lost_session_only_for_a_dropped_session() -> Result<()> {
+        use axum::http::StatusCode;
+        let cases = [
+            (StatusCode::NOT_FOUND, true),
+            (StatusCode::GONE, true),
+            (StatusCode::RANGE_NOT_SATISFIABLE, false),
+            (StatusCode::TOO_MANY_REQUESTS, false),
+            (StatusCode::INTERNAL_SERVER_ERROR, false),
+        ];
+        let app = (0..)
+            .zip(cases)
+            .fold(axum::Router::new(), |app, (index, (status, _))| {
+                app.route(
+                    &format!("/snapshot-sessions/7/payloads/{index}"),
+                    axum::routing::get(move || async move { status }),
+                )
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}");
+        let fetch = |index| {
+            super::fetch_broadcaster_snapshot_payload(
+                &client,
+                &url,
+                7,
+                index,
+                Duration::from_secs(5),
+            )
+        };
+
+        for (index, (status, lost)) in (0..).zip(cases) {
+            let fetched = fetch(index).await;
+            let expected = if lost {
+                matches!(
+                    fetched,
+                    Err(BroadcasterReplayClientError::SnapshotSessionLost { session_id: 7, .. })
+                )
+            } else {
+                matches!(
+                    fetched,
+                    Err(BroadcasterReplayClientError::HttpStatus { status: code, .. })
+                        if code == status.as_u16()
+                )
+            };
+            assert!(expected, "{status}");
+        }
+        Ok(())
     }
 }

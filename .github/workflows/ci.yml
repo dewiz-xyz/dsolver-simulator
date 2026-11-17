@@ -30,7 +30,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
@@ -47,13 +47,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test
@@ -64,14 +64,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
+      - name: Check historical image lock guard
+        run: python3 scripts/test_check_pruned_lock.py
       - uses: taiki-e/install-action@nextest
       - name: Run tests
-        run: cargo nextest run --workspace
+        run: cargo nextest run --locked --workspace
+      - name: Run documentation tests
+        run: cargo test --locked --workspace --doc
+
+  state-history-storage:
+    name: state history storage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure private Git dependencies
+        env:
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
+        run: |
+          test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
+          git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
+          git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
+      - name: Verify state history storage contract
+        run: scripts/verify_state_history.sh --repo .
 
   build:
     name: build
@@ -82,12 +103,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure private Git dependencies
         env:
-          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.PRIVATE_DEWIZ_GITHUB_TOKEN }}
+          PRIVATE_DEWIZ_GITHUB_TOKEN: ${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
         run: |
           test -n "$PRIVATE_DEWIZ_GITHUB_TOKEN"
           git config --global url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "ssh://git@github.com/dewiz-xyz/"
           git config --global --add url."https://x-access-token:${PRIVATE_DEWIZ_GITHUB_TOKEN}@github.com/dewiz-xyz/".insteadOf "git@github.com:dewiz-xyz/"
       - name: Build simulator release binary
-        run: cargo build -p apps --bin dsolver-simulator-service --release
+        run: cargo build --locked -p apps --bin dsolver-simulator-service --release
       - name: Build broadcaster release binary
-        run: cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+        run: cargo build --locked -p apps --bin dsolver-tycho-broadcaster-service --release
+      - name: Build state history migration binary
+        run: cargo build --locked -p apps --bin state-history-migrate --release
+      - name: Build historical quote service
+        run: cargo build --locked -p historical-quote-service --release
+      - name: Build dsolver history CLI
+        run: cargo build --locked -p dsolver-history --release
+      - name: Check historical API contract
+        run: cargo test --locked -p historical-quote --test contract checked_in_openapi_matches_rust_types

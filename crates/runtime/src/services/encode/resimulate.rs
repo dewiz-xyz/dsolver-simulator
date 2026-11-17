@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
+use simulator_replay::{SimulationExecutionError, SimulationExecutor};
 use tracing::debug;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
@@ -20,12 +21,16 @@ use tycho_simulation::{
 use crate::models::erc4626::{
     component_direction_supported, component_is_erc4626, unsupported_direction_message,
 };
-use crate::models::state::{AppState, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard};
-use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
+use crate::models::protocol::ProtocolKind;
+use crate::models::state::{
+    AppState, BackendFreshnessFence, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard,
+    SimulatorBackendKind,
+};
 use crate::services::stream_builder::ENCODE_RFQ_QUOTE_TIMEOUT;
 
 use super::allocation::allocate_swaps_by_bps;
 use super::backend::PoolBackend;
+use super::error::AttemptError;
 use super::model::{
     NormalizedRouteInternal, ResimulatedHopInternal, ResimulatedRouteInternal,
     ResimulatedSegmentInternal, ResimulatedSwapInternal,
@@ -38,6 +43,7 @@ struct CachedPoolEntry {
     pool_state: Arc<dyn ProtocolSim>,
     component: Arc<ProtocolComponent>,
     backend: PoolBackend,
+    serving_backend: SimulatorBackendKind,
 }
 
 struct SegmentSimState {
@@ -53,7 +59,9 @@ struct RouteResimulator<'a> {
     token_cache: TokenCache<'a>,
     pool_cache: HashMap<String, CachedPoolEntry>,
     rebuild_guard: Arc<SimulationRebuildGuard>,
-    native_pin: Option<PublishedStatePin>,
+    native_pin: PublishedStatePin,
+    native_freshness: Option<BackendFreshnessFence>,
+    vm_freshness: Option<BackendFreshnessFence>,
 }
 
 struct SwapSimulationRequest {
@@ -70,55 +78,45 @@ async fn resimulate_route(
     state: &AppState,
     normalized: &NormalizedRouteInternal,
     chain: Chain,
-    request_token_in: &Bytes,
-    request_token_out: &Bytes,
-    native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
-) -> Result<ResimulatedRouteInternal, EncodeError> {
-    let native_pin = Some(state.native_state_store.pin().await);
-    resimulate_route_with_native_pin(
-        state,
-        normalized,
-        chain,
-        request_token_in,
-        request_token_out,
-        native_token_protocol_allowlist,
-        rebuild_guard,
-        native_pin,
-    )
-    .await
+) -> Result<ResimulatedRouteInternal, AttemptError> {
+    let native_pin = state.native_state_store.pin().await;
+    resimulate_route_with_native_pin(state, normalized, chain, rebuild_guard, native_pin)
+        .await
+        .result
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "route, chain, token, guard, and pinned-state inputs remain explicit at the request boundary"
-)]
+pub(super) struct ResimulationOutcome {
+    pub(super) result: Result<ResimulatedRouteInternal, AttemptError>,
+    pub(super) native_pool_ids: HashSet<String>,
+    pub(super) uses_rfq: bool,
+    pub(super) freshness_fences: Vec<BackendFreshnessFence>,
+    pub(super) rebuild_guard: Arc<SimulationRebuildGuard>,
+}
+
 pub(super) async fn resimulate_route_with_native_pin(
     state: &AppState,
     normalized: &NormalizedRouteInternal,
     chain: Chain,
-    request_token_in: &Bytes,
-    request_token_out: &Bytes,
-    native_token_protocol_allowlist: &[String],
     rebuild_guard: Arc<SimulationRebuildGuard>,
-    native_pin: Option<PublishedStatePin>,
-) -> Result<ResimulatedRouteInternal, EncodeError> {
+    native_pin: PublishedStatePin,
+) -> ResimulationOutcome {
     let mut resimulator =
         RouteResimulator::new(state, normalized, chain, rebuild_guard, native_pin);
-
-    // Resimulate in hop-depth order to match build_route_swaps execution order.
-    for hop_index in 0..resimulator.max_hop_depth() {
-        for segment_index in 0..normalized.segments.len() {
-            resimulator
-                .resimulate_segment_hop(segment_index, hop_index)
-                .await?;
-        }
+    let result = resimulator.run().await;
+    // The fence needs the component-resolved backends even when the route failed partway,
+    // so the resolved view survives the result either way.
+    let (native_pool_ids, uses_rfq) = resimulator.resolved_backends();
+    ResimulationOutcome {
+        result,
+        native_pool_ids,
+        uses_rfq,
+        freshness_fences: [resimulator.native_freshness, resimulator.vm_freshness]
+            .into_iter()
+            .flatten()
+            .collect(),
+        rebuild_guard: resimulator.rebuild_guard,
     }
-
-    validate_request_tokens(request_token_in, request_token_out)?;
-    validate_native_request_tokens(normalized, chain, native_token_protocol_allowlist)?;
-    let segments = resimulator.build_resimulated_segments()?;
-    Ok(ResimulatedRouteInternal { segments })
 }
 
 impl<'a> RouteResimulator<'a> {
@@ -127,7 +125,7 @@ impl<'a> RouteResimulator<'a> {
         normalized: &'a NormalizedRouteInternal,
         chain: Chain,
         rebuild_guard: Arc<SimulationRebuildGuard>,
-        native_pin: Option<PublishedStatePin>,
+        native_pin: PublishedStatePin,
     ) -> Self {
         Self {
             state,
@@ -138,7 +136,36 @@ impl<'a> RouteResimulator<'a> {
             pool_cache: HashMap::new(),
             rebuild_guard,
             native_pin,
+            native_freshness: None,
+            vm_freshness: None,
         }
+    }
+
+    async fn run(&mut self) -> Result<ResimulatedRouteInternal, AttemptError> {
+        // Resimulate in hop-depth order to match build_route_swaps execution order.
+        for hop_index in 0..self.max_hop_depth() {
+            for segment_index in 0..self.normalized.segments.len() {
+                self.resimulate_segment_hop(segment_index, hop_index)
+                    .await?;
+            }
+        }
+
+        let segments = self.build_resimulated_segments()?;
+        Ok(ResimulatedRouteInternal { segments })
+    }
+
+    // The cache holds exactly the pools the route loaded so far, including pools the store
+    // fallback served that are absent from the pin. Publication compares work by ID because
+    // reused pools carry route-local state Arcs.
+    fn resolved_backends(&self) -> (HashSet<String>, bool) {
+        let native_pool_ids = self
+            .pool_cache
+            .iter()
+            .filter(|(_, entry)| entry.serving_backend == SimulatorBackendKind::Native)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let uses_rfq = self.pool_cache.values().any(|entry| entry.backend.is_rfq());
+        (native_pool_ids, uses_rfq)
     }
 
     fn max_hop_depth(&self) -> usize {
@@ -154,7 +181,7 @@ impl<'a> RouteResimulator<'a> {
         &mut self,
         segment_index: usize,
         hop_index: usize,
-    ) -> Result<(), EncodeError> {
+    ) -> Result<(), AttemptError> {
         let Some(hop) = self
             .normalized
             .segments
@@ -164,22 +191,25 @@ impl<'a> RouteResimulator<'a> {
             return Ok(());
         };
         let hop_amount_in = {
-            let segment_state = self
-                .segment_states
-                .get_mut(segment_index)
-                .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+            let segment_state = self.segment_states.get_mut(segment_index).ok_or_else(|| {
+                AttemptError::deterministic(EncodeError::internal(
+                    "Segment state missing after resimulation",
+                ))
+            })?;
             require_hop_amount_in(segment_state, segment_index, hop_index)?
         };
         let allocated_swaps =
-            allocate_swaps_by_bps(hop_amount_in.clone(), &hop.swaps, segment_index, hop_index)?;
+            allocate_swaps_by_bps(hop_amount_in.clone(), &hop.swaps, segment_index, hop_index)
+                .map_err(|error| classify_allocation_error(error, hop_index))?;
         let (swap_results, hop_expected) = self
             .simulate_allocated_swaps(allocated_swaps, &hop_amount_in)
             .await?;
         // We come back for the segment state here because the pool work above awaits.
-        let segment_state = self
-            .segment_states
-            .get_mut(segment_index)
-            .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+        let segment_state = self.segment_states.get_mut(segment_index).ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Segment state missing after resimulation",
+            ))
+        })?;
         segment_state.hops[hop_index] = Some(ResimulatedHopInternal {
             token_in: hop.token_in.clone(),
             token_out: hop.token_out.clone(),
@@ -195,20 +225,19 @@ impl<'a> RouteResimulator<'a> {
         &mut self,
         allocated_swaps: Vec<super::allocation::AllocatedSwap>,
         hop_amount_in: &BigUint,
-    ) -> Result<(Vec<ResimulatedSwapInternal>, BigUint), EncodeError> {
+    ) -> Result<(Vec<ResimulatedSwapInternal>, BigUint), AttemptError> {
         let mut swap_results = Vec::with_capacity(allocated_swaps.len());
         let mut hop_expected = BigUint::zero();
 
         for allocated in allocated_swaps {
             let swap = self.simulate_allocated_swap(allocated).await?;
-            hop_expected += swap.expected_amount_out.clone();
+            hop_expected += &swap.expected_amount_out;
             swap_results.push(swap);
         }
 
         if hop_expected.is_zero() {
-            return Err(EncodeError::simulation(format!(
-                "hop amountIn {} produced zero amountOut",
-                hop_amount_in
+            return Err(AttemptError::state_dependent(EncodeError::simulation(
+                format!("hop amountIn {} produced zero amountOut", hop_amount_in),
             )));
         }
 
@@ -218,7 +247,7 @@ impl<'a> RouteResimulator<'a> {
     async fn simulate_allocated_swap(
         &mut self,
         allocated: super::allocation::AllocatedSwap,
-    ) -> Result<ResimulatedSwapInternal, EncodeError> {
+    ) -> Result<ResimulatedSwapInternal, AttemptError> {
         let pool_entry = self.load_pool_entry(&allocated.pool.component_id).await?;
         ensure_erc4626_swap_supported(
             self.state,
@@ -238,11 +267,8 @@ impl<'a> RouteResimulator<'a> {
         )?;
         let sim_token_in = map_swap_token(&allocated.token_in, self.chain, keep_native_unwrapped);
         let sim_token_out = map_swap_token(&allocated.token_out, self.chain, keep_native_unwrapped);
-        let native_pin = pool_entry
-            .backend
-            .is_native()
-            .then_some(self.native_pin.as_ref())
-            .flatten();
+        let native_pin = (pool_entry.serving_backend == SimulatorBackendKind::Native)
+            .then_some(&self.native_pin);
         let token_in = self.token_cache.get(&sim_token_in, native_pin).await?;
         let token_out = self.token_cache.get(&sim_token_out, native_pin).await?;
         let (pre_state, result) = simulate_swap(SwapSimulationRequest {
@@ -251,9 +277,7 @@ impl<'a> RouteResimulator<'a> {
             token_in,
             token_out,
             pool_id: allocated.pool.component_id.clone(),
-            rebuild_guard: pool_entry
-                .backend
-                .uses_rebuild_guard()
+            rebuild_guard: (pool_entry.serving_backend != SimulatorBackendKind::Native)
                 .then(|| Arc::clone(&self.rebuild_guard)),
         })
         .await?;
@@ -266,6 +290,7 @@ impl<'a> RouteResimulator<'a> {
                 pool_state: Arc::from(result.new_state),
                 component: Arc::clone(&pool_entry.component),
                 backend: pool_entry.backend,
+                serving_backend: pool_entry.serving_backend,
             },
         );
         Ok(ResimulatedSwapInternal {
@@ -281,18 +306,17 @@ impl<'a> RouteResimulator<'a> {
         })
     }
 
-    async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, EncodeError> {
+    async fn load_pool_entry(&mut self, pool_id: &str) -> Result<CachedPoolEntry, AttemptError> {
         if let Some(entry) = self.pool_cache.get(pool_id) {
             return Ok(entry.clone());
         }
 
-        if let Some((pool_state, component)) = self
-            .native_pin
-            .as_ref()
-            .and_then(|pin| pin.pool_by_id(pool_id))
-        {
+        if let Some((pool_state, component)) = self.native_pin.pool_by_id(pool_id) {
+            self.ensure_freshness(SimulatorBackendKind::Native, &self.native_pin.clone())
+                .await?;
             let entry = CachedPoolEntry {
                 backend: PoolBackend::from_component(component.as_ref()),
+                serving_backend: SimulatorBackendKind::Native,
                 pool_state,
                 component,
             };
@@ -300,12 +324,12 @@ impl<'a> RouteResimulator<'a> {
             return Ok(entry);
         }
 
-        if let Some((uses_vm, uses_rfq)) = self
+        let mut requirements = self
             .state
             .pool_rebuild_guard_requirements(pool_id)
             .await
-            .map_err(availability_error)?
-        {
+            .map_err(availability_error)?;
+        if let Some((uses_vm, uses_rfq)) = requirements {
             if (uses_vm || uses_rfq)
                 && !self
                     .rebuild_guard
@@ -315,15 +339,47 @@ impl<'a> RouteResimulator<'a> {
                     .state
                     .acquire_simulation_rebuild_guard(uses_vm, uses_rfq)
                     .await;
+                requirements = self
+                    .state
+                    .pool_rebuild_guard_requirements(pool_id)
+                    .await
+                    .map_err(availability_error)?;
             }
         }
-
-        let (pool_state, component) = self
-            .state
-            .pool_by_id(pool_id)
-            .await
-            .map_err(availability_error)?
-            .ok_or_else(|| EncodeError::not_found(format!("Pool {} not found", pool_id)))?;
+        let serving_backend = match requirements {
+            Some((true, _)) => SimulatorBackendKind::Vm,
+            Some((_, true)) => SimulatorBackendKind::Rfq,
+            Some((false, false)) => SimulatorBackendKind::Native,
+            None => {
+                return Err(AttemptError::state_dependent(EncodeError::not_found(
+                    format!("Pool {} not found", pool_id),
+                )))
+            }
+        };
+        let entry = match serving_backend {
+            SimulatorBackendKind::Native => {
+                let pin = self.state.native_state_store.pin().await;
+                self.ensure_freshness(serving_backend, &self.native_pin.clone())
+                    .await?;
+                pin.pool_by_id(pool_id)
+            }
+            SimulatorBackendKind::Vm => {
+                let pin = self.state.vm_state_store.pin().await;
+                self.ensure_freshness(serving_backend, &pin).await?;
+                pin.pool_by_id(pool_id)
+            }
+            SimulatorBackendKind::Rfq => self
+                .state
+                .pool_by_id(pool_id)
+                .await
+                .map_err(availability_error)?,
+        };
+        let (pool_state, component) = entry.ok_or_else(|| {
+            AttemptError::state_dependent(EncodeError::not_found(format!(
+                "Pool {} not found",
+                pool_id
+            )))
+        })?;
         let backend = PoolBackend::from_component(component.as_ref());
         let pool_state = if backend.is_rfq() {
             hydrate_rfq_pool_state(
@@ -339,6 +395,7 @@ impl<'a> RouteResimulator<'a> {
 
         let entry = CachedPoolEntry {
             backend,
+            serving_backend,
             pool_state,
             component,
         };
@@ -346,9 +403,33 @@ impl<'a> RouteResimulator<'a> {
         Ok(entry)
     }
 
+    async fn ensure_freshness(
+        &mut self,
+        backend: SimulatorBackendKind,
+        pin: &PublishedStatePin,
+    ) -> Result<(), AttemptError> {
+        let freshness = match backend {
+            SimulatorBackendKind::Native => &mut self.native_freshness,
+            SimulatorBackendKind::Vm => &mut self.vm_freshness,
+            SimulatorBackendKind::Rfq => return Ok(()),
+        };
+        if freshness.is_none() {
+            *freshness = self.state.backend_freshness_fence(backend, pin).await;
+            if freshness.is_none() {
+                return Err(AttemptError::state_dependent(EncodeError::unavailable(
+                    format!(
+                        "{} state is unavailable for route simulation",
+                        backend.label()
+                    ),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn build_resimulated_segments(
         &mut self,
-    ) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
+    ) -> Result<Vec<ResimulatedSegmentInternal>, AttemptError> {
         build_resimulated_segments(self.normalized, &mut self.segment_states)
     }
 }
@@ -369,7 +450,7 @@ fn hydrate_rfq_pool_state(
     chain: Chain,
     config: &RfqClientConfig,
     quote_timeout: Duration,
-) -> Result<Arc<dyn ProtocolSim>, EncodeError> {
+) -> Result<Arc<dyn ProtocolSim>, AttemptError> {
     let bebop = pool_state.as_any().is::<BebopState>();
     if bebop || pool_state.as_any().is::<HashflowState>() {
         return super::rfq_hydration::hydrate(pool_state, chain, config, quote_timeout, bebop)
@@ -378,9 +459,9 @@ fn hydrate_rfq_pool_state(
             });
     }
     if pool_state.as_any().is::<LiquoriceState>() {
-        return Err(EncodeError::invalid(
+        return Err(AttemptError::deterministic(EncodeError::invalid(
             "Liquorice encoding is not supported by the configured router",
-        ));
+        )));
     }
     if pool_state
         .as_any()
@@ -389,31 +470,32 @@ fn hydrate_rfq_pool_state(
             .as_any()
             .is::<tycho_simulation::pamm::protocols::metric::state::MetricState>()
     {
-        return Err(EncodeError::invalid(
+        return Err(AttemptError::deterministic(EncodeError::invalid(
             "Native and Metric are broadcast-only providers; encoding is not enabled",
-        ));
+        )));
     }
-    Err(EncodeError::internal(format!(
+    Err(AttemptError::deterministic(EncodeError::internal(format!(
         "RFQ pool {pool_id} has unsupported state type"
-    )))
+    ))))
 }
 
 fn rfq_hydration_error(
     pool_id: &str,
     provider: &str,
     error: impl std::fmt::Display,
-) -> EncodeError {
-    EncodeError::internal(format!(
+) -> AttemptError {
+    AttemptError::deterministic(EncodeError::internal(format!(
         "Failed to hydrate {provider} client for RFQ pool {pool_id}: {error}"
-    ))
+    )))
 }
 
-fn availability_error(availability: crate::models::state::EncodeAvailability) -> EncodeError {
-    EncodeError::unavailable(
+fn availability_error(availability: crate::models::state::EncodeAvailability) -> AttemptError {
+    // Unavailable state must fail immediately instead of entering the future retry loop.
+    AttemptError::deterministic(EncodeError::unavailable(
         availability.availability_message().unwrap_or_else(|| {
             unreachable!("unready pool lookup must have an availability message")
         }),
-    )
+    ))
 }
 
 fn initialize_segment_states(normalized: &NormalizedRouteInternal) -> Vec<SegmentSimState> {
@@ -427,17 +509,26 @@ fn initialize_segment_states(normalized: &NormalizedRouteInternal) -> Vec<Segmen
         .collect()
 }
 
+fn classify_allocation_error(error: AttemptError, hop_index: usize) -> AttemptError {
+    // First-hop amounts come from the request. Later hop amounts come from simulated state.
+    if hop_index == 0 {
+        error
+    } else {
+        AttemptError::state_dependent(EncodeError::from(error))
+    }
+}
+
 fn require_hop_amount_in(
     segment_state: &SegmentSimState,
     segment_index: usize,
     hop_index: usize,
-) -> Result<BigUint, EncodeError> {
+) -> Result<BigUint, AttemptError> {
     let hop_amount_in = segment_state.next_amount_in.clone();
     if hop_amount_in.is_zero() {
-        return Err(EncodeError::invalid(format!(
+        return Err(AttemptError::deterministic(EncodeError::invalid(format!(
             "segment[{}].hop[{}] amountIn is zero",
             segment_index, hop_index
-        )));
+        ))));
     }
 
     Ok(hop_amount_in)
@@ -450,7 +541,7 @@ async fn simulate_swap(
         Arc<dyn ProtocolSim>,
         tycho_simulation::tycho_common::simulation::protocol_sim::GetAmountOutResult,
     ),
-    EncodeError,
+    AttemptError,
 > {
     let SwapSimulationRequest {
         pool_state,
@@ -472,30 +563,32 @@ async fn simulate_swap(
         .map_err(|err| execution_error(&failure_pool_id, err))?;
 
     let result = result.map_err(|err| {
-        EncodeError::simulation(format!("Pool {} simulation failed: {}", pool_id, err))
+        AttemptError::state_dependent(EncodeError::simulation(format!(
+            "Pool {} simulation failed: {}",
+            pool_id, err
+        )))
     })?;
     Ok((pre_state, result))
 }
 
-fn execution_error(pool_id: &str, err: SimulationExecutionError) -> EncodeError {
+fn execution_error(pool_id: &str, err: SimulationExecutionError) -> AttemptError {
     match err {
-        SimulationExecutionError::WorkerPanicked(_) => {
-            EncodeError::internal(format!("Pool {} simulation worker panicked", pool_id))
-        }
-        SimulationExecutionError::ResultDropped => {
-            EncodeError::internal(format!("Pool {} simulation result was dropped", pool_id))
-        }
+        SimulationExecutionError::WorkerPanicked(_) => AttemptError::deterministic(
+            EncodeError::internal(format!("Pool {} simulation worker panicked", pool_id)),
+        ),
+        SimulationExecutionError::ResultDropped => AttemptError::deterministic(
+            EncodeError::internal(format!("Pool {} simulation result was dropped", pool_id)),
+        ),
     }
 }
 
 fn require_non_zero_amount_out(
     pool_id: &str,
     expected_out: BigUint,
-) -> Result<BigUint, EncodeError> {
+) -> Result<BigUint, AttemptError> {
     if expected_out.is_zero() {
-        return Err(EncodeError::simulation(format!(
-            "Pool {} returned zero amountOut",
-            pool_id
+        return Err(AttemptError::state_dependent(EncodeError::simulation(
+            format!("Pool {} returned zero amountOut", pool_id),
         )));
     }
 
@@ -505,13 +598,15 @@ fn require_non_zero_amount_out(
 fn build_resimulated_segments(
     normalized: &NormalizedRouteInternal,
     segment_states: &mut [SegmentSimState],
-) -> Result<Vec<ResimulatedSegmentInternal>, EncodeError> {
+) -> Result<Vec<ResimulatedSegmentInternal>, AttemptError> {
     let mut resim_segments = Vec::with_capacity(normalized.segments.len());
     for (segment_index, segment) in normalized.segments.iter().enumerate() {
         let resim_hops = take_segment_hops(segment_states, segment_index, segment.hops.len())?;
-        let last_hop = resim_hops
-            .last()
-            .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
+        let last_hop = resim_hops.last().ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Segment hops missing after resimulation",
+            ))
+        })?;
         resim_segments.push(ResimulatedSegmentInternal {
             share_bps: segment.share_bps,
             amount_in: segment.amount_in.clone(),
@@ -526,31 +621,22 @@ fn take_segment_hops(
     segment_states: &mut [SegmentSimState],
     segment_index: usize,
     hop_len: usize,
-) -> Result<Vec<ResimulatedHopInternal>, EncodeError> {
-    let segment_state = segment_states
-        .get_mut(segment_index)
-        .ok_or_else(|| EncodeError::internal("Segment state missing after resimulation"))?;
+) -> Result<Vec<ResimulatedHopInternal>, AttemptError> {
+    let segment_state = segment_states.get_mut(segment_index).ok_or_else(|| {
+        AttemptError::deterministic(EncodeError::internal(
+            "Segment state missing after resimulation",
+        ))
+    })?;
     let mut resim_hops = Vec::with_capacity(hop_len);
     for hop_index in 0..hop_len {
-        let resim_hop = segment_state.hops[hop_index]
-            .take()
-            .ok_or_else(|| EncodeError::internal("Segment hops missing after resimulation"))?;
+        let resim_hop = segment_state.hops[hop_index].take().ok_or_else(|| {
+            AttemptError::deterministic(EncodeError::internal(
+                "Segment hops missing after resimulation",
+            ))
+        })?;
         resim_hops.push(resim_hop);
     }
     Ok(resim_hops)
-}
-
-fn validate_request_tokens(
-    request_token_in: &Bytes,
-    request_token_out: &Bytes,
-) -> Result<(), EncodeError> {
-    if request_token_in.is_empty() || request_token_out.is_empty() {
-        return Err(EncodeError::internal(
-            "Request tokens missing after resimulation",
-        ));
-    }
-
-    Ok(())
 }
 
 fn ensure_native_swap_supported(
@@ -559,8 +645,8 @@ fn ensure_native_swap_supported(
     token_out: &Bytes,
     component: &ProtocolComponent,
     component_id: &str,
-    native_token_protocol_allowlist: &[String],
-) -> Result<bool, EncodeError> {
+    native_token_protocol_allowlist: &[ProtocolKind],
+) -> Result<bool, AttemptError> {
     let native_address = chain.native_token().address;
     let swap_uses_native = *token_in == native_address || *token_out == native_address;
     let protocol_supports_native =
@@ -568,47 +654,13 @@ fn ensure_native_swap_supported(
 
     if swap_uses_native && !protocol_supports_native {
         let supported = format_native_protocol_allowlist(native_token_protocol_allowlist);
-        return Err(EncodeError::invalid(format!(
+        return Err(AttemptError::deterministic(EncodeError::invalid(format!(
             "native tokenIn/tokenOut is only supported for protocols [{}]; pool {} uses {}",
             supported, component_id, component.protocol_system
-        )));
+        ))));
     }
 
     Ok(protocol_supports_native)
-}
-
-fn validate_native_request_tokens(
-    normalized: &NormalizedRouteInternal,
-    chain: Chain,
-    native_token_protocol_allowlist: &[String],
-) -> Result<(), EncodeError> {
-    let native_address = chain.native_token().address;
-
-    for segment in &normalized.segments {
-        for hop in &segment.hops {
-            let swap_uses_native =
-                hop.token_in == native_address || hop.token_out == native_address;
-            if !swap_uses_native {
-                continue;
-            }
-
-            for swap in &hop.swaps {
-                if !is_native_protocol_allowlisted(
-                    &swap.pool.protocol,
-                    native_token_protocol_allowlist,
-                ) {
-                    let supported =
-                        format_native_protocol_allowlist(native_token_protocol_allowlist);
-                    return Err(EncodeError::invalid(format!(
-                        "native tokenIn/tokenOut is only supported for protocols [{}]; got {}",
-                        supported, swap.pool.protocol
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn ensure_erc4626_swap_supported(
@@ -618,7 +670,7 @@ fn ensure_erc4626_swap_supported(
     token_in: &Bytes,
     token_out: &Bytes,
     erc4626_deposits_enabled: bool,
-) -> Result<(), EncodeError> {
+) -> Result<(), AttemptError> {
     if !component_is_erc4626(component) {
         return Ok(());
     }
@@ -640,11 +692,13 @@ fn ensure_erc4626_swap_supported(
         token_out = token_out.to_string(),
         "Rejecting unsupported ERC4626 encode hop during resimulation"
     );
-    Err(EncodeError::invalid(unsupported_direction_message(
-        token_in,
-        token_out,
-        erc4626_deposits_enabled,
-        &state.erc4626_pair_policies,
+    Err(AttemptError::deterministic(EncodeError::invalid(
+        unsupported_direction_message(
+            token_in,
+            token_out,
+            erc4626_deposits_enabled,
+            &state.erc4626_pair_policies,
+        ),
     )))
 }
 
@@ -675,14 +729,14 @@ impl<'a> TokenCache<'a> {
         &mut self,
         address: &Bytes,
         native_pin: Option<&PublishedStatePin>,
-    ) -> Result<Token, EncodeError> {
+    ) -> Result<Token, AttemptError> {
         if let Some(token) = self.cache.get(address) {
             return Ok(token.clone());
         }
         if let Some(native_pin) = native_pin {
-            let token = native_pin
-                .token(address)
-                .ok_or_else(|| EncodeError::invalid("Token not found"))?;
+            let token = native_pin.token(address).ok_or_else(|| {
+                AttemptError::state_dependent(EncodeError::invalid("Token not found"))
+            })?;
             self.cache.insert(address.clone(), token.clone());
             return Ok(token);
         }
@@ -691,8 +745,13 @@ impl<'a> TokenCache<'a> {
             .tokens
             .ensure(address)
             .await
-            .map_err(|err| EncodeError::simulation(format!("Token lookup failed: {}", err)))?
-            .ok_or_else(|| EncodeError::invalid("Token not found"))?;
+            .map_err(|err| {
+                AttemptError::deterministic(EncodeError::simulation(format!(
+                    "Token lookup failed: {}",
+                    err
+                )))
+            })?
+            .ok_or_else(|| AttemptError::deterministic(EncodeError::invalid("Token not found")))?;
         self.cache.insert(address.clone(), token.clone());
         Ok(token)
     }
@@ -712,7 +771,7 @@ impl<'a> TokenCache<'a> {
     reason = "negative test assertions read more clearly in match form here"
 )]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
     use tycho_simulation::protocol::models::Update;
@@ -723,8 +782,8 @@ mod tests {
     use super::*;
     use crate::models::state::RfqClientConfig;
     use crate::services::encode::fixtures::{
-        component_with_protocol, component_with_tokens, dummy_token, pool_ref, test_app_state,
-        test_state_stores, token_store_with_tokens, TestAppStateConfig,
+        component_with_protocol, component_with_tokens, dummy_token, fixture_bytes, fixture_head,
+        pool_ref, test_app_state, test_state_stores, token_store_with_tokens, TestAppStateConfig,
     };
     use crate::services::encode::mocks::{step_multiplier, StepProtocolSim};
     use crate::services::encode::model::{
@@ -737,10 +796,55 @@ mod tests {
             .await
     }
 
+    #[test]
+    fn allocation_errors_follow_hop_amount_source() {
+        let swaps = vec![
+            NormalizedSwapDraftInternal {
+                pool: pool_ref("p1"),
+                token_in: fixture_bytes("0x0000000000000000000000000000000000000001"),
+                token_out: fixture_bytes("0x0000000000000000000000000000000000000002"),
+                split_bps: 1,
+            },
+            NormalizedSwapDraftInternal {
+                pool: pool_ref("p2"),
+                token_in: fixture_bytes("0x0000000000000000000000000000000000000001"),
+                token_out: fixture_bytes("0x0000000000000000000000000000000000000002"),
+                split_bps: 0,
+            },
+        ];
+
+        let first_hop = match allocate_swaps_by_bps(BigUint::from(1u32), &swaps, 0, 0)
+            .map_err(|error| classify_allocation_error(error, 0))
+        {
+            Ok(_) => panic!("first-hop split should round to zero"),
+            Err(error) => error,
+        };
+        assert!(!first_hop.is_state_dependent());
+
+        let later_hop = match allocate_swaps_by_bps(BigUint::from(1u32), &swaps, 0, 1)
+            .map_err(|error| classify_allocation_error(error, 1))
+        {
+            Ok(_) => panic!("later-hop split should round to zero"),
+            Err(error) => error,
+        };
+        assert!(later_hop.is_state_dependent());
+    }
+
+    #[test]
+    fn simulation_state_and_worker_failures_use_separate_buckets() {
+        let zero_output = match require_non_zero_amount_out("pool", BigUint::zero()) {
+            Ok(_) => panic!("zero output should fail"),
+            Err(error) => error,
+        };
+        assert!(zero_output.is_state_dependent());
+
+        let dropped_result = execution_error("pool", SimulationExecutionError::ResultDropped);
+        assert!(!dropped_result.is_state_dependent());
+    }
+
     fn rfq_client_config() -> RfqClientConfig {
         RfqClientConfig {
             tvl_threshold: 321.0,
-            bebop_user: "runtime-bebop-user".to_string(),
             bebop_key: "runtime-bebop-key".to_string(),
             hashflow_user: "runtime-hashflow-user".to_string(),
             hashflow_key: "runtime-hashflow-key".to_string(),
@@ -842,6 +946,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::Internal
         );
+        assert!(!err.is_state_dependent());
         assert_eq!(
             err.message(),
             "RFQ pool pool-unknown has unsupported state type"
@@ -903,7 +1008,9 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-1".to_string(), component);
         let update = Update::new(1, states, new_pairs);
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head(1)))
+            .await;
 
         let app_state = test_app_state(
             tokens_store,
@@ -942,9 +1049,6 @@ mod tests {
             &app_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &app_state.native_token_protocol_allowlist,
             test_rebuild_guard(&app_state).await,
         )
         .await
@@ -955,6 +1059,85 @@ mod tests {
         assert_eq!(swaps[1].expected_amount_out, BigUint::from(10u32));
         assert_eq!(step_multiplier(swaps[0].pool_state.as_ref()), 1);
         assert_eq!(step_multiplier(swaps[1].pool_state.as_ref()), 2);
+    }
+
+    #[tokio::test]
+    async fn resimulation_outcome_keeps_resolved_native_pools_on_failure() {
+        let token_in = dummy_token("0x0000000000000000000000000000000000000001");
+        let token_out = dummy_token("0x0000000000000000000000000000000000000002");
+        let tokens_store = token_store_with_tokens(vec![token_in.clone(), token_out.clone()]);
+        let (native_state_store, vm_state_store, rfq_state_store) =
+            test_state_stores(Arc::clone(&tokens_store));
+
+        let component = component_with_tokens(
+            "0x0000000000000000000000000000000000000009",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            "pool-1".to_string(),
+            Box::new(StepProtocolSim { multiplier: 1 }) as Box<dyn ProtocolSim>,
+        );
+        let mut new_pairs = HashMap::new();
+        new_pairs.insert("pool-1".to_string(), component);
+        native_state_store
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
+            .await;
+
+        let app_state = test_app_state(
+            tokens_store,
+            Arc::clone(&native_state_store),
+            vm_state_store,
+            rfq_state_store,
+            TestAppStateConfig::default(),
+        );
+
+        let normalized = NormalizedRouteInternal {
+            segments: vec![NormalizedSegmentInternal {
+                share_bps: 10_000,
+                amount_in: BigUint::from(10u32),
+                hops: vec![NormalizedHopInternal {
+                    token_in: token_in.address.clone(),
+                    token_out: token_out.address.clone(),
+                    swaps: vec![
+                        NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-1"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: 5000,
+                        },
+                        NormalizedSwapDraftInternal {
+                            pool: pool_ref("pool-missing"),
+                            token_in: token_in.address.clone(),
+                            token_out: token_out.address.clone(),
+                            split_bps: 0,
+                        },
+                    ],
+                }],
+            }],
+        };
+
+        let rebuild_guard = test_rebuild_guard(&app_state).await;
+        let native_pin = app_state.native_state_store.pin().await;
+        let outcome = resimulate_route_with_native_pin(
+            &app_state,
+            &normalized,
+            Chain::Ethereum,
+            rebuild_guard,
+            native_pin,
+        )
+        .await;
+
+        let error = match outcome.result {
+            Ok(_) => panic!("missing pool should fail"),
+            Err(error) => error,
+        };
+        assert!(error.is_state_dependent());
+        assert_eq!(
+            outcome.native_pool_ids,
+            HashSet::from(["pool-1".to_string()])
+        );
+        assert!(!outcome.uses_rfq);
     }
 
     #[tokio::test]
@@ -979,7 +1162,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-vm".to_string(), component);
         vm_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let app_state = test_app_state(
@@ -993,8 +1176,6 @@ mod tests {
             },
         );
         let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
-        let token_in_address = token_in.address.clone();
-        let token_out_address = token_out.address.clone();
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
                 share_bps: 10_000,
@@ -1016,16 +1197,7 @@ mod tests {
             let guard = state_for_task
                 .acquire_simulation_rebuild_guard(true, false)
                 .await;
-            resimulate_route(
-                &state_for_task,
-                &normalized,
-                Chain::Ethereum,
-                &token_in_address,
-                &token_out_address,
-                &state_for_task.native_token_protocol_allowlist,
-                guard,
-            )
-            .await
+            resimulate_route(&state_for_task, &normalized, Chain::Ethereum, guard).await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1040,8 +1212,14 @@ mod tests {
             Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
         vm_state_store
-            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .apply_update_with_head(
+                Update::new(2, replacement_states, HashMap::new()),
+                Some(fixture_head(2)),
+            )
             .await;
+        app_state
+            .chain_head_observer
+            .observe_for_test(fixture_head(2));
 
         drop(request_guard);
         let resimulated =
@@ -1083,7 +1261,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-vm".to_string(), component);
         vm_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let app_state = test_app_state(
@@ -1097,8 +1275,6 @@ mod tests {
             },
         );
         let request_guard = app_state.vm_simulation_rebuild_gate().write_owned().await;
-        let token_in_address = token_in.address.clone();
-        let token_out_address = token_out.address.clone();
         let normalized = NormalizedRouteInternal {
             segments: vec![NormalizedSegmentInternal {
                 share_bps: 10_000,
@@ -1120,16 +1296,7 @@ mod tests {
             let guard = state_for_task
                 .acquire_simulation_rebuild_guard(false, false)
                 .await;
-            resimulate_route(
-                &state_for_task,
-                &normalized,
-                Chain::Ethereum,
-                &token_in_address,
-                &token_out_address,
-                &state_for_task.native_token_protocol_allowlist,
-                guard,
-            )
-            .await
+            resimulate_route(&state_for_task, &normalized, Chain::Ethereum, guard).await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1144,8 +1311,14 @@ mod tests {
             Box::new(StepProtocolSim { multiplier: 2 }) as Box<dyn ProtocolSim>,
         );
         vm_state_store
-            .apply_update(Update::new(2, replacement_states, HashMap::new()))
+            .apply_update_with_head(
+                Update::new(2, replacement_states, HashMap::new()),
+                Some(fixture_head(2)),
+            )
             .await;
+        app_state
+            .chain_head_observer
+            .observe_for_test(fixture_head(2));
 
         drop(request_guard);
         let resimulated =
@@ -1187,7 +1360,7 @@ mod tests {
         let mut new_pairs = HashMap::new();
         new_pairs.insert("pool-erc4626".to_string(), component);
         native_state_store
-            .apply_update(Update::new(1, states, new_pairs))
+            .apply_update_with_head(Update::new(1, states, new_pairs), Some(fixture_head(1)))
             .await;
 
         let normalized = NormalizedRouteInternal {
@@ -1218,9 +1391,6 @@ mod tests {
             &disabled_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &disabled_state.native_token_protocol_allowlist,
             test_rebuild_guard(&disabled_state).await,
         )
         .await
@@ -1232,6 +1402,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
         );
+        assert!(!err.is_state_dependent());
 
         let enabled_state = test_app_state(
             tokens_store,
@@ -1247,9 +1418,6 @@ mod tests {
             &enabled_state,
             &normalized,
             Chain::Ethereum,
-            &token_in.address,
-            &token_out.address,
-            &enabled_state.native_token_protocol_allowlist,
             test_rebuild_guard(&enabled_state).await,
         )
         .await
@@ -1299,7 +1467,9 @@ mod tests {
         new_pairs.insert("pool-a".to_string(), component_a);
         new_pairs.insert("pool-shared".to_string(), component_shared);
         let update = Update::new(1, states, new_pairs);
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head(1)))
+            .await;
 
         let app_state = test_app_state(
             tokens_store,
@@ -1358,9 +1528,6 @@ mod tests {
             &app_state,
             &normalized,
             Chain::Ethereum,
-            &token_a.address,
-            &token_c.address,
-            &app_state.native_token_protocol_allowlist,
             test_rebuild_guard(&app_state).await,
         )
         .await
@@ -1405,6 +1572,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::Simulation
         );
+        assert!(!err.is_state_dependent());
         assert!(err.message().contains("Token lookup failed"));
     }
 
@@ -1448,7 +1616,7 @@ mod tests {
             ),
         );
         native_state_store
-            .apply_update(Update::new(1, states, pairs))
+            .apply_update_with_head(Update::new(1, states, pairs), Some(fixture_head(1)))
             .await;
         let native_pin = native_state_store.pin().await;
         let app_state = test_app_state(
@@ -1467,6 +1635,19 @@ mod tests {
 
         assert_eq!(from_pin.symbol, "PINNED");
         assert_eq!(from_pin.decimals, 18);
+
+        let missing_address = dummy_token("0x0000000000000000000000000000000000000003").address;
+        let missing_error = match cache.get(&missing_address, Some(&native_pin)).await {
+            Ok(_) => panic!("missing pinned metadata should fail"),
+            Err(error) => error,
+        };
+        assert!(missing_error.is_state_dependent());
+        assert_eq!(
+            missing_error.kind(),
+            crate::services::encode::EncodeErrorKind::InvalidRequest
+        );
+        assert_eq!(missing_error.message(), "Token not found");
+
         assert!(
             !app_state
                 .tokens

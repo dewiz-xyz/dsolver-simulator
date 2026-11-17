@@ -1,3 +1,35 @@
+[[protocols]]
+id = "aero_basic"
+backend = "native"
+
+[[protocols]]
+id = "aero_cl"
+backend = "native"
+
+[[protocols]]
+id = "pancakeswap_infinity_cl"
+backend = "native"
+
+[[protocols]]
+id = "pancakeswap_infinity_bin"
+backend = "native"
+
+[[protocols]]
+id = "lunarbase"
+backend = "native"
+
+[[protocols]]
+id = "biconomy"
+backend = "native"
+
+[[protocols]]
+id = "rfq:native"
+backend = "rfq"
+
+[[protocols]]
+id = "rfq:metric"
+backend = "rfq"
+
 # Declare protocols once up top, then let each chain opt into the ones it actually wants.
 [[protocols]]
 id = "uniswap_v2"
@@ -48,6 +80,10 @@ id = "aerodrome_slipstreams"
 backend = "native"
 
 [[protocols]]
+id = "aerodrome_v1"
+backend = "native"
+
+[[protocols]]
 id = "vm:curve"
 backend = "vm"
 
@@ -65,42 +101,6 @@ backend = "rfq"
 
 [[protocols]]
 id = "rfq:liquorice"
-backend = "rfq"
-
-[[protocols]]
-id = "aerodrome_v1"
-backend = "native"
-
-[[protocols]]
-id = "aero_basic"
-backend = "native"
-
-[[protocols]]
-id = "aero_cl"
-backend = "native"
-
-[[protocols]]
-id = "pancakeswap_infinity_cl"
-backend = "native"
-
-[[protocols]]
-id = "pancakeswap_infinity_bin"
-backend = "native"
-
-[[protocols]]
-id = "lunarbase"
-backend = "native"
-
-[[protocols]]
-id = "biconomy"
-backend = "native"
-
-[[protocols]]
-id = "rfq:native"
-backend = "rfq"
-
-[[protocols]]
-id = "rfq:metric"
 backend = "rfq"
 
 # Route policies hold the routing nuances that do not belong in the plain chain protocol lists.
@@ -140,11 +140,18 @@ native_token_protocol_allowlist = []
 reset_allowance_tokens = []
 
 # Chain entries stay intentionally small: endpoints, enabled protocol sets, and the route policy to use.
-# Only a strictly newer complete block renews each chain's native progress lease.
+# Stream initialization bounds individual replay/bootstrap operations and the first RFQ update.
+# Tycho bootstrap spans construction through complete state; established head mismatch has its own window.
 [[chains]]
 chain_id = 1
-native_progress_lease_secs = 25
+stream_initialization_timeout_secs = 25
+chain_head_poll_interval_ms = 1000
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 15
+tycho_initial_bootstrap_timeout_secs = 900
+tycho_head_mismatch_recovery_timeout_secs = 60
 recovery_max_buffered_native_blocks = 8
+token_max_days_since_last_trade = 42
 tycho_url = "tycho-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/ethereum/v3/tokens"
 hashflow_filename = "./hashflow_supported_tokens.csv"
@@ -169,8 +176,17 @@ route_policy = "ethereum"
 
 [[chains]]
 chain_id = 8453
-native_progress_lease_secs = 10
-recovery_max_buffered_native_blocks = 64
+stream_initialization_timeout_secs = 10
+chain_head_poll_interval_ms = 500
+chain_head_rpc_request_timeout_ms = 2000
+chain_head_observation_max_age_secs = 5
+tycho_initial_bootstrap_timeout_secs = 300
+tycho_head_mismatch_recovery_timeout_secs = 60
+# Base produces a block every 200ms, so a 60s startup or recovery handoff can buffer about
+# 300 blocks. Stay above that so the time limit ends a slow handoff, not a block cap that
+# expires before a 14-25s snapshot build finishes.
+recovery_max_buffered_native_blocks = 512
+token_max_days_since_last_trade = 1
 tycho_url = "tycho-base-beta.propellerheads.xyz"
 bebop_url = "https://api.bebop.xyz/pmm/base/v3/tokens"
 hashflow_filename = "./hashflow_supported_tokens.csv"
@@ -180,14 +196,10 @@ native_protocols = [
     "uniswap_v4",
     "pancakeswap_v3",
     "aerodrome_slipstreams",
-    "sushiswap_v2",
-    "aerodrome_v1",
-    "aero_basic",
-    "aero_cl",
-    "pancakeswap_infinity_cl",
-    "lunarbase",
-    "ekubo_v3",
 ]
+# The broadcaster carries these for DSolver V2, which encodes them itself. Our execution fork has no
+# encoder for them, so the simulator does not route them.
+broadcaster_only_native_protocols = ["aerodrome_v1", "sushiswap_v2", "aero_basic", "aero_cl", "pancakeswap_infinity_cl", "lunarbase", "ekubo_v3"]
 vm_protocols = []
 rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric"]
 route_policy = "base"

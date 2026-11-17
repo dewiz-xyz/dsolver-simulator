@@ -27,6 +27,7 @@ pub fn create_broadcaster_router(app_state: BroadcasterAppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    use simulator_core::models::protocol::ProtocolKind;
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::{
@@ -53,9 +54,10 @@ mod tests {
         broadcaster::state::{
             BroadcasterReadiness, BroadcasterSnapshotCache, BroadcasterUpstreamState,
         },
+        chain_head::ChainHeadObserver,
         models::tokens::TokenStore,
     };
-    use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterBackendHead};
+    use simulator_core::broadcaster::{BlockIdentity, BroadcasterBackend, BroadcasterBackendHead};
     use tokio::{
         sync::{Barrier, Mutex, Notify},
         task::JoinHandle,
@@ -64,10 +66,13 @@ mod tests {
     use tower::ServiceExt;
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
-        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, FeedMessage, SynchronizerState,
+        },
         tycho_common::{
             dto::{PaginationResponse, ProtocolStateDelta, TokensRequestResponse},
-            models::{token::Token, Chain},
+            models::{blockchain::BlockAggregatedChanges, token::Token, Chain},
             simulation::{
                 errors::{SimulationError, TransitionError},
                 protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -149,6 +154,76 @@ mod tests {
         Ready,
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn chain_head_readiness_recovers_without_closing_deployment_admission() -> Result<()> {
+        let protocols = vec![ProtocolKind::UniswapV2];
+        let head = BlockIdentity {
+            number: 10,
+            hash: Bytes::from([11; 32]),
+        };
+        let observer = ChainHeadObserver::ready_for_test(head.clone());
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                redis_publisher_config(),
+                Arc::new(RpcFakeRedisWriter::healthy()),
+            )
+            .with_required_protocols(protocols.clone(), Vec::new()),
+        );
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            publisher.clone(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(observer.clone(), protocols, Vec::new());
+        service.mark_upstream_connected().await;
+        service
+            .apply_feed_message(&raw_feed(&["uniswap_v2"], 10, None))
+            .await?;
+        BroadcasterServiceState::promote_when_ready(std::slice::from_ref(&service), "test_ready")
+            .await?;
+        let app = create_broadcaster_router(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            token_store(
+                Vec::new(),
+                "http://127.0.0.1:1".to_string(),
+                Chain::Ethereum,
+            ),
+            1,
+            Duration::from_secs(300),
+            publisher,
+        ));
+        assert_eq!(get_json(app.clone(), "/ready").await?.0, StatusCode::OK);
+        observer.observe_for_test(BlockIdentity {
+            number: 11,
+            hash: Bytes::from([12; 32]),
+        });
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["backends"]["native"]["head_agreement"],
+            "observer_ahead"
+        );
+        assert_eq!(body["backends"]["native"]["published_head"]["number"], 10);
+        assert_eq!(
+            get_json(app.clone(), "/deployment-ready").await?.0,
+            StatusCode::OK
+        );
+        assert_eq!(get_json(app.clone(), "/status").await?.0, StatusCode::OK);
+        observer.observe_for_test(head);
+        assert_eq!(get_json(app.clone(), "/ready").await?.0, StatusCode::OK);
+        observer.fail_for_test();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "chain_head_unavailable");
+        assert_eq!(body["chain_head"]["observation_available"], false);
+        assert_eq!(get_json(app, "/deployment-ready").await?.0, StatusCode::OK);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn status_reports_upstream_disconnected() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
@@ -168,19 +243,27 @@ mod tests {
     #[tokio::test]
     async fn status_reports_snapshot_warming_up() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["upstream"]["connected"], true);
         assert_eq!(body["snapshot"]["ready"], false);
+
+        let (status, body) = get_json(app.clone(), "/ready").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "snapshot_warming_up");
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn status_reports_ready_once_snapshot_is_bootstrapped() -> Result<()> {
         let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
@@ -192,24 +275,8 @@ mod tests {
         assert_eq!(body["snapshot"]["ready"], true);
         assert_eq!(body["backends"]["native"]["block_number"], 10);
         assert_eq!(body["backends"]["native"]["pool_count"], 1);
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn ready_fails_closed_until_snapshot_is_bootstrapped() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
         let (status, body) = get_json(app, "/ready").await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "snapshot_warming_up");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ready_succeeds_for_active_exportable_publisher() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::Ready).await?);
-        let (status, body) = get_json(app, "/ready").await?;
-
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         Ok(())
@@ -234,7 +301,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn status_reports_passive_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_passive_ready_state().await?);
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_passive");
@@ -242,6 +309,11 @@ mod tests {
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");
         assert!(body["redis_publisher"]["replay_boundary"].is_null());
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_passive");
+        assert_eq!(body["redis_publisher"]["mode"], "passive");
         Ok(())
     }
 
@@ -256,6 +328,7 @@ mod tests {
         assert_eq!(body["status"], "ready");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "active");
+        assert!(body["state_history"].is_null());
         let Some(stream_id) = body["redis_publisher"]["stream_id"].as_str() else {
             bail!("expected redis publisher stream_id");
         };
@@ -364,7 +437,7 @@ mod tests {
     async fn status_reports_unhealthy_publisher_while_remaining_live() -> Result<()> {
         let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
 
-        let (status, body) = get_json(app, "/status").await?;
+        let (status, body) = get_json(app.clone(), "/status").await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "redis_publisher_unhealthy");
@@ -372,6 +445,11 @@ mod tests {
         assert_eq!(body["redis_publisher"]["mode"], "unhealthy");
         assert_eq!(body["deployment_admission"]["admitted"], true);
         assert_eq!(body["deployment_admission"]["phase"], "admitted");
+
+        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "redis_publisher_unhealthy");
+        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 
@@ -385,39 +463,6 @@ mod tests {
         assert_eq!(body["status"], "snapshot_warming_up");
         assert_eq!(body["redis_publisher"]["healthy"], true);
         assert_eq!(body["redis_publisher"]["mode"], "passive");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_session_create_rejects_when_publisher_is_passive() -> Result<()> {
-        let app = create_broadcaster_router(build_passive_ready_state().await?);
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "redis_publisher_passive");
-        assert_eq!(body["redis_publisher"]["mode"], "passive");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_session_create_rejects_until_ready() -> Result<()> {
-        let app = create_broadcaster_router(build_state(SeedMode::WarmingUp).await?);
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "snapshot_warming_up");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_session_create_rejects_when_redis_boundary_is_unavailable() -> Result<()> {
-        let app = create_broadcaster_router(build_state_with_unhealthy_redis().await?);
-
-        let (status, body) = post_json(app, "/snapshot-sessions", serde_json::json!({})).await?;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "redis_publisher_unhealthy");
-        assert_eq!(body["redis_publisher"]["healthy"], false);
         Ok(())
     }
 
@@ -463,6 +508,8 @@ mod tests {
             serde_json::json!(["native", "rfq"])
         );
         assert!(body["backends"]["rfq"].is_object());
+        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
+        assert!(body["snapshot"]["ready"].as_bool().unwrap_or(false));
 
         let (status, body) =
             post_json(app.clone(), "/snapshot-sessions", serde_json::json!({})).await?;
@@ -474,24 +521,6 @@ mod tests {
             get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["backends"], serde_json::json!(["native"]));
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn root_status_reports_rfq_backend_readiness() -> Result<()> {
-        let app = create_broadcaster_router(
-            build_state_with_rfq(SeedMode::Ready, SeedMode::WarmingUp).await?,
-        );
-
-        let (status, body) = get_json(app, "/status").await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "ready");
-        assert_eq!(
-            body["snapshot"]["configured_backends"],
-            serde_json::json!(["native", "rfq"])
-        );
-        assert!(body["upstream"]["connected"].as_bool().unwrap_or(false));
-        assert!(body["snapshot"]["ready"].as_bool().unwrap_or(false));
         Ok(())
     }
 
@@ -634,6 +663,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_snapshot_includes_admitted_stream_token() -> Result<()> {
+        let stream_token = token_with_metadata(0x51, "STREAM", 18, 75);
+        let app = create_broadcaster_router(
+            build_state_with_stream_token(Vec::new(), stream_token, 75).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tokens"][0]["symbol"], "STREAM");
+        assert_eq!(body["tokens"][0]["quality"], 75);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_includes_token_received_during_pending_replacement() -> Result<()> {
+        let stream_token = token_with_metadata(0x54, "RECOVERY", 18, 75);
+        let app = create_broadcaster_router(
+            build_state_with_recovery_stream_token(stream_token, 75).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tokens"][0]["symbol"], "RECOVERY");
+        assert_eq!(body["tokens"][0]["quality"], 75);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_keeps_known_metadata_for_stream_duplicate() -> Result<()> {
+        let stored = token_with_metadata(0x52, "STORED", 6, 80);
+        let incoming = token_with_metadata(0x52, "INCOMING", 18, 100);
+        let app = create_broadcaster_router(
+            build_state_with_stream_token(vec![stored], incoming, 50).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tokens"][0]["symbol"], "STORED");
+        assert_eq!(body["tokens"][0]["decimals"], 6);
+        assert_eq!(body["tokens"][0]["quality"], 80);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_snapshot_excludes_stream_token_below_quality_floor() -> Result<()> {
+        let stream_token = token_with_metadata(0x53, "LOW", 18, 49);
+        let app = create_broadcaster_router(
+            build_state_with_stream_token(Vec::new(), stream_token, 50).await?,
+        );
+
+        let (status, body) = get_json(app, "/tokens/snapshot").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn token_lookup_fetches_cache_misses_from_broadcaster_store() -> Result<()> {
         let fetched = token(0x42, "FETCHED", Chain::Ethereum);
         let (tycho_url, request_count, server_task) =
@@ -748,16 +841,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_lookup_rejects_mismatched_chain_id() -> Result<()> {
-        let (tycho_url, _request_count, server_task) =
-            spawn_tycho_token_server(None, Duration::ZERO).await?;
-        let app = create_broadcaster_router(
-            build_state_with_tokens(
-                SeedMode::Disconnected,
-                token_store(vec![], tycho_url, Chain::Ethereum),
-                Chain::Ethereum,
-            )
-            .await?,
-        );
+        let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
 
         let (status, body) = post_json(
             app,
@@ -768,7 +852,6 @@ mod tests {
             }),
         )
         .await?;
-        server_task.abort();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let Some(error) = body["error"].as_str() else {
@@ -780,16 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_lookup_rejects_malformed_addresses() -> Result<()> {
-        let (tycho_url, _request_count, server_task) =
-            spawn_tycho_token_server(None, Duration::ZERO).await?;
-        let app = create_broadcaster_router(
-            build_state_with_tokens(
-                SeedMode::Disconnected,
-                token_store(vec![], tycho_url, Chain::Ethereum),
-                Chain::Ethereum,
-            )
-            .await?,
-        );
+        let app = create_broadcaster_router(build_state(SeedMode::Disconnected).await?);
 
         let (status, body) = post_json(
             app,
@@ -800,7 +874,6 @@ mod tests {
             }),
         )
         .await?;
-        server_task.abort();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let Some(error) = body["error"].as_str() else {
@@ -887,6 +960,102 @@ mod tests {
             None,
             tokens,
             chain.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_state_with_stream_token(
+        initial_tokens: Vec<Token>,
+        stream_token: Token,
+        token_min_quality: u32,
+    ) -> Result<BroadcasterAppState> {
+        let tokens = token_store(
+            initial_tokens,
+            "http://127.0.0.1:1".to_string(),
+            Chain::Ethereum,
+        );
+        let cache = BroadcasterSnapshotCache::with_token_catalog(
+            Chain::Ethereum.id(),
+            vec![BroadcasterBackend::Native],
+            Arc::clone(&tokens),
+            token_min_quality,
+        );
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache,
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_feed_message(&raw_feed_with_new_token(stream_token))
+            .await?;
+
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            tokens,
+            Chain::Ethereum.id(),
+            Duration::from_secs(300),
+            publisher,
+        ))
+    }
+
+    async fn build_state_with_recovery_stream_token(
+        stream_token: Token,
+        token_min_quality: u32,
+    ) -> Result<BroadcasterAppState> {
+        let tokens = token_store(
+            Vec::new(),
+            "http://127.0.0.1:1".to_string(),
+            Chain::Ethereum,
+        );
+        let cache = BroadcasterSnapshotCache::with_token_catalog(
+            Chain::Ethereum.id(),
+            vec![BroadcasterBackend::Native],
+            Arc::clone(&tokens),
+            token_min_quality,
+        );
+        let (publisher, gate) = publisher_and_gate(RpcFakeRedisWriter::healthy());
+        publisher
+            .promote(
+                vec![BroadcasterBackendHead::new(BroadcasterBackend::Native, 0)],
+                "active_writer_promoted",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            cache.clone(),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            gate,
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_feed_message(&raw_feed(&["uniswap_v2", "sushiswap_v2"], 1, None))
+            .await?;
+
+        cache.begin_same_generation_recovery().await;
+        let published = service
+            .apply_feed_message(&raw_feed(&["uniswap_v2"], 2, Some(stream_token)))
+            .await?;
+        assert!(!published);
+        assert!(service.status_snapshot().await.snapshot.recovery_pending);
+
+        Ok(BroadcasterAppState::with_snapshot_session_ttl(
+            service,
+            None,
+            tokens,
+            Chain::Ethereum.id(),
             Duration::from_secs(300),
             publisher,
         ))
@@ -1164,12 +1333,11 @@ mod tests {
         > {
             Box::pin(async move {
                 let mut state = self.state.lock().await;
-                if let Some(expected_token) = command.expected_writer_token {
-                    if state.active_token.as_deref() != Some(expected_token)
+                if command.expected_writer_token.is_some_and(|expected_token| {
+                    state.active_token.as_deref() != Some(expected_token)
                         || Some(state.active_generation) != command.expected_generation
-                    {
-                        bail!("stale Redis broadcaster writer token");
-                    }
+                }) {
+                    bail!("stale Redis broadcaster writer token");
                 }
                 state.active_generation = state.active_generation.saturating_add(1);
                 state.active_token = Some(command.writer_token.to_string());
@@ -1379,6 +1547,66 @@ mod tests {
 
     fn token(seed: u8, symbol: &str, chain: Chain) -> Token {
         Token::new(&address(seed), symbol, 18, 0, &[Some(21_000)], chain, 100)
+    }
+
+    fn token_with_metadata(seed: u8, symbol: &str, decimals: u32, quality: u32) -> Token {
+        Token::new(
+            &address(seed),
+            symbol,
+            decimals,
+            0,
+            &[Some(21_000)],
+            Chain::Ethereum,
+            quality,
+        )
+    }
+
+    fn raw_feed_with_new_token(token: Token) -> FeedMessage<BlockHeader> {
+        raw_feed(&["uniswap_v2"], 1, Some(token))
+    }
+
+    fn raw_feed(
+        protocols: &[&str],
+        block_number: u64,
+        token: Option<Token>,
+    ) -> FeedMessage<BlockHeader> {
+        let header = BlockHeader {
+            hash: Bytes::from([(block_number + 1) as u8; 32]),
+            number: block_number,
+            parent_hash: Bytes::from([block_number as u8; 32]),
+            revert: false,
+            timestamp: block_number * 10,
+            partial_block_index: None,
+        };
+        FeedMessage {
+            state_msgs: protocols
+                .iter()
+                .map(|protocol| {
+                    let mut deltas = BlockAggregatedChanges::default();
+                    if let Some(token) = token.clone() {
+                        deltas.new_tokens.insert(token.address.clone(), token);
+                    }
+                    (
+                        (*protocol).to_string(),
+                        StateSyncMessage {
+                            header: header.clone(),
+                            snapshots: Snapshot::default(),
+                            deltas: Some(deltas),
+                            removed_components: HashMap::new(),
+                        },
+                    )
+                })
+                .collect(),
+            sync_states: protocols
+                .iter()
+                .map(|protocol| {
+                    (
+                        (*protocol).to_string(),
+                        SynchronizerState::Ready(header.clone()),
+                    )
+                })
+                .collect(),
+        }
     }
 
     fn token_store(

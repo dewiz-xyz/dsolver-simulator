@@ -15,7 +15,7 @@ use tycho_simulation::tycho_common::{models::Chain, Bytes};
 
 use crate::models::messages::{Interaction, InteractionKind, RouteEncodeRequest};
 
-use super::error::map_encoding_error;
+use super::error::{map_encoding_error, AttemptError};
 use super::model::ResimulatedRouteInternal;
 use super::tycho_swaps::build_route_swaps;
 use super::wire::{biguint_to_u256_checked, format_address, format_calldata};
@@ -39,15 +39,15 @@ pub(super) struct RouteContext<'a> {
 pub(super) fn build_encoder(
     chain: Chain,
     router_address: Bytes,
-) -> Result<Arc<dyn TychoEncoder>, EncodeError> {
+) -> Result<Arc<dyn TychoEncoder>, AttemptError> {
     // TODO: we can probably optimize this in the feature to initialize the encoder registry + add default encoders during the server's startup.
     let swap_encoder_registry = SwapEncoderRegistry::new(chain)
         .add_default_encoders(None)
         .map_err(|err| {
-            EncodeError::encoding(format!(
+            AttemptError::deterministic(EncodeError::encoding(format!(
                 "Failed to build swap encoder registry for {}: {}",
                 chain, err
-            ))
+            )))
         })?;
 
     TychoRouterEncoderBuilder::new()
@@ -57,7 +57,12 @@ pub(super) fn build_encoder(
         .router_address(router_address)
         .build()
         .map(Arc::from)
-        .map_err(|err| EncodeError::encoding(format!("Failed to build Tycho encoder: {}", err)))
+        .map_err(|err| {
+            AttemptError::deterministic(EncodeError::encoding(format!(
+                "Failed to build Tycho encoder: {}",
+                err
+            )))
+        })
 }
 
 pub(super) fn build_route_calldata_tx(
@@ -65,9 +70,10 @@ pub(super) fn build_route_calldata_tx(
     resimulated: &ResimulatedRouteInternal,
     encoder: &dyn TychoEncoder,
     min_amount_out: &BigUint,
-) -> Result<CallDataPayload, EncodeError> {
+) -> Result<CallDataPayload, AttemptError> {
     let swaps = build_route_swaps(resimulated)?;
-    let sender = super::wire::parse_address(&context.request.settlement_address)?;
+    let sender = super::wire::parse_address(&context.request.settlement_address)
+        .map_err(AttemptError::deterministic)?;
     let receiver = sender.clone();
 
     let solution = Solution {
@@ -82,31 +88,21 @@ pub(super) fn build_route_calldata_tx(
         native_action: None,
     };
 
-    let encoded_solution = encoder
-        .encode_solutions(vec![solution.clone()])
-        .map_err(|err| match err {
-            EncodingError::InvalidInput(_) => {
-                EncodeError::invalid(format!("Route encoding failed: {}", err))
-            }
-            _ => EncodeError::encoding(format!("Route encoding failed: {}", err)),
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| EncodeError::encoding("Route encoding returned no solutions"))?;
+    let encoded_solution = take_encoded_solution(encoder.encode_solutions(vec![solution.clone()]))?;
 
     if encoded_solution.permit.is_some()
         || encoded_solution.function_signature.contains("Permit2")
         || encoded_solution.function_signature.contains("permit2")
     {
-        return Err(EncodeError::encoding(
+        return Err(AttemptError::deterministic(EncodeError::encoding(
             "Permit2 encodings are not supported for route calldata",
-        ));
+        )));
     }
 
     if &encoded_solution.interacting_with != context.router_address {
-        return Err(EncodeError::encoding(
+        return Err(AttemptError::deterministic(EncodeError::encoding(
             "Encoded router address does not match request tychoRouterAddress",
-        ));
+        )));
     }
 
     let is_transfer_from_allowed = !context.is_native_input;
@@ -129,13 +125,35 @@ pub(super) fn build_route_calldata_tx(
     })
 }
 
+fn take_encoded_solution(
+    result: Result<Vec<EncodedSolution>, EncodingError>,
+) -> Result<EncodedSolution, AttemptError> {
+    result
+        .map_err(|err| match err {
+            EncodingError::InvalidInput(_) => AttemptError::state_dependent(EncodeError::invalid(
+                format!("Route encoding failed: {}", err),
+            )),
+            _ => AttemptError::state_dependent(EncodeError::encoding(format!(
+                "Route encoding failed: {}",
+                err
+            ))),
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            AttemptError::state_dependent(EncodeError::encoding(
+                "Route encoding returned no solutions",
+            ))
+        })
+}
+
 pub(super) fn build_settlement_interactions(
     token_in: &Bytes,
     amount_in: &BigUint,
     router_call: CallDataPayload,
     reset_approval: bool,
     is_native_input: bool,
-) -> Result<Vec<Interaction>, EncodeError> {
+) -> Result<Vec<Interaction>, AttemptError> {
     let mut interactions = Vec::with_capacity(if is_native_input {
         1
     } else if reset_approval {
@@ -172,7 +190,7 @@ fn build_erc20_approve_interaction(
     token: &Bytes,
     spender: &Bytes,
     amount: &BigUint,
-) -> Result<Interaction, EncodeError> {
+) -> Result<Interaction, AttemptError> {
     let calldata = encode_erc20_approve_calldata(spender, amount)?;
     Ok(Interaction {
         kind: InteractionKind::Erc20Approve,
@@ -185,9 +203,12 @@ fn build_erc20_approve_interaction(
 fn encode_erc20_approve_calldata(
     spender: &Bytes,
     amount: &BigUint,
-) -> Result<Vec<u8>, EncodeError> {
-    let spender = bytes_to_address(spender).map_err(map_encoding_error)?;
-    let amount = biguint_to_u256_checked(amount, "approve amount")?;
+) -> Result<Vec<u8>, AttemptError> {
+    let spender = bytes_to_address(spender)
+        .map_err(map_encoding_error)
+        .map_err(AttemptError::deterministic)?;
+    let amount =
+        biguint_to_u256_checked(amount, "approve amount").map_err(AttemptError::deterministic)?;
     let calldata_args = (spender, amount).abi_encode();
     encode_function_call(ERC20_APPROVE_SIGNATURE, calldata_args)
 }
@@ -197,26 +218,34 @@ fn encode_route_calldata(
     solution: &Solution,
     receiver: &Bytes,
     is_transfer_from_allowed: bool,
-) -> Result<Vec<u8>, EncodeError> {
+) -> Result<Vec<u8>, AttemptError> {
     let signature = encoded_solution.function_signature.as_str();
     // `/encode` preserves route token semantics and does not inject wrap/unwrap steps.
     // Routes must already be protocol-compatible, and native-input routes must disable router
     // `transferFrom`.
     let is_wrap = false;
     let is_unwrap = false;
-    let given_amount = biguint_to_u256_checked(&solution.given_amount, "amountIn")?;
-    let checked_amount = biguint_to_u256_checked(&solution.checked_amount, "minAmountOut")?;
+    let given_amount = biguint_to_u256_checked(&solution.given_amount, "amountIn")
+        .map_err(AttemptError::deterministic)?;
+    let checked_amount = biguint_to_u256_checked(&solution.checked_amount, "minAmountOut")
+        .map_err(AttemptError::deterministic)?;
 
     let calldata_args = if signature.contains("splitSwap") {
         (
             given_amount,
-            bytes_to_address(&solution.given_token).map_err(map_encoding_error)?,
-            bytes_to_address(&solution.checked_token).map_err(map_encoding_error)?,
+            bytes_to_address(&solution.given_token)
+                .map_err(map_encoding_error)
+                .map_err(AttemptError::deterministic)?,
+            bytes_to_address(&solution.checked_token)
+                .map_err(map_encoding_error)
+                .map_err(AttemptError::deterministic)?,
             checked_amount,
             is_wrap,
             is_unwrap,
             alloy_primitives::U256::from(encoded_solution.n_tokens),
-            bytes_to_address(receiver).map_err(map_encoding_error)?,
+            bytes_to_address(receiver)
+                .map_err(map_encoding_error)
+                .map_err(AttemptError::deterministic)?,
             is_transfer_from_allowed,
             encoded_solution.swaps.clone(),
         )
@@ -224,27 +253,33 @@ fn encode_route_calldata(
     } else if signature.contains("singleSwap") || signature.contains("sequentialSwap") {
         (
             given_amount,
-            bytes_to_address(&solution.given_token).map_err(map_encoding_error)?,
-            bytes_to_address(&solution.checked_token).map_err(map_encoding_error)?,
+            bytes_to_address(&solution.given_token)
+                .map_err(map_encoding_error)
+                .map_err(AttemptError::deterministic)?,
+            bytes_to_address(&solution.checked_token)
+                .map_err(map_encoding_error)
+                .map_err(AttemptError::deterministic)?,
             checked_amount,
             is_wrap,
             is_unwrap,
-            bytes_to_address(receiver).map_err(map_encoding_error)?,
+            bytes_to_address(receiver)
+                .map_err(map_encoding_error)
+                .map_err(AttemptError::deterministic)?,
             is_transfer_from_allowed,
             encoded_solution.swaps.clone(),
         )
             .abi_encode_params()
     } else {
-        return Err(EncodeError::encoding(format!(
+        return Err(AttemptError::deterministic(EncodeError::encoding(format!(
             "Unsupported Tycho function signature: {}",
             signature
-        )));
+        ))));
     };
 
     encode_function_call(signature, calldata_args)
 }
 
-fn encode_function_call(signature: &str, encoded_args: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
+fn encode_function_call(signature: &str, encoded_args: Vec<u8>) -> Result<Vec<u8>, AttemptError> {
     let selector = function_selector(signature)?;
     let mut call_data = Vec::with_capacity(4 + encoded_args.len());
     call_data.extend_from_slice(&selector);
@@ -252,13 +287,13 @@ fn encode_function_call(signature: &str, encoded_args: Vec<u8>) -> Result<Vec<u8
     Ok(call_data)
 }
 
-fn function_selector(signature: &str) -> Result<[u8; 4], EncodeError> {
+fn function_selector(signature: &str) -> Result<[u8; 4], AttemptError> {
     let normalized = signature.trim();
     if !normalized.contains('(') {
-        return Err(EncodeError::encoding(format!(
+        return Err(AttemptError::deterministic(EncodeError::encoding(format!(
             "Invalid function signature: {}",
             signature
-        )));
+        ))));
     }
     let mut hasher = Keccak256::new();
     hasher.update(normalized.as_bytes());
@@ -306,6 +341,19 @@ mod tests {
             .copied()
             .expect("single-swap calldata should include transferFrom flag")
             == 1
+    }
+
+    #[test]
+    fn tycho_solution_failures_are_state_dependent() {
+        let encode_error = take_encoded_solution(Err(EncodingError::FatalError(
+            "pool state rejected".to_string(),
+        )))
+        .expect_err("Tycho encoding should fail");
+        assert!(encode_error.is_state_dependent());
+
+        let empty_error =
+            take_encoded_solution(Ok(Vec::new())).expect_err("empty solutions should fail");
+        assert!(empty_error.is_state_dependent());
     }
 
     #[test]
@@ -611,6 +659,7 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::Encoding
         );
+        assert!(!err.is_state_dependent());
         assert!(
             err.message().contains("Permit2"),
             "unexpected error: {}",
@@ -702,34 +751,11 @@ mod tests {
             err.kind(),
             crate::services::encode::EncodeErrorKind::InvalidRequest
         );
+        assert!(!err.is_state_dependent());
         assert!(
             err.message().contains("uint256"),
             "unexpected error message: {:?}",
             err.message()
-        );
-    }
-
-    #[test]
-    fn default_registry_supports_ekubo_v3() {
-        let registry = SwapEncoderRegistry::new(Chain::Ethereum)
-            .add_default_encoders(None)
-            .expect("default encoder registry should initialize");
-
-        assert!(
-            registry.get_encoder("ekubo_v3").is_some(),
-            "expected ekubo_v3 encoder in default registry"
-        );
-    }
-
-    #[test]
-    fn default_registry_supports_aerodrome_slipstreams() {
-        let registry = SwapEncoderRegistry::new(Chain::Base)
-            .add_default_encoders(None)
-            .expect("default encoder registry should initialize");
-
-        assert!(
-            registry.get_encoder("aerodrome_slipstreams").is_some(),
-            "expected aerodrome_slipstreams encoder in default registry"
         );
     }
 }

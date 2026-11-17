@@ -9,7 +9,11 @@ use runtime::broadcaster::state::{
     BroadcasterBackendStatus, BroadcasterRecoveryStatus, BroadcasterSnapshotSessionsSnapshot,
     BroadcasterSnapshotStatus, BroadcasterStatusSnapshot, BroadcasterUpstreamSnapshot,
 };
-use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterProtocolSyncStatus};
+use runtime::broadcaster::state_history::{StreamPosition, WriterStatus};
+use runtime::chain_head::{ChainHeadAgreement, ChainHeadSnapshot};
+use simulator_core::broadcaster::{
+    BlockIdentity, BroadcasterBackend, BroadcasterProtocolSyncStatus,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BroadcasterStatusPayload {
@@ -23,6 +27,10 @@ pub struct BroadcasterStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis_publisher: Option<BroadcasterRedisPublisherStatus>,
     pub deployment_admission: BroadcasterDeploymentAdmissionPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_history: Option<BroadcasterStateHistoryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_head: Option<BroadcasterChainHeadPayload>,
 }
 
 impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
@@ -46,6 +54,97 @@ impl From<BroadcasterStatusSnapshot> for BroadcasterStatusPayload {
                 .collect(),
             redis_publisher: snapshot.redis_publisher,
             deployment_admission: snapshot.deployment_admission.into(),
+            state_history: snapshot.state_history.map(Into::into),
+            chain_head: snapshot.chain_head.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcasterChainHeadPayload {
+    pub observed_head: Option<BlockIdentity>,
+    pub observation_available: bool,
+    pub observation_age_ms: Option<u64>,
+    pub rpc_outage_age_ms: Option<u64>,
+    pub last_error: Option<&'static str>,
+}
+
+impl From<ChainHeadSnapshot> for BroadcasterChainHeadPayload {
+    fn from(snapshot: ChainHeadSnapshot) -> Self {
+        Self {
+            observation_available: snapshot.is_observation_available(),
+            observed_head: snapshot.observed_head,
+            observation_age_ms: snapshot.observation_age.map(|age| age.as_millis() as u64),
+            rpc_outage_age_ms: snapshot.rpc_outage_age.map(|age| age.as_millis() as u64),
+            last_error: snapshot.last_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterStateHistoryStatus {
+    pub healthy: bool,
+    pub queue_len: u64,
+    pub queue_capacity: u64,
+    pub enqueued_deltas: u64,
+    pub persisted_deltas: u64,
+    pub dropped_deltas: u64,
+    pub failed_deltas: u64,
+    pub recorded_gaps: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted: Option<BroadcasterStateHistoryPosition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_persisted_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub checkpoints_completed: u64,
+    pub checkpoints_failed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_checkpoint_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_token_snapshot_sha: Option<String>,
+    pub token_persistence_failures: u64,
+}
+
+impl From<WriterStatus> for BroadcasterStateHistoryStatus {
+    fn from(status: WriterStatus) -> Self {
+        Self {
+            healthy: status.healthy,
+            queue_len: status.queue_len,
+            queue_capacity: status.queue_capacity,
+            enqueued_deltas: status.enqueued_deltas,
+            persisted_deltas: status.persisted_deltas,
+            dropped_deltas: status.dropped_deltas,
+            failed_deltas: status.failed_deltas,
+            recorded_gaps: status.recorded_gaps,
+            last_persisted: status.last_persisted.map(Into::into),
+            last_persisted_at_ms: status.last_persisted_at_ms,
+            last_error: status.last_error,
+            checkpoints_completed: status.checkpoints_completed,
+            checkpoints_failed: status.checkpoints_failed,
+            last_checkpoint_status: status.last_checkpoint_status,
+            last_successful_checkpoint_at_ms: status.last_successful_checkpoint_at_ms,
+            last_token_snapshot_sha: status.last_token_snapshot_sha,
+            token_persistence_failures: status.token_persistence_failures,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterStateHistoryPosition {
+    pub generation: u64,
+    pub message_seq: u64,
+}
+
+impl From<StreamPosition> for BroadcasterStateHistoryPosition {
+    fn from(position: StreamPosition) -> Self {
+        Self {
+            generation: position.generation,
+            message_seq: position.message_seq,
         }
     }
 }
@@ -213,6 +312,12 @@ pub struct BroadcasterBackendPayload {
     pub pool_count: usize,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_head: Option<BlockIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_agreement: Option<&'static str>,
 }
 
 impl BroadcasterBackendPayload {
@@ -227,6 +332,94 @@ impl BroadcasterBackendPayload {
             update_timestamp,
             pool_count: status.pool_count,
             sync_statuses: status.sync_statuses,
+            complete_head: status.complete_head,
+            published_head: status.published_head,
+            head_agreement: status.head_agreement.map(ChainHeadAgreement::as_str),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use runtime::broadcaster::{
+        redis_publisher::BroadcasterDeploymentPhase,
+        state::{BroadcasterReadiness, BroadcasterSnapshotSessionsSnapshot},
+    };
+
+    use super::*;
+
+    #[test]
+    fn state_history_token_failure_is_visible_without_changing_readiness() -> anyhow::Result<()> {
+        let payload = BroadcasterStatusPayload::from(BroadcasterStatusSnapshot {
+            readiness: BroadcasterReadiness::Ready,
+            chain_id: 8453,
+            upstream: BroadcasterUpstreamSnapshot {
+                connected: true,
+                restart_count: 0,
+                last_error: None,
+                last_disconnect_reason: None,
+                last_update_age_ms: Some(1),
+            },
+            recovery: BroadcasterRecoveryStatus::default(),
+            snapshot: BroadcasterSnapshotStatus {
+                ready: true,
+                stream_id: "stream".to_owned(),
+                snapshot_id: "snapshot".to_owned(),
+                configured_backends: Vec::new(),
+                total_states: 1,
+                max_payload_bytes: 1,
+                exportable: true,
+                last_export_check_age_ms: Some(1),
+                last_export_success_age_ms: Some(1),
+                last_export_duration_ms: Some(1),
+                last_export_payload_count: Some(1),
+                largest_payload_bytes: Some(1),
+                payload_limit_utilization_bps: Some(1),
+                last_export_error: None,
+                recovery_pending: false,
+                recovery_id: None,
+                recovery_error: None,
+            },
+            snapshot_sessions: BroadcasterSnapshotSessionsSnapshot::default(),
+            backends: BTreeMap::new(),
+            redis_publisher: None,
+            chain_head: None,
+            deployment_admission: BroadcasterDeploymentAdmissionSnapshot {
+                admitted: true,
+                phase: BroadcasterDeploymentPhase::Admitted,
+                last_error: None,
+            },
+            state_history: Some(WriterStatus {
+                healthy: true,
+                queue_len: 0,
+                queue_capacity: 8,
+                enqueued_deltas: 1,
+                persisted_deltas: 1,
+                dropped_deltas: 0,
+                failed_deltas: 0,
+                recorded_gaps: 0,
+                last_persisted: Some(StreamPosition {
+                    generation: 2,
+                    message_seq: 3,
+                }),
+                last_persisted_at_ms: Some(1_000),
+                last_error: None,
+                checkpoints_completed: 2,
+                checkpoints_failed: 0,
+                last_checkpoint_status: Some("complete".to_owned()),
+                last_successful_checkpoint_at_ms: Some(2_000),
+                last_token_snapshot_sha: Some("token-sha".to_owned()),
+                token_persistence_failures: 1,
+            }),
+        });
+
+        let json = serde_json::to_value(payload)?;
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["state_history"]["lastTokenSnapshotSha"], "token-sha");
+        assert_eq!(json["state_history"]["lastPersistedAtMs"], 1_000);
+        assert_eq!(json["state_history"]["lastSuccessfulCheckpointAtMs"], 2_000);
+        assert_eq!(json["state_history"]["tokenPersistenceFailures"], 1);
+        assert_eq!(json["state_history"]["healthy"], true);
+        Ok(())
     }
 }

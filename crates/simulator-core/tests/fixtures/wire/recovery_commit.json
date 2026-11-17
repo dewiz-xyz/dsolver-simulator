@@ -1,0 +1,1 @@
+{"stream_id":"wire-fixture-stream","message_seq":11,"kind":"recovery_commit","recoveryId":"wire-fixture-recovery","targetStateVersion":42,"backends":["native","vm"],"replacementDigest":"sha256:replacement","bufferACount":1,"commitWatermark":19000001}

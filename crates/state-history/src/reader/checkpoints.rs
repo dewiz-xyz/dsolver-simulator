@@ -1,0 +1,692 @@
+use anyhow::{ensure, Context};
+use futures::TryStreamExt;
+use sqlx::Row;
+
+use super::{
+    begin_range_transaction, database_i64, manifest_from_row,
+    positions::{
+        decode_stored_deltas, fetch_backend_cursors, fetch_delta_rows_between, fetch_gaps_between,
+    },
+    BlockInterval, RangeGap, ReadConnectionProvider, ReadLimits, StateHistoryReader, StoredDelta,
+};
+use crate::{Backend, CheckpointKind, CheckpointManifest, CheckpointStatus, StreamPosition};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenAnchor {
+    Available {
+        checkpoint: Box<CheckpointManifest>,
+        used_fallback: bool,
+    },
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitCheckpointPair {
+    pub earlier_position: StreamPosition,
+    pub target_position: StreamPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointPairSelection {
+    BlockRange(BlockInterval),
+    Explicit(Vec<ExplicitCheckpointPair>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointPairQuery {
+    pub chain_id: u64,
+    pub selection: CheckpointPairSelection,
+    pub backends: Vec<Backend>,
+    pub max_pairs: Option<usize>,
+}
+
+impl CheckpointPairQuery {
+    pub const fn new(chain_id: u64, selection: CheckpointPairSelection) -> Self {
+        Self {
+            chain_id,
+            selection,
+            backends: Vec::new(),
+            max_pairs: None,
+        }
+    }
+
+    pub fn for_backends(
+        chain_id: u64,
+        selection: CheckpointPairSelection,
+        mut backends: Vec<Backend>,
+    ) -> Self {
+        backends.sort_unstable();
+        backends.dedup();
+        Self {
+            chain_id,
+            selection,
+            backends,
+            max_pairs: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_max_pairs(mut self, max_pairs: usize) -> Self {
+        self.max_pairs = Some(max_pairs);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointPair {
+    pub earlier: CheckpointManifest,
+    pub target: CheckpointManifest,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointPairReplayPlan {
+    pub pair: CheckpointPair,
+    pub earlier_token_anchor: TokenAnchor,
+    pub target_token_anchor: TokenAnchor,
+    pub deltas: Vec<StoredDelta>,
+    pub gaps: Vec<RangeGap>,
+    pub estimated_decoded_bytes: u64,
+}
+
+struct RetainedCheckpointPair {
+    earlier: CheckpointManifest,
+    target: CheckpointManifest,
+    earlier_token_anchor: TokenAnchor,
+    target_token_anchor: TokenAnchor,
+}
+
+impl<P: ReadConnectionProvider> StateHistoryReader<P> {
+    pub async fn select_token_anchor(
+        &self,
+        selected: &CheckpointManifest,
+    ) -> anyhow::Result<TokenAnchor> {
+        ensure!(
+            selected.status == CheckpointStatus::Complete,
+            "token anchor selection requires a complete checkpoint"
+        );
+        let mut connection = self
+            .connections
+            .acquire()
+            .await
+            .context("failed to acquire token anchor connection")?;
+        let mut transaction = begin_range_transaction(&mut connection).await?;
+        let stored = exact_checkpoint(&mut transaction, selected.chain_id, selected.position)
+            .await?
+            .context("selected checkpoint does not exist as a complete retained checkpoint")?;
+        ensure!(
+            stored.id == selected.id,
+            "selected checkpoint does not match the retained checkpoint at its position"
+        );
+
+        let anchor = token_anchor_in_transaction(&mut transaction, stored).await?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit token anchor transaction")?;
+        Ok(anchor)
+    }
+
+    pub async fn resolve_checkpoint_pairs(
+        &self,
+        query: &CheckpointPairQuery,
+    ) -> anyhow::Result<Vec<CheckpointPair>> {
+        let mut connection = self
+            .connections
+            .acquire()
+            .await
+            .context("failed to acquire checkpoint pair connection")?;
+        let mut transaction = begin_range_transaction(&mut connection).await?;
+        let pairs = match &query.selection {
+            CheckpointPairSelection::BlockRange(bounds) => {
+                range_checkpoint_pairs(
+                    &mut transaction,
+                    query.chain_id,
+                    *bounds,
+                    &query.backends,
+                    query.max_pairs,
+                )
+                .await?
+            }
+            CheckpointPairSelection::Explicit(selections) => {
+                explicit_checkpoint_pairs(
+                    &mut transaction,
+                    query.chain_id,
+                    selections,
+                    &query.backends,
+                    query.max_pairs,
+                )
+                .await?
+            }
+        };
+        transaction
+            .commit()
+            .await
+            .context("failed to commit checkpoint pair transaction")?;
+        Ok(pairs)
+    }
+
+    pub async fn plan_checkpoint_pair(
+        &self,
+        pair: &CheckpointPair,
+        mut backends: Vec<Backend>,
+        limits: ReadLimits,
+    ) -> anyhow::Result<CheckpointPairReplayPlan> {
+        ensure!(
+            !backends.is_empty(),
+            "checkpoint pair backends must not be empty"
+        );
+        ensure!(
+            pair.earlier.chain_id == pair.target.chain_id,
+            "checkpoint pair chain ids differ"
+        );
+        ensure!(
+            pair.earlier.position < pair.target.position,
+            "checkpoint pair must be ordered"
+        );
+        backends.sort_unstable();
+        backends.dedup();
+
+        let mut connection = self
+            .connections
+            .acquire()
+            .await
+            .context("failed to acquire checkpoint pair plan connection")?;
+        let mut transaction = begin_range_transaction(&mut connection).await?;
+        let RetainedCheckpointPair {
+            earlier,
+            target,
+            earlier_token_anchor,
+            target_token_anchor,
+        } = retained_checkpoint_pair(&mut transaction, pair).await?;
+        let (checkpoint_compressed_bytes, checkpoint_decoded_bytes) =
+            declared_pair_checkpoint_bytes(
+                &earlier,
+                &target,
+                [&earlier_token_anchor, &target_token_anchor],
+            )?;
+        limits.check_compressed(checkpoint_compressed_bytes)?;
+        limits.check_decoded(checkpoint_decoded_bytes)?;
+        let remaining_compressed_bytes = limits
+            .max_compressed_bytes
+            .saturating_sub(checkpoint_compressed_bytes);
+        let remaining_decoded_bytes = limits
+            .max_decoded_bytes
+            .saturating_sub(checkpoint_decoded_bytes);
+        let encoded_rows = fetch_delta_rows_between(
+            &mut transaction,
+            earlier.chain_id,
+            earlier.position,
+            target.position,
+            &backends,
+            remaining_compressed_bytes,
+        )
+        .await?;
+        let backend_cursors = fetch_backend_cursors(&mut transaction, &encoded_rows).await?;
+        let gaps = fetch_gaps_between(
+            &mut transaction,
+            earlier.chain_id,
+            earlier.position,
+            target.position,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit checkpoint pair plan transaction")?;
+        drop(connection);
+        let (deltas, delta_decoded_bytes) = decode_stored_deltas(
+            encoded_rows,
+            &backend_cursors,
+            &backends,
+            remaining_decoded_bytes,
+        )?;
+        Ok(CheckpointPairReplayPlan {
+            pair: CheckpointPair { earlier, target },
+            earlier_token_anchor,
+            target_token_anchor,
+            deltas,
+            gaps,
+            estimated_decoded_bytes: checkpoint_decoded_bytes
+                .checked_add(delta_decoded_bytes)
+                .context("checkpoint pair decoded byte estimate overflowed")?,
+        })
+    }
+}
+
+async fn retained_checkpoint_pair(
+    connection: &mut sqlx::PgConnection,
+    pair: &CheckpointPair,
+) -> anyhow::Result<RetainedCheckpointPair> {
+    let earlier = exact_checkpoint(connection, pair.earlier.chain_id, pair.earlier.position)
+        .await?
+        .context("earlier checkpoint is not retained as complete")?;
+    let target = exact_checkpoint(connection, pair.target.chain_id, pair.target.position)
+        .await?
+        .context("target checkpoint is not retained as complete")?;
+    ensure!(
+        earlier.id == pair.earlier.id && target.id == pair.target.id,
+        "checkpoint pair does not match retained checkpoint identity"
+    );
+    let segment_start = segment_boundary_position(connection, target.chain_id, target.position)
+        .await?
+        .context("target checkpoint has no complete segment boundary")?;
+    ensure!(
+        earlier.position >= segment_start,
+        "checkpoint pair must stay in the same segment"
+    );
+
+    let earlier_token_anchor = token_anchor_in_transaction(connection, earlier.clone()).await?;
+    let target_token_anchor = token_anchor_in_transaction(connection, target.clone()).await?;
+    Ok(RetainedCheckpointPair {
+        earlier,
+        target,
+        earlier_token_anchor,
+        target_token_anchor,
+    })
+}
+
+fn declared_pair_checkpoint_bytes(
+    earlier: &CheckpointManifest,
+    target: &CheckpointManifest,
+    token_anchors: [&TokenAnchor; 2],
+) -> anyhow::Result<(u64, u64)> {
+    let mut compressed_bytes = 0_u64;
+    let mut decoded_bytes = 0_u64;
+    let mut token_digests = std::collections::BTreeSet::new();
+    for manifest in [earlier, target] {
+        compressed_bytes = compressed_bytes
+            .checked_add(
+                manifest
+                    .compressed_bytes
+                    .context("complete checkpoint is missing its compressed byte length")?,
+            )
+            .context("checkpoint pair compressed byte estimate overflowed")?;
+        decoded_bytes = decoded_bytes
+            .checked_add(
+                manifest
+                    .archive_bytes
+                    .context("complete checkpoint is missing its archive byte length")?,
+            )
+            .context("checkpoint pair decoded byte estimate overflowed")?;
+    }
+    for anchor in token_anchors {
+        let TokenAnchor::Available { checkpoint, .. } = anchor else {
+            continue;
+        };
+        if let Some(reference) = checkpoint
+            .token_reference
+            .as_ref()
+            .filter(|reference| token_digests.insert(reference.sha256.as_str()))
+        {
+            decoded_bytes = decoded_bytes
+                .checked_add(reference.token_bytes)
+                .context("checkpoint pair token byte estimate overflowed")?;
+        }
+    }
+    Ok((compressed_bytes, decoded_bytes))
+}
+
+pub(super) async fn token_fallback_in_segment(
+    connection: &mut sqlx::PgConnection,
+    selected: &CheckpointManifest,
+) -> anyhow::Result<Option<CheckpointManifest>> {
+    let boundary = sqlx::query(
+        "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
+                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                status, error
+         FROM state_history.checkpoints
+         WHERE chain_id = $1 AND status = 'complete' AND kind = 'boundary'
+           AND (generation, message_seq) <= ($2, $3)
+         ORDER BY generation DESC, message_seq DESC
+         LIMIT 1",
+    )
+    .bind(database_i64(selected.chain_id, "token anchor chain_id")?)
+    .bind(database_i64(
+        selected.position.generation,
+        "token anchor generation",
+    )?)
+    .bind(database_i64(
+        selected.position.message_seq,
+        "token anchor message_seq",
+    )?)
+    .fetch_optional(&mut *connection)
+    .await
+    .context("failed to select token anchor segment boundary")?
+    .as_ref()
+    .map(manifest_from_row)
+    .transpose()?;
+    let Some(boundary) = boundary else {
+        return Ok(None);
+    };
+
+    let row = sqlx::query(
+        "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
+                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                status, error
+         FROM state_history.checkpoints
+         WHERE chain_id = $1 AND status = 'complete' AND token_s3_key IS NOT NULL
+           AND (generation, message_seq) >= ($2, $3)
+           AND (generation, message_seq) < ($4, $5)
+         ORDER BY generation DESC, message_seq DESC
+         LIMIT 1",
+    )
+    .bind(database_i64(selected.chain_id, "token anchor chain_id")?)
+    .bind(database_i64(
+        boundary.position.generation,
+        "token segment generation",
+    )?)
+    .bind(database_i64(
+        boundary.position.message_seq,
+        "token segment message_seq",
+    )?)
+    .bind(database_i64(
+        selected.position.generation,
+        "selected generation",
+    )?)
+    .bind(database_i64(
+        selected.position.message_seq,
+        "selected message_seq",
+    )?)
+    .fetch_optional(connection)
+    .await
+    .context("failed to select same-segment token fallback")?;
+    row.as_ref().map(manifest_from_row).transpose()
+}
+
+async fn token_anchor_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    selected: CheckpointManifest,
+) -> anyhow::Result<TokenAnchor> {
+    if selected.token_reference.is_some() {
+        return Ok(TokenAnchor::Available {
+            checkpoint: Box::new(selected),
+            used_fallback: false,
+        });
+    }
+    Ok(
+        match token_fallback_in_segment(connection, &selected).await? {
+            Some(checkpoint) => TokenAnchor::Available {
+                checkpoint: Box::new(checkpoint),
+                used_fallback: true,
+            },
+            None => TokenAnchor::Missing,
+        },
+    )
+}
+
+async fn range_checkpoint_pairs(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    bounds: BlockInterval,
+    backends: &[Backend],
+    max_pairs: Option<usize>,
+) -> anyhow::Result<Vec<CheckpointPair>> {
+    let mut rows = sqlx::query(
+        "WITH in_range AS (
+             SELECT generation, message_seq
+             FROM state_history.checkpoints
+             WHERE chain_id = $1 AND status = 'complete'
+               AND block_number BETWEEN $2 AND $3
+         ),
+         first_position AS (
+             SELECT generation, message_seq
+             FROM in_range
+             ORDER BY generation, message_seq
+             LIMIT 1
+         ),
+         last_position AS (
+             SELECT generation, message_seq
+             FROM in_range
+             ORDER BY generation DESC, message_seq DESC
+             LIMIT 1
+         ),
+         first_segment_boundary AS (
+             SELECT checkpoint.generation, checkpoint.message_seq
+             FROM state_history.checkpoints checkpoint
+             CROSS JOIN first_position first
+             WHERE checkpoint.chain_id = $1 AND checkpoint.status = 'complete'
+               AND checkpoint.kind = 'boundary'
+               AND (checkpoint.generation, checkpoint.message_seq)
+                   <= (first.generation, first.message_seq)
+             ORDER BY checkpoint.generation DESC, checkpoint.message_seq DESC
+             LIMIT 1
+         ),
+         selected_span AS (
+             SELECT
+                 COALESCE(boundary.generation, first.generation) AS start_generation,
+                 COALESCE(boundary.message_seq, first.message_seq) AS start_message_seq,
+                 last.generation AS end_generation,
+                 last.message_seq AS end_message_seq
+             FROM first_position first
+             CROSS JOIN last_position last
+             LEFT JOIN first_segment_boundary boundary ON true
+         )
+         SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
+                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                status, error
+         FROM state_history.checkpoints
+         CROSS JOIN selected_span span
+         WHERE chain_id = $1 AND status = 'complete'
+           AND (generation, message_seq)
+               >= (span.start_generation, span.start_message_seq)
+           AND (generation, message_seq)
+               <= (span.end_generation, span.end_message_seq)
+         ORDER BY generation, message_seq, kind",
+    )
+    .bind(database_i64(chain_id, "checkpoint pair chain_id")?)
+    .bind(database_i64(bounds.start, "checkpoint pair range start")?)
+    .bind(database_i64(
+        bounds.end_inclusive,
+        "checkpoint pair range end",
+    )?)
+    .fetch(&mut *connection);
+    let sentinel_limit = max_pairs.and_then(|limit| limit.checked_add(1));
+    let mut pairs = Vec::new();
+    let mut previous: Option<CheckpointManifest> = None;
+    let mut previous_position = None;
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .context("failed to select checkpoint pair range")?
+    {
+        let manifest = manifest_from_row(&row)?;
+        ensure!(
+            previous_position != Some(manifest.position),
+            "checkpoint position is ambiguous because multiple complete kinds exist"
+        );
+        previous_position = Some(manifest.position);
+        if manifest.kind == CheckpointKind::Boundary {
+            previous = checkpoint_supports(&manifest, backends).then_some(manifest);
+            continue;
+        }
+        if !checkpoint_supports(&manifest, backends) {
+            continue;
+        }
+        if let Some(earlier) = previous.replace(manifest.clone()) {
+            if manifest.block_number >= bounds.start
+                && manifest.block_number <= bounds.end_inclusive
+            {
+                pairs.push(CheckpointPair {
+                    earlier,
+                    target: manifest,
+                });
+                if sentinel_limit == Some(pairs.len()) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(pairs)
+}
+
+async fn explicit_checkpoint_pairs(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    selections: &[ExplicitCheckpointPair],
+    backends: &[Backend],
+    max_pairs: Option<usize>,
+) -> anyhow::Result<Vec<CheckpointPair>> {
+    let sentinel_limit = max_pairs
+        .and_then(|limit| limit.checked_add(1))
+        .unwrap_or(usize::MAX);
+    let mut pairs = Vec::with_capacity(selections.len().min(sentinel_limit));
+    for selection in selections.iter().take(sentinel_limit) {
+        ensure!(
+            selection.earlier_position < selection.target_position,
+            "explicit checkpoint pair must be ordered"
+        );
+        let earlier = exact_checkpoint(connection, chain_id, selection.earlier_position)
+            .await?
+            .with_context(|| {
+                format!(
+                    "missing complete checkpoint at generation {} message sequence {}",
+                    selection.earlier_position.generation, selection.earlier_position.message_seq
+                )
+            })?;
+        let target = exact_checkpoint(connection, chain_id, selection.target_position)
+            .await?
+            .with_context(|| {
+                format!(
+                    "missing complete checkpoint at generation {} message sequence {}",
+                    selection.target_position.generation, selection.target_position.message_seq
+                )
+            })?;
+        let segment_start = segment_boundary_position(connection, chain_id, target.position)
+            .await?
+            .context("target checkpoint has no complete segment boundary")?;
+        ensure!(
+            earlier.position >= segment_start,
+            "explicit checkpoint pair must stay in the same segment"
+        );
+        ensure!(
+            checkpoint_supports(&earlier, backends) && checkpoint_supports(&target, backends),
+            "explicit checkpoint pair does not contain every requested backend"
+        );
+        pairs.push(CheckpointPair { earlier, target });
+    }
+    Ok(pairs)
+}
+
+fn checkpoint_supports(manifest: &CheckpointManifest, backends: &[Backend]) -> bool {
+    backends
+        .iter()
+        .all(|backend| manifest.backends.binary_search(backend).is_ok())
+}
+
+async fn exact_checkpoint(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    position: StreamPosition,
+) -> anyhow::Result<Option<CheckpointManifest>> {
+    let rows = sqlx::query(
+        "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
+                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
+                status, error
+         FROM state_history.checkpoints
+         WHERE chain_id = $1 AND status = 'complete'
+           AND generation = $2 AND message_seq = $3
+         ORDER BY kind",
+    )
+    .bind(database_i64(chain_id, "exact checkpoint chain_id")?)
+    .bind(database_i64(
+        position.generation,
+        "exact checkpoint generation",
+    )?)
+    .bind(database_i64(
+        position.message_seq,
+        "exact checkpoint message_seq",
+    )?)
+    .fetch_all(connection)
+    .await
+    .context("failed to select exact checkpoint")?;
+    ensure!(
+        rows.len() <= 1,
+        "checkpoint position is ambiguous because multiple complete kinds exist"
+    );
+    rows.first().map(manifest_from_row).transpose()
+}
+
+pub(super) async fn segment_boundary_position(
+    connection: &mut sqlx::PgConnection,
+    chain_id: u64,
+    position: StreamPosition,
+) -> anyhow::Result<Option<StreamPosition>> {
+    let row = sqlx::query(
+        "SELECT generation, message_seq
+         FROM state_history.checkpoints
+         WHERE chain_id = $1 AND status = 'complete' AND kind = 'boundary'
+           AND (generation, message_seq) <= ($2, $3)
+         ORDER BY generation DESC, message_seq DESC
+         LIMIT 1",
+    )
+    .bind(database_i64(chain_id, "segment chain_id")?)
+    .bind(database_i64(position.generation, "segment generation")?)
+    .bind(database_i64(position.message_seq, "segment message_seq")?)
+    .fetch_optional(connection)
+    .await
+    .context("failed to select checkpoint segment boundary")?;
+    row.map(|row| {
+        Ok(StreamPosition {
+            generation: super::database_u64(row.try_get("generation")?, "segment generation")?,
+            message_seq: super::database_u64(row.try_get("message_seq")?, "segment message_seq")?,
+        })
+    })
+    .transpose()
+}
+
+/// What the history holds about a generation's boundary checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GenerationBoundary {
+    /// The status of the generation's latest boundary checkpoint row, if one is recorded.
+    pub(super) status: Option<CheckpointStatus>,
+    /// Whether a `checkpoint_failed` gap is recorded in the generation.
+    pub(super) failure_recorded: bool,
+}
+
+impl GenerationBoundary {
+    /// Reads it for `generation`.
+    pub(super) async fn read(
+        connection: &mut sqlx::PgConnection,
+        chain_id: u64,
+        generation: u64,
+    ) -> anyhow::Result<Self> {
+        let row = sqlx::query(
+            "SELECT
+                 (SELECT status
+                  FROM state_history.checkpoints
+                  WHERE chain_id = $1 AND kind = 'boundary' AND generation = $2
+                  ORDER BY message_seq DESC
+                  LIMIT 1) AS status,
+                 EXISTS (SELECT 1
+                         FROM state_history.gaps
+                         WHERE chain_id = $1 AND generation = $2
+                           AND reason = 'checkpoint_failed') AS failure_recorded",
+        )
+        .bind(database_i64(chain_id, "boundary chain_id")?)
+        .bind(database_i64(generation, "boundary generation")?)
+        .fetch_one(connection)
+        .await
+        .context("failed to select the generation boundary")?;
+        let status = row
+            .try_get::<Option<String>, _>("status")?
+            .map(|status| super::checkpoint_status_from_database(&status))
+            .transpose()?;
+        Ok(Self {
+            status,
+            failure_recorded: row.try_get("failure_recorded")?,
+        })
+    }
+
+    /// Whether the boundary may still land: no row and no recorded failure yet, or a
+    /// row still writing.
+    pub(super) fn pending(self) -> bool {
+        match self.status {
+            None => !self.failure_recorded,
+            Some(status) => status == CheckpointStatus::Writing,
+        }
+    }
+}

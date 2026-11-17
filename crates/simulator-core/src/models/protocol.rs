@@ -6,12 +6,13 @@ pub const NATIVE: &str = "native";
 pub const VM: &str = "vm";
 pub const RFQ: &str = "rfq";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProtocolKind {
     UniswapV2,
     UniswapV3,
     UniswapV4,
     AerodromeSlipstreams,
+    AerodromeV1,
     Curve,
     PancakeswapV2,
     PancakeswapV3,
@@ -26,7 +27,6 @@ pub enum ProtocolKind {
     Hashflow,
     Bebop,
     Liquorice,
-    AerodromeV1,
     AeroBasic,
     AeroCl,
     PancakeswapInfinityCl,
@@ -43,6 +43,7 @@ impl ProtocolKind {
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
         ProtocolKind::AerodromeSlipstreams,
+        ProtocolKind::AerodromeV1,
         ProtocolKind::Curve,
         ProtocolKind::PancakeswapV2,
         ProtocolKind::PancakeswapV3,
@@ -57,7 +58,6 @@ impl ProtocolKind {
         ProtocolKind::Hashflow,
         ProtocolKind::Bebop,
         ProtocolKind::Liquorice,
-        ProtocolKind::AerodromeV1,
         ProtocolKind::AeroBasic,
         ProtocolKind::AeroCl,
         ProtocolKind::PancakeswapInfinityCl,
@@ -74,6 +74,7 @@ impl ProtocolKind {
             ProtocolKind::UniswapV3 => "uniswap_v3",
             ProtocolKind::UniswapV4 => "uniswap_v4",
             ProtocolKind::AerodromeSlipstreams => "aerodrome_slipstreams",
+            ProtocolKind::AerodromeV1 => "aerodrome_v1",
             ProtocolKind::Curve => "vm:curve",
             ProtocolKind::PancakeswapV2 => "pancakeswap_v2",
             ProtocolKind::PancakeswapV3 => "pancakeswap_v3",
@@ -88,7 +89,6 @@ impl ProtocolKind {
             ProtocolKind::Hashflow => "rfq:hashflow",
             ProtocolKind::Bebop => "rfq:bebop",
             ProtocolKind::Liquorice => "rfq:liquorice",
-            ProtocolKind::AerodromeV1 => "aerodrome_v1",
             ProtocolKind::AeroBasic => "aero_basic",
             ProtocolKind::AeroCl => "aero_cl",
             ProtocolKind::PancakeswapInfinityCl => "pancakeswap_infinity_cl",
@@ -98,6 +98,12 @@ impl ProtocolKind {
             ProtocolKind::NativeRfq => "rfq:native",
             ProtocolKind::Metric => "rfq:metric",
         }
+    }
+
+    /// Accepts an exact Tycho protocol system name without normalizing aliases.
+    /// Use this at selection boundaries so a different wire identity is not selected.
+    pub fn from_canonical_protocol_system(name: &str) -> Option<Self> {
+        Self::from_protocol_system(name)
     }
 
     pub fn from_component(component: &ProtocolComponent) -> Option<Self> {
@@ -138,11 +144,11 @@ impl ProtocolKind {
             "erc4626_pool" => Some(ProtocolKind::ERC4626),
             "hashflow_pool" => Some(ProtocolKind::Hashflow),
             "bebop_pool" => Some(ProtocolKind::Bebop),
-            "liquorice_pool" => Some(ProtocolKind::Liquorice),
             "native_relay_pool" => Some(ProtocolKind::NativeRfq),
             "metric_pool" => Some(ProtocolKind::Metric),
             "pancakeswap_infinity_bin_pool" => Some(ProtocolKind::PancakeswapInfinityBin),
             "lunarbase" => Some(ProtocolKind::LunarBase),
+            "liquorice_pool" => Some(ProtocolKind::Liquorice),
             _ => None,
         }
     }
@@ -156,6 +162,7 @@ impl ProtocolKind {
             "pancakeswap_v3" => Some(ProtocolKind::PancakeswapV3),
             "uniswap_v4" => Some(ProtocolKind::UniswapV4),
             "aerodrome_slipstreams" => Some(ProtocolKind::AerodromeSlipstreams),
+            "aerodrome_v1" => Some(ProtocolKind::AerodromeV1),
             "ekubo_v2" => Some(ProtocolKind::EkuboV2),
             "ekubo_v3" => Some(ProtocolKind::EkuboV3),
             "fluid_v1" => Some(ProtocolKind::FluidV1),
@@ -167,7 +174,6 @@ impl ProtocolKind {
             "rfq:hashflow" => Some(ProtocolKind::Hashflow),
             "rfq:bebop" => Some(ProtocolKind::Bebop),
             "rfq:liquorice" => Some(ProtocolKind::Liquorice),
-            "aerodrome_v1" => Some(ProtocolKind::AerodromeV1),
             "aero_basic" => Some(ProtocolKind::AeroBasic),
             "aero_cl" => Some(ProtocolKind::AeroCl),
             "pancakeswap_infinity_cl" => Some(ProtocolKind::PancakeswapInfinityCl),
@@ -208,6 +214,7 @@ mod tests {
         ("pancakeswap_v3", ProtocolKind::PancakeswapV3),
         ("uniswap_v4", ProtocolKind::UniswapV4),
         ("aerodrome_slipstreams", ProtocolKind::AerodromeSlipstreams),
+        ("aerodrome_v1", ProtocolKind::AerodromeV1),
         ("ekubo_v2", ProtocolKind::EkuboV2),
         ("ekubo_v3", ProtocolKind::EkuboV3),
         ("fluid_v1", ProtocolKind::FluidV1),
@@ -219,7 +226,6 @@ mod tests {
         ("rfq:hashflow", ProtocolKind::Hashflow),
         ("rfq:bebop", ProtocolKind::Bebop),
         ("rfq:liquorice", ProtocolKind::Liquorice),
-        ("aerodrome_v1", ProtocolKind::AerodromeV1),
         ("aero_basic", ProtocolKind::AeroBasic),
         ("aero_cl", ProtocolKind::AeroCl),
         (
@@ -252,7 +258,6 @@ mod tests {
         ("erc4626_pool", ProtocolKind::ERC4626),
         ("hashflow_pool", ProtocolKind::Hashflow),
         ("bebop_pool", ProtocolKind::Bebop),
-        ("liquorice_pool", ProtocolKind::Liquorice),
         ("native_relay_pool", ProtocolKind::NativeRfq),
         ("metric_pool", ProtocolKind::Metric),
         (
@@ -260,13 +265,15 @@ mod tests {
             ProtocolKind::PancakeswapInfinityBin,
         ),
         ("lunarbase", ProtocolKind::LunarBase),
+        ("liquorice_pool", ProtocolKind::Liquorice),
     ];
 
-    const NON_CANONICAL_ALIASES: [&str; 15] = [
+    const NON_CANONICAL_ALIASES: [&str; 16] = [
         "uniswapv2",
         "uniswapv3",
         "uniswapv4",
         "aerodromeslipstreams",
+        "aerodromev1",
         "curve",
         "balancer_v2",
         "maverick_v2",
@@ -326,6 +333,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_protocol_system_parser_preserves_wire_identity() {
+        for (name, kind) in CANONICAL_PROTOCOL_SYSTEM_CASES {
+            assert_eq!(
+                ProtocolKind::from_canonical_protocol_system(name),
+                Some(kind)
+            );
+        }
+        for name in ["Uniswap_V2", "uniswap-v2", "uniswap v2", "VM:CURVE"] {
+            assert!(ProtocolKind::from_sync_state_key(name).is_some());
+            assert_eq!(ProtocolKind::from_canonical_protocol_system(name), None);
+        }
+        for name in NON_CANONICAL_ALIASES
+            .into_iter()
+            .chain(["future_protocol", "uniswap_v2_pool"])
+        {
+            assert_eq!(ProtocolKind::from_canonical_protocol_system(name), None);
+        }
+    }
+
+    #[test]
     fn recognizes_canonical_protocol_systems_from_component() {
         for (protocol_system, expected) in CANONICAL_PROTOCOL_SYSTEM_CASES {
             let component = protocol_component(protocol_system, "");
@@ -371,27 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn from_sync_state_key_rejects_protocol_type_names() {
-        let type_names = [
-            "uniswap_v2_pool",
-            "sushiswap_v2_pool",
-            "pancakeswap_v2_pool",
-            "uniswap_v3_pool",
-            "pancakeswap_v3_pool",
-            "uniswap_v4_pool",
-            "ekubo_v2_pool",
-            "ekubo_v3_pool",
-            "fluid_dex_pool",
-            "curve_pool",
-            "balancer_v2_pool",
-            "maverick_v2_pool",
-            "erc4626_pool",
-            "hashflow_pool",
-            "bebop_pool",
-            "liquorice_pool",
-        ];
-
-        for type_name in type_names {
+    fn from_sync_state_key_rejects_type_only_names() {
+        for (type_name, _) in CANONICAL_PROTOCOL_TYPE_CASES {
+            if CANONICAL_PROTOCOL_SYSTEM_CASES
+                .iter()
+                .any(|(name, _)| *name == type_name)
+            {
+                continue;
+            }
             assert_eq!(ProtocolKind::from_sync_state_key(type_name), None);
         }
     }

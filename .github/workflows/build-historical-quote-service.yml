@@ -3,14 +3,73 @@ name: Build Historical Pool Quote API
 on:
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: historical-pool-quote-api
 
 jobs:
-  select-master:
-    name: Select master
+  build:
+    name: Build and push image
     runs-on: ubuntu-latest
+    environment: production
     steps:
-      - name: Require master
-        run: |
-          echo "::error::Run this workflow from the master branch."
-          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ secrets.AWS_HISTORICAL_QUOTE_ECR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "607709788129"
+          role-duration-seconds: 900
+          role-session-name: historical-quote-image-build
+          inline-session-policy: >-
+            {
+              "Version":"2012-10-17",
+              "Statement":[
+                {
+                  "Sid":"EcrLogin",
+                  "Effect":"Allow",
+                  "Action":"ecr:GetAuthorizationToken",
+                  "Resource":"*"
+                },
+                {
+                  "Sid":"PushHistoricalQuoteImage",
+                  "Effect":"Allow",
+                  "Action":[
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:CompleteLayerUpload",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:PutImage",
+                    "ecr:UploadLayerPart"
+                  ],
+                  "Resource":"arn:aws:ecr:${{ env.AWS_REGION }}:607709788129:repository/${{ env.ECR_REPOSITORY }}"
+                }
+              ]
+            }
+
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
+        id: ecr-login
+
+      - name: Install verified Buildx
+        run: bash scripts/install-verified-buildx.sh
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        with:
+          driver-opts: |
+            image=moby/buildkit@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
+        with:
+          context: .
+          file: ./Dockerfile.historical-quote-service
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha,scope=historical-quote-service
+          cache-to: type=gha,mode=max,scope=historical-quote-service

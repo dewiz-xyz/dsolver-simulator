@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 use futures::{future::ready, Stream, StreamExt};
+use simulator_core::models::protocol::ProtocolKind;
 use tracing::warn;
 use tycho_simulation::{
     book::{
@@ -29,7 +30,7 @@ type StreamError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub async fn build_rfq_stream(
     token_stores: RFQTokenStores,
     chain: Chain,
-    protocols: &[String],
+    protocols: &[ProtocolKind],
     config: RFQConfig,
 ) -> Result<impl Stream<Item = Result<Update, StreamError>> + Unpin + Send> {
     let mut feeds = BookFeedStreams::new();
@@ -37,8 +38,9 @@ pub async fn build_rfq_stream(
         usd_stablecoins_for_chain(chain)
             .ok_or_else(|| anyhow!("No USD quote tokens for {chain}"))?,
     );
-    for protocol in protocols {
-        let tokens = match protocol.as_str() {
+    for kind in protocols {
+        let protocol = kind.as_str();
+        let tokens = match protocol {
             "rfq:bebop" => token_stores.bebop.snapshot().await,
             "rfq:hashflow" => token_stores.hashflow.snapshot().await,
             "rfq:liquorice" => token_stores.liquorice.snapshot().await,
@@ -51,7 +53,7 @@ pub async fn build_rfq_stream(
             min_tvl_usd: config.min_tvl_usd,
         };
         let duplicate = || anyhow!("Duplicate RFQ provider: {protocol}");
-        match protocol.as_str() {
+        match protocol {
             "rfq:bebop" => feeds
                 .add(
                     protocol,
@@ -394,12 +396,12 @@ mod tests {
                 liquorice: store,
             },
             Chain::Base,
-            &["rfq:native".to_string(), "rfq:metric".to_string()],
+            &[ProtocolKind::NativeRfq, ProtocolKind::Metric],
             RFQConfig {
                 native_key: std::env::var("NATIVE_API_KEY")?,
                 metric_key: std::env::var("METRIC_API_KEY")?,
                 min_tvl_usd: 100.0,
-                bebop_user: String::new(),
+
                 bebop_key: String::new(),
                 hashflow_user: String::new(),
                 hashflow_key: String::new(),
@@ -420,26 +422,34 @@ mod tests {
                 let published = cache.apply_update(&update).await?;
                 let replay: BroadcasterUpdateMessage =
                     serde_json::from_slice(&serde_json::to_vec(&published)?)?;
-                for partition in replay.partitions {
-                    assert_eq!(partition.backend, BroadcasterBackend::Rfq);
-                    for entry in partition.new_pairs {
-                        let component = &entry.component;
-                        let base = &component.tokens[0];
-                        let quote = &component.tokens[1];
-                        let before = update.states[&entry.component_id].spot_price(base, quote)?;
-                        assert_eq!(entry.state.spot_price(base, quote)?, before);
-                        assert!(before.is_finite() && before > 0.0);
-                        seen.insert(component.protocol_system.clone());
-                        eprintln!(
-                            "Live Base broadcast round-trip: {} {} / {}",
-                            component.protocol_system, base.symbol, quote.symbol
-                        );
-                    }
-                }
+                seen.extend(verify_live_update(replay, &update)?);
             }
             anyhow::Ok(())
         })
         .await??;
         Ok(())
+    }
+    fn verify_live_update(
+        replay: BroadcasterUpdateMessage,
+        update: &Update,
+    ) -> Result<Vec<String>> {
+        let mut providers = Vec::new();
+        for partition in replay.partitions {
+            assert_eq!(partition.backend, BroadcasterBackend::Rfq);
+            for entry in partition.new_pairs {
+                let component = &entry.component;
+                let base = &component.tokens[0];
+                let quote = &component.tokens[1];
+                let before = update.states[&entry.component_id].spot_price(base, quote)?;
+                assert_eq!(entry.state.spot_price(base, quote)?, before);
+                assert!(before.is_finite() && before > 0.0);
+                providers.push(component.protocol_system.clone());
+                eprintln!(
+                    "Live Base broadcast round-trip: {} {} / {}",
+                    component.protocol_system, base.symbol, quote.symbol
+                );
+            }
+        }
+        Ok(providers)
     }
 }

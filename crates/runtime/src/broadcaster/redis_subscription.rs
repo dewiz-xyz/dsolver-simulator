@@ -19,6 +19,7 @@ use simulator_core::broadcaster::{
     BroadcasterPayload, BroadcasterRecoveryCatchUp, BroadcasterRecoveryChunk,
     BroadcasterRecoveryCommit, BroadcasterRecoveryManifest, BroadcasterRedisReplayBoundary,
 };
+use simulator_core::models::protocol::ProtocolKind;
 
 use crate::broadcaster::redis_publisher::replay_entry_encoded_size;
 use crate::config::BroadcasterRedisConfig;
@@ -35,7 +36,6 @@ use crate::stream::StreamSupervisorConfig;
 #[cfg(test)]
 mod live_vm_wire_e2e;
 mod processor;
-mod snapshot;
 #[cfg(test)]
 mod tests;
 
@@ -57,7 +57,7 @@ pub(crate) struct NativeBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub tokens: Arc<TokenStore>,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<ProtocolKind>,
 }
 
 #[derive(Clone)]
@@ -66,7 +66,7 @@ pub(crate) struct VmBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub tokens: Arc<TokenStore>,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<ProtocolKind>,
     pub vm_stream: Arc<RwLock<VmStreamStatus>>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
     pub wire_backend: BroadcasterBackend,
@@ -79,7 +79,7 @@ pub(crate) struct RfqBroadcasterSubscriptionControls {
     pub state_store: Arc<StateStore>,
     pub stream_health: Arc<StreamHealth>,
     pub tokens: Arc<TokenStore>,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<ProtocolKind>,
     pub simulation_rebuild_gate: Arc<RwLock<()>>,
 }
 
@@ -136,7 +136,7 @@ impl BroadcasterSubscriptionControls {
         }
     }
 
-    fn protocols(&self) -> &[String] {
+    fn protocols(&self) -> &[ProtocolKind] {
         match self {
             Self::Native(controls) => &controls.protocols,
             Self::Vm(controls) => &controls.protocols,
@@ -153,6 +153,7 @@ impl BroadcasterSubscriptionControls {
                 state_store: Arc::new(StateStore::new_private_with_snapshot(
                     Arc::clone(&controls.tokens),
                     token_snapshot,
+                    controls.protocols.clone(),
                 )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
@@ -163,6 +164,7 @@ impl BroadcasterSubscriptionControls {
                 state_store: Arc::new(StateStore::new_private_with_snapshot(
                     Arc::clone(&controls.tokens),
                     token_snapshot,
+                    controls.protocols.clone(),
                 )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
@@ -177,6 +179,7 @@ impl BroadcasterSubscriptionControls {
                 state_store: Arc::new(StateStore::new_private_with_snapshot(
                     Arc::clone(&controls.tokens),
                     token_snapshot,
+                    controls.protocols.clone(),
                 )),
                 stream_health: Arc::new(StreamHealth::new()),
                 tokens: Arc::clone(&controls.tokens),
@@ -190,6 +193,10 @@ impl BroadcasterSubscriptionControls {
 #[expect(
     clippy::too_many_lines,
     reason = "subscription ownership and restart decisions stay in one supervisor loop"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Connection, bootstrap and replay failures have distinct rebuild ownership and retry rules"
 )]
 pub(crate) async fn supervise_broadcaster_redis_subscription(
     broadcaster_url: String,
@@ -212,7 +219,7 @@ pub(crate) async fn supervise_broadcaster_redis_subscription(
             redis_url: redis_config.redis_url.clone(),
             block_ms: redis_config.block_ms,
             read_count: redis_config.read_count,
-            request_timeout: cfg.readiness_stale,
+            request_timeout: cfg.initialization_timeout,
         })
         .await
         {
@@ -370,7 +377,6 @@ async fn prepare_broadcaster_redis_subscription(
     for (index, controls) in controls.iter().enumerate() {
         let decoder = match build_broadcaster_subscription_decoder(
             controls.tokens(),
-            controls.tokens().chain(),
             controls.backend(),
             controls.protocols(),
         )
@@ -590,8 +596,8 @@ fn pending_processor_bootstrap_error(
 }
 
 #[expect(
-    clippy::too_many_lines,
-    reason = "tail polling, recovery timeout, and transport retry share one ordered replay loop"
+    clippy::cognitive_complexity,
+    reason = "Tail polling preserves separate transport retry, recovery application and catch-up outcomes"
 )]
 async fn process_broadcaster_redis_subscription(
     replay_client: &impl ReplayPollSource,
@@ -657,33 +663,13 @@ async fn process_broadcaster_redis_subscription(
             }
         };
 
-        match poll {
-            ReplayPoll::Pending => {
-                if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
-                    return (
-                        SubscriptionExit::error(message),
-                        redis_processor_rebuilds(prepared.processors),
-                        caught_up_once,
-                    );
-                }
-            }
+        let caught_up = match poll {
+            ReplayPoll::Pending => false,
             ReplayPoll::CaughtUp {
                 checkpoint: caught_up_checkpoint,
             } => {
-                caught_up_once = true;
-                mark_redis_catch_up_checkpoints(
-                    &prepared.processors,
-                    caught_up_checkpoint.entry_id(),
-                )
-                .await;
                 checkpoint = caught_up_checkpoint;
-                if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
-                    return (
-                        SubscriptionExit::error(message),
-                        redis_processor_rebuilds(prepared.processors),
-                        caught_up_once,
-                    );
-                }
+                true
             }
             ReplayPoll::Batch(batch) => {
                 let caught_up_after_batch = batch.caught_up_after_batch;
@@ -696,19 +682,22 @@ async fn process_broadcaster_redis_subscription(
                         caught_up_once,
                     );
                 }
-                if caught_up_after_batch {
-                    caught_up_once = true;
-                    mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id())
-                        .await;
-                    if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
-                        return (
-                            SubscriptionExit::error(message),
-                            redis_processor_rebuilds(prepared.processors),
-                            caught_up_once,
-                        );
-                    }
+                if !caught_up_after_batch {
+                    continue;
                 }
+                true
             }
+        };
+        if caught_up {
+            caught_up_once = true;
+            mark_redis_catch_up_checkpoints(&prepared.processors, checkpoint.entry_id()).await;
+        }
+        if let Some(message) = incomplete_recovery_timeout(&prepared, cfg) {
+            return (
+                SubscriptionExit::error(message),
+                redis_processor_rebuilds(prepared.processors),
+                caught_up_once,
+            );
         }
     }
 }
@@ -718,7 +707,7 @@ fn incomplete_recovery_timeout(
     cfg: &StreamSupervisorConfig,
 ) -> Option<String> {
     prepared.recovery.as_ref().and_then(|recovery| {
-        (recovery.started_at.elapsed() >= cfg.readiness_stale).then(|| {
+        (recovery.started_at.elapsed() >= cfg.initialization_timeout).then(|| {
             format!(
                 "recovery {} remained incomplete at the Redis tail for {} ms",
                 recovery.manifest.recovery_id,

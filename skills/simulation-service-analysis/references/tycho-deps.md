@@ -1,18 +1,21 @@
-# Tycho / Propeller Heads dependencies
+# Tycho and Propeller Heads dependencies
 
-## Core crate
-- `tycho-simulation` (propeller-heads/tycho-simulation) pinned at tag `0.206.0` in this repo's `Cargo.toml`.
-- The crate simulates supported protocols off-chain and is used for pricing logic in the service.
-- Quickstart guide lives in the upstream repo under `examples/quickstart/Readme.md`.
+Do not pin dependency versions in this skill. Read the checked-out repository:
 
-## Official docs
-- Tycho simulation docs (for solvers):
-  https://docs.propellerheads.xyz/tycho/for-solvers/simulation
-- Supported protocols (high-level list):
-  https://docs.propellerheads.xyz/tycho/for-solvers/supported-protocols
-- Protocol integration docs (for DEXs):
-  https://docs.propellerheads.xyz/tycho/for-dexs/protocol-integration/simulation
+```bash
+rg -n '^tycho-(common|simulation|execution)\s*=' Cargo.toml
+rg -n '^name = "tycho-(common|simulation)"|^version = ' Cargo.lock
+```
 
-## Upstream docs source
-- The Tycho docs are mirrored in the propeller-heads `tycho-indexer` repo under:
-  https://github.com/propeller-heads/tycho-indexer/tree/main/docs/for-dexs/protocol-integration/simulation
+`Cargo.toml` is the declared dependency source and `Cargo.lock` is the resolved
+workspace source. For Git dependencies, keep the exact `rev` from `Cargo.toml`
+with the analysis evidence.
+
+Useful upstream references:
+
+- Tycho simulation for solvers: https://docs.propellerheads.xyz/tycho/for-solvers/simulation
+- Supported protocols: https://docs.propellerheads.xyz/tycho/for-solvers/supported-protocols
+- Protocol integration: https://docs.propellerheads.xyz/tycho/for-dexs/protocol-integration/simulation
+
+Upstream documentation describes Tycho generally. The checked-out manifest,
+runtime config, and lockfile decide what this simulator build actually enables.

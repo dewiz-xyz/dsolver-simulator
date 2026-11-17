@@ -5,19 +5,29 @@ use serde::{
     de::{self, Deserializer},
     Deserialize, Serialize,
 };
+use thiserror::Error;
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update as TychoUpdate},
-    tycho_client::feed::{BlockHeader, HeaderLike, SynchronizerState},
+    tycho_client::feed::{
+        synchronizer::StateSyncMessage, BlockHeader, FeedMessage, HeaderLike, SynchronizerState,
+    },
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::protocol::ProtocolKind;
 
+mod raw_state;
 mod redis_streams;
-pub mod wire;
-use wire::{FeedMessage, StateSyncMessage};
+mod snapshot_reassembly;
 
+pub use raw_state::{
+    apply_raw_protocol_messages, fold_account_update_into_snapshot, merge_shared_vm_accounts,
+    raw_residue_entry_count, RawCompactionStats, RawResidueGrowth, RawStateError,
+};
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
+pub use snapshot_reassembly::{
+    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError, SnapshotReassemblyError,
+};
 
 // Producers and consumers must agree on the largest snapshot response they can exchange.
 pub const BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -28,6 +38,96 @@ pub enum BroadcasterBackend {
     Native,
     Vm,
     Rfq,
+}
+
+/// Identifies a full chain block, including replacements at the same height.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockIdentity {
+    pub number: u64,
+    pub hash: Bytes,
+}
+
+/// A protocol's applied block identity. `None` invalidates its previous full head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolHeadUpdate {
+    pub protocol: ProtocolKind,
+    pub head: Option<BlockIdentity>,
+}
+
+impl ProtocolHeadUpdate {
+    /// Unknown or noncanonical wire identities do not install a supported protocol head.
+    pub fn from_message(message: &BroadcasterProtocolMessage) -> Option<Self> {
+        let header = &message.message.header;
+        Some(Self {
+            protocol: ProtocolKind::from_canonical_protocol_system(&message.protocol)?,
+            // A full Tycho revert names the restored block, so its header is already the applied head.
+            head: header.partial_block_index.is_none().then(|| BlockIdentity {
+                number: header.number,
+                hash: header.hash.clone(),
+            }),
+        })
+    }
+}
+
+/// Tracks the state applied for each configured protocol, independently of stream freshness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolStateHeads {
+    required_protocols: Vec<ProtocolKind>,
+    current: BTreeMap<ProtocolKind, Option<BlockIdentity>>,
+}
+
+impl ProtocolStateHeads {
+    pub fn new(required_protocols: Vec<ProtocolKind>) -> Self {
+        Self {
+            required_protocols,
+            current: BTreeMap::new(),
+        }
+    }
+
+    /// Messages must already contain reassembled snapshot state for each protocol.
+    pub fn from_snapshot(
+        required_protocols: Vec<ProtocolKind>,
+        messages: &[BroadcasterProtocolMessage],
+    ) -> Self {
+        let mut heads = Self::new(required_protocols);
+        heads.apply_messages(messages);
+        heads
+    }
+
+    pub fn clear(&mut self) {
+        self.current.clear();
+    }
+
+    /// Call after applying messages in order. Partial blocks invalidate that protocol's
+    /// full head; protocols absent from the update retain their installed state.
+    pub fn apply_messages(&mut self, messages: &[BroadcasterProtocolMessage]) {
+        for update in messages
+            .iter()
+            .filter_map(ProtocolHeadUpdate::from_message)
+            .filter(|update| self.required_protocols.contains(&update.protocol))
+        {
+            self.current.insert(update.protocol, update.head);
+        }
+    }
+
+    pub fn apply_updates(&mut self, updates: &[ProtocolHeadUpdate]) {
+        for update in updates
+            .iter()
+            .filter(|update| self.required_protocols.contains(&update.protocol))
+        {
+            self.current.insert(update.protocol, update.head.clone());
+        }
+    }
+
+    /// Returns a head only when every configured protocol has installed the same full block.
+    pub fn complete_head(&self) -> Option<BlockIdentity> {
+        let mut protocols = self.required_protocols.iter();
+        let first_head = self.current.get(protocols.next()?)?.as_ref()?;
+        protocols
+            .all(|protocol| self.current.get(protocol).and_then(Option::as_ref) == Some(first_head))
+            .then(|| first_head.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,18 +713,15 @@ impl BroadcasterUpdateMessage {
 
         let partitions = partitions
             .into_iter()
-            .filter_map(|(backend, partition)| {
-                if partition.is_empty() {
-                    return None;
-                }
-                Some(BroadcasterUpdatePartition::new(
+            .map(|(backend, partition)| {
+                BroadcasterUpdatePartition::new(
                     backend,
                     update.block_number,
                     partition.new_pairs,
                     partition.updated_states,
                     partition.removed_pairs,
                     partition.sync_statuses,
-                ))
+                )
             })
             .collect();
 
@@ -637,16 +734,9 @@ impl BroadcasterUpdateMessage {
         let mut partitions = BTreeMap::<BroadcasterBackend, Vec<BroadcasterProtocolMessage>>::new();
         let mut sync_statuses =
             BTreeMap::<BroadcasterBackend, BTreeMap<String, BroadcasterProtocolSyncStatus>>::new();
-        let mut block_numbers = BTreeMap::<BroadcasterBackend, u64>::new();
 
         for (protocol, status) in &feed.sync_states {
             let backend = backend_for_sync_state(protocol)?;
-            if let Some(block_number) = sync_state_block_number(status) {
-                block_numbers
-                    .entry(backend)
-                    .and_modify(|current| *current = (*current).max(block_number))
-                    .or_insert(block_number);
-            }
             sync_statuses.entry(backend).or_default().insert(
                 protocol.clone(),
                 BroadcasterProtocolSyncStatus::from_synchronizer_state(status),
@@ -677,24 +767,22 @@ impl BroadcasterUpdateMessage {
             .collect::<BTreeSet<_>>();
         let partitions = partition_backends
             .into_iter()
-            .filter_map(|backend| {
+            .map(|backend| {
                 let messages = partitions.remove(&backend).unwrap_or_default();
                 let statuses = sync_statuses.remove(&backend).unwrap_or_default();
-                if messages.is_empty() && statuses.is_empty() {
-                    return None;
-                }
                 let block_number = messages
                     .iter()
                     .map(|message| message.message.header.clone().block_number_or_timestamp())
                     .max()
-                    .or_else(|| block_numbers.get(&backend).copied())
+                    .or_else(|| {
+                        statuses
+                            .values()
+                            .filter_map(|status| status.block.as_ref())
+                            .map(|block| block.number)
+                            .max()
+                    })
                     .unwrap_or_default();
-                Some(BroadcasterUpdatePartition::with_messages(
-                    backend,
-                    block_number,
-                    messages,
-                    statuses,
-                ))
+                BroadcasterUpdatePartition::with_messages(backend, block_number, messages, statuses)
             })
             .collect();
 
@@ -706,16 +794,6 @@ impl BroadcasterUpdateMessage {
             .iter()
             .find(|partition| partition.backend == BroadcasterBackend::Native)
             .and_then(BroadcasterUpdatePartition::complete_native_block)
-    }
-}
-
-fn sync_state_block_number(state: &SynchronizerState) -> Option<u64> {
-    match state {
-        SynchronizerState::Ready(header)
-        | SynchronizerState::Delayed(header)
-        | SynchronizerState::Stale(header)
-        | SynchronizerState::Advanced(header) => Some(header.clone().block_number_or_timestamp()),
-        SynchronizerState::Started | SynchronizerState::Ended(_) => None,
     }
 }
 
@@ -852,12 +930,49 @@ pub fn complete_broadcaster_partition_block(
     Some(block_number)
 }
 
+/// Returns the common full block from installed, reassembled snapshot messages.
+/// Every required protocol needs a message. Stream freshness does not invalidate
+/// a full state already installed at that block, so sync states are ignored.
+pub fn complete_broadcaster_snapshot_head(
+    messages: &[BroadcasterProtocolMessage],
+    required_protocols: &[ProtocolKind],
+) -> Option<BlockIdentity> {
+    ProtocolStateHeads::from_snapshot(required_protocols.to_vec(), messages).complete_head()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterProtocolMessage {
+    /// Exact Tycho wire identity; selection converts canonical supported systems to ProtocolKind.
     pub protocol: String,
     pub sync_state: SynchronizerState,
+    #[serde(with = "feed_dto_wire")]
     pub message: StateSyncMessage<BlockHeader>,
+}
+
+// Tycho's feed types no longer implement serde, so use its DTO conversion to preserve
+// the historical feed JSON. Converting back drops db_committed_block_height, which
+// the broadcaster does not consume.
+mod feed_dto_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tycho_simulation::tycho_client::feed::{dto, synchronizer::StateSyncMessage, BlockHeader};
+
+    pub fn serialize<S>(
+        message: &StateSyncMessage<BlockHeader>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        dto::StateSyncMessage::from(message.clone()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<StateSyncMessage<BlockHeader>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        dto::StateSyncMessage::deserialize(deserializer).map(Into::into)
+    }
 }
 
 impl BroadcasterProtocolMessage {
@@ -1056,6 +1171,32 @@ impl BroadcasterProtocolSyncStatus {
             },
         }
     }
+
+    /// The Tycho synchronizer state this status was written from, the inverse of
+    /// [`Self::from_synchronizer_state`]. A status missing the block or reason its kind
+    /// requires is refused.
+    pub fn to_synchronizer_state(&self) -> Result<SynchronizerState, BroadcasterContractError> {
+        let incomplete = |missing: &'static str| BroadcasterContractError::IncompleteSyncStatus {
+            kind: self.kind,
+            missing,
+        };
+        let header = || {
+            self.block
+                .as_ref()
+                .map(BroadcasterBlockRef::to_block_header)
+                .ok_or_else(|| incomplete("block"))
+        };
+        Ok(match self.kind {
+            BroadcasterProtocolSyncStatusKind::Started => SynchronizerState::Started,
+            BroadcasterProtocolSyncStatusKind::Ready => SynchronizerState::Ready(header()?),
+            BroadcasterProtocolSyncStatusKind::Delayed => SynchronizerState::Delayed(header()?),
+            BroadcasterProtocolSyncStatusKind::Stale => SynchronizerState::Stale(header()?),
+            BroadcasterProtocolSyncStatusKind::Advanced => SynchronizerState::Advanced(header()?),
+            BroadcasterProtocolSyncStatusKind::Ended => {
+                SynchronizerState::Ended(self.reason.clone().ok_or_else(|| incomplete("reason"))?)
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1090,6 +1231,20 @@ impl From<&BlockHeader> for BroadcasterBlockRef {
             revert: block.revert,
             timestamp: block.timestamp,
             partial_block_index: block.partial_block_index,
+        }
+    }
+}
+
+impl BroadcasterBlockRef {
+    /// The Tycho block header this reference was written from.
+    pub fn to_block_header(&self) -> BlockHeader {
+        BlockHeader {
+            hash: self.hash.clone(),
+            number: self.number,
+            parent_hash: self.parent_hash.clone(),
+            revert: self.revert,
+            timestamp: self.timestamp,
+            partial_block_index: self.partial_block_index,
         }
     }
 }
@@ -1481,497 +1636,140 @@ impl BroadcasterSubscriptionTracker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BroadcasterContractError {
-    ExpectedSnapshotStart {
-        found: BroadcasterMessageKind,
-    },
-    UnexpectedStreamId {
-        expected: String,
-        found: String,
-    },
-    UnexpectedChainId {
-        expected: u64,
-        found: u64,
-    },
-    UnexpectedMessageSeq {
-        expected: u64,
-        found: u64,
-    },
-    MessageSequenceOverflow {
-        message_seq: u64,
-    },
-    UnexpectedSnapshotStart {
-        state: &'static str,
-    },
+    #[error("expected snapshot_start, found {found}")]
+    ExpectedSnapshotStart { found: BroadcasterMessageKind },
+    #[error("unexpected stream id: expected {expected}, found {found}")]
+    UnexpectedStreamId { expected: String, found: String },
+    #[error("unexpected chain id: expected {expected}, found {found}")]
+    UnexpectedChainId { expected: u64, found: u64 },
+    #[error("unexpected message sequence: expected {expected}, found {found}")]
+    UnexpectedMessageSeq { expected: u64, found: u64 },
+    #[error("message sequence overflow at {message_seq}")]
+    MessageSequenceOverflow { message_seq: u64 },
+    #[error("unexpected snapshot_start while in {state}")]
+    UnexpectedSnapshotStart { state: &'static str },
+    #[error("unexpected snapshot_chunk while live")]
     UnexpectedSnapshotChunk,
+    #[error("unexpected snapshot_end while live")]
     UnexpectedSnapshotEnd,
-    UnexpectedRecoveryMessage {
-        kind: BroadcasterMessageKind,
+    #[error("unexpected {kind} outside a Redis recovery transaction")]
+    UnexpectedRecoveryMessage { kind: BroadcasterMessageKind },
+    #[error("unexpected snapshot id: expected {expected}, found {found}")]
+    UnexpectedSnapshotId { expected: String, found: String },
+    #[error("unexpected snapshot chunk index: expected {expected}, found {found}")]
+    UnexpectedChunkIndex { expected: u32, found: u32 },
+    #[error("a {kind:?} sync status without its {missing}")]
+    IncompleteSyncStatus {
+        kind: BroadcasterProtocolSyncStatusKind,
+        missing: &'static str,
     },
-    UnexpectedSnapshotId {
-        expected: String,
-        found: String,
-    },
-    UnexpectedChunkIndex {
-        expected: u32,
-        found: u32,
-    },
-    ExtraSnapshotChunk {
-        total_chunks: u32,
-        found: u32,
-    },
+    #[error("received extra snapshot chunk {found} after declared total of {total_chunks}")]
+    ExtraSnapshotChunk { total_chunks: u32, found: u32 },
+    #[error("snapshot incomplete: expected {expected_chunks} chunks, observed {observed_chunks}")]
     SnapshotIncomplete {
         expected_chunks: u32,
         observed_chunks: u32,
     },
-    MissingDeclaredSnapshotBackends {
-        missing: Vec<BroadcasterBackend>,
-    },
+    #[error("snapshot is missing declared backends: {}", backend_names(.missing))]
+    MissingDeclaredSnapshotBackends { missing: Vec<BroadcasterBackend> },
+    #[error("received update before snapshot bootstrap completed")]
     UpdateBeforeSnapshotComplete,
+    #[error("received heartbeat before snapshot bootstrap completed")]
     HeartbeatBeforeSnapshotComplete,
+    #[error("received progress before snapshot bootstrap completed")]
     ProgressBeforeSnapshotComplete,
-    RedisReplayBoundaryBeforeSnapshotComplete {
-        state: &'static str,
-    },
+    #[error(
+        "redis replay boundary requires completed snapshot bootstrap, current state is {state}"
+    )]
+    RedisReplayBoundaryBeforeSnapshotComplete { state: &'static str },
+    #[error("update message must contain at least one partition")]
     EmptyUpdate,
+    #[error("progress reason must not be empty")]
     ProgressReasonEmpty,
-    RecoveryManifestInvalid {
-        reason: String,
-    },
-    EmptyUpdatePartition {
-        backend: BroadcasterBackend,
-    },
+    #[error("invalid broadcaster recovery payload: {reason}")]
+    RecoveryManifestInvalid { reason: String },
+    #[error("update partition for {backend:?} must contain state or sync data")]
+    EmptyUpdatePartition { backend: BroadcasterBackend },
+    #[error("duplicate backend entry {backend:?} in {context}")]
     DuplicateBackendEntry {
         context: &'static str,
         backend: BroadcasterBackend,
     },
+    #[error("backend entry {backend:?} in {context} was not declared in snapshot_start.backends")]
     UndeclaredBackendEntry {
         context: &'static str,
         backend: BroadcasterBackend,
     },
-    NewPairMissingState {
-        component_id: String,
-    },
-    UnknownComponentProtocol {
-        component_id: String,
-    },
+    #[error("new pair {component_id} is missing its state payload")]
+    NewPairMissingState { component_id: String },
+    #[error("component {component_id} could not be classified for the broadcaster")]
+    UnknownComponentProtocol { component_id: String },
+    #[error("component {component_id} uses unsupported broadcaster protocol {protocol}")]
     UnsupportedComponentProtocol {
         component_id: String,
         protocol: String,
     },
-    StateBackendMissing {
-        component_id: String,
-    },
-    UnknownSyncStateProtocol {
-        protocol: String,
-    },
-    UnsupportedSyncStateProtocol {
-        protocol: String,
-    },
+    #[error("state {component_id} is missing a known broadcaster backend")]
+    StateBackendMissing { component_id: String },
+    #[error("sync state {protocol} could not be classified for the broadcaster")]
+    UnknownSyncStateProtocol { protocol: String },
+    #[error("sync state {protocol} uses an unsupported broadcaster backend")]
+    UnsupportedSyncStateProtocol { protocol: String },
+    #[error("{context} entry {entry} belongs to {entry_backend:?} but partition backend is {partition_backend:?}")]
     PartitionContentBackendMismatch {
         context: &'static str,
         entry: String,
         partition_backend: BroadcasterBackend,
         entry_backend: BroadcasterBackend,
     },
-    RedisEntryEmptyField {
-        field: &'static str,
-    },
-    RedisEntryUnexpectedField {
-        field: &'static str,
-    },
-    RedisUnsupportedSchemaVersion {
-        found: String,
-    },
-    RedisEntryMissingSnapshotId {
-        kind: BroadcasterMessageKind,
-    },
+    #[error("redis stream field {field} must not be empty")]
+    RedisEntryEmptyField { field: &'static str },
+    #[error("redis stream field {field} is not allowed for this payload")]
+    RedisEntryUnexpectedField { field: &'static str },
+    #[error("unsupported redis schema version: {found}")]
+    RedisUnsupportedSchemaVersion { found: String },
+    #[error("redis {kind} entry requires snapshot_id")]
+    RedisEntryMissingSnapshotId { kind: BroadcasterMessageKind },
+    #[error("redis message_seq must start at 1")]
     RedisMessageSequenceZero,
-    RedisSnapshotPayloadUnsupported {
-        kind: BroadcasterMessageKind,
-    },
-    RedisBackendScopeInvalid {
-        backend_scope: String,
-    },
-    RedisPayloadJsonInvalid {
-        message: String,
-    },
+    #[error("redis stream does not support {kind} payloads in V1")]
+    RedisSnapshotPayloadUnsupported { kind: BroadcasterMessageKind },
+    #[error("invalid redis backend_scope: {backend_scope}")]
+    RedisBackendScopeInvalid { backend_scope: String },
+    #[error("redis payload_json is invalid: {message}")]
+    RedisPayloadJsonInvalid { message: String },
+    #[error("redis payload kind mismatch: expected {expected}, found {found}")]
     RedisPayloadKindMismatch {
         expected: BroadcasterMessageKind,
         found: BroadcasterMessageKind,
     },
+    #[error(
+        "redis block_number mismatch: entry {entry_block_number}, payload {payload_block_number}"
+    )]
     RedisBlockNumberMismatch {
         entry_block_number: u64,
         payload_block_number: u64,
     },
+    #[error("redis observed_timestamp_ms mismatch: entry {entry_observed_timestamp_ms}, payload {payload_observed_timestamp_ms}")]
     RedisObservedTimestampMismatch {
         entry_observed_timestamp_ms: u64,
         payload_observed_timestamp_ms: u64,
     },
-    InvalidRedisEntryId {
-        entry_id: String,
-    },
-    TokenChainMismatch {
-        expected: u64,
-        actual: u64,
-    },
+    #[error("invalid redis stream entry id: {entry_id}")]
+    InvalidRedisEntryId { entry_id: String },
+    #[error("token chain id mismatch: expected {expected}, got {actual}")]
+    TokenChainMismatch { expected: u64, actual: u64 },
 }
 
-fn fmt_unexpected_message_seq(
-    f: &mut fmt::Formatter<'_>,
-    expected: u64,
-    found: u64,
-) -> fmt::Result {
-    write!(
-        f,
-        "unexpected message sequence: expected {expected}, found {found}"
-    )
+fn backend_names(backends: &[BroadcasterBackend]) -> String {
+    backends
+        .iter()
+        .map(|backend| backend.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
-
-fn fmt_unexpected_snapshot_id(
-    f: &mut fmt::Formatter<'_>,
-    expected: &str,
-    found: &str,
-) -> fmt::Result {
-    write!(
-        f,
-        "unexpected snapshot id: expected {expected}, found {found}"
-    )
-}
-
-fn fmt_unexpected_chunk_index(
-    f: &mut fmt::Formatter<'_>,
-    expected: u32,
-    found: u32,
-) -> fmt::Result {
-    write!(
-        f,
-        "unexpected snapshot chunk index: expected {expected}, found {found}"
-    )
-}
-
-fn fmt_snapshot_incomplete(
-    f: &mut fmt::Formatter<'_>,
-    expected_chunks: u32,
-    observed_chunks: u32,
-) -> fmt::Result {
-    write!(
-        f,
-        "snapshot incomplete: expected {expected_chunks} chunks, observed {observed_chunks}"
-    )
-}
-
-fn fmt_unsupported_component_protocol(
-    f: &mut fmt::Formatter<'_>,
-    component_id: &str,
-    protocol: &str,
-) -> fmt::Result {
-    write!(
-        f,
-        "component {component_id} uses unsupported broadcaster protocol {protocol}"
-    )
-}
-
-fn fmt_missing_declared_snapshot_backends(
-    f: &mut fmt::Formatter<'_>,
-    missing: &[BroadcasterBackend],
-) -> fmt::Result {
-    write!(
-        f,
-        "snapshot is missing declared backends: {}",
-        missing
-            .iter()
-            .map(|backend| backend.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-fn fmt_duplicate_backend_entry(
-    f: &mut fmt::Formatter<'_>,
-    context: &str,
-    backend: BroadcasterBackend,
-) -> fmt::Result {
-    write!(f, "duplicate backend entry {backend:?} in {context}")
-}
-
-fn fmt_undeclared_backend_entry(
-    f: &mut fmt::Formatter<'_>,
-    context: &str,
-    backend: BroadcasterBackend,
-) -> fmt::Result {
-    write!(
-        f,
-        "backend entry {backend:?} in {context} was not declared in snapshot_start.backends"
-    )
-}
-
-fn fmt_partition_content_backend_mismatch(
-    f: &mut fmt::Formatter<'_>,
-    context: &str,
-    entry: &str,
-    partition_backend: BroadcasterBackend,
-    entry_backend: BroadcasterBackend,
-) -> fmt::Result {
-    write!(
-        f,
-        "{context} entry {entry} belongs to {entry_backend:?} but partition backend is {partition_backend:?}"
-    )
-}
-
-fn fmt_unknown_component_protocol(f: &mut fmt::Formatter<'_>, component_id: &str) -> fmt::Result {
-    write!(
-        f,
-        "component {component_id} could not be classified for the broadcaster"
-    )
-}
-
-fn fmt_state_backend_missing(f: &mut fmt::Formatter<'_>, component_id: &str) -> fmt::Result {
-    write!(
-        f,
-        "state {component_id} is missing a known broadcaster backend"
-    )
-}
-
-fn fmt_unknown_sync_state_protocol(f: &mut fmt::Formatter<'_>, protocol: &str) -> fmt::Result {
-    write!(
-        f,
-        "sync state {protocol} could not be classified for the broadcaster"
-    )
-}
-
-fn fmt_unsupported_sync_state_protocol(f: &mut fmt::Formatter<'_>, protocol: &str) -> fmt::Result {
-    write!(
-        f,
-        "sync state {protocol} uses an unsupported broadcaster backend"
-    )
-}
-
-fn fmt_redis_contract_error(
-    f: &mut fmt::Formatter<'_>,
-    error: &BroadcasterContractError,
-) -> fmt::Result {
-    match error {
-        BroadcasterContractError::RedisEntryEmptyField { field } => {
-            write!(f, "redis stream field {field} must not be empty")
-        }
-        BroadcasterContractError::RedisEntryUnexpectedField { field } => {
-            write!(f, "redis stream field {field} is not allowed for this payload")
-        }
-        BroadcasterContractError::RedisUnsupportedSchemaVersion { found } => {
-            write!(f, "unsupported redis schema version: {found}")
-        }
-        BroadcasterContractError::RedisEntryMissingSnapshotId { kind } => {
-            write!(f, "redis {kind} entry requires snapshot_id")
-        }
-        BroadcasterContractError::RedisMessageSequenceZero => {
-            write!(f, "redis message_seq must start at 1")
-        }
-        BroadcasterContractError::RedisSnapshotPayloadUnsupported { kind } => {
-            write!(f, "redis stream does not support {kind} payloads in V1")
-        }
-        BroadcasterContractError::RedisBackendScopeInvalid { backend_scope } => {
-            write!(f, "invalid redis backend_scope: {backend_scope}")
-        }
-        BroadcasterContractError::RedisPayloadJsonInvalid { message } => {
-            write!(f, "redis payload_json is invalid: {message}")
-        }
-        BroadcasterContractError::RedisPayloadKindMismatch { expected, found } => {
-            write!(
-                f,
-                "redis payload kind mismatch: expected {expected}, found {found}"
-            )
-        }
-        BroadcasterContractError::RedisBlockNumberMismatch {
-            entry_block_number,
-            payload_block_number,
-        } => write!(
-            f,
-            "redis block_number mismatch: entry {entry_block_number}, payload {payload_block_number}"
-        ),
-        BroadcasterContractError::RedisObservedTimestampMismatch {
-            entry_observed_timestamp_ms,
-            payload_observed_timestamp_ms,
-        } => write!(
-            f,
-            "redis observed_timestamp_ms mismatch: entry {entry_observed_timestamp_ms}, payload {payload_observed_timestamp_ms}"
-        ),
-        BroadcasterContractError::InvalidRedisEntryId { entry_id } => {
-            write!(f, "invalid redis stream entry id: {entry_id}")
-        }
-        _ => f.write_str("redis contract error"),
-    }
-}
-
-fn fmt_protocol_classification_error(
-    f: &mut fmt::Formatter<'_>,
-    error: &BroadcasterContractError,
-) -> fmt::Result {
-    match error {
-        BroadcasterContractError::UnknownComponentProtocol { component_id } => {
-            fmt_unknown_component_protocol(f, component_id)
-        }
-        BroadcasterContractError::UnsupportedComponentProtocol {
-            component_id,
-            protocol,
-        } => fmt_unsupported_component_protocol(f, component_id, protocol),
-        BroadcasterContractError::StateBackendMissing { component_id } => {
-            fmt_state_backend_missing(f, component_id)
-        }
-        BroadcasterContractError::UnknownSyncStateProtocol { protocol } => {
-            fmt_unknown_sync_state_protocol(f, protocol)
-        }
-        BroadcasterContractError::UnsupportedSyncStateProtocol { protocol } => {
-            fmt_unsupported_sync_state_protocol(f, protocol)
-        }
-        _ => f.write_str("protocol classification error"),
-    }
-}
-
-fn fmt_snapshot_flow_error(
-    f: &mut fmt::Formatter<'_>,
-    error: &BroadcasterContractError,
-) -> fmt::Result {
-    match error {
-        BroadcasterContractError::UnexpectedSnapshotStart { state } => {
-            write!(f, "unexpected snapshot_start while in {state}")
-        }
-        BroadcasterContractError::UnexpectedSnapshotChunk => {
-            write!(f, "unexpected snapshot_chunk while live")
-        }
-        BroadcasterContractError::UnexpectedSnapshotEnd => {
-            write!(f, "unexpected snapshot_end while live")
-        }
-        BroadcasterContractError::UnexpectedSnapshotId { expected, found } => {
-            fmt_unexpected_snapshot_id(f, expected, found)
-        }
-        BroadcasterContractError::UnexpectedChunkIndex { expected, found } => {
-            fmt_unexpected_chunk_index(f, *expected, *found)
-        }
-        BroadcasterContractError::ExtraSnapshotChunk {
-            total_chunks,
-            found,
-        } => write!(
-            f,
-            "received extra snapshot chunk {found} after declared total of {total_chunks}"
-        ),
-        BroadcasterContractError::SnapshotIncomplete {
-            expected_chunks,
-            observed_chunks,
-        } => fmt_snapshot_incomplete(f, *expected_chunks, *observed_chunks),
-        BroadcasterContractError::MissingDeclaredSnapshotBackends { missing } => {
-            fmt_missing_declared_snapshot_backends(f, missing)
-        }
-        _ => f.write_str("snapshot flow error"),
-    }
-}
-
-impl fmt::Display for BroadcasterContractError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ExpectedSnapshotStart { found } => {
-                write!(f, "expected snapshot_start, found {found}")
-            }
-            Self::UnexpectedStreamId { expected, found } => write!(
-                f,
-                "unexpected stream id: expected {expected}, found {found}"
-            ),
-            Self::UnexpectedChainId { expected, found } => {
-                write!(f, "unexpected chain id: expected {expected}, found {found}")
-            }
-            Self::UnexpectedMessageSeq { expected, found } => {
-                fmt_unexpected_message_seq(f, *expected, *found)
-            }
-            Self::MessageSequenceOverflow { message_seq } => {
-                write!(f, "message sequence overflow at {message_seq}")
-            }
-            Self::UnexpectedSnapshotStart { .. }
-            | Self::UnexpectedSnapshotChunk
-            | Self::UnexpectedSnapshotEnd
-            | Self::UnexpectedSnapshotId { .. }
-            | Self::UnexpectedChunkIndex { .. }
-            | Self::ExtraSnapshotChunk { .. }
-            | Self::SnapshotIncomplete { .. }
-            | Self::MissingDeclaredSnapshotBackends { .. } => fmt_snapshot_flow_error(f, self),
-            Self::UnexpectedRecoveryMessage { kind } => {
-                write!(f, "unexpected {kind} outside a Redis recovery transaction")
-            }
-            Self::UpdateBeforeSnapshotComplete => {
-                write!(f, "received update before snapshot bootstrap completed")
-            }
-            Self::HeartbeatBeforeSnapshotComplete => {
-                write!(f, "received heartbeat before snapshot bootstrap completed")
-            }
-            Self::ProgressBeforeSnapshotComplete => {
-                write!(f, "received progress before snapshot bootstrap completed")
-            }
-            Self::RedisReplayBoundaryBeforeSnapshotComplete { state } => write!(
-                f,
-                "redis replay boundary requires completed snapshot bootstrap, current state is {state}"
-            ),
-            Self::EmptyUpdate => write!(f, "update message must contain at least one partition"),
-            Self::ProgressReasonEmpty => write!(f, "progress reason must not be empty"),
-            Self::RecoveryManifestInvalid { reason } => {
-                write!(f, "invalid broadcaster recovery payload: {reason}")
-            }
-            Self::EmptyUpdatePartition { backend } => {
-                write!(
-                    f,
-                    "update partition for {backend:?} must contain state or sync data"
-                )
-            }
-            Self::DuplicateBackendEntry { context, backend } => {
-                fmt_duplicate_backend_entry(f, context, *backend)
-            }
-            Self::UndeclaredBackendEntry { context, backend } => {
-                fmt_undeclared_backend_entry(f, context, *backend)
-            }
-            Self::NewPairMissingState { component_id } => {
-                write!(f, "new pair {component_id} is missing its state payload")
-            }
-            Self::UnknownComponentProtocol { .. }
-            | Self::UnsupportedComponentProtocol { .. }
-            | Self::StateBackendMissing { .. }
-            | Self::UnknownSyncStateProtocol { .. }
-            | Self::UnsupportedSyncStateProtocol { .. } => {
-                fmt_protocol_classification_error(f, self)
-            }
-            Self::PartitionContentBackendMismatch {
-                context,
-                entry,
-                partition_backend,
-                entry_backend,
-            } => fmt_partition_content_backend_mismatch(
-                f,
-                context,
-                entry,
-                *partition_backend,
-                *entry_backend,
-            ),
-            Self::RedisEntryEmptyField { .. }
-            | Self::RedisEntryUnexpectedField { .. }
-            | Self::RedisUnsupportedSchemaVersion { .. }
-            | Self::RedisEntryMissingSnapshotId { .. }
-            | Self::RedisMessageSequenceZero
-            | Self::RedisSnapshotPayloadUnsupported { .. }
-            | Self::RedisBackendScopeInvalid { .. }
-            | Self::RedisPayloadJsonInvalid { .. }
-            | Self::RedisPayloadKindMismatch { .. }
-            | Self::RedisBlockNumberMismatch { .. }
-            | Self::RedisObservedTimestampMismatch { .. }
-            | Self::InvalidRedisEntryId { .. } => fmt_redis_contract_error(f, self),
-            Self::TokenChainMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "token chain id mismatch: expected {expected}, got {actual}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for BroadcasterContractError {}
 
 #[derive(Default)]
 struct UpdatePartitionBuilder {
@@ -1979,15 +1777,6 @@ struct UpdatePartitionBuilder {
     updated_states: Vec<BroadcasterStateDelta>,
     removed_pairs: Vec<BroadcasterRemovedPair>,
     sync_statuses: BTreeMap<String, BroadcasterProtocolSyncStatus>,
-}
-
-impl UpdatePartitionBuilder {
-    fn is_empty(&self) -> bool {
-        self.new_pairs.is_empty()
-            && self.updated_states.is_empty()
-            && self.removed_pairs.is_empty()
-            && self.sync_statuses.is_empty()
-    }
 }
 
 fn ensure_stream_id(expected: &str, found: &str) -> Result<(), BroadcasterContractError> {
@@ -2767,11 +2556,13 @@ mod test_support {
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use crate::broadcaster::wire::{Snapshot, StateSyncMessage};
     use anyhow::{anyhow, Result};
     use tycho_simulation::{
         protocol::models::Update as TychoUpdate,
-        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_client::feed::{
+            synchronizer::{Snapshot, StateSyncMessage},
+            BlockHeader, SynchronizerState,
+        },
         tycho_common::{
             models::{token::Token, Chain},
             Bytes,
@@ -2784,16 +2575,157 @@ mod tests {
         snapshot_start_envelope_with_backends, update_envelope,
     };
     use super::{
-        BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError, BroadcasterEnvelope,
-        BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress, BroadcasterProtocolMessage,
-        BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind,
-        BroadcasterRedisReplayBoundary, BroadcasterRemovedPair, BroadcasterSnapshotChunk,
-        BroadcasterSnapshotEnd, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
+        BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterContractError,
+        BroadcasterEnvelope, BroadcasterHeartbeat, BroadcasterPayload, BroadcasterProgress,
+        BroadcasterProtocolMessage, BroadcasterProtocolSyncStatus,
+        BroadcasterProtocolSyncStatusKind, BroadcasterRedisReplayBoundary, BroadcasterRemovedPair,
+        BroadcasterSnapshotChunk, BroadcasterSnapshotPartition, BroadcasterSnapshotSessionResponse,
         BroadcasterSnapshotStart, BroadcasterStateDelta, BroadcasterStateEntry,
         BroadcasterSubscriptionEvent, BroadcasterSubscriptionState, BroadcasterSubscriptionTracker,
         BroadcasterTokenDto, BroadcasterTokenLookupRequest, BroadcasterTokenLookupResponse,
         BroadcasterTokenSnapshotResponse, BroadcasterUpdateMessage, BroadcasterUpdatePartition,
+        ProtocolHeadUpdate, ProtocolKind, ProtocolStateHeads,
     };
+
+    #[test]
+    fn protocol_heads_follow_independent_updates_despite_older_stale_metadata() {
+        let mut heads =
+            ProtocolStateHeads::new(vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3]);
+        let first = raw_protocol_message_at_header("uniswap_v2", block_header(99, 1));
+        heads.apply_messages(&[first]);
+        assert_eq!(heads.complete_head(), None);
+
+        let mut peer = raw_protocol_message_at_header("uniswap_v3", block_header(100, 2));
+        peer.sync_state = SynchronizerState::Stale(block_header(99, 1));
+        heads.apply_messages(&[peer]);
+        assert_eq!(heads.complete_head(), None);
+
+        let mut caught_up = raw_protocol_message_at_header("uniswap_v2", block_header(100, 2));
+        caught_up.sync_state = SynchronizerState::Stale(block_header(99, 1));
+        heads.apply_messages(&[caught_up]);
+        assert_eq!(
+            heads.complete_head(),
+            Some(BlockIdentity {
+                number: 100,
+                hash: block_header(100, 2).hash,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_heads_invalidate_partial_state_until_every_protocol_catches_up() -> Result<()> {
+        let mut heads = ProtocolStateHeads::from_snapshot(
+            vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
+            &[
+                raw_protocol_message("uniswap_v2"),
+                raw_protocol_message("uniswap_v3"),
+            ],
+        );
+        assert!(heads.complete_head().is_some());
+        let mut partial = raw_protocol_message_at_header("uniswap_v2", block_header(124, 2));
+        partial.message.header.partial_block_index = Some(0);
+        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&partial)
+            .ok_or_else(|| anyhow!("canonical partial update missing"))?]);
+        assert_eq!(heads.complete_head(), None);
+
+        let full = raw_protocol_message_at_header("uniswap_v2", block_header(124, 2));
+        heads.apply_updates(&[ProtocolHeadUpdate::from_message(&full)
+            .ok_or_else(|| anyhow!("canonical full update missing"))?]);
+        assert_eq!(heads.complete_head(), None);
+        heads.apply_messages(&[raw_protocol_message_at_header(
+            "uniswap_v3",
+            block_header(124, 2),
+        )]);
+        assert_eq!(
+            heads.complete_head(),
+            Some(BlockIdentity {
+                number: 124,
+                hash: block_header(124, 2).hash,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_heads_follow_same_height_replacements_in_application_order() -> Result<()> {
+        let mut heads = ProtocolStateHeads::from_snapshot(
+            vec![ProtocolKind::UniswapV2, ProtocolKind::UniswapV3],
+            &[
+                raw_protocol_message("uniswap_v2"),
+                raw_protocol_message("uniswap_v3"),
+            ],
+        );
+        let replacement = block_header(123, 2);
+        heads.apply_messages(&[raw_protocol_message_at_header(
+            "uniswap_v2",
+            replacement.clone(),
+        )]);
+        assert_eq!(heads.complete_head(), None);
+        heads.apply_updates(&[
+            ProtocolHeadUpdate::from_message(&raw_protocol_message("uniswap_v3"))
+                .ok_or_else(|| anyhow!("canonical original update missing"))?,
+            ProtocolHeadUpdate::from_message(&raw_protocol_message_at_header(
+                "uniswap_v3",
+                replacement.clone(),
+            ))
+            .ok_or_else(|| anyhow!("canonical replacement update missing"))?,
+        ]);
+        assert_eq!(
+            heads.complete_head(),
+            Some(BlockIdentity {
+                number: replacement.number,
+                hash: replacement.hash
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_heads_ignore_unselected_protocols_and_clear_installed_state() {
+        let mut heads = ProtocolStateHeads::new(vec![ProtocolKind::UniswapV2]);
+        let selected = raw_protocol_message("uniswap_v2");
+        let mut unrelated =
+            raw_protocol_message_at_header("unselected_protocol", block_header(124, 2));
+        unrelated.message.header.partial_block_index = Some(0);
+        heads.apply_messages(&[selected.clone(), unrelated.clone()]);
+        let expected = Some(BlockIdentity {
+            number: 123,
+            hash: block_header(123, 1).hash,
+        });
+        assert_eq!(heads.complete_head(), expected);
+        assert_eq!(ProtocolHeadUpdate::from_message(&unrelated), None);
+        heads.apply_updates(&[ProtocolHeadUpdate {
+            protocol: ProtocolKind::UniswapV3,
+            head: None,
+        }]);
+        assert_eq!(heads.complete_head(), expected);
+
+        heads.clear();
+        assert_eq!(heads.complete_head(), None);
+        heads.apply_messages(&[unrelated]);
+        assert_eq!(heads.complete_head(), None);
+        heads.apply_messages(&[selected]);
+        assert_eq!(heads.complete_head(), expected);
+        assert_eq!(ProtocolStateHeads::new(Vec::new()).complete_head(), None);
+    }
+
+    #[test]
+    fn protocol_heads_never_install_unknown_or_normalized_wire_identities() {
+        let mut heads = ProtocolStateHeads::new(vec![ProtocolKind::UniswapV2]);
+        for name in ["Uniswap_V2", "uniswap-v2", "uniswap v2", "future_protocol"] {
+            let message = raw_protocol_message(name);
+            assert_eq!(ProtocolHeadUpdate::from_message(&message), None);
+            heads.apply_messages(&[message]);
+            assert_eq!(heads.complete_head(), None);
+        }
+        heads.apply_messages(&[raw_protocol_message("uniswap_v2")]);
+        let installed = heads.complete_head();
+        assert!(installed.is_some());
+        let mut alias = raw_protocol_message("UNISWAP_V2");
+        alias.message.header.partial_block_index = Some(0);
+        heads.apply_messages(&[alias]);
+        assert_eq!(heads.complete_head(), installed);
+    }
 
     #[test]
     fn token_lookup_contract_uses_camel_case_shape() -> Result<()> {
@@ -2917,63 +2849,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_start_round_trips_with_sorted_backends() -> Result<()> {
-        let envelope = BroadcasterEnvelope::new(
-            "stream-1",
-            10,
-            BroadcasterPayload::SnapshotStart(BroadcasterSnapshotStart::new(
-                "snapshot-1",
-                8453,
-                vec![BroadcasterBackend::Vm, BroadcasterBackend::Native],
-                2,
-            )?),
-        );
-
-        let value = serde_json::to_value(&envelope)?;
-        assert_eq!(value["kind"], "snapshot_start");
-        assert_eq!(value["backends"], serde_json::json!(["native", "vm"]));
-
-        let decoded: BroadcasterEnvelope = serde_json::from_value(value)?;
-        let BroadcasterPayload::SnapshotStart(start) = decoded.payload else {
-            return Err(anyhow!("expected snapshot_start payload"));
-        };
-        assert_eq!(start.snapshot_id, "snapshot-1");
-        assert_eq!(
-            start.backends,
-            vec![BroadcasterBackend::Native, BroadcasterBackend::Vm]
-        );
-        assert_eq!(start.total_chunks, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn broadcaster_backend_rfq_round_trips() -> Result<()> {
-        let json = serde_json::to_value(BroadcasterBackend::Rfq)?;
-        assert_eq!(json, serde_json::json!("rfq"));
-
-        let decoded: BroadcasterBackend = serde_json::from_value(json)?;
-        assert_eq!(decoded, BroadcasterBackend::Rfq);
-        assert_eq!(BroadcasterBackend::Rfq.as_str(), "rfq");
-        Ok(())
-    }
-
-    #[test]
-    fn snapshot_start_accepts_declared_rfq_backend() -> Result<()> {
-        let start = BroadcasterSnapshotStart::new(
-            "snapshot-1",
-            8453,
-            vec![BroadcasterBackend::Rfq, BroadcasterBackend::Native],
-            2,
-        )?;
-
-        assert_eq!(
-            start.backends,
-            vec![BroadcasterBackend::Native, BroadcasterBackend::Rfq]
-        );
-        Ok(())
-    }
-
-    #[test]
     fn snapshot_start_constructor_rejects_duplicate_backends() -> Result<()> {
         let Err(error) = BroadcasterSnapshotStart::new(
             "snapshot-1",
@@ -3041,24 +2916,6 @@ mod tests {
             partition.sync_statuses["uniswap_v2"].kind,
             BroadcasterProtocolSyncStatusKind::Ready
         );
-        Ok(())
-    }
-
-    #[test]
-    fn snapshot_end_round_trips() -> Result<()> {
-        let envelope = BroadcasterEnvelope::new(
-            "stream-1",
-            12,
-            BroadcasterPayload::SnapshotEnd(BroadcasterSnapshotEnd::new("snapshot-1")),
-        );
-
-        let decoded: BroadcasterEnvelope =
-            serde_json::from_str(&serde_json::to_string(&envelope)?)?;
-
-        let BroadcasterPayload::SnapshotEnd(end) = decoded.payload else {
-            return Err(anyhow!("expected snapshot_end payload"));
-        };
-        assert_eq!(end.snapshot_id, "snapshot-1");
         Ok(())
     }
 
@@ -3168,60 +3025,6 @@ mod tests {
                 protocol: "native:uniswap_v2".to_string(),
             }
         );
-        Ok(())
-    }
-
-    #[test]
-    fn heartbeat_round_trips_without_mutating_payload_state() -> Result<()> {
-        let envelope = BroadcasterEnvelope::new(
-            "stream-1",
-            14,
-            BroadcasterPayload::Heartbeat(BroadcasterHeartbeat::new(
-                8453,
-                "snapshot-1",
-                vec![
-                    BroadcasterBackendHead::new(BroadcasterBackend::Vm, 101),
-                    BroadcasterBackendHead::new(BroadcasterBackend::Native, 100),
-                ],
-            )?),
-        );
-
-        let decoded: BroadcasterEnvelope =
-            serde_json::from_str(&serde_json::to_string(&envelope)?)?;
-
-        let BroadcasterPayload::Heartbeat(heartbeat) = decoded.payload else {
-            return Err(anyhow!("expected heartbeat payload"));
-        };
-        assert_eq!(heartbeat.chain_id, 8453);
-        assert_eq!(heartbeat.snapshot_id, "snapshot-1");
-        assert_eq!(heartbeat.backend_heads.len(), 2);
-        assert_eq!(
-            heartbeat.backend_heads[0].backend,
-            BroadcasterBackend::Native
-        );
-        assert_eq!(heartbeat.backend_heads[1].backend, BroadcasterBackend::Vm);
-        Ok(())
-    }
-
-    #[test]
-    fn heartbeat_accepts_rfq_backend_head() -> Result<()> {
-        let heartbeat = BroadcasterHeartbeat::new(
-            8453,
-            "snapshot-1",
-            vec![
-                BroadcasterBackendHead::new(BroadcasterBackend::Rfq, 102),
-                BroadcasterBackendHead::new(BroadcasterBackend::Native, 100),
-            ],
-        )?;
-
-        assert_eq!(heartbeat.backend_heads.len(), 2);
-        assert_eq!(
-            heartbeat.backend_heads[0].backend,
-            BroadcasterBackend::Native
-        );
-        assert_eq!(heartbeat.backend_heads[0].block_number, 100);
-        assert_eq!(heartbeat.backend_heads[1].backend, BroadcasterBackend::Rfq);
-        assert_eq!(heartbeat.backend_heads[1].block_number, 102);
         Ok(())
     }
 
@@ -4394,11 +4197,18 @@ mod tests {
     }
 
     fn raw_protocol_message(protocol: &str) -> BroadcasterProtocolMessage {
+        raw_protocol_message_at_header(protocol, block_header(123, 1))
+    }
+
+    fn raw_protocol_message_at_header(
+        protocol: &str,
+        header: BlockHeader,
+    ) -> BroadcasterProtocolMessage {
         BroadcasterProtocolMessage::new(
             protocol,
-            SynchronizerState::Ready(block_header(123, 1)),
+            SynchronizerState::Ready(header.clone()),
             StateSyncMessage {
-                header: block_header(123, 1),
+                header,
                 snapshots: Snapshot {
                     states: HashMap::new(),
                     vm_storage: HashMap::new(),
@@ -4407,5 +4217,49 @@ mod tests {
                 removed_components: HashMap::new(),
             },
         )
+    }
+
+    #[test]
+    fn sync_status_round_trips_to_the_synchronizer_state() -> Result<()> {
+        let header = block_header(42, 7);
+        let partial = BlockHeader {
+            partial_block_index: Some(3),
+            ..block_header(43, 8)
+        };
+        let reverted = BlockHeader {
+            revert: true,
+            ..block_header(41, 9)
+        };
+        for state in [
+            SynchronizerState::Started,
+            SynchronizerState::Ready(header.clone()),
+            SynchronizerState::Ready(partial),
+            SynchronizerState::Delayed(reverted),
+            SynchronizerState::Stale(header.clone()),
+            SynchronizerState::Advanced(header),
+            SynchronizerState::Ended("stream closed".to_string()),
+        ] {
+            let status = BroadcasterProtocolSyncStatus::from_synchronizer_state(&state);
+            assert_eq!(status.to_synchronizer_state()?, state);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sync_status_missing_its_block_or_reason_is_refused() {
+        for kind in [
+            BroadcasterProtocolSyncStatusKind::Ready,
+            BroadcasterProtocolSyncStatusKind::Ended,
+        ] {
+            let status = BroadcasterProtocolSyncStatus {
+                kind,
+                block: None,
+                reason: None,
+            };
+            assert!(matches!(
+                status.to_synchronizer_state(),
+                Err(BroadcasterContractError::IncompleteSyncStatus { .. })
+            ));
+        }
     }
 }

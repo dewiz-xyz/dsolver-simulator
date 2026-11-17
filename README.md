@@ -5,7 +5,7 @@
 <h1 align="center">DSolver Simulator</h1>
 
 <p align="center">
-  High-throughput DeFi swap simulation and route encoding on live Tycho-backed state.
+  DeFi swap simulation and route encoding using live Tycho state.
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.91%2B-000000?logo=rust" alt="Rust 1.91+">
+  <img src="https://img.shields.io/badge/Toolchain-1.95.0-000000?logo=rust" alt="Rust toolchain 1.95.0">
   <img src="https://img.shields.io/badge/Axum-0.7-111827" alt="Axum 0.7">
   <img src="https://img.shields.io/badge/Chains-Ethereum%20%7C%20Base-2563eb" alt="Supported chains: Ethereum and Base">
 </p>
@@ -39,20 +39,11 @@
   <a href="#docs-map">Docs</a>
 </p>
 
-DSolver Simulator is a Rust service for DeFi quote simulation and route encoding. It subscribes to the internal Tycho broadcaster for native and VM state, maintains an in-memory view of pool state, and exposes fast HTTP endpoints for quoting, route settlement encoding, and readiness checks.
-
-## What It Is
-
-- Live-state simulation service for swap and routing workloads.
-- Built on Axum and Tokio, with `tycho-simulation` and `tycho-execution` handling pricing and route execution details.
-- Designed for solver and routing integrations that need both quote coverage and deterministic route encoding behavior.
-
-## Why Teams Use It
-
-- Continuous ingestion of native and optional VM-backed pool state through the internal broadcaster service.
-- Structured `/simulate` responses that distinguish usable quotes, partial coverage, warmup states, and request-level failures.
-- `/encode` route resimulation before calldata generation, so settlement interactions are built from the same runtime view used for quoting.
-- Reporting-first local analysis tooling for readiness, latency, sampled evidence, and quick regression investigation.
+DSolver Simulator subscribes to the internal Tycho broadcaster, maintains pool state in memory,
+and exposes HTTP endpoints for quotes, route encoding, and readiness. It uses `tycho-simulation`
+for pricing and `tycho-execution` for calldata. `/simulate` reports usable quotes, partial
+coverage, warmup states, and request failures; `/encode` resimulates routes before generating
+settlement interactions. The local analyzer records readiness, latency, and request evidence.
 
 ## At A Glance
 
@@ -66,6 +57,12 @@ DSolver Simulator is a Rust service for DeFi quote simulation and route encoding
 | Required inputs | `CHAIN_ID`, `TYCHO_BROADCASTER_URL`, Redis connection settings; the broadcaster also requires `TYCHO_API_KEY` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
+
+## Tycho 0.525.0 Base broadcasting
+
+This branch preserves the current replay bootstrap API and adds Native/Metric book broadcasting alongside Bebop on Base. The Base broadcaster also enables the additional hosted on-chain feeds listed in the manifest. Set `CHAIN_ID=8453`, `ENABLE_RFQ_POOLS=true`, `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`; the optional `RFQ_MIN_TVL_USD` defaults to 100 USD.
+
+Consumers must use the matching Tycho 0.525.0 state format and bootstrap fresh snapshots during rollout. Native/Metric settlement encoding is outside this change. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list, dependency provenance, and verification results.
 
 ## Quick Start
 
@@ -93,9 +90,7 @@ Common optional inputs:
 - `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ pool feeds (defaults to `false`)
-- `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY` only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
-- `NATIVE_API_KEY` and `METRIC_API_KEY` for the Base broadcaster when RFQ is enabled
-- `RFQ_MIN_TVL_USD` for the RFQ book liquidity floor (default `100` USD; separate from on-chain `TVL_THRESHOLD`)
+- `BEBOP_KEY` as Bebop's single Bearer credential, plus `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`, only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
 - `HOST` and `PORT` to change the bind address
 - `BROADCASTER_TOKEN_MIN_QUALITY` to tune the broadcaster's startup Tycho token quality floor
 - `BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES` to cap serialized HTTP snapshot payloads
@@ -109,11 +104,31 @@ Common optional inputs:
 `crates/runtime/src/config/mod.rs` is the authoritative source for runtime defaults. `.env.example`
 is an example setup, not the source of truth for every default.
 
+### Protocol identities
+
+Use canonical Tycho protocol names in `simulator-manifest.toml`, such as `uniswap_v3` or
+`vm:curve`. Validation trims surrounding whitespace and requires an exact match. For example,
+`Uniswap-V3` and the protocol type name `uniswap_v3_pool` fail validation. The resolved configuration
+uses `ProtocolKind`, as do decoder registration, applied state tracking, and routing policies.
+
+Tycho messages, JSON payloads, and retained snapshots keep their protocol strings. Snapshot
+reassembly preserves exact upstream keys so differently named streams stay distinct and recovery
+waits for all required streams. Historical pool selectors also match the stored component name
+exactly, including noncanonical names. External metadata and request hints retain their existing
+parsing rules.
+
+Base Uniswap V4 consumes the native wire partition and stores its state in the VM store with
+the shared database. Using `ProtocolKind` preserves that split.
+
 ## Runtime Continuity Contract
 
 The simulator bootstraps local state from the active broadcaster's HTTP snapshot session, then replays Redis Stream deltas after the snapshot replay boundary returned by that session. Redis is the delta transport, not the full-state bootstrap store.
 
 The shared `broadcaster-replay-client` crate owns that bootstrap and Redis replay contract, so simulator and external consumers use the same checkpoint, gap detection, and recovery rules.
+
+Optional broadcaster state history persists full-state checkpoints, token snapshots, and ordered deltas for historical replay and analysis. See [docs/state_history.md](docs/state_history.md) for the segment model, PostgreSQL schema, S3 objects, Rust reader API, environment variables, status fields, and retention contract.
+
+The separate Historical Pool Quote API reconstructs retained Base state for one exact component and token direction. It uses an HTTP-only Rust CLI and has no direct broadcaster, Redis, primary database, or state-history write path. Client users should start with [docs/historical_pool_quote_client.md](docs/historical_pool_quote_client.md); maintainers can use [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md) for the service, API, limits, image, and operator workflow.
 
 Broadcaster deployments use four modes:
 
@@ -123,24 +138,6 @@ Broadcaster deployments use four modes:
 - `Unhealthy` fails closed until it recovers or is replaced.
 
 Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. A same-process reconnect keeps the writer generation and publishes a private full-replacement recovery transaction through the existing Redis stream. Consumers expose that replacement only after its commit, then apply ordered catch-up entries. Invalid, incomplete, or trimmed recovery data fails closed and falls back to a fresh HTTP bootstrap. Each simulator uses its own `XREAD` position; the design does not use Redis consumer groups or per-deployment stream keys.
-
-## Base broadcasting and Tycho 0.526.0
-
-The Base profile subscribes to all 12 on-chain systems advertised by the configured hosted endpoint as checked on 2026-11-17. New subscriptions are Sushi V2, Aerodrome V1, Aero Basic, Aero CL, Pancake Infinity CL, LunarBase, and Ekubo V3. Infinity Bin and Biconomy have decoder registrations but remain disabled because the endpoint does not advertise them.
-
-With `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true`, the broadcaster also runs Bebop, Native (`rfq:native`), and Metric (`rfq:metric`). Set the existing Bebop credentials plus `NATIVE_API_KEY` and `METRIC_API_KEY` in the broadcaster environment. Metric is a pAMM book feed; it uses the same RFQ backend, serialized protocol-state snapshots, and Redis updates as Bebop. Complete books replace that provider's previous set; missing, expired, or ended books emit removals without removing another provider's liquidity. The upstream defaults expire Native snapshots after 30 seconds and Metric snapshots after 15 seconds.
-
-Native and Metric support broadcasting and simulation. Their `/encode` requests return an explicit unsupported error; adding settlement support is a separate step. New on-chain source settlement support is also not established by broadcaster support. Existing Bebop/Hashflow signing clients are rebuilt locally from the serialized books, preserving the original pricing state and request timeout.
-
-This upgrade changes serialized Tycho state internals. Upgrade downstream simulation consumers to the same Tycho release before enabling these feeds; bootstrap a fresh snapshot and use a separate Redis stream key for an isolated rollout. Do not mix old RFQ snapshots with the new consumer. The outer HTTP/Redis transport envelope remains unchanged. The execution fork's small compatibility patch is documented in [vendor/tycho-execution/COMPATIBILITY.md](vendor/tycho-execution/COMPATIBILITY.md).
-
-To verify the two live feeds with credentials supplied through the environment:
-
-```bash
-cargo nextest run --workspace -E 'test(live_base_native_and_metric_broadcast)' --run-ignored only --nocapture
-```
-
-This read-only probe checks Base WETH/USDC/cbBTC books through the actual feed adapter, snapshot cache, and serialized update decoding. It does not request signed quotes or submit transactions.
 
 ## API Surface
 
@@ -215,9 +212,9 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 
 - `200 OK` from `/ready` with `status="ready"` when native traffic can be served
 - `503 Service Unavailable` from `/ready` while native readiness is not ready
-- `backends.native.status="ready"` when the broadcaster subscription is live, bootstrap is complete, and native state is ready and not stale
+- `backends.native.status="ready"` when the broadcaster subscription is live, bootstrap is complete, and the applied native head matches the observed chain head
 - `backends.native.status="warming_up"` while initial native state is still loading
-- `backends.native.status="stale"` when native updates are past the readiness freshness window
+- `backends.native.status="stale"` when the applied complete head cannot be confirmed against a fresh independent RPC observation
 
 `backends.vm.status` is one of:
 
@@ -228,6 +225,51 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 - `ready`
 
 `backends.rfq.status` is one of `disabled`, `warming_up`, `stale`, or `ready`. Native and VM backend status use `block_number`; RFQ backend status uses `update_timestamp` for the current Tycho RFQ update cursor.
+
+Each broadcaster and simulator observes `eth_getBlockByNumber("latest", false)` through its required
+`RPC_URL`, verifying that the endpoint matches `CHAIN_ID`. Native and VM state each need a complete
+block number and hash for their own configured protocols. Their availability remains separate:
+a stale VM backend is skipped by native-only quoting, while encoding requires every backend used
+by its route. On Base, Uniswap V4 uses the VM/shared-database state store even though its wire
+protocol is native.
+
+Native and VM entries in `/status` and `/ready` include `observation_age_ms` after the first
+successful RPC observation. It measures elapsed time from that observation's request start,
+including request duration, and comes from the same observation snapshot as `chain_head_agreement`.
+The age keeps increasing after RPC failures or expiry. It is omitted before the first successful
+observation and for RFQ, and does not measure Tycho update age or how far state lags the chain.
+
+A successful RPC observation may justify serving for at most 5 seconds on Base or 15 seconds on
+Ethereum. These limits are not a grace period for state that disagrees with the observed head:
+a fresh observation of a different block number or hash closes affected availability immediately.
+An RPC error leaves the previous observation usable only until its age limit expires. Tycho
+status-only messages leave installed state unchanged, even when they report delayed or stale
+feed progress. Requests spanning a freshness change cannot return affected results after recovery.
+RPC uncertainty alone does not restart the broadcaster. The `ChainHeadRpcOutageSeconds` metric
+reports continuous observation failure, and the companion `solver-iac` alarm alerts after more
+than five minutes.
+
+The per-chain manifest keeps the clocks separate:
+
+| Setting | Base | Ethereum | What it bounds |
+| --- | ---: | ---: | --- |
+| `chain_head_poll_interval_ms` | 500 ms | 1,000 ms | Time between independent RPC observations |
+| `chain_head_rpc_request_timeout_ms` | 2,000 ms | 2,000 ms | Maximum duration of each chain head JSON-RPC request |
+| `chain_head_observation_max_age_secs` | 5 s | 15 s | How long a successful observation may justify serving |
+| `tycho_initial_bootstrap_timeout_secs` | 300 s | 900 s | Tycho construction through the first complete state for all configured chain backends |
+| `tycho_head_mismatch_recovery_timeout_secs` | 60 s | 60 s | Recovery of an established feed after confirmed divergence or incomplete state |
+| `stream_initialization_timeout_secs` | 10 s | 25 s | Individual native replay snapshot requests, incomplete replay recovery, and the first RFQ update |
+
+The bootstrap deadline starts immediately before constructing the raw Tycho feed. It does not cover
+preceding application initialization such as token loading or Redis setup. An established feed keeps
+its existing Tycho stream during the separate 60-second recovery window; there is no second
+client. Matching heads end the recovery incident. An expired recovery window with fresh divergence
+evidence, a bootstrap timeout, or a terminal feed failure follows the existing bounded process shutdown. `/deployment-ready`
+remains separate from serving readiness so ordinary recovery does not revoke deployment admission.
+
+Custom manifests must supply these timing settings, including `chain_head_rpc_request_timeout_ms`.
+`stream_initialization_timeout_secs` replaces the old `native_progress_lease_secs` name; it no longer defines serving freshness or raw-feed lifetime.
+Production V2 `solve-base` uses its own Tycho path and is outside this behavior.
 
 Timeout behavior differs by endpoint:
 
@@ -246,21 +288,43 @@ Production task definitions pin immutable git SHA image tags, so pushing an imag
 
 ## Verification
 
-CI-equivalent commands:
+The minimum supported Rust version is 1.95.0. Local development, CI, and container builders
+use that version with matching Clippy and rustfmt.
+Builds and tests use the committed `Cargo.lock`:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace
-cargo build -p apps --bin dsolver-simulator-service --release
-cargo build -p apps --bin dsolver-tycho-broadcaster-service --release
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace
+cargo build --locked -p apps --release \
+  --bin dsolver-simulator-service \
+  --bin dsolver-tycho-broadcaster-service \
+  --bin state-history-migrate
+cargo build --locked -p historical-quote-service --release
+cargo build --locked -p dsolver-history --release
+scripts/verify_state_history.sh --repo .
 ```
+
+Linux CI uses `cargo nextest run --locked --workspace` and runs doctests separately with
+`cargo test --locked --workspace --doc`. For local nextest parity, use `--test-threads 16`.
+Run the pinned amount/gas fixture with
+`cargo test --locked -p runtime --test simulation_baseline -- --ignored` and the disposable
+Redis handoff check with `scripts/verify_broadcaster_handoff_redis.sh --repo .`.
+Keep `UPDATE_SIM_BASELINE` and `UPDATE_WIRE_FIXTURES` unset during verification.
+
+The workspace compiler policy denies unused code and unfulfilled lint expectations. Clippy
+adds structural guardrails configured in `clippy.toml`: cognitive complexity 25, function
+length 100 lines, nesting depth 5, type complexity 250, and 7 arguments per function.
+These are review prompts, not a measure of overall code quality. Clippy's cognitive score
+is approximate and skips test functions; distinct behavioral assertions still need review.
+Exceptions must use a narrow `#[expect(..., reason = "...")]` with a concrete explanation.
+Ordinary builds enforce compiler lints; run Clippy to enforce the complexity limits.
 
 Local analysis harness:
 
 ```bash
-cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop
-cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop
+cargo run --locked -p apps --bin sim-analysis -- --chain-id 1 --stop
+cargo run --locked -p apps --bin sim-analysis -- --chain-id 8453 --stop
 ```
 
 When `TYCHO_BROADCASTER_URL` points at local loopback, the analyzer uses the repo lifecycle
@@ -278,18 +342,20 @@ broadcaster plus Redis and enable the explicit live-test gate:
 DSOLVER_LIVE_MAINNET_VM_E2E=1 \
 TYCHO_BROADCASTER_URL=http://127.0.0.1:3001 \
 BROADCASTER_REDIS_URL=redis://127.0.0.1:6379 \
-cargo test -p runtime mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire \
+cargo test --locked --release -p runtime mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire \
   -- --ignored --nocapture --test-threads=1
 ```
 
-The test expects Curve and Balancer VM deltas from live mainnet traffic. A normal
-run should usually finish in about 10 minutes, and it fails after 20 minutes.
+The test first decodes the snapshot and checks Curve and Balancer quotes. It then allows
+up to 20 minutes for live Redis deltas that produce non-zero quotes for both protocols.
+Snapshot initialization adds time before that deadline starts.
 
 Container builds:
 
 ```bash
 docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.simulator-service -t dsolver-simulator-service .
 docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
+docker build -f Dockerfile.historical-quote-service -t historical-quote-service:test .
 ```
 
 Useful helpers:
@@ -307,9 +373,11 @@ The analyzer is intentionally reporting-first. It exercises representative `/sim
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
 - [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
+- [docs/historical_pool_quote_client.md](docs/historical_pool_quote_client.md): client guide for historical Base pool quotes through `dsolver-history`
+- [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md): service architecture, HTTP API, limits, and operator workflow
 - [STRESS_TEST_README.md](STRESS_TEST_README.md): local simulation analysis workflow and report artifacts
+- [skills/historical-pool-quote-cli/SKILL.md](skills/historical-pool-quote-cli/SKILL.md): repo-local workflow for requesting and interpreting historical pool quotes
 - `skills/simulation-service-analysis/SKILL.md`: repo-local analysis skill
-- `skills/tycho-cloudwatch-logs/SKILL.md`: CloudWatch log triage workflow
 
 ## License
 

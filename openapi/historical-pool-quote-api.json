@@ -1,0 +1,3051 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Historical Pool Quote API",
+    "description": "Authenticated historical directed pool quotes from reconstructed Base state.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/coverage": {
+      "post": {
+        "tags": [
+          "coverage"
+        ],
+        "operationId": "post_coverage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoverageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Continuous reconstruction coverage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoverageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Coverage cannot be read safely",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/consistency-check": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "post_consistency_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsistencyCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing retained job",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "New consistency check admitted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Job polling path"
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request ID conflicts with retained content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Admission budget exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Waiting queue is full",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service cannot safely admit work",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/quote": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "post_quote_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuoteJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing retained job",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "New quote job admitted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Job polling path"
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request ID conflicts with retained content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Comparison budget exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Waiting queue is full",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service cannot safely admit work",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/raw-snapshot": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "post_raw_snapshot_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RawSnapshotRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing retained job",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "New raw snapshot job admitted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Job polling path"
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request ID conflicts with retained content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Waiting queue is full",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service cannot safely admit work",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/stored-messages": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "post_stored_messages_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoredMessagesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing retained job",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "New stored messages job admitted",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Job polling path"
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Polling delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmission"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request ID conflicts with retained content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Waiting queue is full",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service cannot safely admit work",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/{jobId}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "get_job",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "description": "Opaque UUID version 4 job ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          },
+          {
+            "name": "X-DSolver-History-API-Revision",
+            "in": "header",
+            "description": "Exact API revision",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 1,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current job envelope",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Present while work is incomplete"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Job ID or API revision is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job is not retained",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/jobs/{jobId}/cancel": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "cancel_job",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "description": "Opaque UUID version 4 job ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          },
+          {
+            "name": "X-DSolver-History-API-Revision",
+            "in": "header",
+            "description": "Exact API revision",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 1,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current state after the cancellation request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Job ID or API revision is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job is not retained",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "service"
+        ],
+        "operationId": "get_ready",
+        "responses": {
+          "200": {
+            "description": "Service can admit work",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "tags": [
+          "service"
+        ],
+        "operationId": "get_status",
+        "parameters": [
+          {
+            "name": "X-DSolver-History-API-Revision",
+            "in": "header",
+            "description": "Exact API revision",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 1,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Protected service status",
+            "headers": {
+              "X-DSolver-History-Auth-Refresh-Age-Seconds": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds since the last successful key-set refresh"
+              },
+              "X-DSolver-History-Auth-Refresh-State": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "healthy or degraded"
+              },
+              "X-DSolver-History-Auth-Version": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Active bearer key-set version used to authenticate this request"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "API revision is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token is absent or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Status cannot be read safely",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Retry delay in seconds"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "description": "Safe error returned by the HTTP API.",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ApiErrorCode"
+          },
+          "details": {},
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ApiErrorCode": {
+        "type": "string",
+        "description": "Stable code returned by an HTTP admission or polling error.",
+        "enum": [
+          "invalid_request",
+          "unauthorized",
+          "job_not_found",
+          "request_id_conflict",
+          "comparison_budget_exceeded",
+          "queue_full",
+          "service_unavailable"
+        ]
+      },
+      "Backend": {
+        "type": "string",
+        "description": "Simulator state partition used by a historical request.",
+        "enum": [
+          "native",
+          "vm",
+          "rfq"
+        ]
+      },
+      "BlockBounds": {
+        "type": "object",
+        "description": "Optional inclusive bounds used by coverage requests.",
+        "required": [
+          "start",
+          "endInclusive"
+        ],
+        "properties": {
+          "endInclusive": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "BlockRange": {
+        "type": "object",
+        "description": "Inclusive block range used by quote requests.",
+        "required": [
+          "start",
+          "endInclusive"
+        ],
+        "properties": {
+          "endInclusive": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "step": {
+            "type": "integer",
+            "format": "int64",
+            "default": 1,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "CanonicalStateSummary": {
+        "type": "object",
+        "description": "Summary of the canonical simulator state on one side of a comparison.",
+        "required": [
+          "sha256",
+          "componentCount",
+          "backendCounts"
+        ],
+        "properties": {
+          "backendCounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            }
+          },
+          "componentCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CheckpointPair": {
+        "type": "object",
+        "description": "Explicit earlier and target checkpoint positions.",
+        "required": [
+          "earlierPosition",
+          "targetPosition"
+        ],
+        "properties": {
+          "earlierPosition": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "targetPosition": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ComparisonBudgetDetails": {
+        "type": "object",
+        "description": "Details returned when a quote comparison budget is exceeded.",
+        "required": [
+          "startBlockCount",
+          "lagCount",
+          "inputAmountCount",
+          "combinationCount",
+          "maxCombinationCount"
+        ],
+        "properties": {
+          "combinationCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "inputAmountCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lagCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxCombinationCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "startBlockCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyCheckProgress": {
+        "type": "object",
+        "description": "Consistency progress counts completed checkpoint pairs.",
+        "required": [
+          "completedCheckpointPairs",
+          "totalCheckpointPairs",
+          "percentComplete"
+        ],
+        "properties": {
+          "completedCheckpointPairs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "percentComplete": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 0
+          },
+          "totalCheckpointPairs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyCheckReport": {
+        "type": "object",
+        "description": "Completed report for a historical state consistency check.",
+        "required": [
+          "requestId",
+          "chainId",
+          "backends",
+          "selection",
+          "selectionStatus",
+          "storage",
+          "summary",
+          "pairs"
+        ],
+        "properties": {
+          "backends": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Backend"
+            }
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "pairs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsistencyPairReport"
+            }
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/ConsistencySelection"
+          },
+          "selectionStatus": {
+            "$ref": "#/components/schemas/ConsistencySelectionStatus"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/StorageVerificationSummary"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/ConsistencySummary"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyCheckRequest": {
+        "type": "object",
+        "description": "Request for a historical state consistency check.",
+        "required": [
+          "requestId",
+          "apiRevision",
+          "timeoutMs",
+          "chainId",
+          "backends",
+          "selection",
+          "quotesToCompare"
+        ],
+        "properties": {
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "quotesToCompare": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuoteComparisonRequest"
+            },
+            "minItems": 1
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/ConsistencySelection"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyDifference": {
+        "type": "object",
+        "description": "One bounded difference between canonical state representations.",
+        "required": [
+          "backend",
+          "field"
+        ],
+        "properties": {
+          "backend": {
+            "$ref": "#/components/schemas/Backend"
+          },
+          "componentId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "directSha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field": {
+            "type": "string"
+          },
+          "replayedSha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyPairReport": {
+        "type": "object",
+        "description": "Direct-versus-replayed result for one checkpoint pair.",
+        "required": [
+          "earlierPosition",
+          "targetPosition",
+          "status",
+          "affectedBackends",
+          "affectedComponentIds",
+          "quoteComparisons",
+          "totalDifferenceCount",
+          "differences"
+        ],
+        "properties": {
+          "affectedBackends": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Backend"
+            }
+          },
+          "affectedComponentIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "differences": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsistencyDifference"
+            }
+          },
+          "directState": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CanonicalStateSummary"
+              }
+            ]
+          },
+          "earlierPosition": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "quoteComparisons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsistencyQuoteComparison"
+            }
+          },
+          "replayedState": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CanonicalStateSummary"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/PairStatus"
+          },
+          "targetPosition": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "totalDifferenceCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyQuoteComparison": {
+        "type": "object",
+        "description": "One quote comparison within a checkpoint pair.",
+        "required": [
+          "pool",
+          "amountIn",
+          "directOutcome",
+          "replayedOutcome",
+          "status"
+        ],
+        "properties": {
+          "amountIn": {
+            "$ref": "#/components/schemas/UnsignedAmount"
+          },
+          "directOutcome": {
+            "$ref": "#/components/schemas/ConsistencyQuoteOutcome"
+          },
+          "pool": {
+            "$ref": "#/components/schemas/PoolSelector"
+          },
+          "replayedOutcome": {
+            "$ref": "#/components/schemas/ConsistencyQuoteOutcome"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PairStatus"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConsistencyQuoteOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "amountOut",
+              "outcome"
+            ],
+            "properties": {
+              "amountOut": {
+                "$ref": "#/components/schemas/UnsignedAmount"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "ok"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "quote_failed"
+                ]
+              },
+              "reason": {
+                "$ref": "#/components/schemas/QuoteFailureReason"
+              }
+            },
+            "additionalProperties": false
+          }
+        ],
+        "description": "Quote result used only for direct-versus-replayed comparison."
+      },
+      "ConsistencySelection": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "pairs",
+              "type"
+            ],
+            "properties": {
+              "pairs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CheckpointPair"
+                },
+                "minItems": 1
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "checkpointPairs"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "start",
+              "endInclusive",
+              "type"
+            ],
+            "properties": {
+              "endInclusive": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "start": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "blockRange"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        ],
+        "description": "Checkpoint pair or block range selected for a consistency check."
+      },
+      "ConsistencySelectionStatus": {
+        "type": "string",
+        "description": "Selection-level status for a consistency check.",
+        "enum": [
+          "compared",
+          "notComparable"
+        ]
+      },
+      "ConsistencySummary": {
+        "type": "object",
+        "description": "Pair counts for a consistency report.",
+        "required": [
+          "selectedCheckpointPairs",
+          "comparedCheckpointPairs",
+          "pass",
+          "mismatch",
+          "gap",
+          "notComparable"
+        ],
+        "properties": {
+          "comparedCheckpointPairs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gap": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "mismatch": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "notComparable": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pass": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "selectedCheckpointPairs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CoverageRequest": {
+        "type": "object",
+        "description": "Request for continuous state reconstruction coverage.",
+        "required": [
+          "apiRevision",
+          "chainId",
+          "backends"
+        ],
+        "properties": {
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "bounds": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BlockBounds"
+              }
+            ]
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          }
+        },
+        "additionalProperties": false
+      },
+      "CoverageResponse": {
+        "type": "object",
+        "description": "Continuous reconstructible intervals visible on the read replica.",
+        "required": [
+          "apiRevision",
+          "chainId",
+          "backends",
+          "visibleThroughBlock",
+          "continuousIntervals",
+          "knownGaps"
+        ],
+        "properties": {
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Backend"
+            }
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "continuousIntervals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlockBounds"
+            }
+          },
+          "knownGaps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KnownGap"
+            }
+          },
+          "visibleThroughBlock": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "DependencyHealth": {
+        "type": "object",
+        "description": "Read replica and object-store health summary.",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/DependencyState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DependencyState": {
+        "type": "string",
+        "description": "Safe dependency state included in the protected status response.",
+        "enum": [
+          "healthy",
+          "degraded",
+          "unavailable"
+        ]
+      },
+      "GapCause": {
+        "type": "string",
+        "description": "Stored cause for a recorded gap.",
+        "enum": [
+          "queue_overflow",
+          "write_failed",
+          "writer_stopped",
+          "checkpoint_failed",
+          "boundary_slip"
+        ]
+      },
+      "GapKind": {
+        "type": "string",
+        "description": "Reason state history has a known unsafe interval.",
+        "enum": [
+          "missing_checkpoint",
+          "recorded",
+          "incomplete_tail"
+        ]
+      },
+      "GapReference": {
+        "type": "object",
+        "description": "Response-local gap reference in a quote result.",
+        "required": [
+          "ref",
+          "kind"
+        ],
+        "properties": {
+          "cause": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GapCause"
+              }
+            ]
+          },
+          "fromBlock": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "fromObservedAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "fromPosition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamPosition"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/GapKind"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "toBlockInclusive": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "toObservedAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "toPosition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamPosition"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "HistoricalQuoteEntry": {
+        "type": "object",
+        "description": "One result for a start block and input amount.",
+        "required": [
+          "startBlock",
+          "amountIn",
+          "startOutcome",
+          "targets"
+        ],
+        "properties": {
+          "amountIn": {
+            "$ref": "#/components/schemas/UnsignedAmount"
+          },
+          "startBlock": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "startOutcome": {
+            "$ref": "#/components/schemas/QuoteOutcome"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoricalQuoteTarget"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "HistoricalQuoteProgress": {
+        "type": "object",
+        "description": "Quote progress counts completed lag comparisons.",
+        "required": [
+          "completedComparisons",
+          "totalComparisons",
+          "percentComplete"
+        ],
+        "properties": {
+          "completedComparisons": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "percentComplete": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 0
+          },
+          "totalComparisons": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HistoricalQuoteResult": {
+        "type": "object",
+        "description": "Result for a completed historical quote job.",
+        "required": [
+          "requestId",
+          "chainId",
+          "pool",
+          "visibleThroughBlock",
+          "gaps",
+          "results"
+        ],
+        "properties": {
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GapReference"
+            }
+          },
+          "pool": {
+            "$ref": "#/components/schemas/PoolSelector"
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoricalQuoteEntry"
+            }
+          },
+          "visibleThroughBlock": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HistoricalQuoteTarget": {
+        "type": "object",
+        "description": "One lagged target in a grouped quote result.",
+        "required": [
+          "lag",
+          "targetBlock",
+          "outcome"
+        ],
+        "properties": {
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/QuoteOutcome"
+          },
+          "targetBlock": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobCounts": {
+        "type": "object",
+        "description": "Counts of jobs currently retained by the service.",
+        "required": [
+          "queued",
+          "running",
+          "retainedTerminal"
+        ],
+        "properties": {
+          "queued": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "retainedTerminal": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "running": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobEnvelope": {
+        "type": "object",
+        "description": "Current job state returned by polling or cancellation.",
+        "required": [
+          "jobId",
+          "requestId",
+          "jobType",
+          "state",
+          "submittedAt",
+          "deadlineAt",
+          "cancellationRequested",
+          "progress"
+        ],
+        "properties": {
+          "cancellationRequested": {
+            "type": "boolean"
+          },
+          "deadlineAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobFailure"
+              }
+            ]
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "jobId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "jobType": {
+            "$ref": "#/components/schemas/JobType"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/JobProgress"
+          },
+          "queuePosition": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 1
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobResult"
+              }
+            ]
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobFailure": {
+        "type": "object",
+        "description": "Safe failure stored in a terminal job envelope.",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/JobFailureCode"
+          },
+          "details": {},
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobFailureCode": {
+        "type": "string",
+        "description": "Stable terminal failure code.",
+        "enum": [
+          "deadline_exceeded",
+          "history_read_failed",
+          "historical_data_invalid",
+          "state_reconstruction_failed",
+          "check_budget_exceeded",
+          "history_not_yet_stored",
+          "history_unavailable",
+          "read_limit_exceeded",
+          "internal_error"
+        ]
+      },
+      "JobProgress": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/HistoricalQuoteProgress"
+          },
+          {
+            "$ref": "#/components/schemas/ConsistencyCheckProgress"
+          },
+          {
+            "$ref": "#/components/schemas/RawHistoryProgress"
+          }
+        ],
+        "description": "Progress shape selected by the job type."
+      },
+      "JobResult": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/HistoricalQuoteResult"
+          },
+          {
+            "$ref": "#/components/schemas/ConsistencyCheckReport"
+          },
+          {
+            "$ref": "#/components/schemas/RawSnapshotResult"
+          },
+          {
+            "$ref": "#/components/schemas/StoredMessagesResult"
+          }
+        ],
+        "description": "Terminal result selected by the job type."
+      },
+      "JobState": {
+        "type": "string",
+        "description": "Lifecycle state of an admitted job.",
+        "enum": [
+          "queued",
+          "running",
+          "completed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "JobSubmission": {
+        "type": "object",
+        "description": "Response returned when a job is submitted or reused.",
+        "required": [
+          "jobId",
+          "requestId",
+          "jobType",
+          "state",
+          "submittedAt",
+          "deadlineAt",
+          "cancellationRequested",
+          "progress",
+          "reused"
+        ],
+        "properties": {
+          "cancellationRequested": {
+            "type": "boolean"
+          },
+          "deadlineAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "jobId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "jobType": {
+            "$ref": "#/components/schemas/JobType"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/JobProgress"
+          },
+          "queuePosition": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 1
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "reused": {
+            "type": "boolean"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobType": {
+        "type": "string",
+        "description": "Work type stored by the shared in-memory scheduler.",
+        "enum": [
+          "historicalQuote",
+          "historicalStateConsistencyCheck",
+          "rawSnapshot",
+          "storedMessages"
+        ]
+      },
+      "KnownGap": {
+        "type": "object",
+        "description": "Gap details shared by quote and coverage responses.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "cause": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GapCause"
+              }
+            ]
+          },
+          "fromBlock": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "fromObservedAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "fromPosition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamPosition"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/GapKind"
+          },
+          "toBlockInclusive": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "toObservedAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "toPosition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamPosition"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "PairStatus": {
+        "type": "string",
+        "description": "Aggregate status for one checkpoint pair.",
+        "enum": [
+          "pass",
+          "mismatch",
+          "gap",
+          "notComparable"
+        ]
+      },
+      "PoolSelector": {
+        "type": "object",
+        "description": "Exact pool and token direction selected by the caller.",
+        "required": [
+          "backend",
+          "protocol",
+          "componentId",
+          "tokenIn",
+          "tokenOut"
+        ],
+        "properties": {
+          "backend": {
+            "$ref": "#/components/schemas/Backend"
+          },
+          "componentId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "protocol": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tokenIn": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tokenOut": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "QuoteComparisonRequest": {
+        "type": "object",
+        "description": "Directed pool quotes compared for each selected checkpoint pair.",
+        "required": [
+          "pool",
+          "amountsIn"
+        ],
+        "properties": {
+          "amountsIn": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Canonical unsigned integer in token smallest units.",
+              "example": "1000000",
+              "pattern": "^[0-9]+$"
+            },
+            "description": "Input amounts must also be numerically distinct after canonical unsigned-integer parsing.",
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "pool": {
+            "$ref": "#/components/schemas/PoolSelector"
+          }
+        },
+        "additionalProperties": false
+      },
+      "QuoteFailureReason": {
+        "type": "string",
+        "description": "Safe reason why existing state could not produce a quote.",
+        "enum": [
+          "component_not_found",
+          "direction_unsupported",
+          "insufficient_liquidity",
+          "zero_output",
+          "simulation_failed"
+        ]
+      },
+      "QuoteJobRequest": {
+        "type": "object",
+        "description": "Request for one historical quote job.",
+        "required": [
+          "requestId",
+          "apiRevision",
+          "timeoutMs",
+          "chainId",
+          "pool",
+          "blocks",
+          "lags",
+          "amountsIn"
+        ],
+        "properties": {
+          "amountsIn": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Canonical unsigned integer in token smallest units.",
+              "example": "1000000",
+              "pattern": "^[0-9]+$"
+            },
+            "description": "Input amounts must also be numerically distinct after canonical unsigned-integer parsing.",
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "blocks": {
+            "$ref": "#/components/schemas/BlockRange"
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "lags": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "pool": {
+            "$ref": "#/components/schemas/PoolSelector"
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "QuoteOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "amountOut",
+              "provenance",
+              "outcome"
+            ],
+            "properties": {
+              "amountOut": {
+                "$ref": "#/components/schemas/UnsignedAmount"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "ok"
+                ]
+              },
+              "provenance": {
+                "$ref": "#/components/schemas/QuoteProvenance"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "outcome"
+            ],
+            "properties": {
+              "gapRefs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "unavailable"
+                ]
+              },
+              "reason": {
+                "$ref": "#/components/schemas/UnavailableReason"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "quote_failed"
+                ]
+              },
+              "reason": {
+                "$ref": "#/components/schemas/QuoteFailureReason"
+              }
+            },
+            "additionalProperties": false
+          }
+        ],
+        "description": "Result of one directed pool quote."
+      },
+      "QuoteProvenance": {
+        "type": "object",
+        "description": "State provenance for one successful historical quote.",
+        "required": [
+          "blockHash",
+          "finalPosition",
+          "anchorCheckpointPosition",
+          "serviceRevision"
+        ],
+        "properties": {
+          "anchorCheckpointPosition": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "blockHash": {
+            "type": "string"
+          },
+          "finalPosition": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "rfqObservationAgeMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "rfqObservationCursor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamPosition"
+              }
+            ]
+          },
+          "rfqObservedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "serviceRevision": {
+            "type": "string"
+          },
+          "tokenSnapshotDigest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "RawHistoryProgress": {
+        "type": "object",
+        "description": "Raw-history progress, a single read that is either pending or done.",
+        "required": [
+          "percentComplete"
+        ],
+        "properties": {
+          "percentComplete": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "RawSnapshotRequest": {
+        "type": "object",
+        "description": "Request for the raw snapshot the broadcaster served at a stream position,\nfor backends kept as raw Tycho messages.",
+        "required": [
+          "requestId",
+          "apiRevision",
+          "timeoutMs",
+          "chainId",
+          "backends",
+          "position"
+        ],
+        "properties": {
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "position": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "RawSnapshotResult": {
+        "type": "object",
+        "description": "The raw snapshot at a stream position.",
+        "required": [
+          "position",
+          "checkpointPosition",
+          "partitions"
+        ],
+        "properties": {
+          "checkpointPosition": {
+            "$ref": "#/components/schemas/StreamPosition",
+            "description": "The checkpoint the snapshot was rebuilt from."
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "One snapshot partition per requested backend, in the broadcaster's\nsnapshot wire form."
+          },
+          "position": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "description": "Readiness response used by the internal load balancer.",
+        "required": [
+          "ready"
+        ],
+        "properties": {
+          "ready": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServiceLimits": {
+        "type": "object",
+        "description": "Configured bounds reported by the protected status endpoint.",
+        "required": [
+          "maxCombinationCount",
+          "maxBlockSpan",
+          "defaultTimeoutMs",
+          "maxTimeoutMs",
+          "maxRunningJobs",
+          "maxWaitingJobs",
+          "decodedByteBudget",
+          "maxTerminalJobs",
+          "terminalRetentionSeconds",
+          "maxConsistencyPairs",
+          "maxQuoteSelectors",
+          "maxAmountsPerQuote",
+          "maxStructuredDifferences"
+        ],
+        "properties": {
+          "decodedByteBudget": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "defaultTimeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxAmountsPerQuote": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxBlockSpan": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxCombinationCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxConsistencyPairs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxQuoteSelectors": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxRunningJobs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxStructuredDifferences": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxTerminalJobs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxTimeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxWaitingJobs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "terminalRetentionSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "StatusResponse": {
+        "type": "object",
+        "description": "Protected service status without storage identifiers or full coverage.",
+        "required": [
+          "serviceRevision",
+          "apiRevision",
+          "supportedChainId",
+          "enabledBackends",
+          "database",
+          "objectStore",
+          "jobs",
+          "reservedDecodedBytes",
+          "limits",
+          "draining"
+        ],
+        "properties": {
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "database": {
+            "$ref": "#/components/schemas/DependencyHealth"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "enabledBackends": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Backend"
+            }
+          },
+          "jobs": {
+            "$ref": "#/components/schemas/JobCounts"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/ServiceLimits"
+          },
+          "objectStore": {
+            "$ref": "#/components/schemas/DependencyHealth"
+          },
+          "reservedDecodedBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "serviceRevision": {
+            "type": "string"
+          },
+          "supportedChainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "visibleThroughBlock": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "StorageVerificationSummary": {
+        "type": "object",
+        "description": "Storage validation completed before state and quote comparison.",
+        "required": [
+          "rangePlanValid",
+          "checkpointObjectsValid",
+          "tokenObjectsValid",
+          "deltaOrderValid",
+          "replayPlansVerified",
+          "checkpointObjectsVerified",
+          "tokenObjectsVerified",
+          "deltasVerified"
+        ],
+        "properties": {
+          "checkpointObjectsValid": {
+            "type": "boolean"
+          },
+          "checkpointObjectsVerified": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "deltaOrderValid": {
+            "type": "boolean"
+          },
+          "deltasVerified": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rangePlanValid": {
+            "type": "boolean"
+          },
+          "replayPlansVerified": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tokenObjectsValid": {
+            "type": "boolean"
+          },
+          "tokenObjectsVerified": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "StoredMessage": {
+        "type": "object",
+        "description": "One stored message, the envelope exactly as the broadcaster stored it.",
+        "required": [
+          "position",
+          "envelope"
+        ],
+        "properties": {
+          "envelope": {
+            "type": "object"
+          },
+          "position": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StoredMessagesRequest": {
+        "type": "object",
+        "description": "Request for the stored messages after one stream position through another,\nas the broadcaster stored them.",
+        "required": [
+          "requestId",
+          "apiRevision",
+          "timeoutMs",
+          "chainId",
+          "backends",
+          "after",
+          "through"
+        ],
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/StreamPosition",
+            "description": "The position before the first message returned."
+          },
+          "apiRevision": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Simulator state partition used by a historical request.",
+              "enum": [
+                "native",
+                "vm",
+                "rfq"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "chainId": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 8453,
+            "minimum": 8453
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "through": {
+            "$ref": "#/components/schemas/StreamPosition",
+            "description": "The position of the last message returned, which must be stored."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "StoredMessagesResult": {
+        "type": "object",
+        "description": "The stored messages in a range, in stream order.",
+        "required": [
+          "after",
+          "through",
+          "messages"
+        ],
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StoredMessage"
+            }
+          },
+          "through": {
+            "$ref": "#/components/schemas/StreamPosition"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamPosition": {
+        "type": "object",
+        "description": "One ordered position in state history.",
+        "required": [
+          "generation",
+          "messageSeq"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "messageSeq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "UnavailableReason": {
+        "type": "string",
+        "description": "Safe reason why historical state is unavailable.",
+        "enum": [
+          "gap",
+          "replica_cutoff",
+          "token_snapshot_missing",
+          "rfq_observation_missing",
+          "block_boundary_missing",
+          "canonical_lineage_invalid",
+          "state_application_invalid"
+        ]
+      },
+      "UnsignedAmount": {
+        "type": "string",
+        "description": "Canonical unsigned integer in token smallest units.",
+        "example": "1000000",
+        "pattern": "^[0-9]+$"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "jobs",
+      "description": "Historical quote, consistency and raw history jobs"
+    },
+    {
+      "name": "coverage",
+      "description": "State reconstruction coverage"
+    },
+    {
+      "name": "service",
+      "description": "Readiness and protected status"
+    }
+  ]
+}

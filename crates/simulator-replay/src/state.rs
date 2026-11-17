@@ -1,0 +1,1115 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
+use serde::Serialize;
+use thiserror::Error;
+use tycho_simulation::{
+    protocol::models::{ProtocolComponent, Update},
+    tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
+};
+
+use simulator_core::models::protocol::ProtocolKind;
+
+use crate::ReplayBackend;
+
+const UPDATE_ANOMALY_SAMPLE_CAP: usize = 6;
+const NATIVE_TOKEN_ADDRESS_BYTES: [u8; 20] = [0u8; 20];
+
+pub type PoolEntry = (Arc<dyn ProtocolSim>, Arc<ProtocolComponent>);
+
+#[derive(Clone)]
+struct ReplayState {
+    shards: HashMap<ProtocolKind, HashMap<String, PoolEntry>>,
+    id_to_kind: HashMap<String, ProtocolKind>,
+    token_index: HashMap<Bytes, HashSet<String>>,
+    tokens: HashMap<Bytes, Token>,
+    wrapped_native_token: Option<Bytes>,
+    block_number: u64,
+}
+
+impl ReplayState {
+    fn empty(tokens: HashMap<Bytes, Token>, wrapped_native_token: Option<Bytes>) -> Self {
+        let mut shards = HashMap::new();
+        for kind in ProtocolKind::ALL {
+            shards.insert(kind, HashMap::new());
+        }
+
+        Self {
+            shards,
+            id_to_kind: HashMap::new(),
+            token_index: HashMap::new(),
+            tokens,
+            wrapped_native_token,
+            block_number: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StatePoint {
+    state: Arc<ReplayState>,
+}
+
+impl StatePoint {
+    pub fn current_block(&self) -> u64 {
+        self.state.block_number
+    }
+
+    pub fn total_states(&self) -> usize {
+        self.state.id_to_kind.len()
+    }
+
+    pub fn token(&self, address: &Bytes) -> Option<Token> {
+        self.state.tokens.get(address).cloned()
+    }
+
+    pub fn tokens(&self) -> HashMap<Bytes, Token> {
+        self.state.tokens.clone()
+    }
+
+    pub fn wrapped_native_token(&self) -> Option<Bytes> {
+        self.state.wrapped_native_token.clone()
+    }
+
+    pub fn matching_pools_by_addresses(
+        &self,
+        token_in: &Bytes,
+        token_out: &Bytes,
+    ) -> Vec<(String, PoolEntry)> {
+        matching_pools_from_state(&self.state, token_in, token_out)
+    }
+
+    pub fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
+        pool_by_id_from_state(&self.state, id)
+    }
+
+    /// Matches the exact component DTO identity, without normalizing retained names.
+    pub fn pool_ids_by_protocol_system(&self, protocol_system: &str) -> Vec<String> {
+        let mut ids = self
+            .state
+            .shards
+            .values()
+            .flat_map(|shard| shard.iter())
+            .filter(|(_, (_, component))| component.protocol_system == protocol_system)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn changed_pool_ids(&self, current: &Self, pool_ids: &HashSet<String>) -> HashSet<String> {
+        pool_ids
+            .iter()
+            .filter(|pool_id| {
+                let pinned_entry = self.pool_by_id(pool_id);
+                let current_entry = current.pool_by_id(pool_id);
+                match (pinned_entry, current_entry) {
+                    (None, None) => false,
+                    (None, Some(_)) | (Some(_), None) => true,
+                    (
+                        Some((pinned_state, pinned_component)),
+                        Some((current_state, current_component)),
+                    ) => {
+                        !Arc::ptr_eq(&pinned_state, &current_state)
+                            || !Arc::ptr_eq(&pinned_component, &current_component)
+                    }
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn canonical_state(
+        &self,
+        backends: &[ReplayBackend],
+    ) -> Result<CanonicalState, CanonicalStateError> {
+        let selected = backends.iter().copied().collect::<BTreeSet<_>>();
+        if selected.contains(&ReplayBackend::Vm) {
+            return Err(CanonicalStateError::UnsupportedBackend(ReplayBackend::Vm));
+        }
+        let mut pools = Vec::new();
+        let mut components = Vec::new();
+        let mut token_addresses = BTreeSet::new();
+        let mut backend_counts = BTreeMap::new();
+
+        for (kind, shard) in &self.state.shards {
+            let backend = ReplayBackend::from_protocol_kind(*kind);
+            if !selected.contains(&backend) {
+                continue;
+            }
+            for (component_id, (state, component)) in shard {
+                for token in &component.tokens {
+                    token_addresses.insert(token.address.clone());
+                }
+                let component_value = canonicalize_json(serde_json::to_value(component.as_ref())?);
+                let state_value = canonicalize_json(serde_json::to_value(state.as_ref())?);
+                components.push(CanonicalComponentState {
+                    backend,
+                    component_id: component_id.clone(),
+                    component_bytes: serde_json::to_vec(&component_value)?,
+                    state_bytes: serde_json::to_vec(&state_value)?,
+                });
+                pools.push(CanonicalPool {
+                    backend,
+                    component_id: component_id.clone(),
+                    component: component_value,
+                    state: state_value,
+                });
+                *backend_counts.entry(backend).or_insert(0) += 1;
+            }
+        }
+        pools.sort_by(|left, right| {
+            (left.backend, left.component_id.as_str())
+                .cmp(&(right.backend, right.component_id.as_str()))
+        });
+
+        let token_values = token_addresses
+            .into_iter()
+            .filter_map(|address| self.state.tokens.get(&address))
+            .map(|token| serde_json::to_value(token).map(canonicalize_json))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tokens = token_values
+            .iter()
+            .map(|value| {
+                Ok::<_, serde_json::Error>(CanonicalTokenState {
+                    address: value
+                        .get("address")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    token_bytes: serde_json::to_vec(value)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = serde_json::to_vec(&CanonicalDocument {
+            block_number: self.state.block_number,
+            pools,
+            tokens: token_values,
+        })?;
+        Ok(CanonicalState {
+            bytes,
+            component_count: backend_counts.values().sum(),
+            backend_counts,
+            components,
+            tokens,
+        })
+    }
+
+    pub(crate) fn pool_by_id_with_kind(&self, id: &str) -> Option<(ProtocolKind, PoolEntry)> {
+        let kind = self.state.id_to_kind.get(id).copied()?;
+        self.pool_by_id(id).map(|entry| (kind, entry))
+    }
+}
+
+pub struct ReplayWorld {
+    state: Arc<ReplayState>,
+}
+
+impl ReplayWorld {
+    pub fn new(tokens: HashMap<Bytes, Token>, wrapped_native_token: Option<Bytes>) -> Self {
+        Self {
+            state: Arc::new(ReplayState::empty(tokens, wrapped_native_token)),
+        }
+    }
+
+    pub fn from_point(point: &StatePoint) -> Self {
+        Self {
+            state: Arc::clone(&point.state),
+        }
+    }
+
+    pub fn restore(&mut self, update: Update) -> ApplyReport {
+        self.clear();
+        self.apply(update)
+    }
+
+    pub fn apply(&mut self, mut update: Update) -> ApplyReport {
+        let state = Arc::make_mut(&mut self.state);
+        let block_number = update.block_number;
+        state.block_number = block_number;
+        let mut stats = UpdateAccumulator::default();
+
+        apply_new_pairs(
+            state,
+            std::mem::take(&mut update.new_pairs),
+            &mut update.states,
+            &mut stats,
+        );
+        apply_state_updates(state, std::mem::take(&mut update.states), &mut stats);
+        apply_removed_pairs(state, std::mem::take(&mut update.removed_pairs), &mut stats);
+        for token in &stats.tokens_to_cache {
+            state
+                .tokens
+                .entry(token.address.clone())
+                .or_insert_with(|| token.clone());
+        }
+
+        ApplyReport {
+            block_number,
+            updated_states: stats.updated_states,
+            new_pairs: stats.new_pairs_count,
+            removed_pairs: stats.removed_pairs_count,
+            total_pairs: state.id_to_kind.len(),
+            new_pairs_missing_state: stats.new_pairs_missing_state,
+            unknown_protocol_new_pairs: stats.unknown_protocol_new_pairs,
+            updates_for_unknown_pair: stats.updates_for_unknown_pair,
+            states_missing_in_shard: stats.states_missing_in_shard,
+            removed_unknown_pair: stats.removed_unknown_pair,
+            anomaly_samples: stats.anomaly_samples,
+            tokens_to_cache: stats.tokens_to_cache,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        let tokens = self.state.tokens.clone();
+        let wrapped_native_token = self.state.wrapped_native_token.clone();
+        self.state = Arc::new(ReplayState::empty(tokens, wrapped_native_token));
+    }
+
+    pub fn reset_protocols(&mut self, protocols: &[ProtocolKind]) -> bool {
+        if protocols.is_empty() {
+            return false;
+        }
+        if protocols.len() >= ProtocolKind::ALL.len() {
+            self.clear();
+            return true;
+        }
+
+        let state = Arc::make_mut(&mut self.state);
+        let mut any_cleared = false;
+        for kind in protocols {
+            if let Some(shard) = state.shards.get_mut(kind) {
+                shard.clear();
+                any_cleared = true;
+            }
+        }
+        if any_cleared {
+            rebuild_indexes(state);
+        }
+        any_cleared
+    }
+
+    pub fn pin(&self) -> StatePoint {
+        StatePoint {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub fn set_current_block(&mut self, block_number: u64) {
+        Arc::make_mut(&mut self.state).block_number = block_number;
+    }
+}
+
+pub struct ApplyReport {
+    pub block_number: u64,
+    pub updated_states: usize,
+    pub new_pairs: usize,
+    pub removed_pairs: usize,
+    pub total_pairs: usize,
+    pub new_pairs_missing_state: usize,
+    pub unknown_protocol_new_pairs: usize,
+    pub updates_for_unknown_pair: usize,
+    pub states_missing_in_shard: usize,
+    pub removed_unknown_pair: usize,
+    pub anomaly_samples: Vec<String>,
+    tokens_to_cache: Vec<Token>,
+}
+
+impl ApplyReport {
+    pub fn has_anomalies(&self) -> bool {
+        self.new_pairs_missing_state > 0
+            || self.unknown_protocol_new_pairs > 0
+            || self.updates_for_unknown_pair > 0
+            || self.states_missing_in_shard > 0
+            || self.removed_unknown_pair > 0
+    }
+
+    /// Whether applying this update left pool state inconsistent.
+    /// Removing an already absent pool remains a diagnostic, not an integrity error.
+    pub fn has_state_integrity_errors(&self) -> bool {
+        self.new_pairs_missing_state > 0
+            || self.unknown_protocol_new_pairs > 0
+            || self.updates_for_unknown_pair > 0
+            || self.states_missing_in_shard > 0
+    }
+
+    pub fn tokens_to_cache(&self) -> &[Token] {
+        &self.tokens_to_cache
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalState {
+    bytes: Vec<u8>,
+    pub component_count: usize,
+    pub backend_counts: BTreeMap<ReplayBackend, usize>,
+    components: Vec<CanonicalComponentState>,
+    tokens: Vec<CanonicalTokenState>,
+}
+
+impl CanonicalState {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn components(&self) -> &[CanonicalComponentState] {
+        &self.components
+    }
+
+    pub fn tokens(&self) -> &[CanonicalTokenState] {
+        &self.tokens
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalComponentState {
+    pub backend: ReplayBackend,
+    pub component_id: String,
+    component_bytes: Vec<u8>,
+    state_bytes: Vec<u8>,
+}
+
+impl CanonicalComponentState {
+    pub fn component_bytes(&self) -> &[u8] {
+        &self.component_bytes
+    }
+
+    pub fn state_bytes(&self) -> &[u8] {
+        &self.state_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalTokenState {
+    pub address: String,
+    token_bytes: Vec<u8>,
+}
+
+impl CanonicalTokenState {
+    pub fn token_bytes(&self) -> &[u8] {
+        &self.token_bytes
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CanonicalStateError {
+    #[error("canonical state comparison does not support backend {0:?}")]
+    UnsupportedBackend(ReplayBackend),
+    #[error("failed to serialize canonical simulator state: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalDocument {
+    block_number: u64,
+    pools: Vec<CanonicalPool>,
+    tokens: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalPool {
+    backend: ReplayBackend,
+    component_id: String,
+    component: serde_json::Value,
+    state: serde_json::Value,
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        value => value,
+    }
+}
+
+#[derive(Default)]
+struct UpdateAccumulator {
+    new_pairs_count: usize,
+    new_pairs_missing_state: usize,
+    unknown_protocol_new_pairs: usize,
+    updated_states: usize,
+    updates_for_unknown_pair: usize,
+    states_missing_in_shard: usize,
+    removed_pairs_count: usize,
+    removed_unknown_pair: usize,
+    anomaly_samples: Vec<String>,
+    tokens_to_cache: Vec<Token>,
+}
+
+impl UpdateAccumulator {
+    fn record_anomaly(&mut self, kind: &str, value: &str) {
+        if self.anomaly_samples.len() >= UPDATE_ANOMALY_SAMPLE_CAP {
+            return;
+        }
+        self.anomaly_samples.push(format!("{kind}:{value}"));
+    }
+}
+
+fn apply_new_pairs(
+    state: &mut ReplayState,
+    new_pairs: HashMap<String, ProtocolComponent>,
+    states: &mut HashMap<String, Box<dyn ProtocolSim>>,
+    stats: &mut UpdateAccumulator,
+) {
+    for (id, component) in new_pairs {
+        let Some(kind) = ProtocolKind::from_component(&component) else {
+            stats.unknown_protocol_new_pairs += 1;
+            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
+            continue;
+        };
+        let Some(protocol_state) = states.remove(&id) else {
+            stats.new_pairs_missing_state += 1;
+            stats.record_anomaly("new_pairs_missing_state", id.as_str());
+            continue;
+        };
+        let Some(shard) = state.shards.get_mut(&kind) else {
+            stats.unknown_protocol_new_pairs += 1;
+            stats.record_anomaly("unknown_protocol_new_pairs", id.as_str());
+            continue;
+        };
+
+        let component = Arc::new(component);
+        state.id_to_kind.insert(id.clone(), kind);
+        stats
+            .tokens_to_cache
+            .extend(component.tokens.iter().cloned());
+        for token in &component.tokens {
+            state
+                .token_index
+                .entry(token.address.clone())
+                .or_default()
+                .insert(id.clone());
+        }
+        shard.insert(id, (Arc::from(protocol_state), component));
+        stats.new_pairs_count += 1;
+    }
+}
+
+fn apply_state_updates(
+    state: &mut ReplayState,
+    states: HashMap<String, Box<dyn ProtocolSim>>,
+    stats: &mut UpdateAccumulator,
+) {
+    for (id, protocol_state) in states {
+        let Some(kind) = state.id_to_kind.get(&id).copied() else {
+            stats.updates_for_unknown_pair += 1;
+            stats.record_anomaly("updates_for_unknown_pair", id.as_str());
+            continue;
+        };
+        let Some(shard) = state.shards.get_mut(&kind) else {
+            stats.states_missing_in_shard += 1;
+            stats.record_anomaly("states_missing_in_shard", id.as_str());
+            continue;
+        };
+        if let Some((existing_state, _)) = shard.get_mut(&id) {
+            *existing_state = Arc::from(protocol_state);
+            stats.updated_states += 1;
+        } else {
+            stats.states_missing_in_shard += 1;
+            stats.record_anomaly("states_missing_in_shard", id.as_str());
+        }
+    }
+}
+
+fn apply_removed_pairs(
+    state: &mut ReplayState,
+    removed_pairs: HashMap<String, ProtocolComponent>,
+    stats: &mut UpdateAccumulator,
+) {
+    for (id, component) in removed_pairs {
+        for token in &component.tokens {
+            if let Some(pool_ids) = state.token_index.get_mut(&token.address) {
+                pool_ids.remove(&id);
+                if pool_ids.is_empty() {
+                    state.token_index.remove(&token.address);
+                }
+            }
+        }
+
+        if let Some(kind) = state.id_to_kind.remove(&id) {
+            if let Some(shard) = state.shards.get_mut(&kind) {
+                shard.remove(&id);
+                stats.removed_pairs_count += 1;
+            }
+        } else {
+            stats.removed_unknown_pair += 1;
+            stats.record_anomaly("removed_unknown_pair", id.as_str());
+        }
+    }
+}
+
+fn rebuild_indexes(state: &mut ReplayState) {
+    state.id_to_kind.clear();
+    state.token_index.clear();
+    for (kind, shard) in &state.shards {
+        for (id, (_, component)) in shard {
+            state.id_to_kind.insert(id.clone(), *kind);
+            for token in &component.tokens {
+                state
+                    .token_index
+                    .entry(token.address.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+        }
+    }
+}
+
+fn native_token_address() -> Bytes {
+    Bytes::from(NATIVE_TOKEN_ADDRESS_BYTES)
+}
+
+fn ids_for_token<'a>(state: &'a ReplayState, token: &Bytes) -> Option<HashSet<&'a String>> {
+    let native_address = native_token_address();
+    let needs_native = state.wrapped_native_token.as_ref() == Some(token);
+    let needs_wrapped = *token == native_address;
+    let mut ids = state
+        .token_index
+        .get(token)
+        .into_iter()
+        .flatten()
+        .collect::<HashSet<_>>();
+    if needs_native {
+        if let Some(native_ids) = state.token_index.get(&native_address) {
+            ids.extend(native_ids);
+        }
+    }
+    if needs_wrapped {
+        if let Some(wrapped_address) = state.wrapped_native_token.as_ref() {
+            if let Some(wrapped_ids) = state.token_index.get(wrapped_address) {
+                ids.extend(wrapped_ids);
+            }
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn pool_entries_for_ids<'a>(
+    state: &ReplayState,
+    ids: impl Iterator<Item = &'a String>,
+) -> Vec<(String, PoolEntry)> {
+    ids.filter_map(|id| pool_by_id_from_state(state, id).map(|entry| (id.clone(), entry)))
+        .collect()
+}
+
+fn matching_pools_from_state(
+    state: &ReplayState,
+    token_in: &Bytes,
+    token_out: &Bytes,
+) -> Vec<(String, PoolEntry)> {
+    if let (Some(token_in_ids), Some(token_out_ids)) = (
+        state.token_index.get(token_in),
+        state.token_index.get(token_out),
+    ) {
+        let exact = pool_entries_for_ids(state, token_in_ids.intersection(token_out_ids));
+        if !exact.is_empty() {
+            return exact;
+        }
+    }
+
+    match (
+        ids_for_token(state, token_in),
+        ids_for_token(state, token_out),
+    ) {
+        (Some(token_in_ids), Some(token_out_ids)) => {
+            pool_entries_for_ids(state, token_in_ids.intersection(&token_out_ids).copied())
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn pool_by_id_from_state(state: &ReplayState, id: &str) -> Option<PoolEntry> {
+    let kind = state.id_to_kind.get(id)?;
+    let (protocol_state, component) = state.shards.get(kind)?.get(id)?;
+    Some((Arc::clone(protocol_state), Arc::clone(component)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use alloy_primitives::U256;
+    use num_bigint::BigUint;
+    use tycho_simulation::tycho_common::{
+        dto::ProtocolStateDelta,
+        models::{token::Token, Chain},
+        simulation::{
+            errors::{SimulationError, TransitionError},
+            protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
+        },
+        Bytes,
+    };
+
+    use super::*;
+    use crate::{ExactPoolQuote, ReplayBackend, ReplayQuoteError};
+
+    #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+    struct DummySim;
+
+    #[typetag::serde]
+    impl ProtocolSim for DummySim {
+        fn fee(&self) -> f64 {
+            0.0
+        }
+
+        fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
+            Ok(0.0)
+        }
+
+        fn get_amount_out(
+            &self,
+            amount_in: BigUint,
+            _token_in: &Token,
+            _token_out: &Token,
+        ) -> Result<GetAmountOutResult, SimulationError> {
+            Ok(GetAmountOutResult::new(
+                amount_in,
+                BigUint::from(0_u8),
+                self.clone_box(),
+            ))
+        }
+
+        fn get_limits(
+            &self,
+            _sell_token: Bytes,
+            _buy_token: Bytes,
+        ) -> Result<(BigUint, BigUint), SimulationError> {
+            Ok((BigUint::from(0_u8), BigUint::from(0_u8)))
+        }
+
+        fn delta_transition(
+            &mut self,
+            _delta: ProtocolStateDelta,
+            _tokens: &HashMap<Bytes, Token>,
+            _balances: &Balances,
+        ) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn clone_box(&self) -> Box<dyn ProtocolSim> {
+            Box::new(self.clone())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn eq(&self, other: &dyn ProtocolSim) -> bool {
+            other.as_any().is::<Self>()
+        }
+    }
+
+    fn address(seed: u8) -> Bytes {
+        Bytes::from([seed; 20])
+    }
+
+    fn token(seed: u8, symbol: &str) -> Token {
+        Token::new(&address(seed), symbol, 18, 0, &[], Chain::Ethereum, 100)
+    }
+
+    fn component(
+        seed: u8,
+        protocol_system: &str,
+        protocol_type_name: &str,
+        tokens: Vec<Token>,
+    ) -> ProtocolComponent {
+        ProtocolComponent::new(
+            address(seed),
+            protocol_system.to_string(),
+            protocol_type_name.to_string(),
+            Chain::Ethereum,
+            tokens,
+            Vec::new(),
+            HashMap::new(),
+            Bytes::new(),
+            chrono::NaiveDateTime::default(),
+        )
+    }
+
+    fn pair_update(id: &str, component: ProtocolComponent) -> Update {
+        Update::new(
+            1,
+            HashMap::from([(id.to_string(), Box::new(DummySim) as Box<dyn ProtocolSim>)]),
+            HashMap::from([(id.to_string(), component)]),
+        )
+    }
+
+    #[test]
+    fn apply_tracks_all_anomaly_counters_and_samples() {
+        let token_a = token(20, "TKNA");
+        let token_b = token(21, "TKNB");
+        let missing_state = component(
+            30,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let unknown_protocol = component(
+            31,
+            "mystery_exchange",
+            "mystery_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let removed_unknown =
+            component(32, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        Arc::make_mut(&mut world.state)
+            .id_to_kind
+            .insert("stale-shard".to_string(), ProtocolKind::UniswapV2);
+
+        let states = HashMap::from([
+            (
+                "unknown-update".to_string(),
+                Box::new(DummySim) as Box<dyn ProtocolSim>,
+            ),
+            (
+                "stale-shard".to_string(),
+                Box::new(DummySim) as Box<dyn ProtocolSim>,
+            ),
+        ]);
+        let new_pairs = HashMap::from([
+            ("missing-state".to_string(), missing_state),
+            ("unknown-proto".to_string(), unknown_protocol),
+        ]);
+        let removed_pairs = HashMap::from([("missing-removal".to_string(), removed_unknown)]);
+
+        let report =
+            world.apply(Update::new(2, states, new_pairs).set_removed_pairs(removed_pairs));
+
+        assert_eq!(report.new_pairs_missing_state, 1);
+        assert_eq!(report.unknown_protocol_new_pairs, 1);
+        assert_eq!(report.updates_for_unknown_pair, 1);
+        assert_eq!(report.states_missing_in_shard, 1);
+        assert_eq!(report.removed_unknown_pair, 1);
+        assert!(report.has_anomalies());
+        assert!(report.has_state_integrity_errors());
+        assert_eq!(report.anomaly_samples.len(), 5);
+        assert!(report
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "new_pairs_missing_state:missing-state"));
+        assert!(report
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample.starts_with("unknown_protocol_new_pairs:")));
+        assert!(report
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "updates_for_unknown_pair:unknown-update"));
+        assert!(report
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "states_missing_in_shard:stale-shard"));
+        assert!(report
+            .anomaly_samples
+            .iter()
+            .any(|sample| sample == "removed_unknown_pair:missing-removal"));
+    }
+
+    #[test]
+    fn apply_caps_anomaly_samples() {
+        let states = (0..10)
+            .map(|index| {
+                (
+                    format!("unknown-{index}"),
+                    Box::new(DummySim) as Box<dyn ProtocolSim>,
+                )
+            })
+            .collect();
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+
+        let report = world.apply(Update::new(7, states, HashMap::new()));
+
+        assert_eq!(report.updates_for_unknown_pair, 10);
+        assert_eq!(report.anomaly_samples.len(), UPDATE_ANOMALY_SAMPLE_CAP);
+        assert!(report
+            .anomaly_samples
+            .iter()
+            .all(|sample| sample.starts_with("updates_for_unknown_pair:")));
+    }
+
+    #[test]
+    fn clean_apply_has_zero_anomaly_counters() {
+        let token_a = token(40, "TKNA");
+        let token_b = token(41, "TKNB");
+        let pool = component(42, "uniswap_v2", "uniswap_v2_pool", vec![token_a, token_b]);
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+
+        let report = world.apply(pair_update("pool-1", pool));
+
+        assert_eq!(report.new_pairs_missing_state, 0);
+        assert_eq!(report.unknown_protocol_new_pairs, 0);
+        assert_eq!(report.updates_for_unknown_pair, 0);
+        assert_eq!(report.states_missing_in_shard, 0);
+        assert_eq!(report.removed_unknown_pair, 0);
+        assert!(report.anomaly_samples.is_empty());
+        assert!(!report.has_anomalies());
+        assert!(!report.has_state_integrity_errors());
+    }
+
+    #[test]
+    fn absent_removal_is_diagnostic_without_invalidating_state() {
+        let token_a = token(70, "A");
+        let token_b = token(71, "B");
+        let healthy = component(
+            72,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let absent = component(
+            73,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        world.apply(pair_update("healthy", healthy));
+        let quote = ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "healthy".to_owned(),
+            token_in: token_a.address,
+            token_out: token_b.address,
+            amount_in: U256::from(10_u64),
+        };
+        let expected = world.pin().quote(&quote);
+        assert_eq!(expected, Ok(U256::from(10_u64)));
+
+        for block in [2, 3] {
+            let report = world.apply(
+                Update::new(block, HashMap::new(), HashMap::new())
+                    .set_removed_pairs(HashMap::from([("absent".to_owned(), absent.clone())])),
+            );
+            assert_eq!(report.removed_unknown_pair, 1);
+            assert!(report.has_anomalies());
+            assert!(!report.has_state_integrity_errors());
+            assert!(report
+                .anomaly_samples
+                .iter()
+                .any(|sample| sample == "removed_unknown_pair:absent"));
+            assert_eq!(world.pin().quote(&quote), expected);
+        }
+    }
+
+    #[test]
+    fn present_and_repeated_removal_clear_state_and_lookup_entries() {
+        let token_a = token(74, "A");
+        let token_b = token(75, "B");
+        let pool = component(
+            76,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_a.clone(), token_b.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        world.apply(pair_update("removed", pool.clone()));
+        let quote = ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "removed".to_owned(),
+            token_in: token_a.address,
+            token_out: token_b.address,
+            amount_in: U256::from(10_u64),
+        };
+        assert_eq!(world.pin().quote(&quote), Ok(quote.amount_in));
+
+        for (block, removed_pairs, removed_unknown_pair) in [(2, 1, 0), (3, 0, 1)] {
+            let report = world.apply(
+                Update::new(block, HashMap::new(), HashMap::new())
+                    .set_removed_pairs(HashMap::from([("removed".to_owned(), pool.clone())])),
+            );
+            assert_eq!(report.removed_pairs, removed_pairs);
+            assert_eq!(report.removed_unknown_pair, removed_unknown_pair);
+            assert!(!report.has_state_integrity_errors());
+            assert!(world.state.id_to_kind.is_empty());
+            assert!(world.state.token_index.is_empty());
+            assert!(world.state.shards.values().all(HashMap::is_empty));
+            assert_eq!(
+                world.pin().quote(&quote),
+                Err(ReplayQuoteError::ComponentNotFound("removed".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn every_integrity_counter_remains_fatal_beside_absent_removal() {
+        for [missing_state, unknown_protocol, unknown_update, missing_shard] in
+            [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+        {
+            let mut report = ReplayWorld::new(HashMap::new(), None).apply(Update::new(
+                1,
+                HashMap::new(),
+                HashMap::new(),
+            ));
+            report.removed_unknown_pair = 1;
+            report.new_pairs_missing_state = missing_state;
+            report.unknown_protocol_new_pairs = unknown_protocol;
+            report.updates_for_unknown_pair = unknown_update;
+            report.states_missing_in_shard = missing_shard;
+            assert!(report.has_anomalies());
+            assert!(report.has_state_integrity_errors());
+        }
+    }
+
+    #[test]
+    fn canonical_json_sorts_nested_object_keys() -> Result<(), serde_json::Error> {
+        let mut left_nested = serde_json::Map::new();
+        left_nested.insert("z".to_owned(), serde_json::json!(1));
+        left_nested.insert("a".to_owned(), serde_json::json!(2));
+        let mut left = serde_json::Map::new();
+        left.insert("second".to_owned(), serde_json::Value::Object(left_nested));
+        left.insert("first".to_owned(), serde_json::json!(0));
+
+        let mut right_nested = serde_json::Map::new();
+        right_nested.insert("a".to_owned(), serde_json::json!(2));
+        right_nested.insert("z".to_owned(), serde_json::json!(1));
+        let mut right = serde_json::Map::new();
+        right.insert("first".to_owned(), serde_json::json!(0));
+        right.insert("second".to_owned(), serde_json::Value::Object(right_nested));
+
+        assert_eq!(
+            serde_json::to_vec(&canonicalize_json(serde_json::Value::Object(left)))?,
+            serde_json::to_vec(&canonicalize_json(serde_json::Value::Object(right)))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matching_pools_falls_back_to_alias_when_exact_ids_are_stale() -> anyhow::Result<()> {
+        let wrapped_address = address(50);
+        let native_address = native_token_address();
+        let token_out = token(51, "TKNX");
+        let native_token = Token::new(&native_address, "ETH", 18, 0, &[], Chain::Ethereum, 100);
+        let pool = component(
+            52,
+            "rocketpool",
+            "rocketpool",
+            vec![native_token, token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), Some(wrapped_address.clone()));
+        world.apply(pair_update("pool-native", pool));
+        Arc::make_mut(&mut world.state).token_index = HashMap::from([
+            (
+                wrapped_address.clone(),
+                HashSet::from(["pool-stale".to_string()]),
+            ),
+            (native_address, HashSet::from(["pool-native".to_string()])),
+            (
+                token_out.address.clone(),
+                HashSet::from(["pool-stale".to_string(), "pool-native".to_string()]),
+            ),
+        ]);
+
+        let point = world.pin();
+        let matches = point.matching_pools_by_addresses(&wrapped_address, &token_out.address);
+        assert_eq!(matches.len(), 1);
+        let (id, (state, component)) = &matches[0];
+        assert_eq!(id, "pool-native");
+        let (expected_state, expected_component) = point
+            .pool_by_id("pool-native")
+            .ok_or_else(|| anyhow::anyhow!("native pool is missing"))?;
+        assert!(Arc::ptr_eq(state, &expected_state));
+        assert!(Arc::ptr_eq(component, &expected_component));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_quote_preserves_custom_chain_failure_and_missing_token_priority(
+    ) -> Result<(), serde_json::Error> {
+        let custom_chain: Chain = serde_json::from_str(r#"{"custom":"quote-unregistered-chain"}"#)?;
+        let mut token_in = token(56, "CUSTOM");
+        token_in.chain = custom_chain;
+        let token_out = token(57, "OTHER");
+        let pool = component(
+            58,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![token_in.clone(), token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(HashMap::new(), None);
+        world.apply(pair_update("pool-custom", pool));
+        let point = world.pin();
+        let mut request = ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "pool-custom".to_owned(),
+            token_in: token_in.address,
+            token_out: address(59),
+            amount_in: U256::from(10_u64),
+        };
+        assert_eq!(
+            point.quote(&request),
+            Err(ReplayQuoteError::TokenMissing(request.token_out.clone()))
+        );
+
+        request.token_out = token_out.address;
+        assert!(catch_unwind(AssertUnwindSafe(|| point.quote(&request))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_quote_remaps_native_and_wrapped_tokens_to_the_selected_component() {
+        let native = Chain::Ethereum.native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"));
+        let token_out = token(53, "TKNX");
+        let tokens = HashMap::from([
+            (native.address.clone(), native.clone()),
+            (wrapped.address.clone(), wrapped.clone()),
+            (token_out.address.clone(), token_out.clone()),
+        ]);
+
+        let native_pool = component(
+            54,
+            "rocketpool",
+            "rocketpool",
+            vec![native.clone(), token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(tokens.clone(), Some(wrapped.address.clone()));
+        world.apply(pair_update("pool-native", native_pool));
+        let native_alias = world.pin().quote(&ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "rocketpool".to_owned(),
+            component_id: "pool-native".to_owned(),
+            token_in: wrapped.address.clone(),
+            token_out: token_out.address.clone(),
+            amount_in: alloy_primitives::U256::from(10_u64),
+        });
+        assert_eq!(native_alias, Ok(alloy_primitives::U256::from(10_u64)));
+
+        let wrapped_pool = component(
+            55,
+            "uniswap_v2",
+            "uniswap_v2_pool",
+            vec![wrapped.clone(), token_out.clone()],
+        );
+        let mut world = ReplayWorld::new(tokens, Some(wrapped.address.clone()));
+        world.apply(pair_update("pool-wrapped", wrapped_pool));
+        let wrapped_alias = world.pin().quote(&ExactPoolQuote {
+            backend: ReplayBackend::Native,
+            protocol: "uniswap_v2".to_owned(),
+            component_id: "pool-wrapped".to_owned(),
+            token_in: native.address,
+            token_out: token_out.address,
+            amount_in: alloy_primitives::U256::from(11_u64),
+        });
+        assert_eq!(wrapped_alias, Ok(alloy_primitives::U256::from(11_u64)));
+    }
+}

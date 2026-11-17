@@ -13,16 +13,16 @@ use futures::StreamExt;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use serde_json::Value;
-use simulator_core::broadcaster::wire::FeedMessage;
+use simulator_core::broadcaster::RawSnapshotReassembly;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
     BroadcasterSnapshotPartition, BroadcasterTokenSnapshotResponse, BroadcasterUpdatePartition,
 };
+use simulator_core::models::protocol::ProtocolKind;
+use simulator_replay::{ReplayBackend, ReplayDecoder};
 use tokio::{sync::RwLock, time::Instant};
 use tycho_simulation::{
-    evm::decoder::TychoStreamDecoder,
     protocol::models::{ProtocolComponent, Update},
-    tycho_client::feed::BlockHeader,
     tycho_common::{
         models::{token::Token, Chain},
         simulation::protocol_sim::ProtocolSim,
@@ -31,7 +31,6 @@ use tycho_simulation::{
 };
 
 use super::processor::{BroadcasterSubscriptionProcessor, PreparedRedisProcessor};
-use super::snapshot::RawSnapshotReassembly;
 use super::{
     apply_replay_batch, mark_redis_catch_up_checkpoints, BroadcasterSubscriptionControls,
     PreparedBroadcasterRedisSubscription, VmBroadcasterSubscriptionControls,
@@ -53,7 +52,11 @@ const REDIS_URL_ENV: &str = "BROADCASTER_REDIS_URL";
 const EXPECTED_CHAIN_ID: u64 = 1;
 const CURVE_PROTOCOL: &str = "vm:curve";
 const BALANCER_PROTOCOL: &str = "vm:balancer_v2";
-const VM_PROTOCOLS: [&str; 3] = [CURVE_PROTOCOL, BALANCER_PROTOCOL, "vm:maverick_v2"];
+const VM_PROTOCOLS: [ProtocolKind; 3] = [
+    ProtocolKind::Curve,
+    ProtocolKind::BalancerV2,
+    ProtocolKind::MaverickV2,
+];
 const REDIS_BLOCK_MS: u64 = 5_000;
 const REDIS_READ_COUNT: u64 = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,6 +70,7 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
         println!("skipping live VM wire e2e; set {LIVE_E2E_GATE}=1 to run it");
         return Ok(());
     }
+    crate::config::install_tls_provider();
 
     let config = LiveConfig::from_env()?;
     require_broadcaster_ready(&config.broadcaster_url).await?;
@@ -84,7 +88,6 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
     let (controls, state_store, protocols) = build_vm_controls(&config.broadcaster_url).await?;
     let decoder = build_broadcaster_subscription_decoder(
         controls.tokens(),
-        Chain::Ethereum,
         BroadcasterBackend::Vm,
         &protocols,
     )
@@ -92,7 +95,6 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
     .context("failed to build real VM broadcaster decoder")?;
     let evidence_decoder = build_broadcaster_subscription_decoder(
         controls.tokens(),
-        Chain::Ethereum,
         BroadcasterBackend::Vm,
         &protocols,
     )
@@ -176,7 +178,7 @@ async fn build_vm_controls(
 ) -> Result<(
     BroadcasterSubscriptionControls,
     Arc<StateStore>,
-    Vec<String>,
+    Vec<ProtocolKind>,
 )> {
     let lookup_url = derive_broadcaster_token_lookup_url(broadcaster_url)
         .context("failed to derive broadcaster token lookup URL")?;
@@ -188,10 +190,7 @@ async fn build_vm_controls(
         REQUEST_TIMEOUT,
     ));
     let state_store = Arc::new(StateStore::new(Arc::clone(&tokens)));
-    let protocols = VM_PROTOCOLS
-        .iter()
-        .map(|protocol| (*protocol).to_string())
-        .collect::<Vec<_>>();
+    let protocols = VM_PROTOCOLS.to_vec();
     let controls = BroadcasterSubscriptionControls::Vm(VmBroadcasterSubscriptionControls {
         broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         state_store: Arc::clone(&state_store),
@@ -290,7 +289,7 @@ async fn require_broadcaster_ready(broadcaster_url: &str) -> Result<()> {
 async fn bootstrap_snapshot(
     replay_client: &BroadcasterReplayClient,
     processor: &mut BroadcasterSubscriptionProcessor,
-    evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+    evidence_decoder: &ReplayDecoder,
     state_store: &StateStore,
 ) -> Result<(
     RequiredProtocolEvidence,
@@ -374,7 +373,7 @@ async fn require_captured_pools_are_present(
 async fn poll_live_redis_until_quotes(
     replay_client: &BroadcasterReplayClient,
     prepared: &mut PreparedBroadcasterRedisSubscription,
-    evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+    evidence_decoder: &ReplayDecoder,
     state_store: &Arc<StateStore>,
 ) -> Result<()> {
     let mut checkpoint =
@@ -608,7 +607,7 @@ impl RequiredProtocolEvidence {
     async fn observe_replay_items(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         items: &[ReplayMessage],
     ) {
         for message in items {
@@ -624,7 +623,7 @@ impl RequiredProtocolEvidence {
     async fn observe_live_envelope(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         envelope: &BroadcasterEnvelope,
     ) -> Result<()> {
         let BroadcasterPayload::Update(update) = &envelope.payload else {
@@ -663,7 +662,7 @@ impl RequiredProtocolEvidence {
     async fn observe_live_partition(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         partition: &BroadcasterUpdatePartition,
     ) -> Result<()> {
         if partition.backend != BroadcasterBackend::Vm {
@@ -697,13 +696,14 @@ impl RequiredProtocolEvidence {
         for component_id in message.message.snapshots.states.keys() {
             self.record_snapshot_material(message.protocol.as_str(), component_id.as_str());
         }
-        self.raw_snapshot.push(message.clone())
+        self.raw_snapshot.push(message.clone())?;
+        Ok(())
     }
 
     async fn observe_raw_live_message(
         &mut self,
         state_store: &StateStore,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
+        evidence_decoder: &ReplayDecoder,
         message: &BroadcasterProtocolMessage,
     ) -> Result<()> {
         if raw_message_has_live_material(message) {
@@ -716,7 +716,7 @@ impl RequiredProtocolEvidence {
             for component_id in deltas.new_protocol_components.keys() {
                 self.record_live_pool(message.protocol.as_str(), component_id.as_str());
             }
-            for component_id in deltas.state_updates.keys() {
+            for component_id in deltas.state_deltas.keys() {
                 self.record_live_pool(message.protocol.as_str(), component_id.as_str());
             }
         }
@@ -728,10 +728,7 @@ impl RequiredProtocolEvidence {
         Ok(())
     }
 
-    async fn decode_snapshot_messages(
-        &mut self,
-        evidence_decoder: &TychoStreamDecoder<BlockHeader>,
-    ) -> Result<()> {
+    async fn decode_snapshot_messages(&mut self, evidence_decoder: &ReplayDecoder) -> Result<()> {
         for message in self.raw_snapshot.take_messages() {
             let update = decode_protocol_message(evidence_decoder, &message)
                 .await
@@ -869,29 +866,22 @@ struct QuoteResult {
 }
 
 async fn decode_protocol_message(
-    decoder: &TychoStreamDecoder<BlockHeader>,
+    decoder: &ReplayDecoder,
     raw: &BroadcasterProtocolMessage,
 ) -> Result<Update> {
-    let mut state_msgs = HashMap::new();
-    state_msgs.insert(raw.protocol.clone(), raw.message.clone());
-    let mut sync_states = HashMap::new();
-    sync_states.insert(raw.protocol.clone(), raw.sync_state.clone());
-    let feed = FeedMessage {
-        state_msgs,
-        sync_states,
-    };
     decoder
-        .decode(&feed.into())
+        .decode_snapshot_messages(ReplayBackend::Vm, vec![raw.clone()])
         .await
-        .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))
+        .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))?
+        .ok_or_else(|| anyhow!("configured VM message produced no decoded update"))
 }
 
 fn raw_message_has_live_material(message: &BroadcasterProtocolMessage) -> bool {
     let snapshots = &message.message.snapshots;
     let has_snapshot = !snapshots.states.is_empty() || !snapshots.vm_storage.is_empty();
     let has_delta = message.message.deltas.as_ref().is_some_and(|deltas| {
-        !deltas.account_updates.is_empty()
-            || !deltas.state_updates.is_empty()
+        !deltas.account_deltas.is_empty()
+            || !deltas.state_deltas.is_empty()
             || !deltas.new_protocol_components.is_empty()
             || !deltas.deleted_protocol_components.is_empty()
     });

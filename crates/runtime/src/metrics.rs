@@ -6,7 +6,8 @@ use tracing::warn;
 use crate::broadcaster::state::{BroadcasterReadiness, BroadcasterStatusSnapshot};
 use crate::models::messages::{QuoteResultQuality, QuoteStatus};
 use crate::models::state::{
-    SimulatorBackendKind, SimulatorBackendReadiness, SimulatorStatusSnapshot,
+    SimulatorBackendKind, SimulatorBackendReadiness, SimulatorBackendStatusSnapshot,
+    SimulatorStatusSnapshot,
 };
 use simulator_core::broadcaster::BroadcasterBackend;
 
@@ -81,6 +82,29 @@ pub fn emit_simulate_result_quality(quality: QuoteResultQuality) {
     );
 }
 
+pub fn emit_chain_head_observation(chain_id: u64, rpc_outage_seconds: u64) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let event = json!({
+        "_aws": {
+            "Timestamp": timestamp_ms,
+            "CloudWatchMetrics": [{
+                "Namespace": METRIC_NAMESPACE,
+                "Dimensions": [["ChainId"]],
+                "Metrics": [{ "Name": "ChainHeadRpcOutageSeconds", "Unit": "Seconds" }],
+            }],
+        },
+        "event": "chain_head_observation",
+        "ChainId": chain_id.to_string(),
+        "ChainHeadRpcOutageSeconds": rpc_outage_seconds,
+    });
+    if let Value::Object(event) = event {
+        emit_emf_event(event, "chain_head_observation");
+    }
+}
+
 pub fn emit_broadcaster_redis_append_failure() {
     emit_count_metric(METRIC_BROADCASTER_REDIS_APPEND_FAILURE, &[]);
 }
@@ -145,14 +169,7 @@ pub fn emit_broadcaster_recovery_outcome(
         json!(buffer_b_count as u64),
     );
 
-    match serde_json::to_string(&Value::Object(event)) {
-        Ok(line) => println!("{line}"),
-        Err(error) => warn!(
-            error = %error,
-            metric = "broadcaster_recovery_outcome",
-            "Failed to serialize EMF metric"
-        ),
-    }
+    emit_emf_event(event, "broadcaster_recovery_outcome");
 }
 
 pub fn emit_broadcaster_redis_transport_failure(operation: &'static str) {
@@ -244,14 +261,134 @@ pub fn emit_broadcaster_health_snapshot(snapshot: &BroadcasterStatusSnapshot) {
         snapshot.recovery.oldest_buffered_age_ms,
         UNIT_MILLISECONDS,
     );
-    emit_gauge_snapshot(
-        "broadcaster_health",
-        &[
-            ("Readiness", json!(snapshot.readiness.as_str())),
-            ("RecoveryPhase", json!(snapshot.recovery.phase)),
-        ],
-        &metrics,
+    let mut properties = vec![
+        ("Readiness", json!(snapshot.readiness.as_str())),
+        ("RecoveryPhase", json!(snapshot.recovery.phase)),
+    ];
+    if let Some(state_history) = &snapshot.state_history {
+        metrics.extend(state_history_health_metrics(
+            state_history,
+            current_timestamp_ms(),
+        ));
+        if let Some(status) = &state_history.last_checkpoint_status {
+            properties.push(("StateHistoryCheckpointStatus", json!(status)));
+        }
+    }
+    emit_gauge_snapshot("broadcaster_health", &properties, &metrics);
+}
+
+fn state_history_health_metrics(
+    status: &state_history::WriterStatus,
+    now_ms: u64,
+) -> Vec<(&'static str, u64, &'static str)> {
+    let queue_utilization_bps = if status.queue_capacity == 0 {
+        0
+    } else {
+        status
+            .queue_len
+            .saturating_mul(10_000)
+            .saturating_div(status.queue_capacity)
+            .min(10_000)
+    };
+    let mut metrics = vec![
+        ("StateHistoryHealthy", u64::from(status.healthy), UNIT_COUNT),
+        ("StateHistoryQueueLength", status.queue_len, UNIT_COUNT),
+        (
+            "StateHistoryQueueCapacity",
+            status.queue_capacity,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryQueueUtilizationBps",
+            queue_utilization_bps,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryEnqueuedDeltaCount",
+            status.enqueued_deltas,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryPersistedDeltaCount",
+            status.persisted_deltas,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryDroppedDeltaCount",
+            status.dropped_deltas,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryFailedDeltaCount",
+            status.failed_deltas,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryRecordedGapCount",
+            status.recorded_gaps,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryCheckpointCompletedCount",
+            status.checkpoints_completed,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryCheckpointFailedCount",
+            status.checkpoints_failed,
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryLastCheckpointSucceeded",
+            u64::from(status.last_checkpoint_status.as_deref() == Some("complete")),
+            UNIT_COUNT,
+        ),
+        (
+            "StateHistoryTokenPersistenceFailureCount",
+            status.token_persistence_failures,
+            UNIT_COUNT,
+        ),
+    ];
+    if let Some(position) = status.last_persisted {
+        metrics.push((
+            "StateHistoryLastPersistedGeneration",
+            position.generation,
+            UNIT_COUNT,
+        ));
+        metrics.push((
+            "StateHistoryLastPersistedMessageSequence",
+            position.message_seq,
+            UNIT_COUNT,
+        ));
+    }
+    push_optional_metric(
+        &mut metrics,
+        "StateHistoryPersistedDeltaAge",
+        status
+            .last_persisted_at_ms
+            .map(|timestamp| timestamp_age_ms(timestamp, now_ms)),
+        UNIT_MILLISECONDS,
     );
+    push_optional_metric(
+        &mut metrics,
+        "StateHistorySuccessfulCheckpointAge",
+        status
+            .last_successful_checkpoint_at_ms
+            .map(|timestamp| timestamp_age_ms(timestamp, now_ms)),
+        UNIT_MILLISECONDS,
+    );
+    metrics
+}
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+const fn timestamp_age_ms(timestamp_ms: u64, now_ms: u64) -> u64 {
+    now_ms.saturating_sub(timestamp_ms)
 }
 
 pub fn emit_simulator_health_snapshot(snapshot: &SimulatorStatusSnapshot) {
@@ -264,7 +401,7 @@ pub fn emit_simulator_health_snapshot(snapshot: &SimulatorStatusSnapshot) {
     let native = backend(SimulatorBackendKind::Native);
     let vm = backend(SimulatorBackendKind::Vm);
     let rfq = backend(SimulatorBackendKind::Rfq);
-    let is_available = |backend: Option<&crate::models::state::SimulatorBackendStatusSnapshot>| {
+    let is_available = |backend: Option<&SimulatorBackendStatusSnapshot>| {
         backend.is_some_and(|status| status.readiness == SimulatorBackendReadiness::Ready)
     };
     let mut metrics = vec![
@@ -356,19 +493,10 @@ fn emit_gauge_snapshot(
         event.insert((*name).to_string(), json!(value));
     }
 
-    match serde_json::to_string(&Value::Object(event)) {
-        Ok(line) => println!("{line}"),
-        Err(error) => warn!(
-            error = %error,
-            metric = event_name,
-            "Failed to serialize EMF metric"
-        ),
-    }
+    emit_emf_event(event, event_name);
 }
 
 pub fn emit_jemalloc_snapshot(label: &str, allocated_bytes: usize, resident_bytes: usize) {
-    // Emit CloudWatch Embedded Metric Format as a raw JSON log line.
-    // Tracing's JSON wrapper would prevent EMF extraction, so we write directly to stdout.
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -398,19 +526,10 @@ pub fn emit_jemalloc_snapshot(label: &str, allocated_bytes: usize, resident_byte
         json!(resident_bytes as u64),
     );
 
-    match serde_json::to_string(&Value::Object(event)) {
-        Ok(line) => println!("{line}"),
-        Err(err) => warn!(
-            error = %err,
-            metric = "jemalloc_snapshot",
-            "Failed to serialize EMF metric"
-        ),
-    }
+    emit_emf_event(event, "jemalloc_snapshot");
 }
 
 fn emit_count_metric(metric_name: &str, dimensions: &[(&str, Value)]) {
-    // Emit CloudWatch Embedded Metric Format as a raw JSON log line.
-    // Tracing's JSON wrapper would prevent EMF extraction, so we write directly to stdout.
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -436,8 +555,72 @@ fn emit_count_metric(metric_name: &str, dimensions: &[(&str, Value)]) {
         event.insert((*name).to_string(), value.clone());
     }
 
+    emit_emf_event(event, metric_name);
+}
+
+fn emit_emf_event(event: Map<String, Value>, metric_name: &str) {
+    // Tracing's JSON wrapper prevents CloudWatch from extracting these metrics.
     match serde_json::to_string(&Value::Object(event)) {
         Ok(line) => println!("{line}"),
-        Err(err) => warn!(error = %err, metric = metric_name, "Failed to serialize EMF metric"),
+        Err(error) => warn!(error = %error, metric = metric_name, "Failed to serialize EMF metric"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use state_history::{StreamPosition, WriterStatus};
+
+    use super::*;
+
+    #[test]
+    fn state_history_metrics_capture_progress_pressure_and_age() {
+        let status = WriterStatus {
+            healthy: false,
+            queue_len: 2,
+            queue_capacity: 8,
+            enqueued_deltas: 20,
+            persisted_deltas: 17,
+            dropped_deltas: 1,
+            failed_deltas: 2,
+            recorded_gaps: 3,
+            last_persisted: Some(StreamPosition {
+                generation: 4,
+                message_seq: 99,
+            }),
+            last_persisted_at_ms: Some(8_000),
+            last_error: Some("failure".to_owned()),
+            checkpoints_completed: 5,
+            checkpoints_failed: 1,
+            last_checkpoint_status: Some("failed".to_owned()),
+            last_successful_checkpoint_at_ms: Some(7_000),
+            last_token_snapshot_sha: None,
+            token_persistence_failures: 1,
+        };
+        let metrics = state_history_health_metrics(&status, 10_000)
+            .into_iter()
+            .map(|(name, value, _)| (name, value))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(metrics.get("StateHistoryQueueUtilizationBps"), Some(&2_500));
+        assert_eq!(metrics.get("StateHistoryPersistedDeltaCount"), Some(&17));
+        assert_eq!(metrics.get("StateHistoryLastPersistedGeneration"), Some(&4));
+        assert_eq!(
+            metrics.get("StateHistoryLastPersistedMessageSequence"),
+            Some(&99)
+        );
+        assert_eq!(metrics.get("StateHistoryPersistedDeltaAge"), Some(&2_000));
+        assert_eq!(
+            metrics.get("StateHistorySuccessfulCheckpointAge"),
+            Some(&3_000)
+        );
+        assert_eq!(metrics.get("StateHistoryDroppedDeltaCount"), Some(&1));
+        assert_eq!(metrics.get("StateHistoryFailedDeltaCount"), Some(&2));
+        assert_eq!(metrics.get("StateHistoryRecordedGapCount"), Some(&3));
+        assert_eq!(
+            metrics.get("StateHistoryTokenPersistenceFailureCount"),
+            Some(&1)
+        );
     }
 }

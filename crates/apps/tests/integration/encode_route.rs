@@ -1,7 +1,9 @@
+use runtime::chain_head::ChainHeadObserver;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -14,13 +16,16 @@ use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
 use runtime::models::erc4626::Erc4626PairPolicy;
+use runtime::models::protocol::ProtocolKind;
 use runtime::models::state::{
     AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
     VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
+use runtime::services::EncodeService;
 use runtime::simulator_service::SimulatorRuntime;
+use simulator_core::broadcaster::BlockIdentity;
 use simulator_core::models::messages::{
     EncodeErrorResponse, HopDraft, InteractionKind, PoolRef, PoolSwapDraft, RouteEncodeRequest,
     RouteEncodeResponse, SegmentDraft, SwapKind,
@@ -39,6 +44,13 @@ use tycho_simulation::tycho_common::simulation::protocol_sim::{
 };
 use tycho_simulation::tycho_common::Bytes;
 
+fn fixture_head() -> BlockIdentity {
+    BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct EchoAmountSim;
 
@@ -47,13 +59,18 @@ struct SlowAmountSim {
     sleep_for: Duration,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
-struct SleepAmountSim {
-    sleep_for: Duration,
-}
-
 struct MockTychoEncoder {
     router: Bytes,
+}
+
+fn mock_encoded_solution(router: Bytes) -> EncodedSolution {
+    EncodedSolution {
+        swaps: vec![0x01, 0x02],
+        interacting_with: router,
+        function_signature: "singleSwap()".to_string(),
+        n_tokens: 0,
+        permit: None,
+    }
 }
 
 impl TychoEncoder for MockTychoEncoder {
@@ -61,13 +78,7 @@ impl TychoEncoder for MockTychoEncoder {
         &self,
         _solutions: Vec<Solution>,
     ) -> Result<Vec<EncodedSolution>, EncodingError> {
-        Ok(vec![EncodedSolution {
-            swaps: vec![0x01, 0x02],
-            interacting_with: self.router.clone(),
-            function_signature: "singleSwap()".to_string(),
-            n_tokens: 0,
-            permit: None,
-        }])
+        Ok(vec![mock_encoded_solution(self.router.clone())])
     }
 
     fn encode_full_calldata(
@@ -84,61 +95,170 @@ impl TychoEncoder for MockTychoEncoder {
     }
 }
 
-#[typetag::serde]
-impl ProtocolSim for SleepAmountSim {
-    fn fee(&self) -> f64 {
-        0.0
+struct PublishingEncoderState {
+    state_store: Arc<StateStore>,
+    router: Bytes,
+    update_pool_id: String,
+    calls: AtomicUsize,
+}
+
+impl PublishingEncoderState {
+    fn new(state_store: Arc<StateStore>, router: Bytes, update_pool_id: String) -> Self {
+        Self {
+            state_store,
+            router,
+            update_pool_id,
+            calls: AtomicUsize::new(0),
+        }
     }
 
-    fn spot_price(&self, _base: &Token, _quote: &Token) -> Result<f64, SimulationError> {
-        Ok(0.0)
+    fn publish_update(&self) {
+        let states = HashMap::from([(
+            self.update_pool_id.clone(),
+            Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+        )]);
+        let new_pairs: HashMap<String, ProtocolComponent> = HashMap::new();
+        // Change the pool publication without moving the chain head, so this exercises
+        // the touched-pool fence independently of the chain freshness fence.
+        let update = Update::new(42, states, new_pairs);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                self.state_store
+                    .apply_update_with_head(update, Some(fixture_head())),
+            );
+        });
     }
 
-    fn get_amount_out(
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+struct PublishUpdateOnFirstCallEncoder {
+    state: PublishingEncoderState,
+}
+
+impl PublishUpdateOnFirstCallEncoder {
+    fn new(state_store: Arc<StateStore>, router: Bytes, update_pool_id: String) -> Self {
+        Self {
+            state: PublishingEncoderState::new(state_store, router, update_pool_id),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.state.call_count()
+    }
+}
+
+impl TychoEncoder for PublishUpdateOnFirstCallEncoder {
+    fn encode_solutions(
         &self,
-        amount_in: BigUint,
-        _token_in: &Token,
-        _token_out: &Token,
-    ) -> Result<GetAmountOutResult, SimulationError> {
-        std::thread::sleep(self.sleep_for);
-        Ok(GetAmountOutResult::new(
-            amount_in,
-            BigUint::zero(),
-            self.clone_box(),
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<EncodedSolution>, EncodingError> {
+        if self.state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.state.publish_update();
+        }
+        Ok(vec![mock_encoded_solution(self.state.router.clone())])
+    }
+
+    fn encode_full_calldata(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<Transaction>, EncodingError> {
+        Err(EncodingError::FatalError(
+            "encode_full_calldata not supported in tests".to_string(),
         ))
     }
 
-    fn get_limits(
-        &self,
-        _sell_token: Bytes,
-        _buy_token: Bytes,
-    ) -> Result<(BigUint, BigUint), SimulationError> {
-        Ok((BigUint::zero(), BigUint::zero()))
-    }
-
-    fn delta_transition(
-        &mut self,
-        _delta: ProtocolStateDelta,
-        _tokens: &HashMap<Bytes, Token>,
-        _balances: &Balances,
-    ) -> Result<(), TransitionError> {
+    fn validate_solution(&self, _solution: &Solution) -> Result<(), EncodingError> {
         Ok(())
     }
+}
 
-    fn clone_box(&self) -> Box<dyn ProtocolSim> {
-        Box::new(self.clone())
+struct PublishUpdateOnEveryCallEncoder {
+    state: PublishingEncoderState,
+}
+
+impl PublishUpdateOnEveryCallEncoder {
+    fn new(state_store: Arc<StateStore>, router: Bytes, update_pool_id: String) -> Self {
+        Self {
+            state: PublishingEncoderState::new(state_store, router, update_pool_id),
+        }
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn call_count(&self) -> usize {
+        self.state.call_count()
+    }
+}
+
+impl TychoEncoder for PublishUpdateOnEveryCallEncoder {
+    fn encode_solutions(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<EncodedSolution>, EncodingError> {
+        self.state.calls.fetch_add(1, Ordering::SeqCst);
+        self.state.publish_update();
+        Ok(vec![mock_encoded_solution(self.state.router.clone())])
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+    fn encode_full_calldata(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<Transaction>, EncodingError> {
+        Err(EncodingError::FatalError(
+            "encode_full_calldata not supported in tests".to_string(),
+        ))
     }
 
-    fn eq(&self, other: &dyn ProtocolSim) -> bool {
-        other.as_any().downcast_ref::<SleepAmountSim>() == Some(self)
+    fn validate_solution(&self, _solution: &Solution) -> Result<(), EncodingError> {
+        Ok(())
+    }
+}
+
+struct PublishUpdateWithWrongRouterEncoder {
+    state: PublishingEncoderState,
+    wrong_router: Bytes,
+}
+
+impl PublishUpdateWithWrongRouterEncoder {
+    fn new(
+        state_store: Arc<StateStore>,
+        router: Bytes,
+        wrong_router: Bytes,
+        update_pool_id: String,
+    ) -> Self {
+        Self {
+            state: PublishingEncoderState::new(state_store, router, update_pool_id),
+            wrong_router,
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.state.call_count()
+    }
+}
+
+impl TychoEncoder for PublishUpdateWithWrongRouterEncoder {
+    fn encode_solutions(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<EncodedSolution>, EncodingError> {
+        self.state.calls.fetch_add(1, Ordering::SeqCst);
+        self.state.publish_update();
+        Ok(vec![mock_encoded_solution(self.wrong_router.clone())])
+    }
+
+    fn encode_full_calldata(
+        &self,
+        _solutions: Vec<Solution>,
+    ) -> Result<Vec<Transaction>, EncodingError> {
+        Err(EncodingError::FatalError(
+            "encode_full_calldata not supported in tests".to_string(),
+        ))
+    }
+
+    fn validate_solution(&self, _solution: &Solution) -> Result<(), EncodingError> {
+        Ok(())
     }
 }
 
@@ -366,6 +486,7 @@ struct EncodeFixtureConfig<'a> {
     chain: Chain,
     pool_id: &'a str,
     amount_in: &'a str,
+    token_decimals: u32,
     min_amount_out: &'a str,
     token_in_hex: &'a str,
     token_out_hex: &'a str,
@@ -395,6 +516,7 @@ impl Default for EncodeFixtureConfig<'_> {
             chain: Chain::Ethereum,
             pool_id: "pool-1",
             amount_in: "10",
+            token_decimals: 18,
             min_amount_out: "8",
             token_in_hex: "0x0000000000000000000000000000000000000001",
             token_out_hex: "0x0000000000000000000000000000000000000002",
@@ -435,8 +557,10 @@ fn build_fixture_tokens(config: &EncodeFixtureConfig<'_>) -> Result<FixtureToken
     } else {
         "TK1"
     };
-    let token_in_meta = make_token(&token_in, token_in_symbol, config.chain);
-    let token_out_meta = make_token(&token_out, "TK2", config.chain);
+    let mut token_in_meta = make_token(&token_in, token_in_symbol, config.chain);
+    let mut token_out_meta = make_token(&token_out, "TK2", config.chain);
+    token_in_meta.decimals = config.token_decimals;
+    token_out_meta.decimals = config.token_decimals;
 
     let mut initial_tokens = HashMap::new();
     initial_tokens.insert(token_in.clone(), token_in_meta.clone());
@@ -491,11 +615,15 @@ async fn build_fixture_stores(
     let new_pairs = HashMap::from([(pool_id.to_string(), component)]);
     let update = Update::new(42, states, new_pairs);
     if config.vm_pool {
-        vm_state_store.apply_update(update).await;
+        vm_state_store
+            .apply_update_with_head(update, Some(fixture_head()))
+            .await;
     } else if config.rfq_pool {
         rfq_state_store.apply_update(update).await;
     } else {
-        native_state_store.apply_update(update).await;
+        native_state_store
+            .apply_update_with_head(update, Some(fixture_head()))
+            .await;
     }
     Ok((native_state_store, vm_state_store, rfq_state_store))
 }
@@ -518,7 +646,6 @@ fn build_bebop_state(token_in: &Token, token_out: &Token) -> Result<BebopState> 
 fn test_rfq_client_config() -> RfqClientConfig {
     RfqClientConfig {
         tvl_threshold: 100.0,
-        bebop_user: "test-bebop-user".to_string(),
         bebop_key: "test-bebop-key".to_string(),
         hashflow_user: "test-hashflow-user".to_string(),
         hashflow_key: "test-hashflow-key".to_string(),
@@ -555,7 +682,7 @@ async fn ensure_native_store_ready(
     )]);
     let new_pairs = HashMap::from([("native-ready".to_string(), component)]);
     native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
+        .apply_update_with_head(Update::new(42, states, new_pairs), Some(fixture_head()))
         .await;
     Ok(())
 }
@@ -649,9 +776,10 @@ async fn build_app_state_and_request(
     };
 
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(test_rfq_client_config()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription,
@@ -669,7 +797,6 @@ async fn build_app_state_and_request(
         },
         enable_vm_pools: config.enable_vm_pools,
         enable_rfq_pools: config.enable_rfq_pools,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -702,6 +829,82 @@ async fn setup_app_state_and_request(
         SimulatorRuntime::new(state)
     };
     Ok((create_router(runtime), request))
+}
+
+async fn add_native_echo_pool(
+    state: &AppState,
+    request: &RouteEncodeRequest,
+    pool_id: &str,
+) -> Result<()> {
+    let token_in = parse_bytes(&request.token_in)?;
+    let token_out = parse_bytes(&request.token_out)?;
+    let component = ProtocolComponent::new(
+        parse_bytes("0x00000000000000000000000000000000000000bb")?,
+        "uniswap_v2".to_string(),
+        "uniswap_v2".to_string(),
+        state.chain,
+        vec![
+            make_token(&token_in, "TK1", state.chain),
+            make_token(&token_out, "TK2", state.chain),
+        ],
+        Vec::new(),
+        HashMap::new(),
+        Bytes::default(),
+        NaiveDateTime::default(),
+    );
+    state
+        .native_state_store
+        .apply_update_with_head(
+            Update::new(
+                42,
+                HashMap::from([(
+                    pool_id.to_string(),
+                    Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(pool_id.to_string(), component)]),
+            ),
+            Some(fixture_head()),
+        )
+        .await;
+    Ok(())
+}
+
+async fn add_vm_echo_pool(
+    state: &AppState,
+    request: &RouteEncodeRequest,
+    pool_id: &str,
+) -> Result<()> {
+    let token_in = parse_bytes(&request.token_in)?;
+    let token_out = parse_bytes(&request.token_out)?;
+    let component = ProtocolComponent::new(
+        parse_bytes("0x00000000000000000000000000000000000000cc")?,
+        "vm:maverick_v2".to_string(),
+        "maverick_v2".to_string(),
+        state.chain,
+        vec![
+            make_token(&token_in, "TK1", state.chain),
+            make_token(&token_out, "TK2", state.chain),
+        ],
+        Vec::new(),
+        HashMap::new(),
+        Bytes::default(),
+        NaiveDateTime::default(),
+    );
+    state
+        .vm_state_store
+        .apply_update_with_head(
+            Update::new(
+                42,
+                HashMap::from([(
+                    pool_id.to_string(),
+                    Box::new(EchoAmountSim) as Box<dyn ProtocolSim>,
+                )]),
+                HashMap::from([(pool_id.to_string(), component)]),
+            ),
+            Some(fixture_head()),
+        )
+        .await;
+    Ok(())
 }
 
 async fn post_encode(
@@ -751,7 +954,7 @@ async fn setup_timeout_app(
     let states = HashMap::from([(pool_id.clone(), sim)]);
     let new_pairs = HashMap::from([(pool_id.clone(), component)]);
     native_state_store
-        .apply_update(Update::new(42, states, new_pairs))
+        .apply_update_with_head(Update::new(42, states, new_pairs), Some(fixture_head()))
         .await;
 
     let native_stream_health = Arc::new(StreamHealth::new());
@@ -760,9 +963,10 @@ async fn setup_timeout_app(
     let rfq_stream_health = Arc::new(StreamHealth::new());
 
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: config.chain,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: Arc::clone(&fixture_tokens.store),
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -780,7 +984,6 @@ async fn setup_timeout_app(
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout,
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -889,6 +1092,197 @@ async fn encode_route_end_to_end_returns_interactions_and_debug() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_retries_after_first_attempt_publication() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_id: "req-retry-success",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    let encoder = Arc::new(PublishUpdateOnFirstCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(encoder.call_count(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_does_not_retry_after_unrelated_pool_publication() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_id: "req-unrelated-publication",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    add_native_echo_pool(&state, &request, "pool-unrelated").await?;
+    let encoder = Arc::new(PublishUpdateOnFirstCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        "pool-unrelated".to_string(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(encoder.call_count(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_returns_service_unavailable_after_second_publication() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_id: "req-retry-second-trip",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    let encoder = Arc::new(PublishUpdateOnEveryCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Native state changed while the route was being encoded; retry against the current version"
+    );
+    assert_eq!(encoder.call_count(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_returns_deterministic_error_without_retry_after_publication() -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_id: "req-deterministic-no-retry",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    let encoder = Arc::new(PublishUpdateWithWrongRouterEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        parse_bytes("0x0000000000000000000000000000000000000005")?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Encoded router address does not match request tychoRouterAddress"
+    );
+    assert_eq!(encoder.call_count(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_retries_for_native_pool_with_vm_protocol_hint() -> Result<()> {
+    // The hint says VM but the stored component is native. The fence must still hold a
+    // pin for the component-resolved native pool and catch the mid-attempt update.
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        enable_vm_pools: true,
+        request_id: "req-hint-mismatch-retry",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    add_vm_echo_pool(&state, &request, "vm-ready").await?;
+    let encoder = Arc::new(PublishUpdateOnFirstCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected status {}: {}",
+        status,
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(encoder.call_count(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encode_route_aborts_for_native_pool_with_vm_protocol_hint_after_second_publication(
+) -> Result<()> {
+    let config = EncodeFixtureConfig {
+        request_pool_protocol: "vm:maverick_v2",
+        enable_vm_pools: true,
+        request_id: "req-hint-mismatch-second-trip",
+        ..EncodeFixtureConfig::default()
+    };
+    let (state, request) = build_app_state_and_request(config).await?;
+    add_vm_echo_pool(&state, &request, "vm-ready").await?;
+    let encoder = Arc::new(PublishUpdateOnEveryCallEncoder::new(
+        Arc::clone(&state.native_state_store),
+        parse_bytes(&request.tycho_router_address)?,
+        request.segments[0].hops[0].swaps[0]
+            .pool
+            .component_id
+            .clone(),
+    ));
+    let runtime_encoder: Arc<dyn TychoEncoder> = encoder.clone();
+    let app = create_router(SimulatorRuntime::new_with_encoder(state, runtime_encoder));
+
+    let (status, body) = post_encode(app, &request).await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
+    assert_eq!(
+        response.error,
+        "Native state changed while the route was being encoded; retry against the current version"
+    );
+    assert_eq!(encoder.call_count(), 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn encode_route_rejects_when_min_amount_out_exceeds_expected() -> Result<()> {
     let config = EncodeFixtureConfig {
@@ -972,8 +1366,13 @@ async fn encode_route_rejects_when_native_state_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.native_progress_lease = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
+    let head = BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    };
+    state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+    state.native_state_store.set_applied_head(Some(head)).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
@@ -1113,9 +1512,13 @@ async fn encode_route_rejects_vm_route_when_vm_is_stale() -> Result<()> {
         ..EncodeFixtureConfig::default()
     };
     let (mut state, request) = build_app_state_and_request(config).await?;
-    state.optional_backend_stale = Duration::from_millis(1);
-    tokio::time::advance(Duration::from_millis(2)).await;
-    state.native_stream_health.record_update(42).await;
+    let head = BlockIdentity {
+        number: 42,
+        hash: Bytes::from(vec![1; 32]),
+    };
+    state.chain_head_observer = Arc::new(ChainHeadObserver::ready_for_test(head.clone()));
+    state.vm_state_store.set_applied_head(Some(head)).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
     let app = create_router(SimulatorRuntime::new(state));
 
     let (status, body) = post_encode(app, &request).await?;
@@ -1602,9 +2005,10 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
     let vm_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let rfq_state_store: Arc<StateStore> = Arc::new(StateStore::new(Arc::clone(&token_store)));
     let state = AppState {
+        chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
         chain: Chain::Ethereum,
         rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec!["rocketpool".to_string()]),
+        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -1622,7 +2026,6 @@ async fn encode_route_rejects_mixed_route_with_unsupported_erc4626_hop() -> Resu
         },
         enable_vm_pools: false,
         enable_rfq_pools: false,
-        native_progress_lease: Duration::from_secs(120),
         optional_backend_stale: Duration::from_secs(120),
         request_timeout: Duration::from_secs(2),
         vm_simulation_rebuild_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1726,5 +2129,254 @@ async fn encode_route_times_out_during_slow_resimulation() -> Result<()> {
     let response: EncodeErrorResponse = serde_json::from_slice(&body)?;
     assert_eq!(response.error, "Encode request timed out after 20ms");
     assert_eq!(response.request_id.as_deref(), Some("req-1"));
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedCalldataFixtures {
+    approval: ExpectedInteraction,
+    scenarios: Vec<ExpectedCalldataScenario>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedCalldataScenario {
+    name: String,
+    chain_id: u64,
+    protocol: String,
+    token_in: String,
+    token_out: String,
+    receiver: String,
+    function_selector: String,
+    router: ExpectedInteraction,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ExpectedInteraction {
+    kind: InteractionKind,
+    target: String,
+    value: String,
+    calldata: String,
+}
+
+fn base_calldata_fixture_configs() -> Vec<(&'static str, EncodeFixtureConfig<'static>)> {
+    let base_config = || EncodeFixtureConfig {
+        chain: Chain::Base,
+        pool_id: "0x0000000000000000000000000000000000000009",
+        component_address_hex: "0x0000000000000000000000000000000000000009",
+        reset_allowance: false,
+        ..EncodeFixtureConfig::default()
+    };
+    vec![
+        (
+            "base_uniswap_v2",
+            EncodeFixtureConfig {
+                request_id: "fixture-base-uniswap-v2",
+                ..base_config()
+            },
+        ),
+        (
+            "base_uniswap_v3",
+            EncodeFixtureConfig {
+                request_pool_protocol: "uniswap_v3",
+                component_protocol_system: "uniswap_v3",
+                component_protocol_type_name: "uniswap_v3",
+                component_static_attributes: HashMap::from([(
+                    "fee".to_string(),
+                    Bytes::from(500_u32),
+                )]),
+                request_id: "fixture-base-uniswap-v3",
+                ..base_config()
+            },
+        ),
+        (
+            "base_pancakeswap_v3",
+            EncodeFixtureConfig {
+                request_pool_protocol: "pancakeswap_v3",
+                component_protocol_system: "pancakeswap_v3",
+                component_protocol_type_name: "pancakeswap_v3",
+                component_static_attributes: HashMap::from([(
+                    "fee".to_string(),
+                    Bytes::from(500_u32),
+                )]),
+                request_id: "fixture-base-pancakeswap-v3",
+                ..base_config()
+            },
+        ),
+        (
+            "base_uniswap_v4",
+            EncodeFixtureConfig {
+                pool_id: "0x0000000000000000000000000000000000000000000000000000000000000009",
+                component_address_hex:
+                    "0x0000000000000000000000000000000000000000000000000000000000000009",
+                request_pool_protocol: "uniswap_v4",
+                component_protocol_system: "uniswap_v4",
+                component_protocol_type_name: "uniswap_v4_pool",
+                component_static_attributes: HashMap::from([
+                    ("key_lp_fee".to_string(), Bytes::from(500_u32)),
+                    ("tick_spacing".to_string(), Bytes::from(10_u32)),
+                ]),
+                vm_pool: true,
+                enable_vm_pools: true,
+                request_id: "fixture-base-uniswap-v4",
+                ..base_config()
+            },
+        ),
+        (
+            "base_aerodrome_slipstreams",
+            EncodeFixtureConfig {
+                request_pool_protocol: "aerodrome_slipstreams",
+                component_protocol_system: "aerodrome_slipstreams",
+                component_protocol_type_name: "aerodrome_slipstreams",
+                component_static_attributes: HashMap::from([(
+                    "tick_spacing".to_string(),
+                    Bytes::from(100_u32),
+                )]),
+                request_id: "fixture-base-aerodrome-slipstreams",
+                ..base_config()
+            },
+        ),
+        (
+            "base_bebop",
+            EncodeFixtureConfig {
+                request_pool_protocol: "rfq:bebop",
+                component_protocol_system: "rfq:bebop",
+                component_protocol_type_name: "bebop_pool",
+                rfq_pool: true,
+                enable_rfq_pools: true,
+                // Keep the ten-unit calldata fixture above the new $1 book minimum.
+                token_decimals: 0,
+                request_id: "fixture-base-bebop",
+                ..base_config()
+            },
+        ),
+    ]
+}
+
+fn calldata_address_word(calldata: &str, word_index: usize) -> Result<String> {
+    const SELECTOR_BYTES: usize = 4;
+    const ABI_WORD_BYTES: usize = 32;
+    const ADDRESS_BYTES: usize = 20;
+
+    let calldata = hex_to_bytes(calldata)?;
+    let address_start =
+        SELECTOR_BYTES + (word_index * ABI_WORD_BYTES) + (ABI_WORD_BYTES - ADDRESS_BYTES);
+    let address_end = address_start + ADDRESS_BYTES;
+    let address = calldata
+        .get(address_start..address_end)
+        .ok_or_else(|| anyhow!("router calldata is missing ABI word {word_index}"))?;
+    Ok(format!("0x{}", alloy_primitives::hex::encode(address)))
+}
+
+#[tokio::test]
+async fn encode_route_calldata_matches_committed_fixtures() -> Result<()> {
+    let expected_fixture: ExpectedCalldataFixtures =
+        serde_json::from_str(include_str!("fixtures/encode_calldata.json"))?;
+    let configs = base_calldata_fixture_configs();
+    assert_eq!(expected_fixture.scenarios.len(), configs.len());
+
+    for (expected, (name, config)) in expected_fixture.scenarios.iter().zip(configs) {
+        assert_eq!(expected.name, name);
+        let (app, request) = setup_app_state_and_request(config).await?;
+        let (status, body) = post_encode(app, &request).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{name} returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let response: RouteEncodeResponse = serde_json::from_slice(&body)?;
+
+        assert_eq!(expected.chain_id, request.chain_id, "{name} chain");
+        assert_eq!(
+            expected.protocol, request.segments[0].hops[0].swaps[0].pool.protocol,
+            "{name} protocol"
+        );
+        assert_eq!(expected.token_in, request.token_in, "{name} token in");
+        assert_eq!(expected.token_out, request.token_out, "{name} token out");
+        assert_eq!(
+            expected.receiver, request.settlement_address,
+            "{name} receiver"
+        );
+        assert_eq!(response.interactions.len(), 2, "{name} interaction count");
+        let approval = &response.interactions[0];
+        assert_eq!(
+            approval.kind, expected_fixture.approval.kind,
+            "{name} approval kind"
+        );
+        assert_eq!(
+            approval.target, expected_fixture.approval.target,
+            "{name} approval target"
+        );
+        assert_eq!(
+            approval.value, expected_fixture.approval.value,
+            "{name} approval value"
+        );
+        assert_eq!(
+            approval.calldata, expected_fixture.approval.calldata,
+            "{name} approval calldata"
+        );
+
+        let router_call = &response.interactions[1];
+        assert_eq!(router_call.kind, expected.router.kind, "{name} router kind");
+        assert_eq!(
+            router_call.target, expected.router.target,
+            "{name} router fixture target"
+        );
+        assert_eq!(
+            router_call.value, expected.router.value,
+            "{name} router value"
+        );
+        assert_eq!(
+            router_call.calldata, expected.router.calldata,
+            "{name} router calldata"
+        );
+        assert_eq!(
+            router_call.target, request.tycho_router_address,
+            "{name} router target"
+        );
+        assert_eq!(
+            &router_call.calldata[..10],
+            expected.function_selector,
+            "{name} function selector"
+        );
+        assert_eq!(
+            calldata_address_word(&router_call.calldata, 1)?,
+            expected.token_in.to_lowercase(),
+            "{name} calldata token in"
+        );
+        assert_eq!(
+            calldata_address_word(&router_call.calldata, 2)?,
+            expected.token_out.to_lowercase(),
+            "{name} calldata token out"
+        );
+        assert_eq!(
+            calldata_address_word(&router_call.calldata, 6)?,
+            expected.receiver.to_lowercase(),
+            "{name} calldata receiver"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn encode_service_reports_single_attempt_amounts() -> Result<()> {
+    let (_, config) = base_calldata_fixture_configs()
+        .into_iter()
+        .find(|(name, _)| *name == "base_uniswap_v2")
+        .ok_or_else(|| anyhow!("missing Base Uniswap v2 fixture configuration"))?;
+    let (state, request) = build_app_state_and_request(config).await?;
+    let expected_amount_out = request.amount_in.clone();
+    let computation = EncodeService::new(state)
+        .encode(request)
+        .await
+        .map_err(|error| anyhow!("encode failed: {error:?}"))?
+        .computation;
+
+    assert_eq!(computation.attempts, 1);
+    assert_eq!(computation.expected_amount_out, expected_amount_out);
+    assert_eq!(computation.amount_out_delta, "2");
+    assert!(!computation.reset_approval);
     Ok(())
 }
