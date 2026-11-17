@@ -13,6 +13,7 @@ use futures::StreamExt;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use serde_json::Value;
+use simulator_core::broadcaster::wire::FeedMessage;
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
     BroadcasterSnapshotPartition, BroadcasterTokenSnapshotResponse, BroadcasterUpdatePartition,
@@ -21,7 +22,7 @@ use tokio::{sync::RwLock, time::Instant};
 use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
     protocol::models::{ProtocolComponent, Update},
-    tycho_client::feed::{BlockHeader, FeedMessage},
+    tycho_client::feed::BlockHeader,
     tycho_common::{
         models::{token::Token, Chain},
         simulation::protocol_sim::ProtocolSim,
@@ -83,6 +84,7 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
     let (controls, state_store, protocols) = build_vm_controls(&config.broadcaster_url).await?;
     let decoder = build_broadcaster_subscription_decoder(
         controls.tokens(),
+        Chain::Ethereum,
         BroadcasterBackend::Vm,
         &protocols,
     )
@@ -90,6 +92,7 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
     .context("failed to build real VM broadcaster decoder")?;
     let evidence_decoder = build_broadcaster_subscription_decoder(
         controls.tokens(),
+        Chain::Ethereum,
         BroadcasterBackend::Vm,
         &protocols,
     )
@@ -878,7 +881,7 @@ async fn decode_protocol_message(
         sync_states,
     };
     decoder
-        .decode(&feed)
+        .decode(&feed.into())
         .await
         .map_err(|error| anyhow!("failed to decode broadcaster raw payload: {error}"))
 }

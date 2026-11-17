@@ -16,11 +16,16 @@ impl PoolBackend {
                 ProtocolKind::Curve
                 | ProtocolKind::BalancerV2
                 | ProtocolKind::MaverickV2
-                | ProtocolKind::UniswapV4,
+                | ProtocolKind::UniswapV4
+                | ProtocolKind::PancakeswapInfinityCl,
             ) => Self::Vm,
-            Some(ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice) => {
-                Self::Rfq
-            }
+            Some(
+                ProtocolKind::Hashflow
+                | ProtocolKind::Bebop
+                | ProtocolKind::Liquorice
+                | ProtocolKind::NativeRfq
+                | ProtocolKind::Metric,
+            ) => Self::Rfq,
             _ => Self::Native,
         }
     }

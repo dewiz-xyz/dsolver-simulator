@@ -30,7 +30,7 @@ use tycho_execution::encoding::errors::EncodingError;
 use tycho_execution::encoding::models::{EncodedSolution, Solution, Transaction};
 use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::protocol::models::{ProtocolComponent, Update};
-use tycho_simulation::rfq::protocols::bebop::{client::BebopClient, state::BebopState};
+use tycho_simulation::rfq::protocols::bebop::state::BebopState;
 use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
 use tycho_simulation::tycho_common::models::{token::Token, Chain};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
@@ -365,6 +365,7 @@ impl Drop for ScopedEnvVar {
 struct EncodeFixtureConfig<'a> {
     chain: Chain,
     pool_id: &'a str,
+    amount_in: &'a str,
     min_amount_out: &'a str,
     token_in_hex: &'a str,
     token_out_hex: &'a str,
@@ -393,6 +394,7 @@ impl Default for EncodeFixtureConfig<'_> {
         Self {
             chain: Chain::Ethereum,
             pool_id: "pool-1",
+            amount_in: "10",
             min_amount_out: "8",
             token_in_hex: "0x0000000000000000000000000000000000000001",
             token_out_hex: "0x0000000000000000000000000000000000000002",
@@ -481,7 +483,6 @@ async fn build_fixture_stores(
         Box::new(build_bebop_state(
             &fixture_tokens.token_in_meta,
             &fixture_tokens.token_out_meta,
-            config.chain,
         )?)
     } else {
         Box::new(EchoAmountSim)
@@ -499,27 +500,18 @@ async fn build_fixture_stores(
     Ok((native_state_store, vm_state_store, rfq_state_store))
 }
 
-fn build_bebop_state(token_in: &Token, token_out: &Token, chain: Chain) -> Result<BebopState> {
-    let client = BebopClient::new(
-        chain,
-        HashSet::new(),
-        100.0,
-        "snapshot-user".to_string(),
-        "snapshot-key".to_string(),
-        HashSet::new(),
-        Duration::from_secs(5),
-    )?;
+fn build_bebop_state(token_in: &Token, token_out: &Token) -> Result<BebopState> {
     Ok(serde_json::from_value(serde_json::json!({
         "base_token": token_in,
         "quote_token": token_out,
-        "price_data": {
-            "base": token_in.address.to_vec(),
-            "quote": token_out.address.to_vec(),
+        "book": {
+            "base": token_in.address,
+            "quote": token_out.address,
             "last_update_ts": 1,
-            "bids": [2.0, 100.0],
-            "asks": [2.0, 100.0],
+            "bids": [{"price": 2.0, "quantity": 100.0}],
+            "asks": [{"price": 2.0, "quantity": 100.0}],
         },
-        "client": client,
+        "usd_per_quote_token": 1.0,
     }))?)
 }
 
@@ -578,7 +570,7 @@ fn build_route_encode_request(
         chain_id: config.chain.id(),
         token_in: config.token_in_hex.to_string(),
         token_out: config.token_out_hex.to_string(),
-        amount_in: "10".to_string(),
+        amount_in: config.amount_in.to_string(),
         min_amount_out: config.min_amount_out.to_string(),
         settlement_address: settlement,
         tycho_router_address: router,
@@ -1144,6 +1136,7 @@ async fn encode_route_succeeds_for_rfq_route_from_broadcaster_snapshot() -> Resu
         component_protocol_type_name: "bebop_pool",
         rfq_pool: true,
         enable_rfq_pools: true,
+        amount_in: "1000000000000000000",
         request_id: "req-rfq-indicative-only",
         ..EncodeFixtureConfig::default()
     };
@@ -1171,6 +1164,7 @@ async fn encode_route_succeeds_for_rfq_pool_when_request_hint_is_native() -> Res
         component_protocol_type_name: "bebop_pool",
         rfq_pool: true,
         enable_rfq_pools: true,
+        amount_in: "1000000000000000000",
         request_id: "req-rfq-actual-backend",
         ..EncodeFixtureConfig::default()
     };
@@ -1198,6 +1192,7 @@ async fn encode_route_keeps_rfq_unavailable_for_type_hint_after_reset() -> Resul
         component_protocol_type_name: "hashflow_pool",
         rfq_pool: true,
         enable_rfq_pools: true,
+        amount_in: "1000000000000000000",
         request_id: "req-rfq-reset-type-hint",
         ..EncodeFixtureConfig::default()
     };

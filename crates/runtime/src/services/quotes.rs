@@ -1422,7 +1422,9 @@ fn simulation_tokens_for_pool_with_remap_log(
 
 fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolComponent) -> Token {
     let native = request_token.chain.native_token();
-    let wrapped_native = request_token.chain.wrapped_native_token();
+    let Some(wrapped_native) = request_token.chain.wrapped_native_token() else {
+        return request_token.clone();
+    };
 
     if native.address == wrapped_native.address {
         return request_token.clone();
@@ -2832,7 +2834,9 @@ mod tests {
     fn remap_request_token_for_pool_maps_wrapped_to_native_for_native_only_pool() {
         let chain = Chain::Ethereum;
         let native = chain.native_token();
-        let wrapped = chain.wrapped_native_token();
+        let wrapped = chain
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let token_x = make_token(&Bytes::from([9u8; 20]), "TKX");
         let component = ProtocolComponent::new(
             Bytes::from([1u8; 20]),
@@ -2855,7 +2859,9 @@ mod tests {
     fn remap_request_token_for_pool_maps_native_to_wrapped_for_wrapped_only_pool() {
         let chain = Chain::Ethereum;
         let native = chain.native_token();
-        let wrapped = chain.wrapped_native_token();
+        let wrapped = chain
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let token_x = make_token(&Bytes::from([10u8; 20]), "TKX");
         let component = ProtocolComponent::new(
             Bytes::from([2u8; 20]),
@@ -2901,7 +2907,9 @@ mod tests {
     fn remap_request_token_for_pool_keeps_native_and_wrapped_when_pool_has_both() {
         let chain = Chain::Ethereum;
         let native = chain.native_token();
-        let wrapped = chain.wrapped_native_token();
+        let wrapped = chain
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let token_x = make_token(&Bytes::from([12u8; 20]), "TKX");
         let component = ProtocolComponent::new(
             Bytes::from([4u8; 20]),
@@ -3761,7 +3769,11 @@ mod tests {
         );
 
         let native = Chain::Ethereum.native_token().address.to_string();
-        let wrapped = Chain::Ethereum.wrapped_native_token().address.to_string();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address
+            .to_string();
         for (request_id, token_in, token_out) in [
             ("req-native-to-wrapped", native.clone(), wrapped.clone()),
             ("req-wrapped-to-native", wrapped.clone(), native.clone()),
@@ -4217,7 +4229,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
@@ -4284,7 +4299,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_prefers_exact_wrapped_pool_over_native_alias_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000006").expect("valid address");
@@ -4372,7 +4390,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_prefers_exact_native_pool_over_wrapped_alias_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000007").expect("valid address");
@@ -4460,7 +4481,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_remaps_wrapped_token_out_for_native_only_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_in =
             Bytes::from_str("0x0000000000000000000000000000000000000008").expect("valid address");
@@ -4527,7 +4551,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_vm_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000004").expect("valid address");
@@ -4784,7 +4811,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_filters_wrong_direction_hashflow_candidate_before_simulation() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let token_in =
             Bytes::from_str("0x0000000000000000000000000000000000000101").expect("valid address");
         let token_out = wrapped_native.clone();
@@ -4871,7 +4901,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_filters_wrong_direction_liquorice_candidate_before_simulation() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let token_in =
             Bytes::from_str("0x0000000000000000000000000000000000000107").expect("valid address");
         let token_out = wrapped_native.clone();
@@ -5027,7 +5060,10 @@ mod tests {
     #[tokio::test]
     async fn get_amounts_out_keeps_hashflow_candidate_after_native_wrapped_remap() {
         let native = Chain::Ethereum.native_token().address;
-        let wrapped = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"))
+            .address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000121").expect("valid address");
 

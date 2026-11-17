@@ -1393,7 +1393,7 @@ impl StateStore {
     ) -> UpdateMetrics {
         let mut replacement = (*current).clone();
         replacement.version = state_version;
-        let block_number = update.block_number_or_timestamp;
+        let block_number = update.block_number;
         replacement.block_number = block_number;
         let mut stats = UpdateAccumulator::default();
 

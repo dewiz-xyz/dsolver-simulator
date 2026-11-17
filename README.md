@@ -94,6 +94,8 @@ Common optional inputs:
 - `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ pool feeds (defaults to `false`)
 - `BEBOP_USER`, `BEBOP_KEY`, `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY` only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
+- `NATIVE_API_KEY` and `METRIC_API_KEY` for the Base broadcaster when RFQ is enabled
+- `RFQ_MIN_TVL_USD` for the RFQ book liquidity floor (default `100` USD; separate from on-chain `TVL_THRESHOLD`)
 - `HOST` and `PORT` to change the bind address
 - `BROADCASTER_TOKEN_MIN_QUALITY` to tune the broadcaster's startup Tycho token quality floor
 - `BROADCASTER_SNAPSHOT_MAX_PAYLOAD_BYTES` to cap serialized HTTP snapshot payloads
@@ -121,6 +123,24 @@ Broadcaster deployments use four modes:
 - `Unhealthy` fails closed until it recovers or is replaced.
 
 Redis append and snapshot-session creation are fenced so stale writers cannot publish after promotion. A same-process reconnect keeps the writer generation and publishes a private full-replacement recovery transaction through the existing Redis stream. Consumers expose that replacement only after its commit, then apply ordered catch-up entries. Invalid, incomplete, or trimmed recovery data fails closed and falls back to a fresh HTTP bootstrap. Each simulator uses its own `XREAD` position; the design does not use Redis consumer groups or per-deployment stream keys.
+
+## Base broadcasting and Tycho 0.526.0
+
+The Base profile subscribes to all 12 on-chain systems advertised by the configured hosted endpoint as checked on 2026-11-17. New subscriptions are Sushi V2, Aerodrome V1, Aero Basic, Aero CL, Pancake Infinity CL, LunarBase, and Ekubo V3. Infinity Bin and Biconomy have decoder registrations but remain disabled because the endpoint does not advertise them.
+
+With `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true`, the broadcaster also runs Bebop, Native (`rfq:native`), and Metric (`rfq:metric`). Set the existing Bebop credentials plus `NATIVE_API_KEY` and `METRIC_API_KEY` in the broadcaster environment. Metric is a pAMM book feed; it uses the same RFQ backend, serialized protocol-state snapshots, and Redis updates as Bebop. Complete books replace that provider's previous set; missing, expired, or ended books emit removals without removing another provider's liquidity. The upstream defaults expire Native snapshots after 30 seconds and Metric snapshots after 15 seconds.
+
+Native and Metric support broadcasting and simulation. Their `/encode` requests return an explicit unsupported error; adding settlement support is a separate step. New on-chain source settlement support is also not established by broadcaster support. Existing Bebop/Hashflow signing clients are rebuilt locally from the serialized books, preserving the original pricing state and request timeout.
+
+This upgrade changes serialized Tycho state internals. Upgrade downstream simulation consumers to the same Tycho release before enabling these feeds; bootstrap a fresh snapshot and use a separate Redis stream key for an isolated rollout. Do not mix old RFQ snapshots with the new consumer. The outer HTTP/Redis transport envelope remains unchanged. The execution fork's small compatibility patch is documented in [vendor/tycho-execution/COMPATIBILITY.md](vendor/tycho-execution/COMPATIBILITY.md).
+
+To verify the two live feeds with credentials supplied through the environment:
+
+```bash
+cargo nextest run --workspace -E 'test(live_base_native_and_metric_broadcast)' --run-ignored only --nocapture
+```
+
+This read-only probe checks Base WETH/USDC/cbBTC books through the actual feed adapter, snapshot cache, and serialized update decoding. It does not request signed quotes or submit transactions.
 
 ## API Surface
 

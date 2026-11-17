@@ -113,8 +113,12 @@ impl TokenStore {
         self.tokens.read().await.get(address).cloned()
     }
 
+    pub fn chain(&self) -> Chain {
+        self.chain
+    }
+
     pub fn wrapped_native_token(&self) -> Option<Bytes> {
-        let address = self.chain.wrapped_native_token().address;
+        let address = self.chain.wrapped_native_token()?.address;
         (address != native_token_address()).then_some(address)
     }
 
@@ -304,7 +308,7 @@ impl TokenStore {
         let maybe_token = tokens
             .into_iter()
             .find(|token| token.address == *address)
-            .and_then(|token| Token::try_from(token).ok());
+            .map(Token::from);
 
         if let Some(token) = maybe_token {
             self.tokens

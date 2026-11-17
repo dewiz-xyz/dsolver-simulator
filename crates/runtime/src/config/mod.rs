@@ -184,7 +184,24 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     let (bebop_user, bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
         load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
+    let native_key = load_single_provider_key(
+        rfq_enabled && rfq_protocol_enabled(&chain_profile.rfq_protocols, "rfq:native"),
+        "NATIVE_API_KEY",
+    );
+    let metric_key = load_single_provider_key(
+        rfq_enabled && rfq_protocol_enabled(&chain_profile.rfq_protocols, "rfq:metric"),
+        "METRIC_API_KEY",
+    );
+    let rfq_min_tvl_usd: f64 = parse_env_or_default("RFQ_MIN_TVL_USD", "100");
+    assert!(
+        rfq_min_tvl_usd.is_finite() && rfq_min_tvl_usd >= 0.0,
+        "RFQ_MIN_TVL_USD must be a finite non-negative number"
+    );
+
     BroadcasterConfig {
+        native_key,
+        metric_key,
+        rfq_min_tvl_usd,
         chain_profile,
         tycho_url: resolved_chain.tycho_url,
         bebop_url: resolved_chain.bebop_url,
@@ -214,6 +231,14 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         hashflow_user,
         liquorice_key,
         liquorice_user,
+    }
+}
+
+fn load_single_provider_key(enabled: bool, key: &str) -> String {
+    if enabled {
+        require_trimmed_env(key)
+    } else {
+        String::new()
     }
 }
 
@@ -686,6 +711,9 @@ pub struct AppConfig {
 
 #[derive(Clone)]
 pub struct BroadcasterConfig {
+    pub native_key: String,
+    pub metric_key: String,
+    pub rfq_min_tvl_usd: f64,
     pub chain_profile: ChainProfile,
     pub tycho_url: String,
     pub bebop_url: String,
@@ -825,13 +853,15 @@ mod tests {
         "BROADCASTER_REDIS_APPEND_RETRY_WINDOW_MS",
         "BROADCASTER_REDIS_MAXLEN",
     ];
-    const RFQ_CREDENTIAL_ENV_KEYS: [&str; 6] = [
+    const RFQ_CREDENTIAL_ENV_KEYS: [&str; 8] = [
         "BEBOP_USER",
         "BEBOP_KEY",
         "HASHFLOW_USER",
         "HASHFLOW_KEY",
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
+        "NATIVE_API_KEY",
+        "METRIC_API_KEY",
     ];
 
     fn clear_slippage_env() {
@@ -904,7 +934,7 @@ mod tests {
         }
     }
 
-    const CONFIG_TEST_ENV_KEYS: [&str; 12] = [
+    const CONFIG_TEST_ENV_KEYS: [&str; 15] = [
         "CHAIN_ID",
         "ENABLE_RFQ_POOLS",
         "HASHFLOW_FILENAME_CSV",
@@ -917,6 +947,9 @@ mod tests {
         "HASHFLOW_KEY",
         "LIQUORICE_USER",
         "LIQUORICE_KEY",
+        "NATIVE_API_KEY",
+        "METRIC_API_KEY",
+        "RFQ_MIN_TVL_USD",
     ];
 
     fn manifest_path() -> std::path::PathBuf {
@@ -966,6 +999,7 @@ mod tests {
             .unwrap_or_else(|_| unreachable!("expected isolated test dir creation to succeed"));
         copy_manifest_to(&isolated_dir);
 
+        std::env::remove_var("RFQ_MIN_TVL_USD");
         std::env::set_var("CHAIN_ID", "1");
         std::env::set_var("ENABLE_RFQ_POOLS", "false");
         std::env::set_var("TYCHO_API_KEY", "test-api-key");
@@ -1528,6 +1562,39 @@ route_policy = " default "
         assert!(config.hashflow_key.is_empty());
         assert!(config.liquorice_user.is_empty());
         assert!(config.liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn base_broadcaster_requires_native_and_metric_keys_only_when_enabled() {
+        with_isolated_config_env(None, || {
+            clear_rfq_credential_env();
+            std::env::set_var("CHAIN_ID", "8453");
+            let disabled = load_broadcaster_config();
+            assert!(disabled.native_key.is_empty());
+            assert!(disabled.metric_key.is_empty());
+            std::env::set_var("ENABLE_RFQ_POOLS", "true");
+            std::env::set_var("BEBOP_USER", "bebop-user");
+            std::env::set_var("BEBOP_KEY", "bebop-key");
+            for (key, value) in [
+                ("NATIVE_API_KEY", "native-key"),
+                ("METRIC_API_KEY", "metric-key"),
+            ] {
+                let error = std::panic::catch_unwind(load_broadcaster_config)
+                    .err()
+                    .unwrap_or_else(|| unreachable!("missing provider key must fail"));
+                assert!(panic_message(error).contains(key));
+                std::env::set_var(key, format!(" {value} "));
+            }
+            std::env::set_var("RFQ_MIN_TVL_USD", "250");
+            let enabled = load_broadcaster_config();
+            assert_eq!(enabled.native_key, "native-key");
+            assert_eq!(enabled.metric_key, "metric-key");
+            assert_eq!(enabled.rfq_min_tvl_usd, 250.0);
+            for invalid in ["NaN", "inf", "-1"] {
+                std::env::set_var("RFQ_MIN_TVL_USD", invalid);
+                assert!(std::panic::catch_unwind(load_broadcaster_config).is_err());
+            }
+        });
     }
 
     #[test]

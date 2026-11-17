@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use simulator_core::broadcaster::wire::FeedMessage;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -9,7 +10,7 @@ use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
     evm::engine_db::SHARED_TYCHO_DB,
     protocol::models::{ProtocolComponent, Update},
-    tycho_client::feed::{BlockHeader, FeedMessage},
+    tycho_client::feed::BlockHeader,
     tycho_common::simulation::protocol_sim::ProtocolSim,
 };
 
@@ -65,7 +66,9 @@ impl BroadcasterSubscriptionProcessor {
         let mut processor = Self::with_decoder(
             expected_chain_id,
             controls,
-            Arc::new(TychoStreamDecoder::new()),
+            Arc::new(TychoStreamDecoder::new(
+                tycho_simulation::tycho_common::models::Chain::Ethereum,
+            )),
             rebuild,
         );
         processor.set_bootstrap_redis_replay_boundary(default_test_redis_replay_boundary());
@@ -379,7 +382,7 @@ impl BroadcasterSubscriptionProcessor {
             return Ok(());
         };
         if let Some(mut combined) = combined {
-            combined.block_number_or_timestamp = block_number;
+            combined.block_number = block_number;
             match state_version {
                 Some(state_version) => {
                     self.controls
@@ -445,7 +448,7 @@ impl BroadcasterSubscriptionProcessor {
                 sync_states,
             };
             let update =
-                self.decoder.decode(&feed).await.map_err(|error| {
+                self.decoder.decode(&feed.into()).await.map_err(|error| {
                     anyhow!("failed to decode broadcaster raw payload: {error}")
                 })?;
             combined = Some(match combined {

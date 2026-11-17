@@ -370,6 +370,7 @@ async fn prepare_broadcaster_redis_subscription(
     for (index, controls) in controls.iter().enumerate() {
         let decoder = match build_broadcaster_subscription_decoder(
             controls.tokens(),
+            controls.tokens().chain(),
             controls.backend(),
             controls.protocols(),
         )

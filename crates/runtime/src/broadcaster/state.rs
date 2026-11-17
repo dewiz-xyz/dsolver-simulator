@@ -3,18 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context, Result};
+use simulator_core::broadcaster::wire::{FeedMessage, Snapshot, StateSyncMessage};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
 use tycho_simulation::{
     protocol::models::Update as TychoUpdate,
-    tycho_client::feed::{
-        synchronizer::{Snapshot, StateSyncMessage},
-        BlockHeader, FeedMessage, SynchronizerState,
-    },
+    tycho_client::feed::{BlockHeader, SynchronizerState},
     tycho_common::{
         dto::{
-            AccountBalance, AccountUpdate, BlockChanges, ChangeType, ProtocolStateDelta,
+            AccountBalance, AccountUpdate, BlockAggregatedChanges, ChangeType, ProtocolStateDelta,
             ResponseAccount,
         },
         Bytes,
@@ -1610,7 +1608,7 @@ fn merge_raw_message(
             .unwrap_or_default();
         existing.message = existing.message.merge(incoming.message);
         if let Some(deltas) = existing.message.deltas.as_mut() {
-            // BlockChanges::merge omits new_tokens and dci_update, so preserve them explicitly.
+            // BlockAggregatedChanges::merge omits new_tokens and dci_update, so preserve them explicitly.
             deltas.new_tokens.extend(incoming_new_tokens);
             for (component_id, entrypoints) in incoming_dci_update.new_entrypoints {
                 deltas
@@ -1717,11 +1715,11 @@ fn compact_raw_state_sync_message(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the accumulator applies one BlockChanges transaction in field order"
+    reason = "the accumulator applies one BlockAggregatedChanges transaction in field order"
 )]
 fn fold_block_changes_into_snapshot(
     snapshots: &mut Snapshot,
-    deltas: &mut BlockChanges,
+    deltas: &mut BlockAggregatedChanges,
 ) -> RawCompactionStats {
     let mut stats = RawCompactionStats::default();
 
@@ -1842,7 +1840,7 @@ fn fold_block_changes_into_snapshot(
 }
 
 fn apply_protocol_delta_to_snapshot(
-    component: &mut tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
+    component: &mut simulator_core::broadcaster::wire::ComponentWithState,
     delta: ProtocolStateDelta,
 ) {
     for attribute in delta.deleted_attributes {
@@ -1861,7 +1859,7 @@ fn fold_account_update_into_snapshot(account: &mut ResponseAccount, update: Acco
     }
 }
 
-fn block_changes_has_bootstrap_residue(deltas: &BlockChanges) -> bool {
+fn block_changes_has_bootstrap_residue(deltas: &BlockAggregatedChanges) -> bool {
     !deltas.new_tokens.is_empty()
         || !deltas.account_updates.is_empty()
         || !deltas.state_updates.is_empty()
@@ -1873,6 +1871,8 @@ fn block_changes_has_bootstrap_residue(deltas: &BlockChanges) -> bool {
         || !deltas.dci_update.new_entrypoints.is_empty()
         || !deltas.dci_update.new_entrypoint_params.is_empty()
         || !deltas.dci_update.trace_results.is_empty()
+        || !deltas.paused_components.is_empty()
+        || !deltas.unpaused_components.is_empty()
 }
 
 fn raw_residue_entry_count(message: &StateSyncMessage<BlockHeader>) -> usize {
@@ -1888,6 +1888,8 @@ fn raw_residue_entry_count(message: &StateSyncMessage<BlockHeader>) -> usize {
             + deltas.dci_update.new_entrypoints.len()
             + deltas.dci_update.new_entrypoint_params.len()
             + deltas.dci_update.trace_results.len()
+            + deltas.paused_components.len()
+            + deltas.unpaused_components.len()
     });
     delta_entries + message.removed_components.len()
 }
@@ -2288,7 +2290,7 @@ impl<'a> ProtocolTailFragmentBuilder<'a> {
         &mut self,
         kind: &str,
         entries: &HashMap<K, V>,
-        insert: impl Fn(&mut BlockChanges, K, V),
+        insert: impl Fn(&mut BlockAggregatedChanges, K, V),
     ) -> Result<()>
     where
         K: Clone + Eq + std::hash::Hash + Ord + std::fmt::Debug,
@@ -2388,8 +2390,8 @@ impl<'a> ProtocolTailFragmentBuilder<'a> {
     }
 }
 
-fn empty_block_changes_fragment(source: &BlockChanges) -> BlockChanges {
-    BlockChanges {
+fn empty_block_changes_fragment(source: &BlockAggregatedChanges) -> BlockAggregatedChanges {
+    BlockAggregatedChanges {
         extractor: source.extractor.clone(),
         chain: source.chain,
         block: source.block.clone(),
@@ -2405,6 +2407,8 @@ fn empty_block_changes_fragment(source: &BlockChanges) -> BlockChanges {
         component_tvl: HashMap::new(),
         dci_update: Default::default(),
         partial_block_index: source.partial_block_index,
+        paused_components: source.paused_components.clone(),
+        unpaused_components: source.unpaused_components.clone(),
     }
 }
 
@@ -2781,6 +2785,9 @@ mod tests {
     };
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
+    use simulator_core::broadcaster::wire::{
+        ComponentWithState, FeedMessage, Snapshot, StateSyncMessage,
+    };
     use simulator_core::broadcaster::{
         BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage,
         BroadcasterProtocolSyncStatus, BroadcasterProtocolSyncStatusKind, BroadcasterSnapshotChunk,
@@ -2788,7 +2795,7 @@ mod tests {
     };
     use tycho_common::{
         dto::{
-            AccountBalance, AccountUpdate, BlockChanges, ChangeType, ComponentBalance,
+            AccountBalance, AccountUpdate, BlockAggregatedChanges, ChangeType, ComponentBalance,
             ProtocolComponent as DtoProtocolComponent, ResponseAccount, ResponseProtocolState,
             ResponseToken, TokenBalances,
         },
@@ -2799,10 +2806,7 @@ mod tests {
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
-        tycho_client::feed::{
-            synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
-            BlockHeader, FeedMessage, SynchronizerState,
-        },
+        tycho_client::feed::{BlockHeader, SynchronizerState},
         tycho_common::{
             models::{token::Token, Chain},
             simulation::protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -3353,7 +3357,7 @@ mod tests {
         );
 
         for block_number in 2..=20 {
-            let mut changes = BlockChanges::default();
+            let mut changes = BlockAggregatedChanges::default();
             changes.state_updates.insert(
                 component_id.to_string(),
                 component_state_delta(
@@ -3406,7 +3410,7 @@ mod tests {
     fn raw_cache_keeps_unfoldable_component_residue() {
         let component_id = "missing";
         let token = DtoBytes::from([18u8; 20]);
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         changes.state_updates.insert(
             component_id.to_string(),
             component_state_delta(component_id, [("version", DtoBytes::from([2u8; 32]))], []),
@@ -3439,7 +3443,7 @@ mod tests {
         let mut messages = Vec::new();
         for block_number in 1..=2 {
             let token_address = DtoBytes::from([block_number as u8; 20]);
-            let mut changes = BlockChanges::default();
+            let mut changes = BlockAggregatedChanges::default();
             changes.new_tokens.insert(
                 token_address.clone(),
                 ResponseToken {
@@ -3488,7 +3492,7 @@ mod tests {
             None,
             HashMap::new(),
         );
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         changes.account_updates.insert(
             address.clone(),
             account_update(
@@ -3529,7 +3533,7 @@ mod tests {
         for address in [&creation, &deletion, &unspecified] {
             vm_storage.insert(address.clone(), raw_response_account(address.clone(), 0, 0));
         }
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         for (address, change, seed) in [
             (creation.clone(), ChangeType::Creation, 1),
             (deletion.clone(), ChangeType::Deletion, 2),
@@ -3567,7 +3571,7 @@ mod tests {
     #[test]
     fn raw_cache_account_creation_then_deletion_does_not_resurrect_on_bootstrap() {
         let address = DtoBytes::from([58u8; 20]);
-        let mut creation = BlockChanges::default();
+        let mut creation = BlockAggregatedChanges::default();
         creation.account_updates.insert(
             address.clone(),
             account_update(address.clone(), ChangeType::Creation, 1, None),
@@ -3584,7 +3588,7 @@ mod tests {
             ),
         );
 
-        let mut deletion = BlockChanges::default();
+        let mut deletion = BlockAggregatedChanges::default();
         deletion.account_updates.insert(
             address.clone(),
             account_update(address.clone(), ChangeType::Deletion, 2, None),
@@ -3612,7 +3616,7 @@ mod tests {
     fn raw_cache_prunes_removed_components_for_fresh_bootstrap() {
         let component_id = "removed";
         let account_address = DtoBytes::from([61u8; 20]);
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         changes.state_updates.insert(
             component_id.to_string(),
             component_state_delta(component_id, [("version", DtoBytes::from([2u8; 32]))], []),
@@ -3674,7 +3678,7 @@ mod tests {
         );
 
         for block_number in 11..=1_010 {
-            let mut changes = BlockChanges::default();
+            let mut changes = BlockAggregatedChanges::default();
             changes.state_updates.insert(
                 component_id.to_string(),
                 component_state_delta(
@@ -3734,7 +3738,7 @@ mod tests {
                 .ok_or_else(|| anyhow!("native partition missing"))?;
             for update_index in 0..UPDATE_COUNT {
                 let component_id = format!("raw-{:02}", update_index as usize % KEY_COUNT);
-                let mut changes = BlockChanges::default();
+                let mut changes = BlockAggregatedChanges::default();
                 changes.state_updates.insert(
                     component_id.clone(),
                     component_state_delta(
@@ -3812,7 +3816,7 @@ mod tests {
             .await?;
 
         for block_number in 11..=510 {
-            let mut changes = BlockChanges::default();
+            let mut changes = BlockAggregatedChanges::default();
             changes.state_updates.insert(
                 component_id.to_string(),
                 component_state_delta(
@@ -3983,7 +3987,7 @@ mod tests {
             "uniswap_v2",
             10,
             Snapshot::default(),
-            Some(BlockChanges::default()),
+            Some(BlockAggregatedChanges::default()),
             HashMap::new(),
         );
         let sizing_ctx = snapshot_chunk_build_context(usize::MAX);
@@ -4505,7 +4509,7 @@ mod tests {
         protocol: &str,
         block_number: u64,
         snapshots: Snapshot,
-        deltas: Option<BlockChanges>,
+        deltas: Option<BlockAggregatedChanges>,
         removed_components: HashMap<String, DtoProtocolComponent>,
     ) -> BroadcasterProtocolMessage {
         let header = block_header(block_number, block_number as u8);
@@ -4537,7 +4541,7 @@ mod tests {
     }
 
     fn residual_tail_message(entry_count: usize, value_size: usize) -> BroadcasterProtocolMessage {
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         for index in (0..entry_count).rev() {
             let component_id = format!("missing-{index:04}");
             changes.state_updates.insert(
@@ -4775,7 +4779,7 @@ mod tests {
         component_seed: u8,
     ) -> StateSyncMessage<BlockHeader> {
         let mut message = raw_snapshot_message(protocol, header, component_seed);
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         changes.state_updates.insert(
             "still-unresolved".to_string(),
             component_state_delta(
@@ -5270,7 +5274,7 @@ mod tests {
             .await?;
 
         let block_11 = linked_header(11, 11, 10);
-        let mut changes = BlockChanges::default();
+        let mut changes = BlockAggregatedChanges::default();
         changes.state_updates.insert(
             "pool-0001".to_string(),
             component_state_delta("pool-0001", [("value", DtoBytes::from([77u8; 32]))], []),
@@ -5481,7 +5485,7 @@ mod tests {
             StateSyncMessage {
                 header: block_11.clone(),
                 snapshots: Snapshot::default(),
-                deltas: Some(BlockChanges {
+                deltas: Some(BlockAggregatedChanges {
                     account_updates: HashMap::from([(address.clone(), update)]),
                     ..Default::default()
                 }),

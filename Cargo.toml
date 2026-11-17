@@ -7,6 +7,7 @@ members = [
     "crates/apps",
 ]
 resolver = "2"
+exclude = ["vendor/tycho-execution"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,9 +43,9 @@ toml = "0.8"
 tower = { version = "0.5", features = ["timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-tycho-common = "0.158.0"
-tycho-execution = { git = "ssh://git@github.com/pedrobergamini/dsolver-execution.git", rev = "46596c8" }
-tycho-simulation = "0.258.0"
+tycho-common = "=0.526.0"
+tycho-execution = { git = "ssh://git@github.com/dewiz-xyz/dsolver-execution.git", rev = "f4d444414c43d2cecf626139fd1749e11d15cba6" }
+tycho-simulation = "=0.526.0"
 typetag = "0.2"
 
 [workspace.lints.clippy]
@@ -63,3 +64,6 @@ trivially_copy_pass_by_ref = "warn"
 struct_excessive_bools = "warn"
 fn_params_excessive_bools = "warn"
 too_many_lines = "warn"
+
+[patch."ssh://git@github.com/dewiz-xyz/dsolver-execution.git"]
+tycho-execution = { path = "vendor/tycho-execution" }

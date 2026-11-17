@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,9 +8,7 @@ use tracing::debug;
 use tycho_simulation::{
     protocol::models::ProtocolComponent,
     rfq::protocols::{
-        bebop::{client::BebopClient, state::BebopState},
-        hashflow::{client::HashflowClient, state::HashflowState},
-        liquorice::{client::LiquoriceClient, state::LiquoriceState},
+        bebop::state::BebopState, hashflow::state::HashflowState, liquorice::state::LiquoriceState,
     },
     tycho_common::{
         models::{token::Token, Chain},
@@ -24,9 +22,7 @@ use crate::models::erc4626::{
 };
 use crate::models::state::{AppState, PublishedStatePin, RfqClientConfig, SimulationRebuildGuard};
 use crate::services::simulation_executor::{SimulationExecutionError, SimulationExecutor};
-use crate::services::stream_builder::{
-    ENCODE_RFQ_QUOTE_TIMEOUT, LIQUORICE_QUOTE_EXPIRY_SECS, RFQ_POLL_TIME,
-};
+use crate::services::stream_builder::ENCODE_RFQ_QUOTE_TIMEOUT;
 
 use super::allocation::allocate_swaps_by_bps;
 use super::backend::PoolBackend;
@@ -374,56 +370,29 @@ fn hydrate_rfq_pool_state(
     config: &RfqClientConfig,
     quote_timeout: Duration,
 ) -> Result<Arc<dyn ProtocolSim>, EncodeError> {
-    // Broadcaster serialization strips credentials, so rebuild only the request-scoped client.
-    // Firm quotes do not use the stream token filters carried by these clients.
-    if let Some(state) = pool_state.as_any().downcast_ref::<BebopState>() {
-        let mut hydrated = state.clone();
-        hydrated.client = BebopClient::new(
-            chain,
-            HashSet::new(),
-            config.tvl_threshold,
-            config.bebop_user.clone(),
-            config.bebop_key.clone(),
-            HashSet::new(),
-            quote_timeout,
-        )
-        .map_err(|err| rfq_hydration_error(pool_id, "Bebop", err))?;
-        return Ok(Arc::new(hydrated));
+    let bebop = pool_state.as_any().is::<BebopState>();
+    if bebop || pool_state.as_any().is::<HashflowState>() {
+        return super::rfq_hydration::hydrate(pool_state, chain, config, quote_timeout, bebop)
+            .map_err(|error| {
+                rfq_hydration_error(pool_id, if bebop { "Bebop" } else { "Hashflow" }, error)
+            });
     }
-
-    if let Some(state) = pool_state.as_any().downcast_ref::<HashflowState>() {
-        let mut hydrated = state.clone();
-        hydrated.client = HashflowClient::new(
-            chain,
-            HashSet::new(),
-            config.tvl_threshold,
-            HashSet::new(),
-            config.hashflow_user.clone(),
-            config.hashflow_key.clone(),
-            RFQ_POLL_TIME,
-            quote_timeout,
-        )
-        .map_err(|err| rfq_hydration_error(pool_id, "Hashflow", err))?;
-        return Ok(Arc::new(hydrated));
+    if pool_state.as_any().is::<LiquoriceState>() {
+        return Err(EncodeError::invalid(
+            "Liquorice encoding is not supported by the configured router",
+        ));
     }
-
-    if let Some(state) = pool_state.as_any().downcast_ref::<LiquoriceState>() {
-        let mut hydrated = state.clone();
-        hydrated.client = LiquoriceClient::new(
-            chain,
-            HashSet::new(),
-            config.tvl_threshold,
-            HashSet::new(),
-            config.liquorice_user.clone(),
-            config.liquorice_key.clone(),
-            RFQ_POLL_TIME,
-            quote_timeout,
-            LIQUORICE_QUOTE_EXPIRY_SECS,
-        )
-        .map_err(|err| rfq_hydration_error(pool_id, "Liquorice", err))?;
-        return Ok(Arc::new(hydrated));
+    if pool_state
+        .as_any()
+        .is::<tycho_simulation::rfq::protocols::native::state::NativeState>()
+        || pool_state
+            .as_any()
+            .is::<tycho_simulation::pamm::protocols::metric::state::MetricState>()
+    {
+        return Err(EncodeError::invalid(
+            "Native and Metric are broadcast-only providers; encoding is not enabled",
+        ));
     }
-
     Err(EncodeError::internal(format!(
         "RFQ pool {pool_id} has unsupported state type"
     )))
@@ -681,7 +650,9 @@ fn ensure_erc4626_swap_supported(
 
 fn map_swap_token(address: &Bytes, chain: Chain, keep_native_unwrapped: bool) -> Bytes {
     if !keep_native_unwrapped && *address == chain.native_token().address {
-        chain.wrapped_native_token().address
+        chain
+            .wrapped_native_token()
+            .map_or_else(|| address.clone(), |token| token.address)
     } else {
         address.clone()
     }
@@ -741,14 +712,12 @@ impl<'a> TokenCache<'a> {
     reason = "negative test assertions read more clearly in match form here"
 )]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use tycho_simulation::protocol::models::Update;
     use tycho_simulation::rfq::protocols::{
-        bebop::{client::BebopClient, state::BebopState},
-        hashflow::{client::HashflowClient, state::HashflowState},
-        liquorice::{client::LiquoriceClient, state::LiquoriceState},
+        bebop::state::BebopState, hashflow::state::HashflowState,
     };
 
     use super::*;
@@ -781,38 +750,26 @@ mod tests {
     }
 
     fn source_bebop_state(base_token: Token, quote_token: Token) -> BebopState {
-        let client = BebopClient::new(
-            Chain::Ethereum,
-            HashSet::new(),
-            1.0,
-            "snapshot-user".to_string(),
-            "snapshot-key".to_string(),
-            HashSet::new(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
         serde_json::from_value(serde_json::json!({
             "base_token": base_token,
             "quote_token": quote_token,
-            "price_data": {
-                "base": base_token.address.to_vec(),
-                "quote": quote_token.address.to_vec(),
+            "book": {
+                "base": base_token.address,
+                "quote": quote_token.address,
                 "last_update_ts": 1,
-                "bids": [2.0, 100.0],
-                "asks": [2.0, 100.0],
+                "bids": [{"price": 2.0, "quantity": 100.0}],
+                "asks": [{"price": 2.0, "quantity": 100.0}],
             },
-            "client": client,
+            "usd_per_quote_token": 13.0,
         }))
         .unwrap()
     }
 
     #[test]
-    fn hydrate_rfq_pool_state_replaces_bebop_client() {
-        let state = source_bebop_state(
-            dummy_token("0x0000000000000000000000000000000000000001"),
-            dummy_token("0x0000000000000000000000000000000000000002"),
-        );
-
+    fn hydrate_rfq_pool_state_preserves_bebop_pricing_and_omits_credentials() {
+        let base = dummy_token("0x0000000000000000000000000000000000000001");
+        let quote = dummy_token("0x0000000000000000000000000000000000000002");
+        let state = source_bebop_state(base.clone(), quote.clone());
         let hydrated = hydrate_rfq_pool_state(
             "pool-bebop",
             &state,
@@ -821,48 +778,31 @@ mod tests {
             ENCODE_RFQ_QUOTE_TIMEOUT,
         )
         .unwrap();
-        let hydrated = hydrated.as_any().downcast_ref::<BebopState>().unwrap();
-        let client = format!("{:?}", hydrated.client);
-
-        assert_eq!(hydrated.base_token, state.base_token);
-        assert_eq!(hydrated.quote_token, state.quote_token);
-        assert!(client.contains("runtime-bebop-user"));
-        assert!(client.contains("runtime-bebop-key"));
-        assert!(client.contains("tvl: 321.0"));
-        assert!(client.contains("quote_timeout: 3s"));
-        assert!(!client.contains("snapshot-user"));
+        let amount = BigUint::from(10_u64).pow(18);
+        let expected = state.get_amount_out(amount.clone(), &base, &quote).unwrap();
+        let actual = hydrated.get_amount_out(amount, &base, &quote).unwrap();
+        assert_eq!(actual.amount, expected.amount);
+        assert!(hydrated.as_indicatively_priced().is_ok());
+        assert!(actual.new_state.as_indicatively_priced().is_ok());
+        let serialized = serde_json::to_string(hydrated.as_ref()).unwrap();
+        assert!(!serialized.contains("runtime-bebop-key"));
+        assert!(serialized.contains("13.0"));
     }
 
     #[test]
-    fn hydrate_rfq_pool_state_replaces_hashflow_client() {
-        let base_token = dummy_token("0x0000000000000000000000000000000000000001");
-        let quote_token = dummy_token("0x0000000000000000000000000000000000000002");
-        let client = HashflowClient::new(
-            Chain::Ethereum,
-            HashSet::new(),
-            1.0,
-            HashSet::new(),
-            "snapshot-user".to_string(),
-            "snapshot-key".to_string(),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+    fn hydrate_rfq_pool_state_restores_hashflow_signing_without_changing_prices() {
+        let base = dummy_token("0x0000000000000000000000000000000000000001");
+        let quote = dummy_token("0x0000000000000000000000000000000000000002");
         let state: HashflowState = serde_json::from_value(serde_json::json!({
-            "base_token": base_token,
-            "quote_token": quote_token,
+            "base_token": base,
+            "quote_token": quote,
             "levels": {
-                "pair": {
-                    "baseToken": base_token.address.to_string(),
-                    "quoteToken": quote_token.address.to_string(),
-                },
-                "levels": [],
+                "pair": {"baseToken": base.address, "quoteToken": quote.address},
+                "levels": [{"q": "0.1", "p": "2"}, {"q": "100", "p": "2"}],
             },
             "market_maker": "maker",
-            "client": client,
         }))
         .unwrap();
-
         let hydrated = hydrate_rfq_pool_state(
             "pool-hashflow",
             &state,
@@ -871,64 +811,18 @@ mod tests {
             ENCODE_RFQ_QUOTE_TIMEOUT,
         )
         .unwrap();
-        let hydrated = hydrated.as_any().downcast_ref::<HashflowState>().unwrap();
-        let client = format!("{:?}", hydrated.client);
-
-        assert_eq!(hydrated.base_token, state.base_token);
-        assert_eq!(hydrated.quote_token, state.quote_token);
-        assert_eq!(hydrated.market_maker, state.market_maker);
-        assert!(client.contains("runtime-hashflow-user"));
-        assert!(client.contains("runtime-hashflow-key"));
-        assert!(client.contains("tvl: 321.0"));
-        assert!(client.contains("poll_time: 5s"));
-        assert!(client.contains("quote_timeout: 3s"));
-        assert!(!client.contains("snapshot-user"));
-    }
-
-    #[test]
-    fn hydrate_rfq_pool_state_replaces_liquorice_client() {
-        let base_token = dummy_token("0x0000000000000000000000000000000000000001");
-        let quote_token = dummy_token("0x0000000000000000000000000000000000000002");
-        let client = LiquoriceClient::new(
-            Chain::Ethereum,
-            HashSet::new(),
-            1.0,
-            HashSet::new(),
-            "snapshot-user".to_string(),
-            "snapshot-key".to_string(),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            1,
-        )
-        .unwrap();
-        let state: LiquoriceState = serde_json::from_value(serde_json::json!({
-            "base_token": base_token,
-            "quote_token": quote_token,
-            "prices_by_mm": {},
-            "client": client,
-        }))
-        .unwrap();
-
-        let hydrated = hydrate_rfq_pool_state(
-            "pool-liquorice",
-            &state,
-            Chain::Ethereum,
-            &rfq_client_config(),
-            ENCODE_RFQ_QUOTE_TIMEOUT,
-        )
-        .unwrap();
-        let hydrated = hydrated.as_any().downcast_ref::<LiquoriceState>().unwrap();
-        let client = format!("{:?}", hydrated.client);
-
-        assert_eq!(hydrated.base_token, state.base_token);
-        assert_eq!(hydrated.quote_token, state.quote_token);
-        assert!(client.contains("runtime-liquorice-user"));
-        assert!(client.contains("runtime-liquorice-key"));
-        assert!(client.contains("tvl: 321.0"));
-        assert!(client.contains("poll_time: 5s"));
-        assert!(client.contains("quote_timeout: 3s"));
-        assert!(client.contains("quote_expiry_secs: 300"));
-        assert!(!client.contains("snapshot-user"));
+        let amount = BigUint::from(10_u64).pow(18);
+        assert_eq!(
+            hydrated
+                .get_amount_out(amount.clone(), &base, &quote)
+                .unwrap()
+                .amount,
+            state.get_amount_out(amount, &base, &quote).unwrap().amount
+        );
+        assert!(hydrated.as_indicatively_priced().is_ok());
+        assert!(!serde_json::to_string(hydrated.as_ref())
+            .unwrap()
+            .contains("runtime-hashflow-key"));
     }
 
     #[test]
@@ -978,7 +872,7 @@ mod tests {
         let chain = Chain::Ethereum;
         let native = chain.native_token().address;
         let mapped = map_swap_token(&native, chain, false);
-        assert_eq!(mapped, chain.wrapped_native_token().address);
+        assert_eq!(mapped, chain.wrapped_native_token().unwrap().address);
     }
 
     #[test]

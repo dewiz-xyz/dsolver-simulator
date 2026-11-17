@@ -67,7 +67,7 @@ fn merge_snapshot_protocol_message(
     let mut merged_message = existing.message.clone().merge(incoming_message);
     merged_message.snapshots.vm_storage = merged_vm_storage;
     if let Some(deltas) = merged_message.deltas.as_mut() {
-        // BlockChanges::merge omits these bootstrap-only fields.
+        // BlockAggregatedChanges::merge omits these bootstrap-only fields.
         deltas.new_tokens.extend(incoming_new_tokens);
         for (component_id, entrypoints) in incoming_dci_update.new_entrypoints {
             deltas

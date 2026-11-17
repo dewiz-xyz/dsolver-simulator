@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rand::Rng;
+use simulator_core::broadcaster::wire::FeedMessage;
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, error, info, warn};
 use tycho_simulation::{
     protocol::models::Update as TychoUpdate,
-    tycho_client::feed::{BlockHeader, FeedMessage, HeaderLike, SynchronizerState},
+    tycho_client::feed::{BlockHeader, HeaderLike, SynchronizerState},
 };
 
 use crate::broadcaster::redis_publisher::current_time_ms;
@@ -352,7 +353,7 @@ async fn handle_broadcaster_update(
         health.clear_advanced().await;
     }
 
-    let block_number = update.block_number_or_timestamp;
+    let block_number = update.block_number;
     let new_pairs = update.new_pairs.len();
     if broadcaster_update_is_empty(&update) {
         health.record_update(block_number).await;

@@ -7,15 +7,15 @@ use serde::{
 };
 use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update as TychoUpdate},
-    tycho_client::feed::{
-        synchronizer::StateSyncMessage, BlockHeader, FeedMessage, HeaderLike, SynchronizerState,
-    },
+    tycho_client::feed::{BlockHeader, HeaderLike, SynchronizerState},
     tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
 };
 
 use crate::models::protocol::ProtocolKind;
 
 mod redis_streams;
+pub mod wire;
+use wire::{FeedMessage, StateSyncMessage};
 
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
 
@@ -619,7 +619,7 @@ impl BroadcasterUpdateMessage {
                 }
                 Some(BroadcasterUpdatePartition::new(
                     backend,
-                    update.block_number_or_timestamp,
+                    update.block_number,
                     partition.new_pairs,
                     partition.updated_states,
                     partition.removed_pairs,
@@ -2063,9 +2063,11 @@ fn backend_for_kind(kind: ProtocolKind) -> BroadcasterBackend {
         ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => {
             BroadcasterBackend::Vm
         }
-        ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => {
-            BroadcasterBackend::Rfq
-        }
+        ProtocolKind::Hashflow
+        | ProtocolKind::Bebop
+        | ProtocolKind::Liquorice
+        | ProtocolKind::NativeRfq
+        | ProtocolKind::Metric => BroadcasterBackend::Rfq,
         _ => BroadcasterBackend::Native,
     }
 }
@@ -2765,13 +2767,11 @@ mod test_support {
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
+    use crate::broadcaster::wire::{Snapshot, StateSyncMessage};
     use anyhow::{anyhow, Result};
     use tycho_simulation::{
         protocol::models::Update as TychoUpdate,
-        tycho_client::feed::{
-            synchronizer::{Snapshot, StateSyncMessage},
-            BlockHeader, SynchronizerState,
-        },
+        tycho_client::feed::{BlockHeader, SynchronizerState},
         tycho_common::{
             models::{token::Token, Chain},
             Bytes,

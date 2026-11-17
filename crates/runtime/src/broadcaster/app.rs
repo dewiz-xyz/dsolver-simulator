@@ -511,9 +511,11 @@ fn spawn_broadcaster_rfq_stream_task(
     token_stores: RFQTokenStores,
 ) -> tokio::task::JoinHandle<()> {
     let chain = config.chain_profile.chain;
-    let tvl_threshold = config.tvl_threshold;
     let protocols = config.chain_profile.rfq_protocols.clone();
     let rfq_config = RFQConfig {
+        native_key: config.native_key.clone(),
+        metric_key: config.metric_key.clone(),
+        min_tvl_usd: config.rfq_min_tvl_usd,
         bebop_user: config.bebop_user.clone(),
         bebop_key: config.bebop_key.clone(),
         hashflow_user: config.hashflow_user.clone(),
@@ -530,10 +532,7 @@ fn spawn_broadcaster_rfq_stream_task(
                 let token_stores = token_stores.clone();
                 let protocols = protocols.clone();
                 let rfq_config = rfq_config.clone();
-                async move {
-                    build_rfq_stream(tvl_threshold, token_stores, chain, &protocols, rfq_config)
-                        .await
-                }
+                async move { build_rfq_stream(token_stores, chain, &protocols, rfq_config).await }
             },
             health,
             supervisor_cfg,
@@ -659,6 +658,9 @@ mod tests {
 
     fn test_config() -> BroadcasterConfig {
         BroadcasterConfig {
+            native_key: String::new(),
+            metric_key: String::new(),
+            rfq_min_tvl_usd: 100.0,
             chain_profile: ChainProfile {
                 chain: Chain::Ethereum,
                 native_protocols: vec!["uniswap_v2".to_string()],

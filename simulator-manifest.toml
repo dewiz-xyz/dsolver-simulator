@@ -67,6 +67,42 @@ backend = "rfq"
 id = "rfq:liquorice"
 backend = "rfq"
 
+[[protocols]]
+id = "aerodrome_v1"
+backend = "native"
+
+[[protocols]]
+id = "aero_basic"
+backend = "native"
+
+[[protocols]]
+id = "aero_cl"
+backend = "native"
+
+[[protocols]]
+id = "pancakeswap_infinity_cl"
+backend = "native"
+
+[[protocols]]
+id = "pancakeswap_infinity_bin"
+backend = "native"
+
+[[protocols]]
+id = "lunarbase"
+backend = "native"
+
+[[protocols]]
+id = "biconomy"
+backend = "native"
+
+[[protocols]]
+id = "rfq:native"
+backend = "rfq"
+
+[[protocols]]
+id = "rfq:metric"
+backend = "rfq"
+
 # Route policies hold the routing nuances that do not belong in the plain chain protocol lists.
 [[route_policies]]
 id = "ethereum"
@@ -144,7 +180,14 @@ native_protocols = [
     "uniswap_v4",
     "pancakeswap_v3",
     "aerodrome_slipstreams",
+    "sushiswap_v2",
+    "aerodrome_v1",
+    "aero_basic",
+    "aero_cl",
+    "pancakeswap_infinity_cl",
+    "lunarbase",
+    "ekubo_v3",
 ]
 vm_protocols = []
-rfq_protocols = ["rfq:bebop"]
+rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric"]
 route_policy = "base"

@@ -7,6 +7,7 @@ mod normalize;
 mod request;
 mod resimulate;
 pub mod response;
+mod rfq_hydration;
 mod tycho_swaps;
 mod wire;
 

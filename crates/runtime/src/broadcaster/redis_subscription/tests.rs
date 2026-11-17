@@ -6,8 +6,9 @@ use std::time::Duration;
 use alloy_primitives::keccak256;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
+use simulator_core::broadcaster::wire::{ComponentWithState, Snapshot, StateSyncMessage};
 use tokio::sync::RwLock;
-use tycho_simulation::tycho_common::dto::{BlockChanges, ProtocolStateDelta};
+use tycho_simulation::tycho_common::dto::{BlockAggregatedChanges, ProtocolStateDelta};
 use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
 use tycho_simulation::{
     evm::decoder::TychoStreamDecoder,
@@ -15,10 +16,7 @@ use tycho_simulation::{
         errors::InvalidSnapshotError,
         models::{DecoderContext, ProtocolComponent, TryFromWithBlock},
     },
-    tycho_client::feed::{
-        synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
-        BlockHeader, SynchronizerState,
-    },
+    tycho_client::feed::{BlockHeader, SynchronizerState},
     tycho_common::{
         dto::{
             Chain as DtoChain, ComponentBalance, EntryPoint,
@@ -127,11 +125,16 @@ impl ProtocolSim for DummySim {
     }
 }
 
-impl TryFromWithBlock<ComponentWithState, BlockHeader> for DummySim {
+impl
+    TryFromWithBlock<
+        tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
+        BlockHeader,
+    > for DummySim
+{
     type Error = InvalidSnapshotError;
 
     async fn try_from_with_header(
-        _snapshot: ComponentWithState,
+        _snapshot: tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
         _block: BlockHeader,
         _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
         _all_tokens: &HashMap<Bytes, Token>,
@@ -211,11 +214,16 @@ impl ProtocolSim for StatefulSim {
     }
 }
 
-impl TryFromWithBlock<ComponentWithState, BlockHeader> for StatefulSim {
+impl
+    TryFromWithBlock<
+        tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
+        BlockHeader,
+    > for StatefulSim
+{
     type Error = InvalidSnapshotError;
 
     async fn try_from_with_header(
-        snapshot: ComponentWithState,
+        snapshot: tycho_simulation::tycho_client::feed::synchronizer::ComponentWithState,
         block: BlockHeader,
         _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
         _all_tokens: &HashMap<Bytes, Token>,
@@ -1611,13 +1619,13 @@ fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
 }
 
 fn raw_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
-    let mut decoder = TychoStreamDecoder::new();
+    let mut decoder = TychoStreamDecoder::new(Chain::Ethereum);
     decoder.register_decoder::<DummySim>("vm:curve");
     Arc::new(decoder)
 }
 
 fn stateful_decoder() -> Arc<TychoStreamDecoder<BlockHeader>> {
-    let mut decoder = TychoStreamDecoder::new();
+    let mut decoder = TychoStreamDecoder::new(Chain::Ethereum);
     decoder.register_decoder::<StatefulSim>("vm:curve");
     Arc::new(decoder)
 }
@@ -1798,7 +1806,7 @@ fn raw_snapshot_reassembly_happy_path_preserves_header_and_sync_state() -> Resul
 async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
     let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
     let header = raw_block_header(10, 1);
-    let mut changes = BlockChanges::default();
+    let mut changes = BlockAggregatedChanges::default();
     for index in (0..24).rev() {
         let component_id = format!("missing-{index:04}");
         changes.state_updates.insert(
@@ -1858,7 +1866,7 @@ async fn raw_cache_tail_reassembly_matches_unsplit_message() -> Result<()> {
             .insert(entrypoint_id, Default::default());
     }
     cache
-        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
+        .apply_feed_message(&simulator_core::broadcaster::wire::FeedMessage {
             state_msgs: HashMap::from([(
                 "vm:curve".to_string(),
                 StateSyncMessage {
@@ -1966,7 +1974,7 @@ struct StatefulCompactionFixture {
     component_id: &'static str,
     token: Bytes,
     snapshot_state: ComponentWithState,
-    changes: BlockChanges,
+    changes: BlockAggregatedChanges,
     initial_header: BlockHeader,
     final_header: BlockHeader,
 }
@@ -1987,7 +1995,7 @@ fn stateful_compaction_fixture() -> StatefulCompactionFixture {
         component_tvl: Some(1.0),
         entrypoints: Vec::new(),
     };
-    let mut changes = BlockChanges::default();
+    let mut changes = BlockAggregatedChanges::default();
     changes.state_updates.insert(
         component_id.to_string(),
         ProtocolStateDelta {
@@ -2070,7 +2078,7 @@ async fn bootstrap_uncompacted_stateful(
 async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Result<TestControls> {
     let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Vm]);
     cache
-        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
+        .apply_feed_message(&simulator_core::broadcaster::wire::FeedMessage {
             state_msgs: HashMap::from([(
                 "vm:curve".to_string(),
                 StateSyncMessage {
@@ -2093,7 +2101,7 @@ async fn bootstrap_compacted_stateful(fixture: &StatefulCompactionFixture) -> Re
         })
         .await?;
     cache
-        .apply_feed_message(&tycho_simulation::tycho_client::feed::FeedMessage {
+        .apply_feed_message(&simulator_core::broadcaster::wire::FeedMessage {
             state_msgs: HashMap::from([(
                 "vm:curve".to_string(),
                 StateSyncMessage {

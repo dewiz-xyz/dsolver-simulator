@@ -7,14 +7,12 @@ use std::time::Duration;
 use alloy_primitives::keccak256;
 use anyhow::{Context, Result};
 use futures::FutureExt;
+use simulator_core::broadcaster::wire::FeedMessage;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::warn;
-use tycho_simulation::{
-    protocol::models::Update as TychoUpdate,
-    tycho_client::feed::{BlockHeader, FeedMessage},
-};
+use tycho_simulation::{protocol::models::Update as TychoUpdate, tycho_client::feed::BlockHeader};
 
 use crate::broadcaster::redis_publisher::{
     format_redis_snapshot_id, format_redis_stream_id, BroadcasterDeploymentPhase,
@@ -2172,16 +2170,14 @@ mod tests {
 
     use anyhow::{anyhow, Result};
     use num_bigint::BigUint;
+    use simulator_core::broadcaster::wire::{FeedMessage, Snapshot, StateSyncMessage};
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
     use tycho_simulation::tycho_common::dto::ProtocolStateDelta;
     use tycho_simulation::tycho_common::simulation::errors::{SimulationError, TransitionError};
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
-        tycho_client::feed::{
-            synchronizer::{Snapshot, StateSyncMessage},
-            BlockHeader, FeedMessage, SynchronizerState,
-        },
+        tycho_client::feed::{BlockHeader, SynchronizerState},
         tycho_common::{
             dto::{Chain as DtoChain, ResponseAccount},
             models::{token::Token, Chain},

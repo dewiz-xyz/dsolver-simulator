@@ -1,6 +1,7 @@
 pub mod encode;
 pub mod quote_service;
 pub mod quotes;
+mod rfq_stream;
 pub mod rfq_tokens;
 pub(crate) mod simulation_executor;
 pub mod stream_builder;
