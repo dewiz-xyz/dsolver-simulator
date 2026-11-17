@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -7,7 +6,7 @@ use std::time::Duration;
 
 use simulator_core::broadcaster::BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES;
 use simulator_core::models::protocol::ProtocolKind;
-use tycho_simulation::tycho_common::{models::Chain, Bytes};
+use tycho_simulation::tycho_common::models::Chain;
 
 mod logging;
 mod manifest;
@@ -34,7 +33,7 @@ pub struct ChainProfile {
     pub chain: Chain,
     pub native_protocols: Vec<ProtocolKind>,
     /// Native protocols the broadcaster publishes but the standalone simulator does not
-    /// route, because its encoder cannot build them. DSolver V2 encodes them itself.
+    /// quote. Downstream consumers enable and simulate these sources themselves.
     pub broadcaster_only_native_protocols: Vec<ProtocolKind>,
     pub vm_protocols: Vec<ProtocolKind>,
     pub rfq_protocols: Vec<ProtocolKind>,
@@ -54,9 +53,6 @@ pub struct ChainProfile {
     pub recovery_max_buffered_native_blocks: usize,
     /// How many days back a token must have last traded for the broadcaster to load it.
     pub token_max_days_since_last_trade: u64,
-    /// Protocols allowed to swap with the native token (e.g. rocketpool on Ethereum).
-    pub native_token_protocol_allowlist: Vec<ProtocolKind>,
-    pub reset_allowance_tokens: HashMap<u64, HashSet<Bytes>>,
     pub erc4626_pair_policies: Vec<Erc4626PairPolicy>,
 }
 
@@ -106,22 +102,13 @@ pub fn load_config() -> AppConfig {
     let stream = load_stream_config();
     let slippage = load_slippage_config();
     let chain_profile = resolved_chain.chain_profile;
-    let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
-    let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
-    let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
-        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     AppConfig {
         chain_profile,
         tycho_broadcaster_url: require_trimmed_env("TYCHO_BROADCASTER_URL"),
-        bebop_url: resolved_chain.bebop_url,
-        hashflow_filename: resolved_chain.hashflow_filename,
-        liquorice_url: resolved_chain.liquorice_url,
         rpc_url: network.rpc_url,
-        tvl_threshold: network.tvl_threshold,
-        tvl_keep_threshold: network.tvl_keep_threshold,
         port: network.port,
         host: network.host,
         request_timeout_ms: timeouts.request_timeout_ms,
@@ -129,7 +116,6 @@ pub fn load_config() -> AppConfig {
         token_refresh_timeout_ms: timeouts.token_refresh_timeout_ms,
         enable_vm_pools: network.enable_vm_pools,
         enable_rfq_pools: network.enable_rfq_pools,
-        reset_allowance_tokens,
         erc4626_pair_policies,
         stream_stale_secs: stream.stream_stale_secs,
         stream_missing_block_burst: stream.stream_missing_block_burst,
@@ -142,11 +128,6 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
         slippage,
         memory,
-        bebop_key,
-        hashflow_key,
-        hashflow_user,
-        liquorice_key,
-        liquorice_user,
     }
 }
 
@@ -168,6 +149,7 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         }
     };
     let network = load_network_config();
+    let (tvl_threshold, tvl_keep_threshold) = load_broadcaster_tvl_thresholds();
     let api_key = require_env("TYCHO_API_KEY");
     let timeouts = load_timeout_config();
     let resolved_chain = match resolve_chain_config(
@@ -189,7 +171,27 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
         load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
+    let native_key = load_enabled_provider_key(
+        rfq_enabled
+            && chain_profile
+                .rfq_protocols
+                .contains(&ProtocolKind::NativeRfq),
+        "NATIVE_API_KEY",
+    );
+    let metric_key = load_enabled_provider_key(
+        rfq_enabled && chain_profile.rfq_protocols.contains(&ProtocolKind::Metric),
+        "METRIC_API_KEY",
+    );
+    let rfq_min_tvl_usd: f64 = parse_env_or_default("RFQ_MIN_TVL_USD", "100");
+    assert!(
+        rfq_min_tvl_usd.is_finite() && rfq_min_tvl_usd >= 0.0,
+        "RFQ_MIN_TVL_USD must be finite and non-negative"
+    );
+
     BroadcasterConfig {
+        native_key,
+        metric_key,
+        rfq_min_tvl_usd,
         chain_profile,
         tycho_url: resolved_chain.tycho_url,
         bebop_url: resolved_chain.bebop_url,
@@ -197,8 +199,8 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         liquorice_url: resolved_chain.liquorice_url,
         api_key,
         rpc_url: network.rpc_url,
-        tvl_threshold: network.tvl_threshold,
-        tvl_keep_threshold: network.tvl_keep_threshold,
+        tvl_threshold,
+        tvl_keep_threshold,
         port: network.port,
         host: network.host,
         enable_rfq_pools: network.enable_rfq_pools,
@@ -219,6 +221,14 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
         hashflow_user,
         liquorice_key,
         liquorice_user,
+    }
+}
+
+fn load_enabled_provider_key(enabled: bool, key: &str) -> String {
+    if enabled {
+        require_trimmed_env(key)
+    } else {
+        String::new()
     }
 }
 
@@ -306,8 +316,6 @@ fn load_provider_credentials(
 
 struct NetworkConfig {
     rpc_url: Option<String>,
-    tvl_threshold: f64,
-    tvl_keep_threshold: f64,
     port: u16,
     host: IpAddr,
     enable_vm_pools: bool,
@@ -390,12 +398,19 @@ impl Default for SlippageConfig {
 }
 
 fn load_network_config() -> NetworkConfig {
-    let rpc_url = optional_trimmed_env("RPC_URL");
+    NetworkConfig {
+        rpc_url: optional_trimmed_env("RPC_URL"),
+        port: parse_env_or_default("PORT", "3000"),
+        host: parse_host_env(),
+        enable_vm_pools: parse_env_or_default("ENABLE_VM_POOLS", "true"),
+        enable_rfq_pools: parse_env_or_default("ENABLE_RFQ_POOLS", "false"),
+    }
+}
+
+fn load_broadcaster_tvl_thresholds() -> (f64, f64) {
     let tvl_threshold: f64 = parse_env_or_default("TVL_THRESHOLD", "100");
     let tvl_keep_ratio: f64 = parse_env_or_default("TVL_KEEP_RATIO", "0.2");
-    let tvl_keep_threshold: f64 = (tvl_threshold * tvl_keep_ratio).min(tvl_threshold);
-    let port: u16 = parse_env_or_default("PORT", "3000");
-    let host = parse_host_env();
+    let tvl_keep_threshold = (tvl_threshold * tvl_keep_ratio).min(tvl_threshold);
     assert!(tvl_threshold > 0.0, "TVL_THRESHOLD must be > 0");
     assert!(
         tvl_keep_ratio > 0.0 && tvl_keep_ratio <= 1.0,
@@ -405,16 +420,7 @@ fn load_network_config() -> NetworkConfig {
         tvl_keep_threshold > 0.0,
         "Derived TVL keep threshold must be > 0"
     );
-
-    NetworkConfig {
-        rpc_url,
-        tvl_threshold,
-        tvl_keep_threshold,
-        port,
-        host,
-        enable_vm_pools: parse_env_or_default("ENABLE_VM_POOLS", "true"),
-        enable_rfq_pools: parse_env_or_default("ENABLE_RFQ_POOLS", "false"),
-    }
+    (tvl_threshold, tvl_keep_threshold)
 }
 
 fn load_timeout_config() -> TimeoutConfig {
@@ -726,12 +732,7 @@ fn load_slippage_config() -> SlippageConfig {
 pub struct AppConfig {
     pub chain_profile: ChainProfile,
     pub tycho_broadcaster_url: String,
-    pub bebop_url: String,
-    pub hashflow_filename: String,
-    pub liquorice_url: Option<String>,
     pub rpc_url: Option<String>,
-    pub tvl_threshold: f64,
-    pub tvl_keep_threshold: f64,
     pub port: u16,
     pub host: IpAddr,
     pub request_timeout_ms: u64,
@@ -739,7 +740,6 @@ pub struct AppConfig {
     pub token_refresh_timeout_ms: u64,
     pub enable_vm_pools: bool,
     pub enable_rfq_pools: bool,
-    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
     pub stream_stale_secs: u64,
     pub stream_missing_block_burst: u64,
@@ -752,15 +752,13 @@ pub struct AppConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub slippage: SlippageConfig,
     pub memory: MemoryConfig,
-    pub bebop_key: String,
-    pub hashflow_user: String,
-    pub hashflow_key: String,
-    pub liquorice_user: String,
-    pub liquorice_key: String,
 }
 
 #[derive(Clone)]
 pub struct BroadcasterConfig {
+    pub native_key: String,
+    pub metric_key: String,
+    pub rfq_min_tvl_usd: f64,
     pub chain_profile: ChainProfile,
     pub tycho_url: String,
     pub bebop_url: String,
@@ -1024,11 +1022,16 @@ mod tests {
         std::env::set_var("STATE_HISTORY_CHECKPOINT_BLOCK_INTERVAL", "300");
     }
 
-    const CONFIG_TEST_ENV_KEYS: [&str; 11] = [
+    const CONFIG_TEST_ENV_KEYS: [&str; 16] = [
         "CHAIN_ID",
         "ENABLE_RFQ_POOLS",
         "HASHFLOW_FILENAME_CSV",
         "TOKEN_SNAPSHOT_TIMEOUT_MS",
+        "NATIVE_API_KEY",
+        "METRIC_API_KEY",
+        "RFQ_MIN_TVL_USD",
+        "TVL_THRESHOLD",
+        "TVL_KEEP_RATIO",
         "TYCHO_API_KEY",
         "TYCHO_BROADCASTER_URL",
         "BEBOP_KEY",
@@ -1091,6 +1094,15 @@ mod tests {
         std::env::remove_var("HASHFLOW_FILENAME_CSV");
         std::env::remove_var("TOKEN_SNAPSHOT_TIMEOUT_MS");
         clear_broadcaster_redis_env();
+        for key in [
+            "NATIVE_API_KEY",
+            "METRIC_API_KEY",
+            "RFQ_MIN_TVL_USD",
+            "TVL_THRESHOLD",
+            "TVL_KEEP_RATIO",
+        ] {
+            std::env::remove_var(key);
+        }
         match broadcaster_base_url {
             Some(value) => std::env::set_var("TYCHO_BROADCASTER_URL", value),
             None => std::env::remove_var("TYCHO_BROADCASTER_URL"),
@@ -1202,11 +1214,6 @@ mod tests {
             chain.liquorice_url.as_deref(),
             Some("https://api.liquorice.tech/v1/solver/supported-tokens")
         );
-        assert!(chain
-            .chain_profile
-            .native_token_protocol_allowlist
-            .contains(&ProtocolKind::Rocketpool));
-        assert!(chain.chain_profile.reset_allowance_tokens.contains_key(&1));
         assert_eq!(chain.chain_profile.erc4626_pair_policies.len(), 3);
     }
 
@@ -1245,10 +1252,24 @@ mod tests {
             .contains(&ProtocolKind::AerodromeV1));
         assert_eq!(
             chain.chain_profile.broadcaster_only_native_protocols,
-            vec![ProtocolKind::AerodromeV1]
+            vec![
+                ProtocolKind::AerodromeV1,
+                ProtocolKind::SushiswapV2,
+                ProtocolKind::AeroBasic,
+                ProtocolKind::AeroCl,
+                ProtocolKind::PancakeswapInfinityCl,
+                ProtocolKind::LunarBase,
+                ProtocolKind::EkuboV3
+            ]
         );
         let mut broadcaster_native_protocols = chain.chain_profile.native_protocols.clone();
-        broadcaster_native_protocols.push(ProtocolKind::AerodromeV1);
+        broadcaster_native_protocols.extend(
+            chain
+                .chain_profile
+                .broadcaster_only_native_protocols
+                .iter()
+                .copied(),
+        );
         assert_eq!(
             chain.chain_profile.broadcaster_native_protocols(),
             broadcaster_native_protocols
@@ -1263,11 +1284,6 @@ mod tests {
             .rfq_protocols
             .contains(&ProtocolKind::Liquorice));
         assert!(chain.liquorice_url.is_none());
-        assert!(chain
-            .chain_profile
-            .native_token_protocol_allowlist
-            .is_empty());
-        assert!(chain.chain_profile.reset_allowance_tokens.is_empty());
         assert!(chain.chain_profile.erc4626_pair_policies.is_empty());
     }
 
@@ -1295,8 +1311,6 @@ backend = "native"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
@@ -1343,8 +1357,6 @@ backend = "vm"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 8453
@@ -1413,8 +1425,6 @@ backend = "native"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
@@ -1502,8 +1512,6 @@ backend = "native"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
@@ -1540,8 +1548,6 @@ backend = "rfq"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
@@ -1578,8 +1584,6 @@ backend = "native"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 999999
@@ -1618,12 +1622,8 @@ backend = "native"
 
 [[route_policies]]
 id = "default"
-native_token_protocol_allowlist = []
-reset_allowance_tokens = []
 
 [[route_policies.erc4626_pairs]]
-asset_symbol = "USDS"
-share_symbol = "sUSDS"
 asset = "0xdC035D45d973E3EC169d2276DDab16f1e407384F"
 share = "0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"
 allow_asset_to_share = false
@@ -1668,8 +1668,6 @@ backend = "rfq"
 
 [[route_policies]]
 id = " default "
-native_token_protocol_allowlist = [" uniswap_v2 "]
-reset_allowance_tokens = []
 
 [[chains]]
 chain_id = 1
@@ -1709,10 +1707,6 @@ route_policy = " default "
         );
         assert!(chain.chain_profile.vm_protocols.is_empty());
         assert_eq!(chain.chain_profile.rfq_protocols, vec![ProtocolKind::Bebop]);
-        assert_eq!(
-            chain.chain_profile.native_token_protocol_allowlist,
-            vec![ProtocolKind::UniswapV2]
-        );
     }
 
     #[test]
@@ -1744,17 +1738,41 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_config_requires_rfq_provider_credentials_when_effective() {
-        let message = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
-            clear_rfq_credential_env();
-            std::env::set_var("ENABLE_RFQ_POOLS", "true");
-            match std::panic::catch_unwind(load_config) {
-                Ok(_) => unreachable!("simulator config should require RFQ credentials"),
+    fn load_config_accepts_rfq_without_provider_credentials() {
+        for chain_id in ["1", "8453"] {
+            let config = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
+                clear_rfq_credential_env();
+                std::env::set_var("CHAIN_ID", chain_id);
+                std::env::set_var("ENABLE_RFQ_POOLS", "true");
+                load_config()
+            });
+            assert!(config.enable_rfq_pools);
+            assert!(!config.chain_profile.rfq_protocols.is_empty());
+        }
+    }
+
+    #[test]
+    fn load_config_ignores_broadcaster_tvl_settings() {
+        let config = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
+            std::env::set_var("TVL_THRESHOLD", "not-a-number");
+            std::env::set_var("TVL_KEEP_RATIO", "not-a-number");
+            load_config()
+        });
+
+        assert_eq!(config.chain_profile.chain, Chain::Ethereum);
+    }
+
+    #[test]
+    fn load_broadcaster_config_rejects_invalid_tvl_settings() {
+        let message = with_isolated_config_env(None, || {
+            std::env::set_var("TVL_THRESHOLD", "0");
+            match std::panic::catch_unwind(load_broadcaster_config) {
+                Ok(_) => unreachable!("broadcaster config should validate TVL thresholds"),
                 Err(panic) => panic_message(panic),
             }
         });
 
-        assert!(message.contains("BEBOP_KEY"));
+        assert!(message.contains("TVL_THRESHOLD"));
     }
 
     #[test]
@@ -1829,6 +1847,33 @@ route_policy = " default "
         assert!(config.hashflow_key.is_empty());
         assert!(config.liquorice_user.is_empty());
         assert!(config.liquorice_key.is_empty());
+    }
+
+    #[test]
+    fn base_broadcaster_requires_native_and_metric_keys_only_when_enabled() {
+        with_isolated_config_env(None, || {
+            std::env::set_var("CHAIN_ID", "8453");
+            let disabled = load_broadcaster_config();
+            assert!(disabled.native_key.is_empty() && disabled.metric_key.is_empty());
+            std::env::set_var("ENABLE_RFQ_POOLS", "true");
+            std::env::set_var("BEBOP_KEY", "fixture-bebop");
+            for key in ["NATIVE_API_KEY", "METRIC_API_KEY"] {
+                let result = std::panic::catch_unwind(load_broadcaster_config);
+                assert!(result.is_err());
+                if let Err(error) = result {
+                    assert!(panic_message(error).contains(key));
+                }
+                std::env::set_var(key, "  fixture-key  ");
+            }
+            let enabled = load_broadcaster_config();
+            assert_eq!(enabled.native_key, "fixture-key");
+            assert_eq!(enabled.metric_key, "fixture-key");
+            assert_eq!(enabled.rfq_min_tvl_usd, 100.0);
+            for value in ["NaN", "inf", "-1"] {
+                std::env::set_var("RFQ_MIN_TVL_USD", value);
+                assert!(std::panic::catch_unwind(load_broadcaster_config).is_err());
+            }
+        });
     }
 
     #[test]

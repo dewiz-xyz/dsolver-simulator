@@ -438,7 +438,7 @@ async fn handle_broadcaster_update(
         return Some(exit);
     }
 
-    let block_number = update.block_number_or_timestamp;
+    let block_number = update.block_number;
     let new_pairs = update.new_pairs.len();
     if broadcaster_update_is_empty(&update) {
         health.record_update(block_number).await;

@@ -24,7 +24,6 @@ repository = "https://github.com/dewiz-xyz/dsolver-simulator"
 alloy-eips = "1.8.3"
 alloy-primitives = "1.5.4"
 alloy-provider = { version = "1.8.3", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
-alloy-sol-types = "1.5.2"
 alloy-transport = "1.8.3"
 anyhow = "1.0"
 aws-config = "1"
@@ -62,9 +61,10 @@ toml = "0.8"
 tower = { version = "0.5", features = ["timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-tycho-common = "=0.381.0"
-tycho-execution = { git = "ssh://git@github.com/dewiz-xyz/dsolver-execution.git", rev = "f4d4444" }
-tycho-simulation = "=0.381.0"
+tycho-common = "=0.525.0"
+# Encoding is handled by consumers; keep the agreed pin without a runtime dependency.
+tycho-execution = "=0.525.0"
+tycho-simulation = "=0.525.0"
 typetag = "0.2"
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 uuid = { version = "1", features = ["serde", "v4"] }

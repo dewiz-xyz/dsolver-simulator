@@ -27,10 +27,18 @@ pub enum ProtocolKind {
     Hashflow,
     Bebop,
     Liquorice,
+    AeroBasic,
+    AeroCl,
+    PancakeswapInfinityCl,
+    PancakeswapInfinityBin,
+    LunarBase,
+    Biconomy,
+    NativeRfq,
+    Metric,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 19] = [
+    pub const ALL: [ProtocolKind; 27] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -50,6 +58,14 @@ impl ProtocolKind {
         ProtocolKind::Hashflow,
         ProtocolKind::Bebop,
         ProtocolKind::Liquorice,
+        ProtocolKind::AeroBasic,
+        ProtocolKind::AeroCl,
+        ProtocolKind::PancakeswapInfinityCl,
+        ProtocolKind::PancakeswapInfinityBin,
+        ProtocolKind::LunarBase,
+        ProtocolKind::Biconomy,
+        ProtocolKind::NativeRfq,
+        ProtocolKind::Metric,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -73,6 +89,14 @@ impl ProtocolKind {
             ProtocolKind::Hashflow => "rfq:hashflow",
             ProtocolKind::Bebop => "rfq:bebop",
             ProtocolKind::Liquorice => "rfq:liquorice",
+            ProtocolKind::AeroBasic => "aero_basic",
+            ProtocolKind::AeroCl => "aero_cl",
+            ProtocolKind::PancakeswapInfinityCl => "pancakeswap_infinity_cl",
+            ProtocolKind::PancakeswapInfinityBin => "pancakeswap_infinity_bin",
+            ProtocolKind::LunarBase => "lunarbase",
+            ProtocolKind::Biconomy => "biconomy",
+            ProtocolKind::NativeRfq => "rfq:native",
+            ProtocolKind::Metric => "rfq:metric",
         }
     }
 
@@ -120,6 +144,10 @@ impl ProtocolKind {
             "erc4626_pool" => Some(ProtocolKind::ERC4626),
             "hashflow_pool" => Some(ProtocolKind::Hashflow),
             "bebop_pool" => Some(ProtocolKind::Bebop),
+            "native_relay_pool" => Some(ProtocolKind::NativeRfq),
+            "metric_pool" => Some(ProtocolKind::Metric),
+            "pancakeswap_infinity_bin_pool" => Some(ProtocolKind::PancakeswapInfinityBin),
+            "lunarbase" => Some(ProtocolKind::LunarBase),
             "liquorice_pool" => Some(ProtocolKind::Liquorice),
             _ => None,
         }
@@ -146,6 +174,14 @@ impl ProtocolKind {
             "rfq:hashflow" => Some(ProtocolKind::Hashflow),
             "rfq:bebop" => Some(ProtocolKind::Bebop),
             "rfq:liquorice" => Some(ProtocolKind::Liquorice),
+            "aero_basic" => Some(ProtocolKind::AeroBasic),
+            "aero_cl" => Some(ProtocolKind::AeroCl),
+            "pancakeswap_infinity_cl" => Some(ProtocolKind::PancakeswapInfinityCl),
+            "pancakeswap_infinity_bin" => Some(ProtocolKind::PancakeswapInfinityBin),
+            "lunarbase" => Some(ProtocolKind::LunarBase),
+            "biconomy" => Some(ProtocolKind::Biconomy),
+            "rfq:native" => Some(ProtocolKind::NativeRfq),
+            "rfq:metric" => Some(ProtocolKind::Metric),
             _ => None,
         }
     }
@@ -170,7 +206,7 @@ mod tests {
 
     use super::*;
 
-    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 19] = [
+    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 27] = [
         ("uniswap_v2", ProtocolKind::UniswapV2),
         ("sushiswap_v2", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
@@ -190,9 +226,23 @@ mod tests {
         ("rfq:hashflow", ProtocolKind::Hashflow),
         ("rfq:bebop", ProtocolKind::Bebop),
         ("rfq:liquorice", ProtocolKind::Liquorice),
+        ("aero_basic", ProtocolKind::AeroBasic),
+        ("aero_cl", ProtocolKind::AeroCl),
+        (
+            "pancakeswap_infinity_cl",
+            ProtocolKind::PancakeswapInfinityCl,
+        ),
+        (
+            "pancakeswap_infinity_bin",
+            ProtocolKind::PancakeswapInfinityBin,
+        ),
+        ("lunarbase", ProtocolKind::LunarBase),
+        ("biconomy", ProtocolKind::Biconomy),
+        ("rfq:native", ProtocolKind::NativeRfq),
+        ("rfq:metric", ProtocolKind::Metric),
     ];
 
-    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 16] = [
+    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 20] = [
         ("uniswap_v2_pool", ProtocolKind::UniswapV2),
         ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
@@ -208,6 +258,13 @@ mod tests {
         ("erc4626_pool", ProtocolKind::ERC4626),
         ("hashflow_pool", ProtocolKind::Hashflow),
         ("bebop_pool", ProtocolKind::Bebop),
+        ("native_relay_pool", ProtocolKind::NativeRfq),
+        ("metric_pool", ProtocolKind::Metric),
+        (
+            "pancakeswap_infinity_bin_pool",
+            ProtocolKind::PancakeswapInfinityBin,
+        ),
+        ("lunarbase", ProtocolKind::LunarBase),
         ("liquorice_pool", ProtocolKind::Liquorice),
     ];
 
@@ -341,8 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn from_sync_state_key_rejects_protocol_type_names() {
+    fn from_sync_state_key_rejects_type_only_names() {
         for (type_name, _) in CANONICAL_PROTOCOL_TYPE_CASES {
+            if CANONICAL_PROTOCOL_SYSTEM_CASES
+                .iter()
+                .any(|(name, _)| *name == type_name)
+            {
+                continue;
+            }
             assert_eq!(ProtocolKind::from_sync_state_key(type_name), None);
         }
     }

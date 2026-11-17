@@ -198,122 +198,11 @@ pub struct QuoteResult {
     pub meta: QuoteMeta,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct PoolRef {
-    pub protocol: String,
-    pub component_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pool_address: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PoolSwapDraft {
-    pub pool: PoolRef,
-    pub token_in: String,
-    pub token_out: String,
-    pub split_bps: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HopDraft {
-    pub token_in: String,
-    pub token_out: String,
-    pub swaps: Vec<PoolSwapDraft>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SegmentDraft {
-    pub kind: SwapKind,
-    pub share_bps: u32,
-    pub hops: Vec<HopDraft>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase")]
-pub enum SwapKind {
-    SimpleSwap,
-    MultiSwap,
-    MegaSwap,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RouteEncodeRequest {
-    pub chain_id: u64,
-    pub token_in: String,
-    pub token_out: String,
-    pub amount_in: String,
-    pub min_amount_out: String,
-    pub settlement_address: String,
-    pub tycho_router_address: String,
-    pub swap_kind: SwapKind,
-    pub segments: Vec<SegmentDraft>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimated_amount_in: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum InteractionKind {
-    #[serde(rename = "ERC20_APPROVE")]
-    Erc20Approve,
-    #[serde(rename = "CALL")]
-    Call,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Interaction {
-    pub kind: InteractionKind,
-    pub target: String,
-    pub value: String,
-    pub calldata: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ResimulationDebug {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_number: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tycho_state_tag: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RouteDebug {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resimulation: Option<ResimulationDebug>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RouteEncodeResponse {
-    pub interactions: Vec<Interaction>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub debug: Option<RouteDebug>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct EncodeErrorResponse {
-    pub error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         AmountOutResponse, PoolOutcomeKind, QuoteFailureKind, QuoteMeta, QuotePartialKind,
-        QuoteResultQuality, QuoteStatus, RouteEncodeRequest,
+        QuoteResultQuality, QuoteStatus,
     };
     use anyhow::Result;
 
@@ -441,25 +330,6 @@ mod tests {
         let value = serde_json::to_value(response)?;
 
         assert!(value.get("limit_max_out").is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn route_encode_request_accepts_estimated_amount_in() -> Result<()> {
-        let request: RouteEncodeRequest = serde_json::from_value(serde_json::json!({
-            "chainId": 1,
-            "tokenIn": "0x0000000000000000000000000000000000000001",
-            "tokenOut": "0x0000000000000000000000000000000000000002",
-            "amountIn": "10",
-            "minAmountOut": "8",
-            "settlementAddress": "0x0000000000000000000000000000000000000003",
-            "tychoRouterAddress": "0x0000000000000000000000000000000000000004",
-            "swapKind": "SimpleSwap",
-            "segments": [],
-            "estimatedAmountIn": "10"
-        }))?;
-
-        assert_eq!(request.estimated_amount_in.as_deref(), Some("10"));
         Ok(())
     }
 }

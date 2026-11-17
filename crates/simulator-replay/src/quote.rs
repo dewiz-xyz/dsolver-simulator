@@ -129,7 +129,9 @@ fn remap_native_token_for_component(requested: Token, component: &ProtocolCompon
     }
 
     let native = requested.chain.native_token();
-    let wrapped = requested.chain.wrapped_native_token();
+    let Some(wrapped) = requested.chain.wrapped_native_token() else {
+        return requested;
+    };
     if native.address == wrapped.address {
         return requested;
     }
@@ -244,7 +246,9 @@ mod tests {
     #[test]
     fn remapping_preserves_metadata_without_alias_substitution() -> Result<(), serde_json::Error> {
         let native = Chain::Ethereum.native_token();
-        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let ordinary = Token::new(&Bytes::from([2; 20]), "OTHER", 18, 0, &[], Chain::Base, 100);
         let starknet_native = Chain::Starknet.native_token();
         let cases = [
@@ -292,7 +296,9 @@ mod tests {
     #[test]
     fn alias_substitution_uses_canonical_chain_metadata() -> Result<(), serde_json::Error> {
         let native = Chain::Ethereum.native_token();
-        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         for (requested, expected) in [(wrapped.clone(), native.clone()), (native, wrapped)] {
             let requested = distinctive_metadata(requested);
             let component = component(vec![distinctive_metadata(expected.clone())]);

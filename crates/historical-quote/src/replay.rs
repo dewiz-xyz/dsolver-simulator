@@ -312,7 +312,10 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
     };
     check_cancelled(cancellation)?;
     let archive = source.fetch_checkpoint(manifest.clone(), limits).await?;
-    let decoder = ReplayDecoder::new(DecoderConfig::retained_v1(), tokens.clone())
+    let config = DecoderConfig::retained_v1()
+        .with_chain_id(manifest.chain_id)
+        .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
+    let decoder = ReplayDecoder::new(config, tokens.clone())
         .await
         .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
     let replay_backends = backends

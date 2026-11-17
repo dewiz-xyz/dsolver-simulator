@@ -395,7 +395,7 @@ async fn native_and_bebop_fixtures_characterize_current_live_path() -> Result<()
     assert_eq!(rfq.amount_out, "1995000000");
     assert_eq!(
         rfq.state_digest,
-        "e61eec744107cc67994fce061e007b27ec7037e40ebb0544ee9edc5ded2d3f76"
+        "e23c543028cd884cb3687027a66abe10d636989107fa9e3525d52a0b9b4c77a3"
     );
     Ok(())
 }
@@ -1085,7 +1085,7 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         104,
         BroadcasterPayload::RecoveryStart(BroadcasterRecoveryStart::new(manifest)?),
     )?;
-    let request_generation_before_recovery = controls.native_state_store.request_generation().await;
+    let head_revision_before_recovery = controls.native_state_store.pin().await.head_revision();
     apply_replay_batch(&mut prepared, &mut checkpoint, vec![start])
         .await
         .map_err(|exit| anyhow!(exit.message))?;
@@ -1098,7 +1098,7 @@ async fn recovery_stays_private_until_commit_then_swaps_native_version() -> Resu
         .applied_head()
         .is_none());
     assert!(
-        controls.native_state_store.request_generation().await > request_generation_before_recovery,
+        controls.native_state_store.pin().await.head_revision() > head_revision_before_recovery,
         "RecoveryStart must fence requests before assembling private replacement state"
     );
     assert!(
@@ -1982,7 +1982,7 @@ fn snapshot_end_envelope_at(message_seq: u64) -> BroadcasterEnvelope {
 }
 
 fn raw_decoder() -> Arc<ReplayDecoder> {
-    let mut decoder = TychoStreamDecoder::new();
+    let mut decoder = TychoStreamDecoder::new(Chain::Ethereum);
     decoder.register_decoder::<DummySim>("vm:curve");
     Arc::new(ReplayDecoder::with_decoder(
         DecoderConfig::for_backend(ReplayBackend::Vm, vec![ProtocolKind::Curve], 0),
@@ -1991,7 +1991,7 @@ fn raw_decoder() -> Arc<ReplayDecoder> {
 }
 
 fn stateful_decoder() -> Arc<ReplayDecoder> {
-    let mut decoder = TychoStreamDecoder::new();
+    let mut decoder = TychoStreamDecoder::new(Chain::Ethereum);
     decoder.register_decoder::<StatefulSim>("vm:curve");
     Arc::new(ReplayDecoder::with_decoder(
         DecoderConfig::for_backend(ReplayBackend::Vm, vec![ProtocolKind::Curve], 0),
@@ -3076,7 +3076,9 @@ async fn native_wire_vm_store_compares_only_its_own_protocols() -> Result<()> {
 async fn serving_subset_uses_its_head_in_decoded_and_published_state() -> Result<()> {
     let decoder = ReplayDecoder::with_decoder(
         DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0),
-        Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+        Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+        )),
     );
     let mut envelope = update_envelope_for_stream("stream-1", 4, 101)?;
     let BroadcasterPayload::Update(update) = &mut envelope.payload else {
@@ -3126,10 +3128,7 @@ async fn serving_subset_uses_its_head_in_decoded_and_published_state() -> Result
     );
     assert_eq!(decoded.block_number, 100);
     assert_eq!(
-        decoded
-            .update
-            .as_ref()
-            .map(|update| update.block_number_or_timestamp),
+        decoded.update.as_ref().map(|update| update.block_number),
         Some(100)
     );
     let decoded_snapshot = decoder
@@ -3140,7 +3139,7 @@ async fn serving_subset_uses_its_head_in_decoded_and_published_state() -> Result
         decoded_snapshot
             .update
             .as_ref()
-            .map(|update| update.block_number_or_timestamp),
+            .map(|update| update.block_number),
         Some(100)
     );
 

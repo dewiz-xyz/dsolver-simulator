@@ -716,7 +716,7 @@ impl BroadcasterUpdateMessage {
             .map(|(backend, partition)| {
                 BroadcasterUpdatePartition::new(
                     backend,
-                    update.block_number_or_timestamp,
+                    update.block_number,
                     partition.new_pairs,
                     partition.updated_states,
                     partition.removed_pairs,
@@ -1852,9 +1852,11 @@ fn backend_for_kind(kind: ProtocolKind) -> BroadcasterBackend {
         ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => {
             BroadcasterBackend::Vm
         }
-        ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => {
-            BroadcasterBackend::Rfq
-        }
+        ProtocolKind::Hashflow
+        | ProtocolKind::Bebop
+        | ProtocolKind::Liquorice
+        | ProtocolKind::NativeRfq
+        | ProtocolKind::Metric => BroadcasterBackend::Rfq,
         _ => BroadcasterBackend::Native,
     }
 }

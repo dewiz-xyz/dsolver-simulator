@@ -8,16 +8,17 @@ use tycho_simulation::{
         decoder::TychoStreamDecoder,
         engine_db::tycho_db::PreCachedDB,
         protocol::{
+            aero_basic::state::AeroBasicState,
             aerodrome_slipstreams::state::AerodromeSlipstreamsState,
             aerodrome_v1::state::AerodromeV1State,
+            biconomy::state::BiconomyState,
             ekubo::state::EkuboState,
-            ekubo_v3::state::EkuboV3State,
+            ekubo_v3::{filter_fn as ekubo_v3_extension_filter, state::EkuboV3State},
             erc4626::state::ERC4626State,
-            filters::{
-                balancer_v2_pool_filter, ekubo_v3_extension_filter, erc4626_filter,
-                fluid_v1_paused_pools_filter,
-            },
+            filters::{balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter},
             fluid::FluidV1,
+            lunarbase::state::LunarBaseState,
+            pancakeswap_infinity_bin::state::PancakeswapInfinityBinState,
             pancakeswap_v2::state::PancakeswapV2State,
             rocketpool::state::RocketpoolState,
             uniswap_v2::state::UniswapV2State,
@@ -82,6 +83,7 @@ const RETAINED_RFQ_PROTOCOLS_V1: &[ProtocolKind] = &[
 
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
+    chain: Option<Chain>,
     min_token_quality: u32,
     protocols: BTreeMap<ReplayBackend, Vec<ProtocolKind>>,
     profile: DecoderProfile,
@@ -94,6 +96,15 @@ enum DecoderProfile {
 }
 
 impl DecoderConfig {
+    pub fn with_chain(mut self, chain: Chain) -> Self {
+        self.chain = Some(chain);
+        self
+    }
+
+    pub fn with_chain_id(self, chain_id: u64) -> Result<Self, ReplayDecodeError> {
+        Ok(self.with_chain(replay_chain(chain_id)?))
+    }
+
     pub fn new(
         min_token_quality: u32,
         protocols: impl IntoIterator<Item = (ReplayBackend, Vec<ProtocolKind>)>,
@@ -103,6 +114,7 @@ impl DecoderConfig {
             min_token_quality,
             protocols,
             profile: DecoderProfile::Live,
+            chain: None,
         }
     }
 
@@ -126,6 +138,7 @@ impl DecoderConfig {
             .map(|(backend, protocols)| (backend, protocols.to_vec()))
             .collect(),
             profile: DecoderProfile::RetainedV1,
+            chain: None,
         }
     }
 
@@ -149,6 +162,8 @@ impl DecoderConfig {
 
 #[derive(Debug, Error)]
 pub enum ReplayDecodeError {
+    #[error("replay decoder needs an explicit chain or a nonempty token catalog from one chain")]
+    MissingOrMixedChain,
     #[error("Unknown native protocol in chain profile: {0}")]
     UnknownNativeProtocol(ProtocolKind),
     #[error("Unknown VM protocol in chain profile: {0}")]
@@ -196,8 +211,15 @@ impl ReplayDecoder {
         config: DecoderConfig,
         mut tokens: TokenMap,
     ) -> Result<Self, ReplayDecodeError> {
+        let chain = config
+            .chain
+            .or_else(|| tokens.values().next().map(|token| token.chain))
+            .ok_or(ReplayDecodeError::MissingOrMixedChain)?;
+        if tokens.values().any(|token| token.chain != chain) {
+            return Err(ReplayDecodeError::MissingOrMixedChain);
+        }
         tokens.retain(|_, token| token.quality >= config.min_token_quality);
-        let mut decoder = TychoStreamDecoder::new();
+        let mut decoder = TychoStreamDecoder::new(chain);
         decoder.skip_state_decode_failures(true);
 
         for backend in config.configured_backends() {
@@ -313,7 +335,7 @@ impl ReplayDecoder {
             ));
         }
         if let Some(update) = combined.as_mut() {
-            update.block_number_or_timestamp = block_number;
+            update.block_number = block_number;
         }
         Ok(DecodedReplay {
             had_applicable_partition: true,
@@ -353,7 +375,7 @@ impl ReplayDecoder {
         };
         let block_number = update
             .as_ref()
-            .map_or(block_number, |update| update.block_number_or_timestamp);
+            .map_or(block_number, |update| update.block_number);
         Ok(DecodedReplay {
             had_applicable_partition: true,
             block_number,
@@ -466,12 +488,12 @@ impl ReplayDecoder {
                 decoded
             };
             if let Some(update) = &decoded {
-                block_number = block_number.max(update.block_number_or_timestamp);
+                block_number = block_number.max(update.block_number);
             }
             merge_update(&mut combined, decoded);
         }
         if let Some(update) = combined.as_mut() {
-            update.block_number_or_timestamp = block_number;
+            update.block_number = block_number;
         }
         Ok(DecodedReplay {
             had_applicable_partition,
@@ -540,20 +562,7 @@ pub fn decode_token_map(
     chain_id: u64,
     tokens: &serde_json::value::RawValue,
 ) -> Result<TokenMap, ReplayDecodeError> {
-    let chain = [
-        Chain::Ethereum,
-        Chain::Starknet,
-        Chain::ZkSync,
-        Chain::Arbitrum,
-        Chain::Base,
-        Chain::Bsc,
-        Chain::Unichain,
-        Chain::Polygon,
-        Chain::Plasma,
-    ]
-    .into_iter()
-    .find(|chain| chain.id() == chain_id)
-    .ok_or(ReplayDecodeError::UnsupportedTokenChain(chain_id))?;
+    let chain = replay_chain(chain_id)?;
     let decoded: Vec<BroadcasterTokenDto> = serde_json::from_str(tokens.get())
         .map_err(|error| ReplayDecodeError::TokenSnapshot(error.to_string()))?;
     let mut result = HashMap::with_capacity(decoded.len());
@@ -568,6 +577,23 @@ pub fn decode_token_map(
         }
     }
     Ok(result)
+}
+
+fn replay_chain(chain_id: u64) -> Result<Chain, ReplayDecodeError> {
+    [
+        Chain::Ethereum,
+        Chain::Starknet,
+        Chain::ZkSync,
+        Chain::Arbitrum,
+        Chain::Base,
+        Chain::Bsc,
+        Chain::Unichain,
+        Chain::Polygon,
+        Chain::Plasma,
+    ]
+    .into_iter()
+    .find(|chain| chain.id() == chain_id)
+    .ok_or(ReplayDecodeError::UnsupportedTokenChain(chain_id))
 }
 
 fn merge_update(current: &mut Option<Update>, incoming: Option<Update>) {
@@ -594,7 +620,15 @@ fn register_native_decoder(
         ProtocolKind::UniswapV3 | ProtocolKind::PancakeswapV3 => {
             decoder.register_decoder::<UniswapV3State>(protocol.as_str())
         }
-        ProtocolKind::UniswapV4 => decoder.register_decoder::<UniswapV4State>(protocol.as_str()),
+        ProtocolKind::UniswapV4 | ProtocolKind::PancakeswapInfinityCl => {
+            decoder.register_decoder::<UniswapV4State>(protocol.as_str())
+        }
+        ProtocolKind::AeroBasic => decoder.register_decoder::<AeroBasicState>(protocol.as_str()),
+        ProtocolKind::LunarBase => decoder.register_decoder::<LunarBaseState>(protocol.as_str()),
+        ProtocolKind::Biconomy => decoder.register_decoder::<BiconomyState>(protocol.as_str()),
+        ProtocolKind::PancakeswapInfinityBin => {
+            decoder.register_decoder::<PancakeswapInfinityBinState>(protocol.as_str())
+        }
         ProtocolKind::EkuboV2 => decoder.register_decoder::<EkuboState>(protocol.as_str()),
         ProtocolKind::FluidV1 => {
             decoder.register_decoder::<FluidV1>(protocol.as_str());
@@ -605,7 +639,7 @@ fn register_native_decoder(
             decoder.register_decoder::<EkuboV3State>(protocol.as_str());
             decoder.register_filter(protocol.as_str(), ekubo_v3_extension_filter);
         }
-        ProtocolKind::AerodromeSlipstreams => {
+        ProtocolKind::AerodromeSlipstreams | ProtocolKind::AeroCl => {
             decoder.register_decoder::<AerodromeSlipstreamsState>(protocol.as_str())
         }
         ProtocolKind::AerodromeV1 => {
@@ -685,7 +719,8 @@ mod tests {
     #[tokio::test]
     async fn raw_selection_ignores_unknown_alias_and_unselected_protocols() -> anyhow::Result<()> {
         let decoder = ReplayDecoder::new(
-            DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0),
+            DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0)
+                .with_chain(Chain::Ethereum),
             HashMap::new(),
         )
         .await?;
@@ -804,7 +839,8 @@ mod tests {
                 ReplayBackend::Native,
                 vec![ProtocolKind::AerodromeSlipstreams],
                 0,
-            ),
+            )
+            .with_chain(Chain::Base),
             HashMap::new(),
         )
         .await?;
@@ -905,7 +941,9 @@ mod tests {
 
     #[tokio::test]
     async fn ekubo_v3_leaves_out_signed_exclusive_swap_pools() -> anyhow::Result<()> {
-        let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
+        let mut decoder = TychoStreamDecoder::<BlockHeader>::new(
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+        );
         register_native_decoder(&mut decoder, ProtocolKind::EkuboV3)?;
         let signed_exclusive_swap: Bytes = "0x55b703eED01b35641963da2FB2E14885993605A3".parse()?;
 
@@ -1002,7 +1040,9 @@ mod tests {
         )?;
         let decoder = ReplayDecoder::with_decoder(
             DecoderConfig::for_backend(ReplayBackend::Native, Vec::new(), 100),
-            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+                tycho_simulation::tycho_common::models::Chain::Ethereum,
+            )),
         );
 
         let Err(error) = decoder
@@ -1022,7 +1062,9 @@ mod tests {
     fn test_decoder() -> ReplayDecoder {
         ReplayDecoder::with_decoder(
             DecoderConfig::retained_v1(),
-            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+                tycho_simulation::tycho_common::models::Chain::Ethereum,
+            )),
         )
     }
 }

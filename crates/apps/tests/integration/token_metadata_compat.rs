@@ -1,6 +1,6 @@
 use runtime::chain_head::ChainHeadObserver;
 use simulator_core::broadcaster::BlockIdentity;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,18 +14,15 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use rpc::create_router;
 use runtime::config::SlippageConfig;
-use runtime::models::protocol::ProtocolKind;
 use runtime::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
-    VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
 };
 use runtime::models::stream_health::StreamHealth;
 use runtime::models::tokens::TokenStore;
 use runtime::simulator_service::SimulatorRuntime;
 use simulator_core::broadcaster::{BroadcasterTokenDto, BroadcasterTokenLookupResponse};
 use simulator_core::models::messages::{
-    AmountOutRequest, EncodeErrorResponse, HopDraft, PoolRef, PoolSwapDraft, QuoteFailureKind,
-    QuoteResult, QuoteResultQuality, QuoteStatus, RouteEncodeRequest, SegmentDraft, SwapKind,
+    AmountOutRequest, QuoteFailureKind, QuoteResult, QuoteResultQuality, QuoteStatus,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -276,9 +273,7 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
 
     Ok(AppState {
         chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(fixture_head())),
-        chain: Chain::Ethereum,
-        rfq_client_config: Arc::new(RfqClientConfig::default()),
-        native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
+        chain: token_store.chain(),
         tokens: token_store,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -303,7 +298,6 @@ async fn build_app_state(token_store: Arc<TokenStore>) -> Result<AppState> {
         slippage: SlippageConfig::default(),
         erc4626_deposits_enabled: false,
         erc4626_pair_policies: Arc::new(Vec::new()),
-        reset_allowance_tokens: Arc::new(HashMap::<u64, HashSet<Bytes>>::new()),
     })
 }
 
@@ -326,57 +320,6 @@ async fn post_simulate(app: axum::Router, request: &AmountOutRequest) -> Result<
         String::from_utf8_lossy(&body)
     );
     Ok(serde_json::from_slice(&body)?)
-}
-
-async fn post_encode(
-    app: axum::Router,
-    request: &RouteEncodeRequest,
-) -> Result<(StatusCode, EncodeErrorResponse)> {
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/encode")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(request)?))?,
-        )
-        .await?;
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX).await?;
-    Ok((status, serde_json::from_slice(&body)?))
-}
-
-fn encode_request(token_in: &str, token_out: &str, pool_id: &str) -> RouteEncodeRequest {
-    RouteEncodeRequest {
-        chain_id: Chain::Ethereum.id(),
-        token_in: token_in.to_string(),
-        token_out: token_out.to_string(),
-        amount_in: "10".to_string(),
-        min_amount_out: "8".to_string(),
-        settlement_address: "0x0000000000000000000000000000000000000003".to_string(),
-        tycho_router_address: "0x0000000000000000000000000000000000000004".to_string(),
-        swap_kind: SwapKind::SimpleSwap,
-        segments: vec![SegmentDraft {
-            kind: SwapKind::SimpleSwap,
-            share_bps: 0,
-            hops: vec![HopDraft {
-                token_in: token_in.to_string(),
-                token_out: token_out.to_string(),
-                swaps: vec![PoolSwapDraft {
-                    pool: PoolRef {
-                        protocol: "uniswap_v2".to_string(),
-                        component_id: pool_id.to_string(),
-                        pool_address: None,
-                    },
-                    token_in: token_in.to_string(),
-                    token_out: token_out.to_string(),
-                    split_bps: 0,
-                }],
-            }],
-        }],
-        request_id: Some("encode-missing-token".to_string()),
-        estimated_amount_in: None,
-    }
 }
 
 #[tokio::test]
@@ -439,44 +382,25 @@ async fn simulate_missing_token_preserves_token_coverage_semantics_without_tycho
 }
 
 #[tokio::test]
-async fn encode_missing_native_token_uses_pinned_metadata_without_fetch() -> Result<()> {
-    let token_in_hex = "0x0000000000000000000000000000000000000011";
-    let token_out_hex = "0x0000000000000000000000000000000000000012";
-    let token_in = parse_address(token_in_hex)?;
-    let authority = TokenAuthority::spawn(vec![make_token(&token_in, "TK1")]).await?;
-    let token_store = Arc::new(TokenStore::broadcaster_backed(
+async fn encode_endpoint_is_not_supported() -> Result<()> {
+    let token_store = Arc::new(TokenStore::new(
         HashMap::new(),
-        authority.lookup_url.clone(),
-        Chain::Ethereum,
+        "http://localhost".to_string(),
+        "test".to_string(),
+        Chain::Base,
         Duration::from_secs(1),
     ));
-    let state = build_app_state(Arc::clone(&token_store)).await?;
-    install_pool(
-        &state.native_state_store,
-        "encode-pool",
-        "0x0000000000000000000000000000000000000019",
-        Vec::new(),
-    )
-    .await?;
+    let state = build_app_state(token_store).await?;
     let app = create_router(SimulatorRuntime::new(state));
-
-    let (status, response) = post_encode(
-        app,
-        &encode_request(token_in_hex, token_out_hex, "encode-pool"),
-    )
-    .await?;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.error, "Token not found");
-    assert_eq!(
-        authority.broadcaster_hits.load(Ordering::SeqCst),
-        0,
-        "/encode must not mix global token metadata into a pinned native request"
-    );
-    authority.assert_no_tycho_fetches();
-    assert!(
-        !token_store.snapshot().await.contains_key(&token_in),
-        "a failed pinned native lookup must not populate the global token mirror"
-    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/encode")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     Ok(())
 }

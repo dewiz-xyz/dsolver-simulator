@@ -752,9 +752,11 @@ fn spawn_broadcaster_rfq_stream_task(
     stop: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let chain = config.chain_profile.chain;
-    let tvl_threshold = config.tvl_threshold;
     let protocols = config.chain_profile.rfq_protocols.clone();
     let rfq_config = RFQConfig {
+        native_key: config.native_key.clone(),
+        metric_key: config.metric_key.clone(),
+        min_tvl_usd: config.rfq_min_tvl_usd,
         bebop_key: config.bebop_key.clone(),
         hashflow_user: config.hashflow_user.clone(),
         hashflow_key: config.hashflow_key.clone(),
@@ -770,10 +772,7 @@ fn spawn_broadcaster_rfq_stream_task(
                 let token_stores = token_stores.clone();
                 let protocols = protocols.clone();
                 let rfq_config = rfq_config.clone();
-                async move {
-                    build_rfq_stream(tvl_threshold, token_stores, chain, &protocols, rfq_config)
-                        .await
-                }
+                async move { build_rfq_stream(token_stores, chain, &protocols, rfq_config).await }
             },
             health,
             supervisor_cfg,
@@ -1092,7 +1091,6 @@ fn spawn_state_history_checkpoint_task(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1100,7 +1098,7 @@ mod tests {
     use simulator_core::broadcaster::BroadcasterBackend;
     use simulator_core::models::protocol::ProtocolKind;
     use tokio_util::sync::CancellationToken;
-    use tycho_simulation::tycho_common::{models::Chain, Bytes};
+    use tycho_simulation::tycho_common::models::Chain;
 
     use super::{
         raw_configured_backends, rfq_configured_backends,
@@ -1175,6 +1173,9 @@ mod tests {
 
     fn test_config() -> BroadcasterConfig {
         BroadcasterConfig {
+            native_key: String::new(),
+            metric_key: String::new(),
+            rfq_min_tvl_usd: 100.0,
             chain_profile: ChainProfile {
                 chain: Chain::Ethereum,
                 native_protocols: vec![ProtocolKind::UniswapV2],
@@ -1189,8 +1190,6 @@ mod tests {
                 tycho_head_mismatch_recovery_timeout_secs: 60,
                 recovery_max_buffered_native_blocks: 8,
                 token_max_days_since_last_trade: 1,
-                native_token_protocol_allowlist: Vec::new(),
-                reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),
                 erc4626_pair_policies: Vec::new(),
             },
             tycho_url: "http://localhost:4242".to_string(),

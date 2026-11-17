@@ -33,7 +33,7 @@ PY
   `vm_protocols` is non-empty.
 - RFQ is effective only when `ENABLE_RFQ_POOLS=true` and the selected chain's
   `rfq_protocols` is non-empty.
-- When RFQ is effective, startup requires the credential set associated with
+- When RFQ is effective, broadcaster startup requires the credential set associated with
   every selected RFQ provider. Derive that mapping from runtime config and tests;
   do not copy provider assumptions into this reference.
 

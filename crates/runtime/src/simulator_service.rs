@@ -10,7 +10,6 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
     Bytes,
@@ -30,15 +29,14 @@ use crate::config::{
 use crate::memory::maybe_log_memory_snapshot;
 use crate::metrics::emit_simulator_health_snapshot;
 use crate::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig,
-    SimulatorBackendReadiness, SimulatorReadinessReason, SimulatorServiceStatus, StateStore,
-    VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, SimulatorBackendReadiness,
+    SimulatorReadinessReason, SimulatorServiceStatus, StateStore, VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{
     derive_broadcaster_token_lookup_url, derive_broadcaster_token_snapshot_url, TokenStore,
 };
-use crate::services::{EncodeService, QuoteService};
+use crate::services::QuoteService;
 use crate::stream::StreamSupervisorConfig;
 
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -57,22 +55,12 @@ pub struct SimulatorServiceParts {
 pub struct SimulatorRuntime {
     app_state: AppState,
     quote_service: QuoteService,
-    encode_service: EncodeService,
 }
 
 impl SimulatorRuntime {
     pub fn new(app_state: AppState) -> Self {
         Self {
             quote_service: QuoteService::new(app_state.clone()),
-            encode_service: EncodeService::new(app_state.clone()),
-            app_state,
-        }
-    }
-
-    pub fn new_with_encoder(app_state: AppState, encoder: Arc<dyn TychoEncoder>) -> Self {
-        Self {
-            quote_service: QuoteService::new(app_state.clone()),
-            encode_service: EncodeService::with_encoder(app_state.clone(), encoder),
             app_state,
         }
     }
@@ -83,10 +71,6 @@ impl SimulatorRuntime {
 
     pub fn quote_service(&self) -> QuoteService {
         self.quote_service.clone()
-    }
-
-    pub fn encode_service(&self) -> EncodeService {
-        self.encode_service.clone()
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -484,17 +468,6 @@ fn build_app_state(
                 config.chain_profile.chain_head_observation_max_age_secs,
             ),
         })),
-        rfq_client_config: Arc::new(RfqClientConfig {
-            tvl_threshold: config.tvl_threshold,
-            bebop_key: config.bebop_key.clone(),
-            hashflow_user: config.hashflow_user.clone(),
-            hashflow_key: config.hashflow_key.clone(),
-            liquorice_user: config.liquorice_user.clone(),
-            liquorice_key: config.liquorice_key.clone(),
-        }),
-        native_token_protocol_allowlist: Arc::new(
-            config.chain_profile.native_token_protocol_allowlist.clone(),
-        ),
         tokens,
         native_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
         vm_broadcaster_subscription: BroadcasterSubscriptionStatus::default(),
@@ -519,7 +492,6 @@ fn build_app_state(
         slippage: config.slippage,
         erc4626_deposits_enabled: config.rpc_url.is_some(),
         erc4626_pair_policies: Arc::clone(&config.erc4626_pair_policies),
-        reset_allowance_tokens: Arc::clone(&config.reset_allowance_tokens),
     }
 }
 
@@ -793,7 +765,7 @@ fn rfq_broadcaster_subscription_controls(
 #[cfg(test)]
 mod tests {
     use simulator_core::models::protocol::ProtocolKind;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1009,18 +981,12 @@ mod tests {
         enable_rfq_pools: bool,
         rpc_url: Option<&str>,
     ) -> AppConfig {
-        let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
         let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
 
         AppConfig {
             chain_profile,
             tycho_broadcaster_url: "http://127.0.0.1:3001".to_string(),
-            bebop_url: "https://example.com/bebop".to_string(),
-            hashflow_filename: "./hashflow.csv".to_string(),
-            liquorice_url: Some("https://example.com/liquorice".to_string()),
             rpc_url: rpc_url.map(str::to_string),
-            tvl_threshold: 100.0,
-            tvl_keep_threshold: 20.0,
             port: 3000,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             request_timeout_ms: 4_500,
@@ -1028,7 +994,6 @@ mod tests {
             token_refresh_timeout_ms: 1_000,
             enable_vm_pools,
             enable_rfq_pools,
-            reset_allowance_tokens,
             erc4626_pair_policies,
             stream_stale_secs: 120,
             stream_missing_block_burst: 3,
@@ -1047,11 +1012,6 @@ mod tests {
                 snapshots_min_new_pairs: 1_000,
                 snapshots_emit_emf: false,
             },
-            bebop_key: "bebop-key".to_string(),
-            hashflow_user: "hashflow-user".to_string(),
-            hashflow_key: "hashflow-key".to_string(),
-            liquorice_user: "liquorice-user".to_string(),
-            liquorice_key: "liquorice-key".to_string(),
         }
     }
 
@@ -1089,16 +1049,11 @@ mod tests {
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 64,
             token_max_days_since_last_trade: 1,
-            native_token_protocol_allowlist: Vec::new(),
-            reset_allowance_tokens: HashMap::new(),
             erc4626_pair_policies: Vec::new(),
         }
     }
 
     fn ethereum_chain_profile() -> ChainProfile {
-        let mut reset_allowance_tokens = HashMap::new();
-        reset_allowance_tokens.insert(1, HashSet::from([Bytes::from([7_u8; 20])]));
-
         ChainProfile {
             chain: Chain::Ethereum,
             native_protocols: vec![
@@ -1117,8 +1072,6 @@ mod tests {
             tycho_head_mismatch_recovery_timeout_secs: 60,
             recovery_max_buffered_native_blocks: 8,
             token_max_days_since_last_trade: 1,
-            native_token_protocol_allowlist: vec![ProtocolKind::Rocketpool],
-            reset_allowance_tokens,
             erc4626_pair_policies: Vec::new(),
         }
     }
@@ -1339,14 +1292,6 @@ mod tests {
         assert_eq!(app_state.chain, Chain::Base);
         assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
-        assert_eq!(app_state.rfq_client_config.tvl_threshold, 100.0);
-        assert_eq!(app_state.rfq_client_config.bebop_key, "bebop-key");
-        assert_eq!(app_state.rfq_client_config.hashflow_user, "hashflow-user");
-        assert_eq!(app_state.rfq_client_config.hashflow_key, "hashflow-key");
-        assert_eq!(app_state.rfq_client_config.liquorice_user, "liquorice-user");
-        assert_eq!(app_state.rfq_client_config.liquorice_key, "liquorice-key");
-        assert!(app_state.native_token_protocol_allowlist.is_empty());
-        assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(
@@ -1436,11 +1381,6 @@ mod tests {
         assert_eq!(app_state.chain, Chain::Ethereum);
         assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
-        assert_eq!(
-            app_state.native_token_protocol_allowlist.as_ref(),
-            &vec![ProtocolKind::Rocketpool]
-        );
-        assert!(app_state.reset_allowance_tokens.contains_key(&1));
         assert!(app_state.erc4626_deposits_enabled);
         assert_eq!(app_state.optional_backend_stale, Duration::from_secs(300));
         assert_eq!(

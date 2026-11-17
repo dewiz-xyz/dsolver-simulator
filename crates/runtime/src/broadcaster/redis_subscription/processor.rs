@@ -66,7 +66,9 @@ impl BroadcasterSubscriptionProcessor {
                 controls.protocols().to_vec(),
                 0,
             ),
-            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+                controls.tokens().chain(),
+            )),
         );
         let mut processor =
             Self::with_decoder(expected_chain_id, controls, Arc::new(decoder), rebuild);

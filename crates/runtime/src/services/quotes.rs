@@ -1435,7 +1435,9 @@ fn simulation_tokens_for_pool_with_remap_log(
 
 fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolComponent) -> Token {
     let native = request_token.chain.native_token();
-    let wrapped_native = request_token.chain.wrapped_native_token();
+    let Some(wrapped_native) = request_token.chain.wrapped_native_token() else {
+        return request_token.clone();
+    };
 
     if native.address == wrapped_native.address {
         return request_token.clone();
@@ -2703,8 +2705,7 @@ mod tests {
     use simulator_core::broadcaster::{BlockIdentity, BroadcasterRedisReplayBoundary};
 
     use crate::models::state::{
-        BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
-        VmStreamStatus,
+        BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -2848,7 +2849,9 @@ mod tests {
     fn remap_request_token_for_pool_maps_wrapped_to_native_for_native_only_pool() {
         let chain = Chain::Ethereum;
         let native = chain.native_token();
-        let wrapped = chain.wrapped_native_token();
+        let wrapped = chain
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let token_x = make_token(&Bytes::from([9u8; 20]), "TKX");
         let component = ProtocolComponent::new(
             Bytes::from([1u8; 20]),
@@ -2871,7 +2874,9 @@ mod tests {
     fn remap_request_token_for_pool_maps_native_to_wrapped_for_wrapped_only_pool() {
         let chain = Chain::Ethereum;
         let native = chain.native_token();
-        let wrapped = chain.wrapped_native_token();
+        let wrapped = chain
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let token_x = make_token(&Bytes::from([10u8; 20]), "TKX");
         let component = ProtocolComponent::new(
             Bytes::from([2u8; 20]),
@@ -2917,7 +2922,9 @@ mod tests {
     fn remap_request_token_for_pool_keeps_native_and_wrapped_when_pool_has_both() {
         let chain = Chain::Ethereum;
         let native = chain.native_token();
-        let wrapped = chain.wrapped_native_token();
+        let wrapped = chain
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let token_x = make_token(&Bytes::from([12u8; 20]), "TKX");
         let component = ProtocolComponent::new(
             Bytes::from([4u8; 20]),
@@ -3335,24 +3342,18 @@ mod tests {
     fn erc4626_pair_policies() -> Vec<crate::models::erc4626::Erc4626PairPolicy> {
         vec![
             crate::models::erc4626::Erc4626PairPolicy {
-                asset_symbol: "USDS".to_string(),
-                share_symbol: "sUSDS".to_string(),
                 asset: test_address("0xdC035D45d973E3EC169d2276DDab16f1e407384F"),
                 share: test_address("0xa3931d71877c0e7a3148cb7eb4463524fec27fbd"),
                 allow_asset_to_share: true,
                 allow_share_to_asset: true,
             },
             crate::models::erc4626::Erc4626PairPolicy {
-                asset_symbol: "USDC".to_string(),
-                share_symbol: "sUSDC".to_string(),
                 asset: test_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
                 share: test_address("0xBc65ad17c5C0a2A4D159fa5a503f4992c7B545FE"),
                 allow_asset_to_share: true,
                 allow_share_to_asset: true,
             },
             crate::models::erc4626::Erc4626PairPolicy {
-                asset_symbol: "PYUSD".to_string(),
-                share_symbol: "spPYUSD".to_string(),
                 asset: test_address("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"),
                 share: test_address("0x80128DbB9f07b93DDE62A6daeadb69ED14a7D354"),
                 allow_asset_to_share: true,
@@ -3396,8 +3397,6 @@ mod tests {
         AppState {
             chain: Chain::Ethereum,
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head(1))),
-            rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -3422,7 +3421,6 @@ mod tests {
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: config.erc4626_deposits_enabled,
             erc4626_pair_policies: Arc::new(erc4626_pair_policies()),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
         }
     }
 
@@ -3845,7 +3843,11 @@ mod tests {
         );
 
         let native = Chain::Ethereum.native_token().address.to_string();
-        let wrapped = Chain::Ethereum.wrapped_native_token().address.to_string();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address
+            .to_string();
         for (request_id, token_in, token_out) in [
             ("req-native-to-wrapped", native.clone(), wrapped.clone()),
             ("req-wrapped-to-native", wrapped.clone(), native.clone()),
@@ -4260,7 +4262,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000002").expect("valid address");
@@ -4327,7 +4332,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_prefers_exact_wrapped_pool_over_native_alias_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000006").expect("valid address");
@@ -4415,7 +4423,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_prefers_exact_native_pool_over_wrapped_alias_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000007").expect("valid address");
@@ -4503,7 +4514,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_remaps_wrapped_token_out_for_native_only_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_in =
             Bytes::from_str("0x0000000000000000000000000000000000000008").expect("valid address");
@@ -4570,7 +4584,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_remaps_wrapped_request_tokens_for_native_only_vm_pool() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let native = Chain::Ethereum.native_token().address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000004").expect("valid address");
@@ -5025,7 +5042,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_filters_wrong_direction_hashflow_candidate_before_simulation() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let token_in =
             Bytes::from_str("0x0000000000000000000000000000000000000101").expect("valid address");
         let token_out = wrapped_native.clone();
@@ -5112,7 +5132,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_amounts_out_filters_wrong_direction_liquorice_candidate_before_simulation() {
-        let wrapped_native = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped_native = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let token_in =
             Bytes::from_str("0x0000000000000000000000000000000000000107").expect("valid address");
         let token_out = wrapped_native.clone();
@@ -5268,7 +5291,10 @@ mod tests {
     #[tokio::test]
     async fn get_amounts_out_keeps_hashflow_candidate_after_native_wrapped_remap() {
         let native = Chain::Ethereum.native_token().address;
-        let wrapped = Chain::Ethereum.wrapped_native_token().address;
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"))
+            .address;
         let token_out =
             Bytes::from_str("0x0000000000000000000000000000000000000121").expect("valid address");
 

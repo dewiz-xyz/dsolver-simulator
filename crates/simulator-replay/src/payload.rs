@@ -34,7 +34,11 @@ impl ReplayBackend {
     pub const fn from_protocol_kind(kind: ProtocolKind) -> Self {
         match kind {
             ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => Self::Vm,
-            ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => Self::Rfq,
+            ProtocolKind::Hashflow
+            | ProtocolKind::Bebop
+            | ProtocolKind::Liquorice
+            | ProtocolKind::NativeRfq
+            | ProtocolKind::Metric => Self::Rfq,
             _ => Self::Native,
         }
     }

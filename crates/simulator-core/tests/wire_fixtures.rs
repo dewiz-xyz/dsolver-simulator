@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::PathBuf,
-    time::Duration,
 };
 
 use anyhow::Result;
@@ -18,7 +17,7 @@ use simulator_core::broadcaster::{
 };
 use tycho_simulation::{
     protocol::models::ProtocolComponent as SimulationProtocolComponent,
-    rfq::protocols::bebop::{client::BebopClient, state::BebopState},
+    rfq::protocols::bebop::state::BebopState,
     tycho_client::feed::{
         synchronizer::{ComponentWithState, Snapshot, StateSyncMessage},
         BlockHeader, SynchronizerState,
@@ -49,14 +48,14 @@ fn rfq_update_matches_wire_fixture() -> Result<()> {
     assert_wire_fixture("rfq_update.json", rfq_update_envelope(2)?)
 }
 
-/// An RFQ update written before the Bebop client gained its optional origin fields still
-/// reads, as the current wire form with those fields empty. Only this direction is tested.
+/// Pre-book Tycho RFQ states require the old reader; reject them explicitly.
 #[test]
-fn rfq_update_written_before_the_bebop_origin_fields_still_reads() -> Result<()> {
+fn legacy_rfq_state_requires_a_matching_tycho_reader() -> Result<()> {
     let legacy = fs::read(fixture_path("rfq_update_before_bebop_origin.json"))?;
-    let decoded: BroadcasterEnvelope = serde_json::from_slice(&legacy)?;
-    let current = fs::read(fixture_path("rfq_update.json"))?;
-    assert_eq!(serde_json::to_string(&decoded)?.as_bytes(), current);
+    let error = serde_json::from_slice::<BroadcasterEnvelope>(&legacy)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("legacy state unexpectedly decoded"))?;
+    assert!(error.to_string().contains("missing field `book`"));
     Ok(())
 }
 
@@ -335,7 +334,7 @@ fn rfq_update_envelope(message_seq: u64) -> Result<BroadcasterEnvelope> {
         "rfq:bebop".to_string(),
         "bebop_pool".to_string(),
         Chain::Ethereum,
-        vec![state.base_token.clone(), state.quote_token.clone()],
+        vec![token(0xb1, "WETH", 18), token(0xb2, "USDC", 6)],
         Vec::new(),
         HashMap::from([("market".to_string(), bytes(0xd2, 9))]),
         bytes(0xd0, 32),
@@ -569,30 +568,17 @@ fn protocol_component(
 fn bebop_state() -> Result<BebopState> {
     let base_token = token(0xb1, "WETH", 18);
     let quote_token = token(0xb2, "USDC", 6);
-    let base_address = base_token.address.to_vec();
-    let quote_address = quote_token.address.to_vec();
-    let client = BebopClient::new(
-        Chain::Ethereum,
-        HashSet::from([base_token.address.clone()]),
-        100.0,
-        "fixture-key".to_string(),
-        HashSet::from([quote_token.address.clone()]),
-        Duration::from_secs(5),
-        None,
-        None,
-        None,
-    )?;
     Ok(serde_json::from_value(serde_json::json!({
         "base_token": base_token,
         "quote_token": quote_token,
-        "price_data": {
-            "base": base_address,
-            "quote": quote_address,
+        "book": {
+            "base": base_token.address,
+            "quote": quote_token.address,
             "last_update_ts": 1_710_000_000_u64,
-            "bids": [2_000.0, 10.0],
-            "asks": [2_001.0, 11.0],
+            "bids": [{"price": 2000.0, "quantity": 10.0}],
+            "asks": [{"price": 2001.0, "quantity": 11.0}]
         },
-        "client": client,
+        "usd_per_quote_token": 1.0
     }))?)
 }
 
