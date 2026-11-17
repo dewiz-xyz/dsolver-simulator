@@ -67,7 +67,7 @@ impl BroadcasterSubscriptionProcessor {
                 0,
             ),
             Arc::new(TychoStreamDecoder::<BlockHeader>::new(
-                tycho_simulation::tycho_common::models::Chain::Ethereum,
+                controls.tokens().chain(),
             )),
         );
         let mut processor =
