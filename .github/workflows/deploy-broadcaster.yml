@@ -65,8 +65,6 @@ jobs:
             ${{ steps.ecr-login.outputs.registry }}/${{ steps.ecr-repository.outputs.repository }}:latest
           cache-from: type=gha,scope=broadcaster-service-${{ inputs.target }}
           cache-to: type=gha,mode=max,scope=broadcaster-service-${{ inputs.target }}
-          secrets: |
-            github_token=${{ secrets.DEWIZ_EXECUTION_READ_TOKEN }}
 
       - name: Force deploy broadcaster ECS service
         if: inputs.target == 'staging-solve-base'

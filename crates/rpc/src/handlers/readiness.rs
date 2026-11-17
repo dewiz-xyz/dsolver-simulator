@@ -170,8 +170,7 @@ mod tests {
     use super::{ready, status, StatusPayload};
     use crate::config::SlippageConfig;
     use crate::models::state::{
-        AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
-        VmStreamStatus,
+        AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -299,7 +298,6 @@ mod tests {
         AppState {
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_head())),
             chain: Chain::Ethereum,
-            rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: Arc::clone(&token_store),
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

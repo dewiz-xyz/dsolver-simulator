@@ -2,7 +2,7 @@
 
 The corrected `feat/update-tycho-deps` branch targets the agreed **0.525.0** migration. Its original 0.526.0 commit was based on the obsolete `97a2d50` simulator and was not a compatible dependency for current dsolver.
 
-The correction merges simulator master `45a984c4fd78fdc091e65a8fb313b4b2cd83de8a`, which includes dsolver's required baseline `c94491de6a9a8b48d5dc9e2e0933091d009b3da7`. This retains the current bootstrap API, raw snapshot reassembly, lifecycle cancellation, chain-head/freshness checks, historical services, and Base replay buffer settings. Both Tycho simulation and common are pinned exactly to `=0.525.0`; the lockfile also resolves client and ethereum to 0.525.0.
+The correction merges simulator master `45a984c4fd78fdc091e65a8fb313b4b2cd83de8a`, which includes dsolver's required baseline `c94491de6a9a8b48d5dc9e2e0933091d009b3da7`. This retains the current bootstrap API, raw snapshot reassembly, lifecycle cancellation, chain-head/freshness checks, historical services, and Base replay buffer settings. Tycho simulation, common, and the published execution crate are pinned exactly to `=0.525.0`; the lockfile also resolves client and ethereum to 0.525.0.
 
 ## Client compatibility
 
@@ -19,7 +19,7 @@ The Base broadcaster subscribes to all 12 on-chain systems advertised by the aut
 - Existing simulator sources: Uniswap V2/V3/V4, PancakeSwap V3, Aerodrome Slipstreams.
 - Broadcast-only sources: Aerodrome V1, SushiSwap V2, Aero Basic, Aero CL, PancakeSwap Infinity CL, LunarBase, Ekubo V3.
 
-Aerodrome V1 was already broadcast-only in the merged baseline. The other six expand that baseline's coverage. Infinity Bin and Biconomy have canonical identities and decoders registered but remain disabled because the hosted Base endpoint did not advertise them. Ethereum's selected sources are unchanged. Registration does not establish router/executor support; the standalone simulator's encodable on-chain selection remains explicit in the manifest.
+Aerodrome V1 was already broadcast-only in the merged baseline. The other six expand that baseline's coverage. Infinity Bin and Biconomy have canonical identities and decoders registered but remain disabled because the hosted Base endpoint did not advertise them. Ethereum's selected sources are unchanged. The standalone simulator's quoting selection remains explicit in the manifest; downstream consumers own router/executor support.
 
 Base RFQ broadcasting enables **Bebop, Native, and Metric**. Metric uses Tycho's pAMM book feed but travels through the same decoded-state snapshot and Redis contract as the RFQ providers.
 
@@ -31,21 +31,26 @@ Set `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true` on the broadcaster. Supply `BEBO
 
 `RFQ_MIN_TVL_USD` defaults to `100` and must be finite and nonnegative. It is independent of the on-chain `TVL_THRESHOLD`, whose units are the native token.
 
-The removed upstream `RFQStreamBuilder` is replaced with public provider feed builders and `BookFeedStreams`. Existing Bebop and Hashflow encode clients are rebuilt through public book assemblers. Simulation still delegates to the original broadcast state, preserving its pricing; locally attached signing clients are omitted from serialization. Native and Metric settlement encoding remains outside this broadcasting change and returns an explicit unsupported error.
+The removed upstream `RFQStreamBuilder` is replaced with public provider feed builders and `BookFeedStreams`. Simulation uses the serialized broadcast books directly. The simulator requires no RFQ provider credentials; only the broadcaster connects to provider feeds.
 
-The existing private execution fork remains pinned to `f4d444414c43d2cecf626139fd1749e11d15cba6`, with a small vendored compatibility patch for common 0.525.0. Its provenance and changes are documented in [COMPATIBILITY.md](../vendor/tycho-execution/COMPATIBILITY.md). No new executors or router addresses are introduced.
+`POST /encode` is removed and returns `404 Not Found`. Its service, request/response models, firm-quote hydration, route-only state fences, calldata fixtures, and analyzer probes are removed. `/simulate`, `/status`, `/ready`, and broadcaster contracts remain supported. The analyzer writes schema version 8 without encode inspection fields.
+
+The workspace uses the published `tycho-execution = "=0.525.0"` dependency. The private execution fork, vendored source, Cargo patch, and private Git credential plumbing in CI/Docker builds are removed. The historical service builds directly against the shared lockfile. Consumers are responsible for settlement encoding; no executor or router deployment is included.
 
 ## Verification
 
-Validated on 2026-11-17 with Rust 1.95.0:
+Validated after removing `/encode` on 2026-11-17 with Rust 1.95.0:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`: passed.
-- `cargo nextest run --locked --workspace --no-fail-fast --test-threads 4`: **1,061 passed, 102 skipped**. Three CLI timing tests failed during the initial concurrent build workload and passed in the final full run at lower concurrency.
+- `cargo nextest run --locked --workspace --no-fail-fast --test-threads 4`: **924 passed, 102 skipped**. Includes the removed endpoint's 404 contract, RFQ-enabled simulator startup without provider credentials on Base/Ethereum, and broadcaster/replay coverage. One passing quote test was flagged for a lingering process; its isolated rerun passed without that flag.
 - `cargo test --locked --workspace --doc`: passed (no doctests defined).
-- `cargo build --locked --workspace --bins --release`: passed, including both services, historical service/CLI, and migration tools.
-- `python3 scripts/test_check_pruned_lock.py`: nine passed. The actual pruned historical workspace also resolves and passes the lockfile identity/edge guard with no execution dependency.
-- Opt-in simulation amount/gas baseline: passed unchanged for Uniswap V2/V3/V4, PancakeSwap V3, and Aerodrome Slipstreams. The existing Base calldata fixtures also pass unchanged.
+- Lockfile inspection: execution/simulation/common/client/ethereum each resolve once to crates.io `0.525.0`; no Git dependency or local execution patch remains.
+- `cargo build --locked --workspace --bins --release`: blocked by local disk exhaustion (`No space left on device`), including after removing this checkout's generated debug artifacts. Test-profile binaries compiled and all active tests passed; the release build still needs CI validation.
+
+Additional verification recorded before the encoding removal for the broadcasting upgrade:
+
+- Opt-in simulation amount/gas baseline: passed unchanged for Uniswap V2/V3/V4, PancakeSwap V3, and Aerodrome Slipstreams.
 - Opt-in live Base Native/Metric test: passed. Three Metric books (WETH/USDC, cbBTC/USDC, WETH/cbBTC) and two Native books (WETH/USDC, USDC/cbBTC) preserve spot prices exactly through serialization. Counts describe this test token universe, not total provider coverage. No firm quote or transaction was requested.
 - Isolated downstream workspace compile with all targets/features, formatting, and public documentation checks: passed. Its lockfile contains one version of simulation/common/client/ethereum, all 0.525.0.
 

@@ -42,10 +42,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50ab0cd8afe573d1f7dc2353698a51b1f93aec362c8211e28cfd3948c6adba39"
 dependencies = [
  "alloy-consensus",
- "alloy-contract",
  "alloy-core",
  "alloy-eips",
- "alloy-genesis",
  "alloy-json-rpc",
  "alloy-network",
  "alloy-node-bindings",
@@ -115,29 +113,6 @@ dependencies = [
  "alloy-rlp",
  "alloy-serde",
  "serde",
-]
-
-[[package]]
-name = "alloy-contract"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ac9e0c34dc6bce643b182049cdfcca1b8ce7d9c260cbdd561f511873b7e26cd"
-dependencies = [
- "alloy-consensus",
- "alloy-dyn-abi",
- "alloy-json-abi",
- "alloy-network",
- "alloy-network-primitives",
- "alloy-primitives 1.7.3",
- "alloy-provider",
- "alloy-rpc-types-eth",
- "alloy-sol-types",
- "alloy-transport",
- "futures 0.3.32",
- "futures-util",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -255,9 +230,7 @@ dependencies = [
  "alloy-primitives 1.7.3",
  "alloy-serde",
  "alloy-trie",
- "borsh",
  "serde",
- "serde_with",
 ]
 
 [[package]]
@@ -938,7 +911,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "tycho-execution",
  "tycho-simulation",
  "typetag",
 ]
@@ -6351,7 +6323,6 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives 1.7.3",
  "alloy-provider",
- "alloy-sol-types",
  "alloy-transport",
  "anyhow",
  "broadcaster-replay-client",
@@ -8157,20 +8128,25 @@ dependencies = [
 
 [[package]]
 name = "tycho-execution"
-version = "0.165.1"
+version = "0.525.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa1bbb6812ae863e679505991ea713e7baade53880c2bf447df541838b1cda8c"
 dependencies = [
  "alloy",
  "chrono",
  "clap",
- "dotenv",
+ "dotenvy",
  "hex",
+ "metrics",
  "num-bigint",
- "once_cell",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "strum",
+ "strum_macros",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "tycho-common",
 ]
 

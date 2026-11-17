@@ -1,6 +1,6 @@
 # DSolver Simulator Local Analysis
 
-This repo ships a reporting-first Rust CLI for local DSolver Simulator analysis. It starts or reuses the local Tycho broadcaster plus simulator stack, waits for simulator readiness, exercises representative `/simulate` and `/encode` flows, runs latency and light stress probes, captures sampled evidence, and writes a structured report instead of enforcing a strict pass/fail gate.
+This repo ships a reporting-first Rust CLI for local DSolver Simulator analysis. It starts or reuses the local Tycho broadcaster plus simulator stack, waits for simulator readiness, exercises representative `/simulate` flows, runs latency and light stress probes, captures sampled evidence, and writes a structured report instead of enforcing a strict pass/fail gate.
 
 ## Quick start
 
@@ -43,7 +43,6 @@ cargo run -p apps --bin sim-analysis -- --chain-id 1 --baseline none --stop
 - reads `/status` for service state, then waits on `/ready` for native readiness and includes VM and RFQ checks when those backends are enabled
 - allows longer VM or RFQ warmups on fresh starts; budget up to about 10 minutes before assuming either backend is stuck
 - runs a balanced `/simulate` sweep across representative pairs
-- builds the balanced `/encode` route matrix from live `/simulate` prep hops: 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain
 - runs latency and light stress sweeps
 - saves a JSON report, markdown summary, sampled request/response artifacts, and simulator/broadcaster log excerpts
 - optionally compares the current run with the most recent compatible saved report

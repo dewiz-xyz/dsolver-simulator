@@ -34,21 +34,9 @@ ARG CARGO_NET_OFFLINE=false
 COPY Cargo.toml Cargo.lock ./
 COPY . .
 
-# Cargo auto-discovers packages below the workspace root. Exclude the application path that reaches
-# the private execution repository so this service image needs no source credential.
+# All workspace dependencies are public; use the shared lockfile directly.
 RUN --mount=type=cache,id=dsolver-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    cp Cargo.lock /tmp/original-workspace.Cargo.lock \
-    && sed -i \
-        -e '/"crates\/runtime",/d' \
-        -e '/"crates\/rpc",/d' \
-        -e '/"crates\/apps",/d' \
-        -e 's|^exclude = .*|exclude = ["vendor/tycho-execution", "crates/runtime", "crates/rpc", "crates/apps"]|' \
-        -e '/^tycho-execution = /d' \
-        Cargo.toml \
-    && cargo metadata --format-version 1 --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" > /dev/null \
-    && python3 scripts/check_pruned_lock.py /tmp/original-workspace.Cargo.lock Cargo.lock \
-    && cargo build --locked -p historical-quote-service --release \
-    && rm /tmp/original-workspace.Cargo.lock
+    cargo build --locked -p historical-quote-service --release
 
 
 FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:833d7afe7d42e2fc552740ebdb947218770eb6f0a533927ed2a04b4d453e4f0a AS runner

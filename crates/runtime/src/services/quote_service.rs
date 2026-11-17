@@ -515,8 +515,7 @@ mod tests {
     use crate::config::SlippageConfig;
     use crate::models::messages::{QuoteFailure, QuoteFailureKind};
     use crate::models::state::{
-        BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig, StateStore,
-        VmStreamStatus,
+        BroadcasterSubscriptionStatus, ConfiguredBackends, StateStore, VmStreamStatus,
     };
     use crate::models::stream_health::StreamHealth;
     use crate::models::tokens::TokenStore;
@@ -563,7 +562,6 @@ mod tests {
                 hash: Bytes::from(vec![1; 32]),
             })),
             chain: Chain::Ethereum,
-            rfq_client_config: Arc::new(RfqClientConfig::default()),
             native_token_protocol_allowlist: Arc::new(Vec::new()),
             tokens: token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),

@@ -34,7 +34,7 @@ pub struct ChainProfile {
     pub chain: Chain,
     pub native_protocols: Vec<ProtocolKind>,
     /// Native protocols the broadcaster publishes but the standalone simulator does not
-    /// route, because its encoder cannot build them. DSolver V2 encodes them itself.
+    /// quote. Downstream consumers enable and simulate these sources themselves.
     pub broadcaster_only_native_protocols: Vec<ProtocolKind>,
     pub vm_protocols: Vec<ProtocolKind>,
     pub rfq_protocols: Vec<ProtocolKind>,
@@ -109,9 +109,6 @@ pub fn load_config() -> AppConfig {
     let reset_allowance_tokens = Arc::new(chain_profile.reset_allowance_tokens.clone());
     let erc4626_pair_policies = Arc::new(chain_profile.erc4626_pair_policies.clone());
     let memory = MemoryConfig::from_env();
-    let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
-    let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
-        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
 
     AppConfig {
         chain_profile,
@@ -142,11 +139,6 @@ pub fn load_config() -> AppConfig {
         stream_restart_backoff_jitter_pct: stream.stream_restart_backoff_jitter_pct,
         slippage,
         memory,
-        bebop_key,
-        hashflow_key,
-        hashflow_user,
-        liquorice_key,
-        liquorice_user,
     }
 }
 
@@ -780,11 +772,6 @@ pub struct AppConfig {
     pub stream_restart_backoff_jitter_pct: f64,
     pub slippage: SlippageConfig,
     pub memory: MemoryConfig,
-    pub bebop_key: String,
-    pub hashflow_user: String,
-    pub hashflow_key: String,
-    pub liquorice_user: String,
-    pub liquorice_key: String,
 }
 
 #[derive(Clone)]
@@ -1795,17 +1782,17 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_config_requires_rfq_provider_credentials_when_effective() {
-        let message = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
-            clear_rfq_credential_env();
-            std::env::set_var("ENABLE_RFQ_POOLS", "true");
-            match std::panic::catch_unwind(load_config) {
-                Ok(_) => unreachable!("simulator config should require RFQ credentials"),
-                Err(panic) => panic_message(panic),
-            }
-        });
-
-        assert!(message.contains("BEBOP_KEY"));
+    fn load_config_accepts_rfq_without_provider_credentials() {
+        for chain_id in ["1", "8453"] {
+            let config = with_isolated_config_env(Some("http://127.0.0.1:3001"), || {
+                clear_rfq_credential_env();
+                std::env::set_var("CHAIN_ID", chain_id);
+                std::env::set_var("ENABLE_RFQ_POOLS", "true");
+                load_config()
+            });
+            assert!(config.enable_rfq_pools);
+            assert!(!config.chain_profile.rfq_protocols.is_empty());
+        }
     }
 
     #[test]

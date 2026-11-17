@@ -137,7 +137,7 @@ RFQ readiness:
 - `backends.rfq.status="stale"` when RFQ updates are past the readiness freshness window
 - `backends.rfq.status="ready"` when RFQ state is usable
 - `backends.rfq.update_timestamp` is the current Tycho RFQ update timestamp/cursor when RFQ state is ready; RFQ backend status does not expose `block_number`
-- when RFQ is enabled, the simulator requires credentials for every configured RFQ provider at startup so `/encode` can request firm signed quotes
+- RFQ provider credentials are required by the broadcaster; the simulator consumes serialized book states without provider credentials
 
 Quote-path implications:
 
@@ -199,10 +199,6 @@ backend's rows, even if state recovers before the request finishes. Removed nati
 through `stale_native_state`; removed VM rows set `vm_unavailable=true` and add a `simulator` failure.
 RFQ rows do not use this chain-head freshness check.
 
-The separate native pool identity check belongs to `/encode`: it compares the route's own pools
-against current published state and may retry once if those pools changed. Updating unrelated pools
-does not trigger that retry, but native and VM chain freshness must still hold for the encoded route.
-
 `meta.pool_results` is the per-pool anomaly layer.
 
 Use it to understand:
@@ -226,11 +222,6 @@ Router-level timeout behavior:
 - `/simulate` also sits behind a router timeout layer with extra headroom
 - when the router boundary fires, the endpoint still returns `200 OK` with `result_quality=request_level_failure`
 - logs mark those cases with `scope="router_timeout"`
-
-`/encode` is intentionally different:
-
-- router timeouts return `408 Request Timeout`
-- the payload shape is `{ error }`, with `requestId` included when available
 
 ## Observability contract
 
@@ -258,22 +249,8 @@ Operational guidance:
 - use `partial_kind` to split partial requested-amount coverage from incomplete pool coverage
 - treat `simulate-successes` style queries as `ready + (complete|partial)` only
 
-`/encode` observability:
-
-- `/encode` still does not expose `QuoteMeta`; its API contract stays success/error oriented
-- the handler emits one structured completion event per request instead of relying on per-hop `info` logs
-- summary logs include route shape fields such as `segments`, `hops`, `swaps`, `route_protocols`, `swap_kind`, request amounts, and whether the route uses VM pools
-- failure logs also include stable `encode_error_kind` and `failure_stage` fields
-- current `failure_stage` values are `validation`, `readiness`, `normalization`, `resimulation`, `min_amount_out_guard`, `encoding`, `interaction_build`, `internal`, `handler_timeout`, and `router_timeout`
-- per-segment, per-hop, and per-swap resimulation traces are emitted at `debug`, not `info`
-
 ## Integrations
 
-`/encode` integration:
-
-- `/encode` does not expose `QuoteMeta`
-- `/encode` clients and the local analyzer depend on `/simulate` to find candidate pools
-- `/encode` supports RFQ pools when RFQ state is ready; it rebuilds the selected request-scoped RFQ client with simulator credentials because broadcaster serialization omits them
 - pool selection should stay strict: `ready + complete|partial` is usable, `request_level_failure` and `no_results` are not
 - clients should filter returned rows explicitly for the amount position they need instead of relying on `data[0]`
 

@@ -197,8 +197,8 @@ native_protocols = [
     "pancakeswap_v3",
     "aerodrome_slipstreams",
 ]
-# The broadcaster carries these for DSolver V2, which encodes them itself. Our execution fork has no
-# encoder for them, so the simulator does not route them.
+# Additional sources for downstream consumers. The standalone simulator retains its existing
+# quoting selection; consumers enable and simulate these sources themselves.
 broadcaster_only_native_protocols = ["aerodrome_v1", "sushiswap_v2", "aero_basic", "aero_cl", "pancakeswap_infinity_cl", "lunarbase", "ekubo_v3"]
 vm_protocols = []
 rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric"]

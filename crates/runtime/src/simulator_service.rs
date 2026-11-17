@@ -10,7 +10,6 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use tycho_execution::encoding::tycho_encoder::TychoEncoder;
 use tycho_simulation::tycho_common::{
     models::{token::Token, Chain},
     Bytes,
@@ -30,15 +29,14 @@ use crate::config::{
 use crate::memory::maybe_log_memory_snapshot;
 use crate::metrics::emit_simulator_health_snapshot;
 use crate::models::state::{
-    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, RfqClientConfig,
-    SimulatorBackendReadiness, SimulatorReadinessReason, SimulatorServiceStatus, StateStore,
-    VmStreamStatus,
+    AppState, BroadcasterSubscriptionStatus, ConfiguredBackends, SimulatorBackendReadiness,
+    SimulatorReadinessReason, SimulatorServiceStatus, StateStore, VmStreamStatus,
 };
 use crate::models::stream_health::StreamHealth;
 use crate::models::tokens::{
     derive_broadcaster_token_lookup_url, derive_broadcaster_token_snapshot_url, TokenStore,
 };
-use crate::services::{EncodeService, QuoteService};
+use crate::services::QuoteService;
 use crate::stream::StreamSupervisorConfig;
 
 const TOKEN_SNAPSHOT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -57,22 +55,12 @@ pub struct SimulatorServiceParts {
 pub struct SimulatorRuntime {
     app_state: AppState,
     quote_service: QuoteService,
-    encode_service: EncodeService,
 }
 
 impl SimulatorRuntime {
     pub fn new(app_state: AppState) -> Self {
         Self {
             quote_service: QuoteService::new(app_state.clone()),
-            encode_service: EncodeService::new(app_state.clone()),
-            app_state,
-        }
-    }
-
-    pub fn new_with_encoder(app_state: AppState, encoder: Arc<dyn TychoEncoder>) -> Self {
-        Self {
-            quote_service: QuoteService::new(app_state.clone()),
-            encode_service: EncodeService::with_encoder(app_state.clone(), encoder),
             app_state,
         }
     }
@@ -83,10 +71,6 @@ impl SimulatorRuntime {
 
     pub fn quote_service(&self) -> QuoteService {
         self.quote_service.clone()
-    }
-
-    pub fn encode_service(&self) -> EncodeService {
-        self.encode_service.clone()
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -484,14 +468,6 @@ fn build_app_state(
                 config.chain_profile.chain_head_observation_max_age_secs,
             ),
         })),
-        rfq_client_config: Arc::new(RfqClientConfig {
-            tvl_threshold: config.tvl_threshold,
-            bebop_key: config.bebop_key.clone(),
-            hashflow_user: config.hashflow_user.clone(),
-            hashflow_key: config.hashflow_key.clone(),
-            liquorice_user: config.liquorice_user.clone(),
-            liquorice_key: config.liquorice_key.clone(),
-        }),
         native_token_protocol_allowlist: Arc::new(
             config.chain_profile.native_token_protocol_allowlist.clone(),
         ),
@@ -1047,11 +1023,6 @@ mod tests {
                 snapshots_min_new_pairs: 1_000,
                 snapshots_emit_emf: false,
             },
-            bebop_key: "bebop-key".to_string(),
-            hashflow_user: "hashflow-user".to_string(),
-            hashflow_key: "hashflow-key".to_string(),
-            liquorice_user: "liquorice-user".to_string(),
-            liquorice_key: "liquorice-key".to_string(),
         }
     }
 
@@ -1339,12 +1310,6 @@ mod tests {
         assert_eq!(app_state.chain, Chain::Base);
         assert!(app_state.enable_vm_pools);
         assert!(app_state.enable_rfq_pools);
-        assert_eq!(app_state.rfq_client_config.tvl_threshold, 100.0);
-        assert_eq!(app_state.rfq_client_config.bebop_key, "bebop-key");
-        assert_eq!(app_state.rfq_client_config.hashflow_user, "hashflow-user");
-        assert_eq!(app_state.rfq_client_config.hashflow_key, "hashflow-key");
-        assert_eq!(app_state.rfq_client_config.liquorice_user, "liquorice-user");
-        assert_eq!(app_state.rfq_client_config.liquorice_key, "liquorice-key");
         assert!(app_state.native_token_protocol_allowlist.is_empty());
         assert!(app_state.reset_allowance_tokens.is_empty());
         assert!(!app_state.erc4626_deposits_enabled);
