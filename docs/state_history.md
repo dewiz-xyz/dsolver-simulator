@@ -4,7 +4,7 @@ State history records the broadcaster as ordered segments. A stream position is 
 
 A reader starts from the newest complete checkpoint at or before the requested start block, then selects deltas using each backend's own block or timestamp cursor. A replay plan can contain multiple legs. Each leg starts from one checkpoint and applies its deltas in `(generation, message_seq)` order.
 
-Boundary checkpoints start new segments after writer promotion and recovery commits. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
+Boundary checkpoints start new segments after writer promotion and recovery commits. At startup promotion the writer retains the same pinned snapshot and token catalog used to establish the new generation, at the Redis reset position. It persists startup handoff updates as deltas at their assigned Redis positions. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
 
 ## Terminology
 

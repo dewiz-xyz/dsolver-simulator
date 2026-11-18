@@ -237,6 +237,7 @@ impl<S: HistorySource> HistoricalReconstructor<S> {
 }
 
 pub(crate) struct RestoredWorld {
+    pub(crate) archive_schema_version: u32,
     pub(crate) world: ReplayWorld,
     pub(crate) decoder: ReplayDecoder,
     pub(crate) final_position: HistoryPosition,
@@ -343,6 +344,7 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
     let mut world = ReplayWorld::new(tokens, None);
     let report = world.restore(update);
     Ok(Some(RestoredWorld {
+        archive_schema_version: archive.metadata.schema_version,
         world,
         decoder,
         final_position: manifest.position,

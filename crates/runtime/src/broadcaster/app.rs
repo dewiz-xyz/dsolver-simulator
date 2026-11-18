@@ -929,6 +929,11 @@ fn spawn_promotion_task(
                 "Broadcaster active writer promoted"
             );
             refreshing_recovered_snapshot = mode == BroadcasterRedisPublisherMode::Unhealthy;
+            // Normal promotion retained the same snapshot it installed for HTTP bootstrap.
+            // Reacquiring a lost writer has no prepared startup snapshot.
+            if !refreshing_recovered_snapshot {
+                continue;
+            }
             let Some(state_history) = &state_history else {
                 continue;
             };

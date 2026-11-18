@@ -35,7 +35,8 @@ use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapsho
 use simulator_core::broadcaster::{
     BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
     BroadcasterPayload, BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
-    BroadcasterUpdateMessage, ProtocolStateHeads, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
+    BroadcasterTokenDto, BroadcasterUpdateMessage, ProtocolStateHeads,
+    BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
 };
 use simulator_core::models::protocol::ProtocolKind;
 
@@ -338,7 +339,14 @@ struct CachedSnapshotBoundaryRetention {
 }
 
 #[derive(Debug)]
+struct PromotionCheckpoint {
+    block_number: u64,
+    tokens: Vec<BroadcasterTokenDto>,
+}
+
+#[derive(Debug)]
 struct BroadcasterSnapshotCandidate {
+    checkpoint: Option<PromotionCheckpoint>,
     chain_id: u64,
     export: BroadcasterSnapshotExport,
     base_heads: Vec<BroadcasterBackendHead>,
@@ -353,6 +361,7 @@ struct BroadcasterSnapshotCandidate {
 
 #[derive(Debug)]
 struct StartupCandidateCapture {
+    checkpoint: Option<PromotionCheckpoint>,
     chain_id: u64,
     handoff_id: u64,
     captured: Vec<(
@@ -1961,8 +1970,20 @@ impl BroadcasterServiceState {
                 return Ok(None);
             }
         }
+        let checkpoint = if let Some(history) = services[0].redis_publisher.state_history() {
+            let Some(block_number) = aligned_onchain_head(&base_heads) else {
+                return Ok(None);
+            };
+            Some(PromotionCheckpoint {
+                block_number,
+                tokens: history.clone_token_catalog().await,
+            })
+        } else {
+            None
+        };
         let handoff_id = services[0].redis_publisher.begin_startup_handoff().await?;
         Ok(Some(StartupCandidateCapture {
+            checkpoint,
             chain_id,
             handoff_id,
             captured,
@@ -2229,27 +2250,33 @@ fn record_boundary_slip_gap_if_any(
 }
 
 async fn state_history_aligned_backend_head(services: &[BroadcasterServiceState]) -> Option<u64> {
-    let mut aligned_head = None;
+    let mut heads = Vec::new();
     for service in services {
-        for head in service.cache.backend_heads().await {
-            if matches!(
-                head.backend,
-                simulator_core::broadcaster::BroadcasterBackend::Native
-                    | simulator_core::broadcaster::BroadcasterBackend::Vm
-            ) {
-                if aligned_head.is_some_and(|current| current != head.block_number) {
-                    warn!(
-                        event = "state_history_checkpoint_skipped",
-                        reason = "backend_skew",
-                        "State history checkpoint skipped because backend heads are not aligned"
-                    );
-                    return None;
-                }
-                aligned_head = Some(head.block_number);
-            }
-        }
+        heads.extend(service.cache.backend_heads().await);
     }
-    aligned_head
+    aligned_onchain_head(&heads)
+}
+
+fn aligned_onchain_head(heads: &[BroadcasterBackendHead]) -> Option<u64> {
+    let mut blocks = heads
+        .iter()
+        .filter(|head| {
+            matches!(
+                head.backend,
+                BroadcasterBackend::Native | BroadcasterBackend::Vm
+            )
+        })
+        .map(|head| head.block_number);
+    let block = blocks.next()?;
+    if blocks.any(|other| other != block) {
+        warn!(
+            event = "state_history_checkpoint_skipped",
+            reason = "backend_skew",
+            "State history checkpoint skipped because backend heads are not aligned"
+        );
+        return None;
+    }
+    Some(block)
 }
 
 pub(crate) struct BroadcasterFeedApply {
@@ -2272,6 +2299,7 @@ async fn prepare_startup_snapshot_candidate(
         return Ok(None);
     };
     let StartupCandidateCapture {
+        checkpoint,
         chain_id,
         handoff_id,
         captured,
@@ -2297,6 +2325,7 @@ async fn prepare_startup_snapshot_candidate(
             protocol_heads,
             recovery_work_ids,
             handoff_id,
+            checkpoint,
         )
     });
     let result = match tokio::time::timeout(STARTUP_HANDOFF_ABORT_AFTER, worker).await {
@@ -2352,10 +2381,10 @@ async fn prepare_startup_snapshot_candidate(
 
 async fn promote_prepared_startup_candidate(
     services: &[BroadcasterServiceState],
-    candidate: BroadcasterSnapshotCandidate,
+    mut candidate: BroadcasterSnapshotCandidate,
     reason: String,
 ) -> Result<BroadcasterRedisReplayBoundary> {
-    let _gate = services[0].lifecycle_gate.lock().await;
+    let gate = services[0].lifecycle_gate.lock().await;
     anyhow::ensure!(
         services[0].redis_publisher.mode().await == BroadcasterRedisPublisherMode::Passive,
         "startup snapshot candidate can only promote a passive publisher"
@@ -2369,6 +2398,15 @@ async fn promote_prepared_startup_candidate(
     services[0]
         .redis_publisher
         .set_deployment_phase(BroadcasterDeploymentPhase::Promoting, None);
+    let checkpoint = services[0]
+        .redis_publisher
+        .state_history()
+        .zip(candidate.checkpoint.take());
+    let rfq_observed_at_ms = if checkpoint.is_some() {
+        super::state_history::rfq_observed_at_ms_from_export(&candidate.export)?
+    } else {
+        None
+    };
     let boundary = services[0]
         .redis_publisher
         .promote(candidate.base_heads.clone(), reason)
@@ -2381,6 +2419,9 @@ async fn promote_prepared_startup_candidate(
         .redis_publisher
         .set_deployment_phase(BroadcasterDeploymentPhase::ArtifactFinalizing, None);
     let published_heads = candidate.protocol_heads.clone();
+    if let Some((history, _)) = &checkpoint {
+        history.observe_rfq_timestamp(rfq_observed_at_ms);
+    }
     let artifact = Arc::new(finalize_snapshot_candidate(candidate, boundary.clone()));
     for service in services {
         *service.snapshot_artifact.write().await = Some(Arc::clone(&artifact));
@@ -2390,12 +2431,68 @@ async fn promote_prepared_startup_candidate(
         .install_published_snapshot_heads(published_heads)
         .await;
 
-    services[0]
+    let drained = services[0]
         .redis_publisher
         .drain_startup_handoff(frozen_handoff)
-        .await?;
-    services[0].redis_publisher.admit_deployment();
+        .await;
+    if drained.is_ok() {
+        services[0].redis_publisher.admit_deployment();
+    }
+    drop(gate);
+
+    // Redis and HTTP already refer to this immutable snapshot. Catch-up or a change in
+    // live readiness must not move the starting position of the historical segment.
+    if let Some((history, checkpoint)) = checkpoint {
+        persist_promotion_checkpoint(history, artifact, checkpoint, rfq_observed_at_ms).await;
+    }
+    drained?;
     Ok(boundary)
+}
+
+async fn persist_promotion_checkpoint(
+    history: Arc<super::state_history::StateHistoryRuntime>,
+    artifact: Arc<BroadcasterSnapshotArtifact>,
+    checkpoint: PromotionCheckpoint,
+    rfq_observed_at_ms: Option<u64>,
+) {
+    let chain_id = artifact.chain_id;
+    let boundary = &artifact.redis_replay_boundary;
+    let position = StreamPosition {
+        generation: boundary.generation,
+        message_seq: boundary.exclusive_message_seq,
+    };
+    let block_number = checkpoint.block_number;
+    let result = tokio::task::spawn_blocking(move || {
+        super::state_history::captured_state_from_payloads(
+            CheckpointKind::Boundary,
+            artifact.payloads.iter().map(|envelope| &envelope.payload),
+            position,
+            artifact.redis_replay_boundary.state_version,
+            block_number,
+            None,
+        )
+    })
+    .await
+    .context("promotion checkpoint worker failed")
+    .and_then(std::convert::identity)
+    .and_then(|state| {
+        anyhow::ensure!(
+            history
+                .handle
+                .request_checkpoint(history.checkpoint_capture(state, checkpoint.tokens)),
+            "state history checkpoint queue rejected the capture"
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        history.handle.record_boundary_failure_gap(
+            chain_id,
+            position,
+            Some(block_number),
+            rfq_observed_at_ms,
+        );
+        warn!(event = "state_history_boundary_checkpoint_failed", generation = position.generation, message_seq = position.message_seq, %error, "Could not retain the promoted snapshot");
+    }
 }
 
 async fn ensure_recovery_work_ids_current(
@@ -2423,6 +2520,7 @@ fn build_snapshot_candidate(
     protocol_heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
     captured_recovery_work_ids: Vec<u64>,
     handoff_id: u64,
+    checkpoint: Option<PromotionCheckpoint>,
 ) -> Result<BroadcasterSnapshotCandidate> {
     let placeholder_stream_id = format_redis_stream_id(chain_id, u64::MAX);
     let placeholder_snapshot_id = format_redis_snapshot_id(chain_id, u64::MAX);
@@ -2461,6 +2559,7 @@ fn build_snapshot_candidate(
         .count() as u32;
 
     Ok(BroadcasterSnapshotCandidate {
+        checkpoint,
         chain_id,
         export,
         base_heads,
@@ -3609,6 +3708,93 @@ mod tests {
             .gaps()
             .iter()
             .all(|gap| gap.reason != state_history::GapReason::BoundarySlip));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promotion_retains_the_bootstrap_snapshot_and_every_buffered_update() -> Result<()> {
+        let (history, probe) =
+            test_state_history_runtime_with_tokens(8, vec![dummy_token(7, "SEVEN")]);
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )
+            .with_state_history(Arc::clone(&history)),
+        );
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(
+            ChainHeadObserver::ready_for_test(BlockIdentity {
+                number: 12,
+                hash: Bytes::from([12; 32]),
+            }),
+            vec![ProtocolKind::UniswapV2],
+            Vec::new(),
+        );
+        service.mark_upstream_connected().await;
+        service.apply_feed_message(&raw_feed(10, 10, 9)).await?;
+        let services = std::slice::from_ref(&service);
+        let candidate = super::prepare_startup_snapshot_candidate(services)
+            .await?
+            .ok_or_else(|| anyhow!("missing promotion snapshot"))?;
+        service.apply_feed_message(&raw_feed(11, 11, 10)).await?;
+        let boundary =
+            super::promote_prepared_startup_candidate(services, candidate, "test_active".into())
+                .await?;
+        let tail = publisher.replay_boundary().await?;
+        assert!(tail.exclusive_message_seq > boundary.exclusive_message_seq);
+        assert_ne!(
+            service.status_snapshot().await.readiness,
+            BroadcasterReadiness::Ready
+        );
+        timeout(Duration::from_secs(2), async {
+            while history.handle.status().checkpoints_completed != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let checkpoints = probe.checkpoints();
+        let checkpoint = &checkpoints[0];
+        assert_eq!(checkpoint.kind(), state_history::CheckpointKind::Boundary);
+        assert_eq!(checkpoint.block_number(), 10);
+        assert_eq!(
+            checkpoint.position(),
+            state_history::StreamPosition {
+                generation: boundary.generation,
+                message_seq: boundary.exclusive_message_seq
+            }
+        );
+        assert_eq!(checkpoint.state_version(), Some(boundary.state_version));
+        let artifact = service
+            .snapshot_artifact
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("missing HTTP snapshot"))?;
+        let payloads = artifact
+            .payloads
+            .iter()
+            .map(|envelope| serde_json::to_string(&envelope.payload))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(checkpoint.payloads_json(), payloads);
+        assert_eq!(
+            probe.token_snapshots()[0].tokens[0].address,
+            dummy_token(7, "SEVEN").address
+        );
+        assert_eq!(
+            history.handle.status().last_persisted,
+            Some(state_history::StreamPosition {
+                generation: tail.generation,
+                message_seq: tail.exclusive_message_seq
+            })
+        );
+        assert!(probe.gaps().is_empty());
         Ok(())
     }
 
@@ -5772,6 +5958,7 @@ mod tests {
             BTreeMap::new(),
             vec![3],
             9,
+            None,
         )?;
         assert_eq!(
             candidate.export.stream_id,
