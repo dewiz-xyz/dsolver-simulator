@@ -226,8 +226,9 @@ native_protocols = [
     "erc4626",
 ]
 broadcaster_only_native_protocols = ["uniswap_v4", "uniswap_v4_hooks", "ring_swap_v2", "sky", "lido_v4", "etherfi", "aero_basic", "aero_cl"]
-vm_protocols = ["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
-broadcaster_only_vm_protocols = ["vm:balancer_v3", "vm:liquidityparty"]
+# Balancer V2/V3 are intentionally disabled.
+vm_protocols = ["vm:curve", "vm:maverick_v2"]
+broadcaster_only_vm_protocols = ["vm:liquidityparty"]
 # Ethereum v4 is broadcast-only until one guarded simulator subscription can retain the VM set.
 # TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
 rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric", "rfq:hashflow"]

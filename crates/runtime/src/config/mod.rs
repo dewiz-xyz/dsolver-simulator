@@ -1201,7 +1201,14 @@ mod tests {
         );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
         assert_eq!(chain.chain_profile.broadcaster_native_protocols().len(), 18);
-        assert_eq!(chain.chain_profile.broadcaster_vm_protocols().len(), 5);
+        assert_eq!(
+            chain.chain_profile.broadcaster_vm_protocols(),
+            vec![
+                ProtocolKind::Curve,
+                ProtocolKind::MaverickV2,
+                ProtocolKind::LiquidityParty
+            ]
+        );
         assert_eq!(chain.chain_profile.broadcaster_rfq_protocols().len(), 12);
         assert_eq!(chain.chain_profile.broadcaster_only_rfq_protocols.len(), 8);
         assert!(!chain
@@ -1214,11 +1221,7 @@ mod tests {
             .contains(&ProtocolKind::Rocketpool));
         assert_eq!(
             chain.chain_profile.vm_protocols,
-            vec![
-                ProtocolKind::Curve,
-                ProtocolKind::BalancerV2,
-                ProtocolKind::MaverickV2
-            ]
+            vec![ProtocolKind::Curve, ProtocolKind::MaverickV2]
         );
         assert!(chain
             .chain_profile
@@ -1440,12 +1443,12 @@ route_policy = "default"
             fs::read_to_string(manifest_path()).unwrap_or_else(|error| unreachable!("{error}"));
         for (from, to, expected) in [
             (
-                "broadcaster_only_vm_protocols = [\"vm:balancer_v3\", \"vm:liquidityparty\"]",
+                "broadcaster_only_vm_protocols = [\"vm:liquidityparty\"]",
                 "broadcaster_only_vm_protocols = [\"vm:curve\"]",
                 "in both vm_protocols",
             ),
             (
-                "broadcaster_only_vm_protocols = [\"vm:balancer_v3\", \"vm:liquidityparty\"]",
+                "broadcaster_only_vm_protocols = [\"vm:liquidityparty\"]",
                 "broadcaster_only_vm_protocols = [\"rfq:bebop\"]",
                 "manifest declares rfq",
             ),

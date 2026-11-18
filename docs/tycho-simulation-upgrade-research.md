@@ -27,7 +27,7 @@ The adapter publishes complete serialized states and diffs consecutive complete 
 
 ## Ethereum sources
 
-The authenticated Ethereum beta endpoint advertised 23 on-chain systems during discovery. The broadcaster now subscribes to all of them: 18 native systems and five VM systems. The ten additions are `uniswap_v4`, `uniswap_v4_hooks`, `ring_swap_v2`, `sky`, `lido_v4`, `etherfi`, `aero_basic`, `aero_cl`, `vm:balancer_v3`, and `vm:liquidityparty`. Replay decoder registration includes the hybrid Balancer V3 state and LiquidityParty's killed-pool filter. The standalone simulator's selected on-chain set is unchanged; new sources use the manifest's broadcaster-only lists.
+The authenticated Ethereum beta endpoint advertised 23 on-chain systems during discovery. With Balancer V2 and V3 disabled, the broadcaster subscribes to 21 of them: 18 native systems and three VM systems (Curve, Maverick V2, and LiquidityParty). The nine enabled additions are `uniswap_v4`, `uniswap_v4_hooks`, `ring_swap_v2`, `sky`, `lido_v4`, `etherfi`, `aero_basic`, `aero_cl`, and `vm:liquidityparty`. Replay decoder registration includes the hybrid Balancer V3 state and LiquidityParty's killed-pool filter. Balancer V2 is also removed from the standalone simulator's selected VM set. New sources use the manifest's broadcaster-only lists.
 
 Direct book providers are **Bebop, Native, Metric, and Hashflow**. Hashflow uses the existing provider token CSV and keeps each maker's book identity. Its credentials are checked at broadcaster startup.
 
@@ -57,6 +57,7 @@ Use the updated `simulator-manifest.toml` when deploying. Custom manifests must 
 
 Validated after adding Ethereum broadcasting on 2026-11-18 with Rust 1.95.0:
 
+- Balancer-disable follow-up: 68 existing configuration, decoder-registration, and simulator-startup tests passed.
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`: passed.
 - `cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4`: **932 passed, 105 skipped**. Includes the removed endpoint's 404 contract, broadcaster credential/backend validation, all manifest decoder registrations, Hashflow quote/serialization parity, Titan state deadline/replay rejection, and provider termination/recovery behavior.

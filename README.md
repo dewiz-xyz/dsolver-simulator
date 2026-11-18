@@ -64,7 +64,7 @@ have been removed.
 
 ## Tycho 0.525.0 broadcasting
 
-This branch preserves the current replay bootstrap API and enables all discovered hosted on-chain feeds: 12 on Base and 23 on Ethereum. Enable `ENABLE_VM_POOLS=true` for Ethereum's five VM systems.
+This branch preserves the current replay bootstrap API and enables 12 hosted on-chain feeds on Base and 21 on Ethereum. Balancer V2 and V3 are disabled. Enable `ENABLE_VM_POOLS=true` for Ethereum's three active VM systems.
 
 With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed once; Titan Bebop and Bebop RFQ have distinct identities.
 
