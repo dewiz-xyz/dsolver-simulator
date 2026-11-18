@@ -1,6 +1,10 @@
 //! Adapt complete provider books to the broadcaster's existing RFQ state/delta contract.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Result};
 use futures::{
@@ -12,7 +16,7 @@ use simulator_core::models::protocol::ProtocolKind;
 use tracing::warn;
 use tycho_simulation::{
     book::{
-        quote_tokens::usd_stablecoins_for_chain, BookFeedConfig, BookFeedEvent, BookFeedStreams,
+        quote_tokens::usd_stablecoins_for_chain, BookFeedConfig, BookFeedEvent, BookFeedStream,
         BookSnapshot,
     },
     pamm::protocols::metric::feed::MetricFeedBuilder,
@@ -37,41 +41,32 @@ pub async fn build_rfq_stream(
     protocols: &[ProtocolKind],
     config: RFQConfig,
 ) -> Result<BoxStream<'static, Result<Update, StreamError>>> {
-    let books = protocols
-        .iter()
-        .copied()
-        .filter(|protocol| protocol.titan_venue().is_none())
-        .collect::<Vec<_>>();
-    let titan = if protocols
+    let mut seen = HashSet::new();
+    for kind in protocols {
+        if !seen.insert(kind) {
+            bail!("Duplicate RFQ provider: {kind}");
+        }
+    }
+    let mut streams = Vec::new();
+    if protocols
         .iter()
         .any(|protocol| protocol.titan_venue().is_some())
     {
-        super::titan_stream::build_titan_stream(
-            chain,
-            protocols,
-            token_stores.tokens.snapshot().await,
-        )?
-        .map(RfqEvent::Update)
-        .boxed()
-    } else {
-        stream::empty().boxed()
-    };
-    let books = build_book_stream(token_stores, chain, &books, config).await?;
-    Ok(merge_streams(books, titan))
-}
-
-async fn build_book_stream(
-    token_stores: RFQTokenStores,
-    chain: Chain,
-    protocols: &[ProtocolKind],
-    config: RFQConfig,
-) -> Result<BoxStream<'static, RfqEvent>> {
-    let mut feeds = BookFeedStreams::new();
+        streams.push(
+            super::titan_stream::build_titan_stream(
+                chain,
+                protocols,
+                token_stores.tokens.snapshot().await,
+            )?
+            .map(Ok)
+            .boxed(),
+        );
+    }
     let quote_tokens = Arc::new(
         usd_stablecoins_for_chain(chain)
             .ok_or_else(|| anyhow!("No USD quote tokens for {chain}"))?,
     );
-    for kind in protocols {
+    for kind in protocols.iter().filter(|kind| kind.titan_venue().is_none()) {
         let protocol = kind.as_str();
         let tokens = match protocol {
             "rfq:bebop" => token_stores.bebop.snapshot().await,
@@ -85,38 +80,35 @@ async fn build_book_stream(
             tokens: Arc::new(tokens),
             min_tvl_usd: config.min_tvl_usd,
         };
-        let duplicate = || anyhow!("Duplicate RFQ provider: {protocol}");
-        match protocol {
-            "rfq:bebop" => feeds
-                .add(
+        let config = config.clone();
+        let quote_tokens = Arc::clone(&quote_tokens);
+        let start = move || {
+            let feed = match protocol {
+                "rfq:bebop" => BookFeedStream::spawn(
                     protocol,
                     BebopFeedBuilder::new(
-                        book_config,
+                        book_config.clone(),
                         Arc::clone(&quote_tokens),
                         config.bebop_key.clone(),
                     )
                     .quote_timeout(RFQ_QUOTE_TIMEOUT)
                     .build()?,
-                )
-                .map_err(|_| duplicate())?,
-            "rfq:hashflow" => feeds
-                .add(
+                ),
+                "rfq:hashflow" => BookFeedStream::spawn(
                     protocol,
                     HashflowFeedBuilder::new(
-                        book_config,
+                        book_config.clone(),
                         Arc::clone(&quote_tokens),
                         config.hashflow_user.clone(),
                         config.hashflow_key.clone(),
                     )
                     .quote_timeout(RFQ_QUOTE_TIMEOUT)
                     .build()?,
-                )
-                .map_err(|_| duplicate())?,
-            "rfq:liquorice" => feeds
-                .add(
+                ),
+                "rfq:liquorice" => BookFeedStream::spawn(
                     protocol,
                     LiquoriceFeedBuilder::new(
-                        book_config,
+                        book_config.clone(),
                         Arc::clone(&quote_tokens),
                         config.liquorice_user.clone(),
                         config.liquorice_key.clone(),
@@ -124,80 +116,66 @@ async fn build_book_stream(
                     .quote_timeout(RFQ_QUOTE_TIMEOUT)
                     .quote_expiry_secs(LIQUORICE_QUOTE_EXPIRY_SECS)
                     .build()?,
-                )
-                .map_err(|_| duplicate())?,
-            "rfq:native" => feeds
-                .add(
+                ),
+                "rfq:native" => BookFeedStream::spawn(
                     protocol,
                     NativeFeedBuilder::new(
-                        book_config,
+                        book_config.clone(),
                         Arc::clone(&quote_tokens),
                         config.native_key.clone(),
                     )
                     .quote_timeout(RFQ_QUOTE_TIMEOUT)
                     .build()?,
-                )
-                .map_err(|_| duplicate())?,
-            "rfq:metric" => feeds
-                .add(
+                ),
+                "rfq:metric" => BookFeedStream::spawn(
                     protocol,
-                    MetricFeedBuilder::new(book_config, config.metric_key.clone()).build()?,
-                )
-                .map_err(|_| duplicate())?,
-            other => bail!("Unknown RFQ provider: {other}"),
-        }
+                    MetricFeedBuilder::new(book_config.clone(), config.metric_key.clone())
+                        .build()?,
+                ),
+                other => bail!("Unknown RFQ provider: {other}"),
+            };
+            Ok(feed)
+        };
+        streams.push(provider_updates(protocol, start)?);
     }
-    Ok(book_updates(feeds))
+    Ok(stream::select_all(streams).boxed())
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "updates dominate; avoid allocating each update just for a terminal sentinel"
-)]
-enum RfqEvent {
-    Update(Update),
-    Ended,
-}
-
-fn merge_streams(
-    books: BoxStream<'static, RfqEvent>,
-    titan: BoxStream<'static, RfqEvent>,
-) -> BoxStream<'static, Result<Update, StreamError>> {
-    stream::select(books, titan)
-        .scan((), |(), event| {
-            ready(match event {
-                RfqEvent::Update(update) => Some(Ok(update)),
-                // Closing the whole stream lets the existing supervisor rebuild every feed with
-                // backoff. A surviving provider (including Titan) must not hide a terminal failure.
-                RfqEvent::Ended => None,
-            })
-        })
-        .boxed()
-}
-
-fn book_updates(
-    feeds: impl Stream<Item = (String, BookFeedEvent)> + Send + 'static,
-) -> BoxStream<'static, RfqEvent> {
-    let mut books = ProviderBooks::default();
-    feeds.flat_map(move |(provider, event)| {
-        let ended = matches!(event, BookFeedEvent::Ended(_));
-        let snapshot = match event {
-            BookFeedEvent::Published(snapshot) => Some(snapshot),
-            BookFeedEvent::Withdrawn => None,
-            BookFeedEvent::Ended(outcome) => {
-                warn!(%provider, ?outcome, "RFQ provider ended; withdrawing liquidity and restarting feeds");
-                None
+/// A terminal event withdraws this provider's books. Rebuild only its feed so
+/// other providers keep their published pair IDs and can still withdraw them.
+fn provider_updates<S>(
+    provider: &'static str,
+    start: impl Fn() -> Result<S> + Send + 'static,
+) -> Result<BoxStream<'static, Result<Update, StreamError>>>
+where
+    S: Stream<Item = BookFeedEvent> + Send + Unpin + 'static,
+{
+    let first = start()?;
+    let events = stream::unfold((Some(first), start), move |(feed, start)| async move {
+        let mut feed = match feed {
+            Some(feed) => feed,
+            None => loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                match start() {
+                    Ok(feed) => break feed,
+                    Err(error) => warn!(%provider, %error, "Could not restart RFQ provider"),
+                }
+            },
+        };
+        let (snapshot, next) = match feed.next().await {
+            Some(BookFeedEvent::Published(snapshot)) => (Some(snapshot), Some(feed)),
+            Some(BookFeedEvent::Withdrawn) => (None, Some(feed)),
+            terminal => {
+                warn!(%provider, ?terminal, "RFQ provider ended; withdrawing its books before reconnecting");
+                (None, None)
             }
         };
-        let mut events = Vec::with_capacity(2);
-        if let Some(update) = books.replace(&provider, snapshot) {
-            events.push(RfqEvent::Update(update));
-        }
-        if ended {
-            events.push(RfqEvent::Ended);
-        }
-        stream::iter(events)
-    }).boxed()
+        Some((snapshot, (next, start)))
+    });
+    let mut books = ProviderBooks::default();
+    Ok(events
+        .filter_map(move |snapshot| ready(books.replace(provider, snapshot).map(Ok)))
+        .boxed())
 }
 
 #[derive(Default)]
@@ -455,71 +433,46 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.new_pairs.len(), 1);
     }
-    #[tokio::test]
-    async fn ended_provider_withdraws_then_ends_combined_stream_even_with_active_titan() {
+    #[tokio::test(start_paused = true)]
+    async fn terminal_provider_restarts_independently_and_peers_keep_tracking_removals(
+    ) -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tycho_simulation::book::BookFeedOutcome;
-        for published_first in [false, true] {
-            let mut events = vec![(
-                "rfq:bebop".to_string(),
-                BookFeedEvent::Published(snapshot(vec![book("rfq:bebop", 3)])),
-            )];
-            if published_first {
-                events.push((
-                    "rfq:native".into(),
-                    BookFeedEvent::Published(snapshot(vec![book("rfq:native", 4)])),
-                ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let starts = attempts.clone();
+        let mut native = provider_updates("rfq:native", move || {
+            let id = starts.fetch_add(1, Ordering::SeqCst);
+            let mut events = Vec::new();
+            if id > 0 {
+                events.push(BookFeedEvent::Published(snapshot(vec![book(
+                    "rfq:native",
+                    3,
+                )])));
             }
-            events.push((
-                "rfq:native".into(),
-                BookFeedEvent::Ended(BookFeedOutcome::RanOut),
-            ));
-            let books = book_updates(stream::iter(events));
-            let titan = stream::repeat_with(|| {
-                RfqEvent::Update(Update::new(
-                    current_time_ms(),
-                    HashMap::new(),
-                    HashMap::new(),
-                ))
-            })
-            .boxed();
-            let updates = merge_streams(books, titan)
-                .take(12)
-                .collect::<Vec<_>>()
-                .await;
-            assert!(
-                updates.len() < 12,
-                "Titan must not hide a terminal book failure"
-            );
-            let removed = updates
-                .into_iter()
-                .flat_map(|update| update.unwrap().removed_pairs.into_values())
-                .collect::<Vec<_>>();
-            assert_eq!(removed.len(), usize::from(published_first));
-            assert!(removed
-                .iter()
-                .all(|component| component.protocol_system == "rfq:native"));
-        }
-    }
-
-    #[tokio::test]
-    async fn temporary_withdrawal_keeps_feed_alive_for_republication() {
-        let events = stream::iter([
-            (
-                "rfq:native".into(),
-                BookFeedEvent::Published(snapshot(vec![book("rfq:native", 4)])),
-            ),
-            ("rfq:native".into(), BookFeedEvent::Withdrawn),
-            (
-                "rfq:native".into(),
-                BookFeedEvent::Published(snapshot(vec![book("rfq:native", 4)])),
-            ),
-        ]);
-        let updates = merge_streams(book_updates(events), stream::empty().boxed())
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(updates.len(), 3);
-        assert_eq!(updates[1].as_ref().unwrap().removed_pairs.len(), 1);
-        assert_eq!(updates[2].as_ref().unwrap().new_pairs.len(), 1);
+            events.push(BookFeedEvent::Ended(BookFeedOutcome::RanOut));
+            Ok(stream::iter(events))
+        })?;
+        let mut peer = provider_updates("rfq:bebop", || {
+            Ok(stream::iter([
+                BookFeedEvent::Published(snapshot(vec![
+                    book("rfq:bebop", 4),
+                    book("rfq:bebop", 5),
+                ])),
+                BookFeedEvent::Published(snapshot(vec![book("rfq:bebop", 5)])),
+                BookFeedEvent::Withdrawn,
+                BookFeedEvent::Published(snapshot(vec![book("rfq:bebop", 5)])),
+            ]))
+        })?;
+        assert_eq!(peer.next().await.unwrap().unwrap().new_pairs.len(), 2);
+        assert_eq!(native.next().await.unwrap().unwrap().new_pairs.len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(native.next().await.unwrap().unwrap().removed_pairs.len(), 1);
+        assert_eq!(peer.next().await.unwrap().unwrap().removed_pairs.len(), 1);
+        assert_eq!(peer.next().await.unwrap().unwrap().removed_pairs.len(), 1);
+        assert_eq!(peer.next().await.unwrap().unwrap().new_pairs.len(), 1);
+        assert_eq!(native.next().await.unwrap().unwrap().new_pairs.len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 
     #[tokio::test]

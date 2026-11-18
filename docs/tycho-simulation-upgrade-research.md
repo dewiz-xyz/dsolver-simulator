@@ -23,7 +23,7 @@ Aerodrome V1 was already broadcast-only in the master baseline. The other six ex
 
 Base RFQ broadcasting enables **Bebop, Native, and Metric**. Metric uses Tycho's pAMM book feed but travels through the same decoded-state snapshot and Redis contract as the RFQ providers.
 
-The adapter publishes complete serialized states and diffs consecutive complete provider books. Missing pairs are removed. Temporary withdrawals remove only that provider's liquidity. Terminal feed events publish its withdrawal and close the combined stream so the existing supervisor restarts the feeds; ongoing Titan or peer updates cannot hide a terminated provider. Tests check replacement, empty books, idempotent withdrawal, provider isolation, and exact quote preservation after serialization.
+The adapter publishes complete serialized states and diffs consecutive complete provider books. Missing pairs are removed. Temporary withdrawals remove only that provider's liquidity. A terminal feed event withdraws that provider’s books and reconnects its feed after a delay. Peers continue diffing their own books throughout the restart. Tests check replacement, empty books, idempotent withdrawal, provider isolation, and exact quote preservation after serialization.
 
 ## Ethereum sources
 
@@ -35,15 +35,15 @@ The **eight Titan propAMMs** are **FermiSwap, Kipseli, Bebop, TaurusFi, Tempest,
 
 Titan's incremental updates are multiplexed with the complete-book provider adapter. They retain `pricelevelstream:<venue>` identities and explicit upstream removals, use observed Unix milliseconds for the shared RFQ cursor, and preserve the upstream simulation overrides. Fallback-router identities are disabled because downstream consumers choose the execution path.
 
-Tycho skips its process-local Titan quote deadline during ordinary serde. The broadcaster's state wire adapter adds `quote_expires_at_unix_ms` and reconstructs the remaining monotonic lifetime on receipt, capped at the upstream quote TTL. Delayed snapshots and replay therefore cannot renew expired liquidity. A Titan state with no deadline is rejected. Broadcaster and consumer hosts need synchronized clocks, and consumers must use this updated replay client; older readers do not enforce the new wire deadline. The pinned retained-V1 historical on-chain decoder profile is unchanged; the added on-chain protocols are live broadcaster/replay coverage, not an expansion of that historical format.
+Tycho skips its process-local Titan quote deadline during ordinary serde. The broadcaster's state wire adapter adds `quote_expires_at_unix_ms` and reconstructs the remaining monotonic lifetime on receipt, capped at the upstream quote TTL. Delayed snapshots and replay therefore cannot renew expired liquidity. A Titan state with no deadline is rejected. Broadcaster and consumer hosts need synchronized clocks, and consumers must use this updated replay client; older readers do not enforce the new wire deadline. New history checkpoints and deltas use format 2, which registers the added protocols for historical reconstruction. Format 1 retains its original on-chain decoder selection.
 
 ## Configuration and encoding
 
-Set `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true` on the broadcaster. Supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY` through the runtime secret environment. For Ethereum, set `CHAIN_ID=1`, keep `ENABLE_VM_POOLS=true`, and also supply `HASHFLOW_USER` and `HASHFLOW_KEY`. Native/Metric keys are required only when their broadcaster feeds are enabled. Titan needs no API key; its two public WebSocket URLs can be overridden with `TITAN_PAMM_PRICE_LEVEL_URL` and `TITAN_PAMM_QUOTE_STREAM_URL`. No supplied credentials are committed.
+Set `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true` on the broadcaster. Supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY` through the runtime secret environment. For Ethereum, set `CHAIN_ID=1` and also supply `HASHFLOW_USER` and `HASHFLOW_KEY`. Native/Metric keys are required only when their broadcaster feeds are enabled. Titan needs no API key; its two public WebSocket URLs can be overridden with `TITAN_PAMM_PRICE_LEVEL_URL` and `TITAN_PAMM_QUOTE_STREAM_URL`. No supplied credentials are committed.
 
 `RFQ_MIN_TVL_USD` defaults to `100` and must be finite and nonnegative. It applies to direct book providers, not Titan, and is independent of the on-chain `TVL_THRESHOLD`, whose units are the native token.
 
-The removed upstream `RFQStreamBuilder` is replaced with public provider feed builders and `BookFeedStreams`. Simulation uses the serialized broadcast books directly. The simulator requires no RFQ provider credentials; only the broadcaster connects to provider feeds.
+The removed upstream `RFQStreamBuilder` is replaced with public provider feed builders and a `BookFeedStream` per provider. Simulation uses the serialized broadcast books directly. The simulator requires no RFQ provider credentials; only the broadcaster connects to provider feeds.
 
 `POST /encode` is removed and returns `404 Not Found`. Its service, request/response models, firm-quote hydration, route-only state fences, calldata fixtures, and analyzer probes are removed. `/simulate`, `/status`, `/ready`, and broadcaster contracts remain supported. The analyzer writes schema version 8 without encode inspection fields.
 
@@ -60,10 +60,10 @@ Validated after adding Ethereum broadcasting on 2026-11-18 with Rust 1.95.0:
 - Balancer-disable follow-up: 68 existing configuration, decoder-registration, and simulator-startup tests passed.
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`: passed.
-- `cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4`: **932 passed, 105 skipped**. Includes the removed endpoint's 404 contract, broadcaster credential/backend validation, all manifest decoder registrations, Hashflow quote/serialization parity, Titan state deadline/replay rejection, and provider termination/recovery behavior.
+- `cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4` passed all 935 active tests after review, with 105 skipped. Coverage includes retained V2 checkpoints and deltas, independent RFQ provider restarts, standalone subscription filtering, expired Titan books, and the removed endpoint's 404 contract.
 - `cargo test --locked --workspace --all-features --doc`: passed (no doctests defined).
 - Lockfile inspection: simulation/common/client/ethereum each resolve once to crates.io `0.525.0`; no execution package, Git dependency, or local execution patch remains.
-- The earlier `cargo build --locked --workspace --bins --release` attempt was blocked by local disk exhaustion (`No space left on device`), including after removing this checkout's generated debug artifacts. Test-profile binaries compiled and all active tests passed; the release build still needs CI validation.
+- The local all-binaries release build ran out of disk space. GitHub Actions built the simulator, broadcaster, migration, historical quote service, and history CLI release targets on the preceding revision. [Build log](https://github.com/dewiz-xyz/dsolver-simulator/actions/runs/44275680962/job/134703061543)
 
 Live Ethereum read-only checks on 2026-11-18:
 

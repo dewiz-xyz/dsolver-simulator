@@ -312,9 +312,17 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
     };
     check_cancelled(cancellation)?;
     let archive = source.fetch_checkpoint(manifest.clone(), limits).await?;
-    let config = DecoderConfig::retained_v1()
-        .with_chain_id(manifest.chain_id)
-        .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
+    let config = match archive.metadata.schema_version {
+        1 => DecoderConfig::retained_v1(),
+        2 => DecoderConfig::retained_v2(),
+        version => {
+            return Err(HistoricalError::HistoricalDataInvalid(format!(
+                "unsupported checkpoint archive schema version {version}"
+            )))
+        }
+    }
+    .with_chain_id(manifest.chain_id)
+    .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;
     let decoder = ReplayDecoder::new(config, tokens.clone())
         .await
         .map_err(|error| HistoricalError::HistoricalDataInvalid(error.to_string()))?;

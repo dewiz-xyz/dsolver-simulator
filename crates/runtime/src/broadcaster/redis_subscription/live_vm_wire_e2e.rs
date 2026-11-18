@@ -51,11 +51,11 @@ const BROADCASTER_URL_ENV: &str = "TYCHO_BROADCASTER_URL";
 const REDIS_URL_ENV: &str = "BROADCASTER_REDIS_URL";
 const EXPECTED_CHAIN_ID: u64 = 1;
 const CURVE_PROTOCOL: &str = "vm:curve";
-const BALANCER_PROTOCOL: &str = "vm:balancer_v2";
+const MAVERICK_PROTOCOL: &str = "vm:maverick_v2";
 const VM_PROTOCOLS: [ProtocolKind; 3] = [
     ProtocolKind::Curve,
-    ProtocolKind::BalancerV2,
     ProtocolKind::MaverickV2,
+    ProtocolKind::LiquidityParty,
 ];
 const REDIS_BLOCK_MS: u64 = 5_000;
 const REDIS_READ_COUNT: u64 = 256;
@@ -120,8 +120,8 @@ async fn mainnet_vm_liquidity_survives_snapshot_and_redis_delta_wire() -> Result
     .await?;
     require_non_zero_quote(
         "snapshot",
-        BALANCER_PROTOCOL,
-        snapshot_evidence.pool_ids(BALANCER_PROTOCOL),
+        MAVERICK_PROTOCOL,
+        snapshot_evidence.pool_ids(MAVERICK_PROTOCOL),
         &state_store,
     )
     .await?;
@@ -344,7 +344,7 @@ async fn require_captured_pools_are_present(
     evidence: &RequiredProtocolEvidence,
     state_store: &StateStore,
 ) -> Result<()> {
-    for protocol in [CURVE_PROTOCOL, BALANCER_PROTOCOL] {
+    for protocol in [CURVE_PROTOCOL, MAVERICK_PROTOCOL] {
         if evidence.pool_ids(protocol).is_empty() {
             bail!(
                 "decoded {protocol} snapshot material produced no quote candidates; raw_count={}",
@@ -386,13 +386,13 @@ async fn poll_live_redis_until_quotes(
     loop {
         if started_at.elapsed() >= LIVE_DELTA_TIMEOUT {
             bail!(
-                "timed out after {}s waiting for Curve and Balancer VM Redis deltas; \
-                 curve_updates={} curve_candidates={} balancer_updates={} balancer_candidates={} checkpoint={}",
+                "timed out after {}s waiting for Curve and Maverick V2 VM Redis deltas; \
+                 curve_updates={} curve_candidates={} maverick_updates={} maverick_candidates={} checkpoint={}",
                 LIVE_DELTA_TIMEOUT.as_secs(),
                 live_evidence.event_count(CURVE_PROTOCOL),
                 live_evidence.pool_count(CURVE_PROTOCOL),
-                live_evidence.event_count(BALANCER_PROTOCOL),
-                live_evidence.pool_count(BALANCER_PROTOCOL),
+                live_evidence.event_count(MAVERICK_PROTOCOL),
+                live_evidence.pool_count(MAVERICK_PROTOCOL),
                 checkpoint.entry_id()
             );
         }
@@ -471,15 +471,15 @@ async fn verify_live_quotes_if_ready(
         .await?;
         verified.curve = true;
     }
-    if !verified.balancer && live_evidence.has_quote_candidates(BALANCER_PROTOCOL) {
+    if !verified.maverick && live_evidence.has_quote_candidates(MAVERICK_PROTOCOL) {
         require_non_zero_quote(
             "live Redis delta",
-            BALANCER_PROTOCOL,
-            live_evidence.pool_ids(BALANCER_PROTOCOL),
+            MAVERICK_PROTOCOL,
+            live_evidence.pool_ids(MAVERICK_PROTOCOL),
             state_store,
         )
         .await?;
-        verified.balancer = true;
+        verified.maverick = true;
     }
     Ok(())
 }
@@ -563,13 +563,13 @@ fn maybe_print_live_progress(
         return;
     }
     println!(
-        "waiting for live VM Redis deltas: elapsed={}s checkpoint={} curve_updates={} curve_candidates={} balancer_updates={} balancer_candidates={}",
+        "waiting for live VM Redis deltas: elapsed={}s checkpoint={} curve_updates={} curve_candidates={} maverick_updates={} maverick_candidates={}",
         started_at.elapsed().as_secs(),
         checkpoint.entry_id(),
         evidence.event_count(CURVE_PROTOCOL),
         evidence.pool_count(CURVE_PROTOCOL),
-        evidence.event_count(BALANCER_PROTOCOL),
-        evidence.pool_count(BALANCER_PROTOCOL)
+        evidence.event_count(MAVERICK_PROTOCOL),
+        evidence.pool_count(MAVERICK_PROTOCOL)
     );
     *last_progress = Instant::now();
 }
@@ -577,19 +577,19 @@ fn maybe_print_live_progress(
 #[derive(Default)]
 struct RequiredProtocolFlags {
     curve: bool,
-    balancer: bool,
+    maverick: bool,
 }
 
 impl RequiredProtocolFlags {
     const fn all(&self) -> bool {
-        self.curve && self.balancer
+        self.curve && self.maverick
     }
 }
 
 #[derive(Default)]
 struct RequiredProtocolEvidence {
     curve: ProtocolEvidence,
-    balancer: ProtocolEvidence,
+    maverick: ProtocolEvidence,
     raw_snapshot: RawSnapshotReassembly,
 }
 
@@ -770,7 +770,7 @@ impl RequiredProtocolEvidence {
     }
 
     async fn collect_stored_pools(&mut self, state_store: &StateStore) {
-        for protocol in [CURVE_PROTOCOL, BALANCER_PROTOCOL] {
+        for protocol in [CURVE_PROTOCOL, MAVERICK_PROTOCOL] {
             for pool_id in state_store.pool_ids_by_protocol_system(protocol).await {
                 self.record_pool(protocol, pool_id.as_str());
             }
@@ -801,19 +801,19 @@ impl RequiredProtocolEvidence {
     }
 
     fn require_snapshot_material(&self) -> Result<()> {
-        if self.curve.raw_pool_ids.is_empty() || self.balancer.raw_pool_ids.is_empty() {
+        if self.curve.raw_pool_ids.is_empty() || self.maverick.raw_pool_ids.is_empty() {
             bail!(
-                "snapshot VM material must include Curve and Balancer pools; curve_count={} balancer_count={}",
+                "snapshot VM material must include Curve and Maverick V2 pools; curve_count={} maverick_count={}",
                 self.curve.raw_pool_ids.len(),
-                self.balancer.raw_pool_ids.len()
+                self.maverick.raw_pool_ids.len()
             );
         }
         Ok(())
     }
 
     fn pool_ids(&self, protocol: &str) -> &BTreeSet<String> {
-        if protocol == BALANCER_PROTOCOL {
-            &self.balancer.pool_ids
+        if protocol == MAVERICK_PROTOCOL {
+            &self.maverick.pool_ids
         } else {
             &self.curve.pool_ids
         }
@@ -822,7 +822,7 @@ impl RequiredProtocolEvidence {
     fn event_count(&self, protocol: &str) -> usize {
         match protocol {
             CURVE_PROTOCOL => self.curve.events,
-            BALANCER_PROTOCOL => self.balancer.events,
+            MAVERICK_PROTOCOL => self.maverick.events,
             _ => 0,
         }
     }
@@ -830,7 +830,7 @@ impl RequiredProtocolEvidence {
     fn raw_pool_count(&self, protocol: &str) -> usize {
         match protocol {
             CURVE_PROTOCOL => self.curve.raw_pool_ids.len(),
-            BALANCER_PROTOCOL => self.balancer.raw_pool_ids.len(),
+            MAVERICK_PROTOCOL => self.maverick.raw_pool_ids.len(),
             _ => 0,
         }
     }
@@ -846,7 +846,7 @@ impl RequiredProtocolEvidence {
     fn protocol_mut(&mut self, protocol: &str) -> Option<&mut ProtocolEvidence> {
         match protocol {
             CURVE_PROTOCOL => Some(&mut self.curve),
-            BALANCER_PROTOCOL => Some(&mut self.balancer),
+            MAVERICK_PROTOCOL => Some(&mut self.maverick),
             _ => None,
         }
     }

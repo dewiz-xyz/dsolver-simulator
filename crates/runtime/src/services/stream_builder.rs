@@ -165,6 +165,23 @@ mod tests {
         )
     }
 
+    #[test]
+    fn retained_writer_profile_covers_every_configured_onchain_feed() {
+        let profile = DecoderConfig::retained_v2();
+        for chain_id in [1, 8453] {
+            let (native, vm) = chain_protocols(chain_id);
+            for (backend, published) in [(ReplayBackend::Native, native), (ReplayBackend::Vm, vm)] {
+                let retained = profile.protocols(backend).unwrap_or_default();
+                for protocol in published {
+                    assert!(
+                        retained.contains(&protocol),
+                        "missing retained decoder for {chain_id}/{protocol}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn manifest_native_protocols_all_register_successfully() {
         let (ethereum_native_protocols, _) = chain_protocols(1);

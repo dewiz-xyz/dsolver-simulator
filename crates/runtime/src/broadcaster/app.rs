@@ -553,7 +553,7 @@ fn validate_retained_history_decoder_profile(
     if state_history_enabled {
         anyhow::ensure!(
             token_min_quality == RETAINED_TOKEN_QUALITY_V1,
-            "state history delta format 1 requires BROADCASTER_TOKEN_MIN_QUALITY={RETAINED_TOKEN_QUALITY_V1}; got {token_min_quality}"
+            "state history requires BROADCASTER_TOKEN_MIN_QUALITY={RETAINED_TOKEN_QUALITY_V1}; got {token_min_quality}"
         );
     }
     Ok(())

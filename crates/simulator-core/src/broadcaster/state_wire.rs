@@ -29,8 +29,13 @@ where
         .duration_since(UNIX_EPOCH)
         .map_err(serde::ser::Error::custom)?;
     let remaining = until.saturating_duration_since(Instant::now());
-    let deadline = u64::try_from(now.saturating_add(remaining).as_millis())
-        .map_err(serde::ser::Error::custom)?;
+    let deadline = if remaining.is_zero() {
+        // Once expired, every receiver must reject this book, even if its clock is behind.
+        0
+    } else {
+        u64::try_from(now.saturating_add(remaining).as_millis())
+            .map_err(serde::ser::Error::custom)?
+    };
     let mut value = serde_json::to_value(state).map_err(serde::ser::Error::custom)?;
     let object = value
         .as_object_mut()
@@ -153,6 +158,7 @@ mod tests {
         snapshot_wire["state"][DEADLINE] = 0u64.into();
         let expired: BroadcasterStateEntry = serde_json::from_value(snapshot_wire).unwrap();
         assert!(expired.state.spot_price(&base, &quote).is_err());
+        assert_eq!(serde_json::to_value(expired).unwrap()["state"][DEADLINE], 0);
 
         let mut encoded = serde_json::to_value(delta).unwrap();
         encoded["state"][DEADLINE] = 0u64.into();
@@ -166,6 +172,7 @@ mod tests {
             .state
             .get_limits(base.address.clone(), quote.address.clone())
             .is_err());
+        assert_eq!(serde_json::to_value(decoded).unwrap()["state"][DEADLINE], 0);
     }
 
     #[test]

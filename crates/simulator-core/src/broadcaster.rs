@@ -216,6 +216,30 @@ impl From<Token> for BroadcasterTokenDto {
 }
 
 impl BroadcasterBackend {
+    pub const fn from_protocol_kind(kind: ProtocolKind) -> Self {
+        match kind {
+            ProtocolKind::Curve
+            | ProtocolKind::BalancerV2
+            | ProtocolKind::MaverickV2
+            | ProtocolKind::BalancerV3
+            | ProtocolKind::LiquidityParty => Self::Vm,
+            ProtocolKind::Hashflow
+            | ProtocolKind::Bebop
+            | ProtocolKind::Liquorice
+            | ProtocolKind::NativeRfq
+            | ProtocolKind::Metric
+            | ProtocolKind::TitanFermiSwap
+            | ProtocolKind::TitanKipseli
+            | ProtocolKind::TitanBebop
+            | ProtocolKind::TitanTaurusFi
+            | ProtocolKind::TitanTempest
+            | ProtocolKind::TitanGoliath
+            | ProtocolKind::TitanStelaxis
+            | ProtocolKind::TitanElZorro => Self::Rfq,
+            _ => Self::Native,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
@@ -1838,7 +1862,7 @@ fn backend_for_component(
             component_id: component_id.to_string(),
         });
     };
-    Ok(backend_for_kind(kind))
+    Ok(BroadcasterBackend::from_protocol_kind(kind))
 }
 
 fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, BroadcasterContractError> {
@@ -1847,31 +1871,7 @@ fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, Broadcas
             protocol: protocol.to_string(),
         });
     };
-    Ok(backend_for_kind(kind))
-}
-
-fn backend_for_kind(kind: ProtocolKind) -> BroadcasterBackend {
-    match kind {
-        ProtocolKind::Curve
-        | ProtocolKind::BalancerV2
-        | ProtocolKind::MaverickV2
-        | ProtocolKind::BalancerV3
-        | ProtocolKind::LiquidityParty => BroadcasterBackend::Vm,
-        ProtocolKind::Hashflow
-        | ProtocolKind::Bebop
-        | ProtocolKind::Liquorice
-        | ProtocolKind::NativeRfq
-        | ProtocolKind::Metric
-        | ProtocolKind::TitanFermiSwap
-        | ProtocolKind::TitanKipseli
-        | ProtocolKind::TitanBebop
-        | ProtocolKind::TitanTaurusFi
-        | ProtocolKind::TitanTempest
-        | ProtocolKind::TitanGoliath
-        | ProtocolKind::TitanStelaxis
-        | ProtocolKind::TitanElZorro => BroadcasterBackend::Rfq,
-        _ => BroadcasterBackend::Native,
-    }
+    Ok(BroadcasterBackend::from_protocol_kind(kind))
 }
 
 fn deserialize_unique_backends<'de, D>(deserializer: D) -> Result<Vec<BroadcasterBackend>, D::Error>

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::reader::{decode_zstd_with_limit, ReadLimitError};
 use crate::{Backend, CheckpointKind, EncodedArchiveInfo, StreamPosition};
 
-pub const ARCHIVE_SCHEMA_VERSION: u32 = 1;
+pub const ARCHIVE_SCHEMA_VERSION: u32 = 2;
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -110,8 +110,8 @@ pub(crate) fn decode_archive_with_info(
     let envelope: ArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
     match envelope.schema_version {
-        ARCHIVE_SCHEMA_VERSION => {
-            decode_archive_v1(envelope, archive_json, bytes).map_err(anyhow::Error::from)
+        1 | 2 => {
+            decode_archive_envelope(envelope, archive_json, bytes).map_err(anyhow::Error::from)
         }
         other => Err(ArchiveCodecError::UnsupportedSchemaVersion(other).into()),
     }
@@ -133,14 +133,14 @@ pub(crate) fn decode_archive_with_info_and_limit(
     let envelope: ArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
     match envelope.schema_version {
-        ARCHIVE_SCHEMA_VERSION => decode_archive_v1(envelope, archive_json, bytes),
+        1 | 2 => decode_archive_envelope(envelope, archive_json, bytes),
         other => Err(ReadLimitError::Read(
             ArchiveCodecError::UnsupportedSchemaVersion(other).into(),
         )),
     }
 }
 
-fn decode_archive_v1(
+fn decode_archive_envelope(
     envelope: ArchiveEnvelope,
     archive_json: Vec<u8>,
     compressed: &[u8],
@@ -321,6 +321,21 @@ mod tests {
         let decoded = decode_archive(&encoded.bytes, &encoded.info.sha256)?;
         assert_eq!(decoded.payloads_json, archive.payloads_json);
         assert!(decode_archive(&encoded.bytes, "deadbeef").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reads_legacy_checkpoint_envelopes() -> anyhow::Result<()> {
+        let mut metadata = test_metadata();
+        metadata.schema_version = 1;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "metadata": metadata, "payloads": [{"k": 1}]
+        }))?;
+        let sha256 = hex::encode(Sha256::digest(&raw));
+        let bytes = zstd::stream::encode_all(raw.as_slice(), ZSTD_COMPRESSION_LEVEL)?;
+        let decoded = decode_archive_with_info_and_limit(&bytes, &sha256, 4096)?;
+        assert_eq!(decoded.archive.metadata, metadata);
+        assert_eq!(decoded.archive.payloads_json, [r#"{"k":1}"#]);
         Ok(())
     }
 

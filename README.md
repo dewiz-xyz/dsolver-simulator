@@ -64,7 +64,7 @@ have been removed.
 
 ## Tycho 0.525.0 broadcasting
 
-This branch preserves the current replay bootstrap API and enables 12 hosted on-chain feeds on Base and 21 on Ethereum. Balancer V2 and V3 are disabled. Enable `ENABLE_VM_POOLS=true` for Ethereum's three active VM systems.
+This branch preserves the current replay bootstrap API and enables 12 hosted on-chain feeds on Base and 21 on Ethereum. Balancer V2 and V3 are disabled. The Ethereum broadcaster subscribes to the three VM systems selected in the manifest.
 
 With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed once; Titan Bebop and Bebop RFQ have distinct identities.
 
@@ -96,7 +96,7 @@ Required runtime inputs:
 Common optional inputs:
 
 - `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
-- `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
+- `ENABLE_VM_POOLS` to enable the standalone simulator’s shared database backend (VM pools on Ethereum, Uniswap V4 on Base)
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ pool feeds (defaults to `false`)
 - `BEBOP_KEY` as Bebop's single Bearer credential, plus `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`, only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
 - `HOST` and `PORT` to change the bind address
@@ -346,7 +346,7 @@ cargo test --locked --release -p runtime mainnet_vm_liquidity_survives_snapshot_
   -- --ignored --nocapture --test-threads=1
 ```
 
-The test first decodes the snapshot and checks Curve and Balancer quotes. It then allows
+The test first decodes the snapshot and checks Curve and Maverick V2 quotes. It then allows
 up to 20 minutes for live Redis deltas that produce non-zero quotes for both protocols.
 Snapshot initialization adds time before that deadline starts.
 

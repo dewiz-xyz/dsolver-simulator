@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use simulator_core::broadcaster::RawSnapshotReassembly;
+use simulator_core::models::protocol::ProtocolKind;
 use simulator_replay::{ReplayBackend, ReplayDecoder};
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
 use tracing::{info, warn};
 use tycho_simulation::evm::engine_db::SHARED_TYCHO_DB;
+use tycho_simulation::protocol::models::{ProtocolComponent, Update};
 
 #[cfg(test)]
 use simulator_replay::DecoderConfig;
@@ -297,7 +299,8 @@ impl BroadcasterSubscriptionProcessor {
     ) -> Result<()> {
         if partition.messages.is_empty() {
             let decoded = self.decoder.decode_snapshot_partition(partition).await?;
-            if let Some(update) = decoded.update {
+            if let Some(mut update) = decoded.update {
+                self.retain_selected_rfq_entries(&mut update).await;
                 self.controls
                     .state_store()
                     .apply_update_with_protocol_heads(update, &decoded.protocol_head_updates)
@@ -341,6 +344,37 @@ impl BroadcasterSubscriptionProcessor {
         Ok(())
     }
 
+    async fn retain_selected_rfq_entries(&self, update: &mut Update) {
+        let BroadcasterSubscriptionControls::Rfq(controls) = &self.controls else {
+            return;
+        };
+        let selected = |component: &ProtocolComponent| {
+            ProtocolKind::from_canonical_protocol_system(&component.protocol_system)
+                .is_some_and(|kind| controls.protocols.contains(&kind))
+        };
+        let previous = controls.state_store.pin().await;
+        update
+            .removed_pairs
+            .retain(|_, component| selected(component));
+        update.new_pairs.retain(|id, component| {
+            if selected(component) {
+                return true;
+            }
+            update.states.remove(id);
+            if let Some((_, old_component)) = previous.pool_by_id(id) {
+                update
+                    .removed_pairs
+                    .insert(id.clone(), (*old_component).clone());
+            }
+            false
+        });
+        // State-only deltas have no provider field. Only previously admitted books or
+        // a selected new pair in this update can receive them.
+        update
+            .states
+            .retain(|id, _| update.new_pairs.contains_key(id) || previous.pool_by_id(id).is_some());
+    }
+
     async fn apply_live_update(
         &self,
         update: BroadcasterUpdateMessage,
@@ -361,7 +395,16 @@ impl BroadcasterSubscriptionProcessor {
         if decoded.update.is_none() && decoded.protocol_head_updates.is_empty() {
             return Ok(());
         }
-        if let Some(update) = decoded.update {
+        if let Some(mut update) = decoded.update {
+            self.retain_selected_rfq_entries(&mut update).await;
+            if backend == ReplayBackend::Rfq
+                && update.states.is_empty()
+                && update.removed_pairs.is_empty()
+            {
+                // The replay tracker has consumed this envelope. Unselected books do not
+                // advance the standalone RFQ store or refresh its quote readiness.
+                return Ok(());
+            }
             match state_version {
                 Some(state_version) => {
                     self.controls

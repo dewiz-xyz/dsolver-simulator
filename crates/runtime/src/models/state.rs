@@ -1156,7 +1156,6 @@ impl PublishedStatePin {
             .matching_pools_by_addresses(token_in, token_out)
     }
 
-    #[cfg(test)]
     pub(crate) fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         self.state.point.pool_by_id(id)
     }

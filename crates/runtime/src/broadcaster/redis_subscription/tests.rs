@@ -2627,6 +2627,75 @@ async fn rfq_snapshot_partition_hydrates_rfq_state_store() -> Result<()> {
 }
 
 #[tokio::test]
+async fn standalone_rfq_subscription_filters_broadcaster_only_books() -> Result<()> {
+    let controls = TestControls::new();
+    let mut processor =
+        BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), controls.rfq(), None);
+    let mut titan = rfq_component();
+    titan.protocol_system = "pricelevelstream:fermiswap".into();
+    let titan_entry = |id| BroadcasterStateEntry::new(id, titan.clone(), Box::new(DummySim(2)));
+    let mut snapshot = rfq_snapshot_chunk_envelope(21)?;
+    let BroadcasterPayload::SnapshotChunk(chunk) = &mut snapshot.payload else {
+        return Err(anyhow!("expected a snapshot chunk"));
+    };
+    chunk.partitions[0].states.push(titan_entry("pool-titan"));
+
+    processor.observe(rfq_snapshot_start_envelope(1)?).await?;
+    processor.observe(snapshot).await?;
+    processor.observe(snapshot_end_envelope()).await?;
+    assert!(controls.rfq_state_store.has_pool("pool-rfq").await);
+    assert!(!controls.rfq_state_store.has_pool("pool-titan").await);
+
+    let delta = |block, additions, changes| {
+        BroadcasterUpdateMessage::new(vec![BroadcasterUpdatePartition::new(
+            BroadcasterBackend::Rfq,
+            block,
+            additions,
+            changes,
+            Vec::new(),
+            BTreeMap::new(),
+        )])
+    };
+    let state_delta =
+        |id| BroadcasterStateDelta::new(id, BroadcasterBackend::Rfq, Box::new(DummySim(12)));
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "stream-1",
+            4,
+            BroadcasterPayload::Update(delta(
+                22,
+                vec![titan_entry("second-titan")],
+                vec![state_delta("pool-rfq"), state_delta("pool-titan")],
+            )?),
+        ))
+        .await?;
+    assert_eq!(controls.rfq_state_store.total_states().await, 1);
+    let (state, _) = controls
+        .rfq_state_store
+        .pool_by_id("pool-rfq")
+        .await
+        .ok_or_else(|| anyhow!("selected book missing"))?;
+    assert_eq!(
+        state
+            .as_any()
+            .downcast_ref::<DummySim>()
+            .map(|state| state.0),
+        Some(12)
+    );
+
+    processor
+        .observe(BroadcasterEnvelope::new(
+            "stream-1",
+            5,
+            BroadcasterPayload::Update(delta(23, vec![], vec![state_delta("pool-titan")])?),
+        ))
+        .await?;
+    assert_eq!(controls.rfq_state_store.current_block().await, 22);
+    assert_eq!(controls.rfq_stream_health.last_block().await, 22);
+    Ok(())
+}
+
+#[tokio::test]
 async fn rfq_live_update_partition_advances_rfq_state_store() -> Result<()> {
     let controls = TestControls::new();
     let mut rfq_processor =

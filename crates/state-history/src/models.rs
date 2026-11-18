@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub const DELTA_PAYLOAD_FORMAT_VERSION: i16 = 1;
+pub const DELTA_PAYLOAD_FORMAT_VERSION: i16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StreamPosition {

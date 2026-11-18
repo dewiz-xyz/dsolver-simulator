@@ -61,6 +61,7 @@ use crate::{DecodedReplay, ReplayBackend};
 pub type TokenMap = HashMap<Bytes, Token>;
 
 pub const RETAINED_DELTA_FORMAT_VERSION_V1: i16 = 1;
+pub const RETAINED_DELTA_FORMAT_VERSION_V2: i16 = 2;
 pub const RETAINED_TOKEN_QUALITY_V1: u32 = 0;
 
 const RETAINED_NATIVE_PROTOCOLS_V1: &[ProtocolKind] = &[
@@ -101,6 +102,7 @@ pub struct DecoderConfig {
 enum DecoderProfile {
     Live,
     RetainedV1,
+    RetainedV2,
 }
 
 impl DecoderConfig {
@@ -148,6 +150,57 @@ impl DecoderConfig {
             profile: DecoderProfile::RetainedV1,
             chain: None,
         }
+    }
+
+    /// Tycho 0.525 retained recordings. Pin the supported systems independently of
+    /// the live manifest, including systems that a custom writer can select.
+    pub fn retained_v2() -> Self {
+        let mut config = Self::retained_v1();
+        for (backend, additions) in [
+            (
+                ReplayBackend::Native,
+                &[
+                    ProtocolKind::AeroBasic,
+                    ProtocolKind::AeroCl,
+                    ProtocolKind::LunarBase,
+                    ProtocolKind::PancakeswapInfinityCl,
+                    ProtocolKind::PancakeswapInfinityBin,
+                    ProtocolKind::Biconomy,
+                    ProtocolKind::UniswapV4Hooks,
+                    ProtocolKind::RingSwapV2,
+                    ProtocolKind::Sky,
+                    ProtocolKind::LidoV4,
+                    ProtocolKind::Etherfi,
+                ][..],
+            ),
+            (
+                ReplayBackend::Vm,
+                &[ProtocolKind::LiquidityParty, ProtocolKind::BalancerV3][..],
+            ),
+            (
+                ReplayBackend::Rfq,
+                &[
+                    ProtocolKind::NativeRfq,
+                    ProtocolKind::Metric,
+                    ProtocolKind::TitanFermiSwap,
+                    ProtocolKind::TitanKipseli,
+                    ProtocolKind::TitanBebop,
+                    ProtocolKind::TitanTaurusFi,
+                    ProtocolKind::TitanTempest,
+                    ProtocolKind::TitanGoliath,
+                    ProtocolKind::TitanStelaxis,
+                    ProtocolKind::TitanElZorro,
+                ][..],
+            ),
+        ] {
+            config
+                .protocols
+                .entry(backend)
+                .or_default()
+                .extend_from_slice(additions);
+        }
+        config.profile = DecoderProfile::RetainedV2;
+        config
     }
 
     pub const fn min_token_quality(&self) -> u32 {
@@ -414,33 +467,25 @@ impl ReplayDecoder {
         payload: &RawValue,
         applicable_backends: &[ReplayBackend],
     ) -> Result<DecodedReplay, ReplayDecodeError> {
-        match payload_format_version {
-            RETAINED_DELTA_FORMAT_VERSION_V1 => {
-                if self.config.profile != DecoderProfile::RetainedV1 {
-                    return Err(ReplayDecodeError::RetainedDecoderProfileRequired(
-                        payload_format_version,
-                    ));
-                }
-                let envelope: BroadcasterEnvelope = serde_json::from_str(payload.get())
-                    .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
-                let BroadcasterPayload::Update(update) = envelope.payload else {
-                    return Err(ReplayDecodeError::StoredDeltaIsNotUpdate);
-                };
-                self.decode_delta_v1(update, applicable_backends).await
-            }
-            other => Err(ReplayDecodeError::UnsupportedDeltaFormat(other)),
+        let required_profile = match payload_format_version {
+            RETAINED_DELTA_FORMAT_VERSION_V1 => DecoderProfile::RetainedV1,
+            RETAINED_DELTA_FORMAT_VERSION_V2 => DecoderProfile::RetainedV2,
+            other => return Err(ReplayDecodeError::UnsupportedDeltaFormat(other)),
+        };
+        if self.config.profile != required_profile {
+            return Err(ReplayDecodeError::RetainedDecoderProfileRequired(
+                payload_format_version,
+            ));
         }
+        let envelope: BroadcasterEnvelope = serde_json::from_str(payload.get())
+            .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
+        let BroadcasterPayload::Update(update) = envelope.payload else {
+            return Err(ReplayDecodeError::StoredDeltaIsNotUpdate);
+        };
+        self.decode_live_delta(update, applicable_backends).await
     }
 
     pub async fn decode_live_delta(
-        &self,
-        update: BroadcasterUpdateMessage,
-        applicable_backends: &[ReplayBackend],
-    ) -> Result<DecodedReplay, ReplayDecodeError> {
-        self.decode_delta_v1(update, applicable_backends).await
-    }
-
-    async fn decode_delta_v1(
         &self,
         update: BroadcasterUpdateMessage,
         applicable_backends: &[ReplayBackend],
@@ -870,6 +915,86 @@ mod tests {
             .await?;
         assert!(update.is_none());
         assert!(heads.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_v2_restores_and_updates_new_aero_basic_pools() -> anyhow::Result<()> {
+        use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterUpdatePartition};
+        let token = |id| Token::new(&Bytes::from([id; 20]), "TEST", 18, 0, &[], Chain::Base, 100);
+        let (a, b) = (token(1), token(2));
+        let mut raw = aerodrome_v1_message(&a, &b);
+        raw.protocol = "aero_basic".to_owned();
+        for pool in raw.message.snapshots.states.values_mut() {
+            pool.component.protocol_system = raw.protocol.clone();
+            pool.state.attributes.extend([
+                ("custom_fee".into(), Bytes::from(0u32)),
+                ("default_fee".into(), Bytes::from(30u32)),
+                ("fee_module".into(), Bytes::from([0; 20])),
+                ("paused".into(), Bytes::from([0])),
+            ]);
+        }
+        let tokens = HashMap::from([
+            (a.address.clone(), a.clone()),
+            (b.address.clone(), b.clone()),
+        ]);
+        let decoder = ReplayDecoder::new(DecoderConfig::retained_v2(), tokens).await?;
+        let partition = BroadcasterSnapshotPartition::with_messages(
+            BroadcasterBackend::Native,
+            123,
+            vec![raw.clone()],
+            BTreeMap::new(),
+        );
+        let restored = decoder
+            .decode_snapshot_partition(partition)
+            .await?
+            .update
+            .ok_or_else(|| anyhow::anyhow!("checkpoint skipped Aero Basic"))?;
+        let quote = |update: &Update| -> anyhow::Result<_> {
+            Ok(update
+                .states
+                .get("0x01")
+                .ok_or_else(|| anyhow::anyhow!("missing Aero Basic pool"))?
+                .get_amount_out(1_000_000u64.into(), &a, &b)?
+                .amount)
+        };
+        let before = quote(&restored)?;
+        let pool = raw
+            .message
+            .snapshots
+            .states
+            .get_mut("0x01")
+            .ok_or_else(|| anyhow::anyhow!("missing pool fixture"))?;
+        pool.state.attributes.insert(
+            "reserve1".into(),
+            Bytes::from((2u128 * 10u128.pow(21)).to_be_bytes().to_vec()),
+        );
+        raw.message.header.number += 1;
+        let envelope = BroadcasterEnvelope::new(
+            "test",
+            2,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage {
+                partitions: vec![BroadcasterUpdatePartition::with_messages(
+                    BroadcasterBackend::Native,
+                    124,
+                    vec![raw],
+                    BTreeMap::new(),
+                )],
+            }),
+        );
+        let payload = serde_json::value::to_raw_value(&envelope)?;
+        let delta = decoder
+            .decode_delta(2, &payload, &[ReplayBackend::Native])
+            .await?
+            .update
+            .ok_or_else(|| anyhow::anyhow!("delta skipped Aero Basic"))?;
+        assert!(quote(&delta)? > before);
+        assert!(matches!(
+            decoder
+                .decode_delta(1, &payload, &[ReplayBackend::Native])
+                .await,
+            Err(ReplayDecodeError::RetainedDecoderProfileRequired(1))
+        ));
         Ok(())
     }
 

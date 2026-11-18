@@ -32,37 +32,21 @@ impl ReplayBackend {
     }
 
     pub const fn from_protocol_kind(kind: ProtocolKind) -> Self {
-        match kind {
-            ProtocolKind::Curve
-            | ProtocolKind::BalancerV2
-            | ProtocolKind::MaverickV2
-            | ProtocolKind::BalancerV3
-            | ProtocolKind::LiquidityParty => Self::Vm,
-            ProtocolKind::Hashflow
-            | ProtocolKind::Bebop
-            | ProtocolKind::Liquorice
-            | ProtocolKind::NativeRfq
-            | ProtocolKind::Metric
-            | ProtocolKind::TitanFermiSwap
-            | ProtocolKind::TitanKipseli
-            | ProtocolKind::TitanBebop
-            | ProtocolKind::TitanTaurusFi
-            | ProtocolKind::TitanTempest
-            | ProtocolKind::TitanGoliath
-            | ProtocolKind::TitanStelaxis
-            | ProtocolKind::TitanElZorro => Self::Rfq,
-            _ => Self::Native,
+        Self::from_broadcaster_backend(BroadcasterBackend::from_protocol_kind(kind))
+    }
+
+    const fn from_broadcaster_backend(value: BroadcasterBackend) -> Self {
+        match value {
+            BroadcasterBackend::Native => Self::Native,
+            BroadcasterBackend::Vm => Self::Vm,
+            BroadcasterBackend::Rfq => Self::Rfq,
         }
     }
 }
 
 impl From<BroadcasterBackend> for ReplayBackend {
     fn from(value: BroadcasterBackend) -> Self {
-        match value {
-            BroadcasterBackend::Native => Self::Native,
-            BroadcasterBackend::Vm => Self::Vm,
-            BroadcasterBackend::Rfq => Self::Rfq,
-        }
+        Self::from_broadcaster_backend(value)
     }
 }
 

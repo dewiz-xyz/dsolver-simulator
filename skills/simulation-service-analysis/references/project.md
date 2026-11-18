@@ -8,7 +8,7 @@
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
 - Keep `TYCHO_BROADCASTER_URL` pointed at the broadcaster HTTP base URL and configure `BROADCASTER_REDIS_URL` plus `BROADCASTER_REDIS_STREAM_KEY` for Redis deltas. The local default lets the lifecycle helper start the broadcaster on port `3001` before the simulator.
-- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and read the selected chain's `rfq_protocols` in `simulator-manifest.toml` for the actual provider set.
+- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and use [the protocol inventory](protocols.md) to inspect the simulator and broadcaster selections for the chain.
 - The broadcaster requires credentials for its enabled RFQ providers. The simulator consumes the broadcaster books without provider credentials.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
