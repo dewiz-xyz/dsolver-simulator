@@ -36,7 +36,9 @@ pub struct ChainProfile {
     /// quote. Downstream consumers enable and simulate these sources themselves.
     pub broadcaster_only_native_protocols: Vec<ProtocolKind>,
     pub vm_protocols: Vec<ProtocolKind>,
+    pub broadcaster_only_vm_protocols: Vec<ProtocolKind>,
     pub rfq_protocols: Vec<ProtocolKind>,
+    pub broadcaster_only_rfq_protocols: Vec<ProtocolKind>,
     /// Per-operation bound for replay snapshot requests, incomplete replay recovery,
     /// and the first RFQ update. This is separate from overall Tycho bootstrap and serving freshness.
     pub stream_initialization_timeout_secs: u64,
@@ -57,6 +59,24 @@ pub struct ChainProfile {
 }
 
 impl ChainProfile {
+    /// All VM protocols published by the broadcaster.
+    pub fn broadcaster_vm_protocols(&self) -> Vec<ProtocolKind> {
+        self.vm_protocols
+            .iter()
+            .chain(&self.broadcaster_only_vm_protocols)
+            .copied()
+            .collect()
+    }
+
+    /// All RFQ protocols published by the broadcaster.
+    pub fn broadcaster_rfq_protocols(&self) -> Vec<ProtocolKind> {
+        self.rfq_protocols
+            .iter()
+            .chain(&self.broadcaster_only_rfq_protocols)
+            .copied()
+            .collect()
+    }
+
     /// Every native protocol the broadcaster subscribes to and requires in a complete snapshot.
     pub fn broadcaster_native_protocols(&self) -> Vec<ProtocolKind> {
         self.native_protocols
@@ -167,19 +187,17 @@ pub fn load_broadcaster_config() -> BroadcasterConfig {
     let memory = MemoryConfig::from_env();
     let tuning = load_broadcaster_tuning();
     let chain_profile = resolved_chain.chain_profile;
+    let rfq_protocols = chain_profile.broadcaster_rfq_protocols();
     let rfq_enabled = rfq_effectively_enabled(network.enable_rfq_pools, &chain_profile);
     let (bebop_key, hashflow_user, hashflow_key, liquorice_user, liquorice_key) =
-        load_rfq_credentials(rfq_enabled, &chain_profile.rfq_protocols);
+        load_rfq_credentials(rfq_enabled, &rfq_protocols);
 
     let native_key = load_enabled_provider_key(
-        rfq_enabled
-            && chain_profile
-                .rfq_protocols
-                .contains(&ProtocolKind::NativeRfq),
+        rfq_enabled && rfq_protocols.contains(&ProtocolKind::NativeRfq),
         "NATIVE_API_KEY",
     );
     let metric_key = load_enabled_provider_key(
-        rfq_enabled && chain_profile.rfq_protocols.contains(&ProtocolKind::Metric),
+        rfq_enabled && rfq_protocols.contains(&ProtocolKind::Metric),
         "METRIC_API_KEY",
     );
     let rfq_min_tvl_usd: f64 = parse_env_or_default("RFQ_MIN_TVL_USD", "100");
@@ -233,7 +251,7 @@ fn load_enabled_provider_key(enabled: bool, key: &str) -> String {
 }
 
 fn rfq_effectively_enabled(enable_rfq_pools: bool, chain_profile: &ChainProfile) -> bool {
-    enable_rfq_pools && !chain_profile.rfq_protocols.is_empty()
+    enable_rfq_pools && !chain_profile.broadcaster_rfq_protocols().is_empty()
 }
 
 #[expect(
@@ -1182,10 +1200,10 @@ mod tests {
             60
         );
         assert_eq!(chain.chain_profile.recovery_max_buffered_native_blocks, 8);
-        assert!(chain
-            .chain_profile
-            .broadcaster_only_native_protocols
-            .is_empty());
+        assert_eq!(chain.chain_profile.broadcaster_native_protocols().len(), 18);
+        assert_eq!(chain.chain_profile.broadcaster_vm_protocols().len(), 5);
+        assert_eq!(chain.chain_profile.broadcaster_rfq_protocols().len(), 12);
+        assert_eq!(chain.chain_profile.broadcaster_only_rfq_protocols.len(), 8);
         assert!(!chain
             .chain_profile
             .native_protocols
@@ -1413,6 +1431,36 @@ route_policy = "default"
                 format!("{error:#}").contains(expected),
                 "{broadcaster_only}: {error:#}"
             );
+        }
+    }
+
+    #[test]
+    fn broadcaster_protocol_extensions_validate_backend_overlap_and_chain() {
+        let manifest =
+            fs::read_to_string(manifest_path()).unwrap_or_else(|error| unreachable!("{error}"));
+        for (from, to, expected) in [
+            (
+                "broadcaster_only_vm_protocols = [\"vm:balancer_v3\", \"vm:liquidityparty\"]",
+                "broadcaster_only_vm_protocols = [\"vm:curve\"]",
+                "in both vm_protocols",
+            ),
+            (
+                "broadcaster_only_vm_protocols = [\"vm:balancer_v3\", \"vm:liquidityparty\"]",
+                "broadcaster_only_vm_protocols = [\"rfq:bebop\"]",
+                "manifest declares rfq",
+            ),
+            (
+                "broadcaster_only_rfq_protocols = [",
+                "broadcaster_only_rfq_protocols = [\"rfq:hashflow\",",
+                "in both rfq_protocols",
+            ),
+            ("chain_id = 1\n", "chain_id = 8453\n", "only on Ethereum"),
+        ] {
+            assert!(manifest.contains(from));
+            let error = manifest::parse_manifest_registries(&manifest.replacen(from, to, 1))
+                .err()
+                .unwrap_or_else(|| unreachable!("expected invalid manifest"));
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
     }
 
@@ -1792,16 +1840,24 @@ route_policy = " default "
     }
 
     #[test]
-    fn load_broadcaster_config_does_not_require_unconfigured_hashflow_credentials() {
-        let config = with_isolated_config_env(None, || {
+    fn ethereum_broadcaster_requires_hashflow_credentials() {
+        with_isolated_config_env(None, || {
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
             std::env::set_var("BEBOP_KEY", "bebop-key");
-            load_broadcaster_config()
+            std::env::set_var("NATIVE_API_KEY", "native-key");
+            std::env::set_var("METRIC_API_KEY", "metric-key");
+            for key in ["HASHFLOW_USER", "HASHFLOW_KEY"] {
+                let Err(error) = std::panic::catch_unwind(load_broadcaster_config) else {
+                    unreachable!("enabled Hashflow must require credentials");
+                };
+                assert!(panic_message(error).contains(key));
+                std::env::set_var(key, "hashflow-fixture");
+            }
+            let config = load_broadcaster_config();
+            assert_eq!(config.hashflow_user, "hashflow-fixture");
+            assert_eq!(config.hashflow_key, "hashflow-fixture");
         });
-
-        assert!(config.hashflow_user.is_empty());
-        assert!(config.hashflow_key.is_empty());
     }
 
     #[test]
@@ -1826,6 +1882,10 @@ route_policy = " default "
             clear_rfq_credential_env();
             std::env::set_var("ENABLE_RFQ_POOLS", "true");
             std::env::set_var("BEBOP_KEY", "bebop-key");
+            std::env::set_var("HASHFLOW_USER", "hashflow-user");
+            std::env::set_var("HASHFLOW_KEY", "hashflow-key");
+            std::env::set_var("NATIVE_API_KEY", "native-key");
+            std::env::set_var("METRIC_API_KEY", "metric-key");
             load_broadcaster_config()
         });
 
@@ -1843,8 +1903,8 @@ route_policy = " default "
             Some("https://api.liquorice.tech/v1/solver/supported-tokens")
         );
         assert_eq!(config.bebop_key, "bebop-key");
-        assert!(config.hashflow_user.is_empty());
-        assert!(config.hashflow_key.is_empty());
+        assert_eq!(config.hashflow_user, "hashflow-user");
+        assert_eq!(config.hashflow_key, "hashflow-key");
         assert!(config.liquorice_user.is_empty());
         assert!(config.liquorice_key.is_empty());
     }

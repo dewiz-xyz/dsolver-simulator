@@ -62,11 +62,15 @@ have been removed.
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
-## Tycho 0.525.0 Base broadcasting
+## Tycho 0.525.0 broadcasting
 
-This branch preserves the current replay bootstrap API and adds Native/Metric book broadcasting alongside Bebop on Base. The Base broadcaster also enables the additional hosted on-chain feeds listed in the manifest. Set `CHAIN_ID=8453`, `ENABLE_RFQ_POOLS=true`, `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`; the optional `RFQ_MIN_TVL_USD` defaults to 100 USD.
+This branch preserves the current replay bootstrap API and enables all discovered hosted on-chain feeds: 12 on Base and 23 on Ethereum. Enable `ENABLE_VM_POOLS=true` for Ethereum's five VM systems.
 
-Consumers must use the matching Tycho 0.525.0 state format and bootstrap fresh snapshots during rollout. Native/Metric settlement encoding is outside this change. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list, dependency provenance, and verification results.
+With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed once; Titan Bebop and Bebop RFQ have distinct identities.
+
+Set `CHAIN_ID=8453` or `1`, and supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`. Ethereum also requires `HASHFLOW_USER` and `HASHFLOW_KEY`. Titan's public stream needs no API key. The optional `RFQ_MIN_TVL_USD` defaults to 100 USD for direct book providers.
+
+Consumers must use the matching Tycho 0.525.0 state format and bootstrap fresh snapshots during rollout. Titan snapshots and deltas preserve quote expiry; receiving or replaying a book does not renew it. Downstream consumers own routing and settlement encoding. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list and verification results.
 
 ## Quick Start
 

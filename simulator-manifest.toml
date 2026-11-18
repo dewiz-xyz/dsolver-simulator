@@ -1,4 +1,68 @@
 [[protocols]]
+id = "uniswap_v4_hooks"
+backend = "native"
+
+[[protocols]]
+id = "ring_swap_v2"
+backend = "native"
+
+[[protocols]]
+id = "sky"
+backend = "native"
+
+[[protocols]]
+id = "lido_v4"
+backend = "native"
+
+[[protocols]]
+id = "etherfi"
+backend = "native"
+
+[[protocols]]
+id = "vm:balancer_v3"
+backend = "vm"
+
+[[protocols]]
+id = "vm:liquidityparty"
+backend = "vm"
+
+[[protocols]]
+id = "pricelevelstream:fermiswap"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:kipseli"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:bebop"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:taurusfi"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:tempest"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:goliath"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:stelaxis"
+backend = "rfq"
+
+[[protocols]]
+id = "pricelevelstream:elzorro"
+backend = "rfq"
+
+[[protocols]]
+id = "rfq:hashflow"
+backend = "rfq"
+
+[[protocols]]
 id = "aero_basic"
 backend = "native"
 
@@ -161,10 +225,14 @@ native_protocols = [
     "ekubo_v3",
     "erc4626",
 ]
+broadcaster_only_native_protocols = ["uniswap_v4", "uniswap_v4_hooks", "ring_swap_v2", "sky", "lido_v4", "etherfi", "aero_basic", "aero_cl"]
 vm_protocols = ["vm:curve", "vm:balancer_v2", "vm:maverick_v2"]
-# Ethereum v4 stays disabled until one guarded shared-database subscription can retain the VM set.
+broadcaster_only_vm_protocols = ["vm:balancer_v3", "vm:liquidityparty"]
+# Ethereum v4 is broadcast-only until one guarded simulator subscription can retain the VM set.
 # TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
-rfq_protocols = ["rfq:bebop"]
+rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric", "rfq:hashflow"]
+# Titan publishes independently of mined blocks. Metric uses its direct book feed once.
+broadcaster_only_rfq_protocols = ["pricelevelstream:fermiswap", "pricelevelstream:kipseli", "pricelevelstream:bebop", "pricelevelstream:taurusfi", "pricelevelstream:tempest", "pricelevelstream:goliath", "pricelevelstream:stelaxis", "pricelevelstream:elzorro"]
 route_policy = "ethereum"
 
 [[chains]]

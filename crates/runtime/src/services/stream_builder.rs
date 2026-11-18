@@ -161,7 +161,7 @@ mod tests {
 
         (
             resolved.chain_profile.broadcaster_native_protocols(),
-            resolved.chain_profile.vm_protocols,
+            resolved.chain_profile.broadcaster_vm_protocols(),
         )
     }
 

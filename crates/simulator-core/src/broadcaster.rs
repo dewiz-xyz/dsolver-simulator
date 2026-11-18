@@ -19,6 +19,7 @@ use crate::models::protocol::ProtocolKind;
 mod raw_state;
 mod redis_streams;
 mod snapshot_reassembly;
+mod state_wire;
 
 pub use raw_state::{
     apply_raw_protocol_messages, fold_account_update_into_snapshot, merge_shared_vm_accounts,
@@ -1071,6 +1072,7 @@ impl BroadcasterBackendHead {
 pub struct BroadcasterStateEntry {
     pub component_id: String,
     pub component: ProtocolComponent,
+    #[serde(with = "state_wire")]
     pub state: Box<dyn ProtocolSim>,
 }
 
@@ -1093,6 +1095,7 @@ impl BroadcasterStateEntry {
 pub struct BroadcasterStateDelta {
     pub component_id: String,
     pub backend: BroadcasterBackend,
+    #[serde(with = "state_wire")]
     pub state: Box<dyn ProtocolSim>,
 }
 
@@ -1849,14 +1852,24 @@ fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, Broadcas
 
 fn backend_for_kind(kind: ProtocolKind) -> BroadcasterBackend {
     match kind {
-        ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => {
-            BroadcasterBackend::Vm
-        }
+        ProtocolKind::Curve
+        | ProtocolKind::BalancerV2
+        | ProtocolKind::MaverickV2
+        | ProtocolKind::BalancerV3
+        | ProtocolKind::LiquidityParty => BroadcasterBackend::Vm,
         ProtocolKind::Hashflow
         | ProtocolKind::Bebop
         | ProtocolKind::Liquorice
         | ProtocolKind::NativeRfq
-        | ProtocolKind::Metric => BroadcasterBackend::Rfq,
+        | ProtocolKind::Metric
+        | ProtocolKind::TitanFermiSwap
+        | ProtocolKind::TitanKipseli
+        | ProtocolKind::TitanBebop
+        | ProtocolKind::TitanTaurusFi
+        | ProtocolKind::TitanTempest
+        | ProtocolKind::TitanGoliath
+        | ProtocolKind::TitanStelaxis
+        | ProtocolKind::TitanElZorro => BroadcasterBackend::Rfq,
         _ => BroadcasterBackend::Native,
     }
 }

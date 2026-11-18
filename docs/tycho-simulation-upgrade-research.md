@@ -19,17 +19,29 @@ The Base broadcaster subscribes to all 12 on-chain systems advertised by the aut
 - Existing simulator sources: Uniswap V2/V3/V4, PancakeSwap V3, Aerodrome Slipstreams.
 - Broadcast-only sources: Aerodrome V1, SushiSwap V2, Aero Basic, Aero CL, PancakeSwap Infinity CL, LunarBase, Ekubo V3.
 
-Aerodrome V1 was already broadcast-only in the master baseline. The other six expand that baseline's coverage. Infinity Bin and Biconomy have canonical identities and decoders registered but remain disabled because the hosted Base endpoint did not advertise them. Ethereum's selected sources are unchanged. The standalone simulator's quoting selection remains explicit in the manifest; downstream consumers own router/executor support.
+Aerodrome V1 was already broadcast-only in the master baseline. The other six expand that baseline's coverage. Infinity Bin and Biconomy have canonical identities and decoders registered but remain disabled because the hosted Base endpoint did not advertise them. The standalone simulator's quoting selection remains explicit in the manifest; downstream consumers own router/executor support.
 
 Base RFQ broadcasting enables **Bebop, Native, and Metric**. Metric uses Tycho's pAMM book feed but travels through the same decoded-state snapshot and Redis contract as the RFQ providers.
 
-The adapter publishes complete serialized states and diffs consecutive complete provider books. Missing pairs are removed. Withdrawal and terminal feed events remove only that provider's liquidity; other providers remain in the snapshot. Tests check replacement, empty books, idempotent withdrawal, provider isolation, and exact quote preservation after serialization.
+The adapter publishes complete serialized states and diffs consecutive complete provider books. Missing pairs are removed. Temporary withdrawals remove only that provider's liquidity. Terminal feed events publish its withdrawal and close the combined stream so the existing supervisor restarts the feeds; ongoing Titan or peer updates cannot hide a terminated provider. Tests check replacement, empty books, idempotent withdrawal, provider isolation, and exact quote preservation after serialization.
+
+## Ethereum sources
+
+The authenticated Ethereum beta endpoint advertised 23 on-chain systems during discovery. The broadcaster now subscribes to all of them: 18 native systems and five VM systems. The ten additions are `uniswap_v4`, `uniswap_v4_hooks`, `ring_swap_v2`, `sky`, `lido_v4`, `etherfi`, `aero_basic`, `aero_cl`, `vm:balancer_v3`, and `vm:liquidityparty`. Replay decoder registration includes the hybrid Balancer V3 state and LiquidityParty's killed-pool filter. The standalone simulator's selected on-chain set is unchanged; new sources use the manifest's broadcaster-only lists.
+
+Direct book providers are **Bebop, Native, Metric, and Hashflow**. Hashflow uses the existing provider token CSV and keeps each maker's book identity. Its credentials are checked at broadcaster startup.
+
+The **eight Titan propAMMs** are **FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro**. They are selected explicitly from Tycho 0.525.0's named registry. Metric is omitted from Titan because it is already subscribed directly. Unknown/new Titan venues are not automatically enabled. Fermi uses Titan's current router `0xf6d5b2fefec7b420d9990b95790adfd3d4c4f977`, replacing the old address in the pinned crate. Gas estimates otherwise remain the upstream estimates; no new execution-gas calibration is claimed.
+
+Titan's incremental updates are multiplexed with the complete-book provider adapter. They retain `pricelevelstream:<venue>` identities and explicit upstream removals, use observed Unix milliseconds for the shared RFQ cursor, and preserve the upstream simulation overrides. Fallback-router identities are disabled because downstream consumers choose the execution path.
+
+Tycho skips its process-local Titan quote deadline during ordinary serde. The broadcaster's state wire adapter adds `quote_expires_at_unix_ms` and reconstructs the remaining monotonic lifetime on receipt, capped at the upstream quote TTL. Delayed snapshots and replay therefore cannot renew expired liquidity. A Titan state with no deadline is rejected. Broadcaster and consumer hosts need synchronized clocks, and consumers must use this updated replay client; older readers do not enforce the new wire deadline. The pinned retained-V1 historical on-chain decoder profile is unchanged; the added on-chain protocols are live broadcaster/replay coverage, not an expansion of that historical format.
 
 ## Configuration and encoding
 
-Set `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true` on the broadcaster. Supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY` through the runtime secret environment. Native/Metric keys are required only when their broadcaster feeds are enabled. No supplied credentials are committed.
+Set `CHAIN_ID=8453` and `ENABLE_RFQ_POOLS=true` on the broadcaster. Supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY` through the runtime secret environment. For Ethereum, set `CHAIN_ID=1`, keep `ENABLE_VM_POOLS=true`, and also supply `HASHFLOW_USER` and `HASHFLOW_KEY`. Native/Metric keys are required only when their broadcaster feeds are enabled. Titan needs no API key; its two public WebSocket URLs can be overridden with `TITAN_PAMM_PRICE_LEVEL_URL` and `TITAN_PAMM_QUOTE_STREAM_URL`. No supplied credentials are committed.
 
-`RFQ_MIN_TVL_USD` defaults to `100` and must be finite and nonnegative. It is independent of the on-chain `TVL_THRESHOLD`, whose units are the native token.
+`RFQ_MIN_TVL_USD` defaults to `100` and must be finite and nonnegative. It applies to direct book providers, not Titan, and is independent of the on-chain `TVL_THRESHOLD`, whose units are the native token.
 
 The removed upstream `RFQStreamBuilder` is replaced with public provider feed builders and `BookFeedStreams`. Simulation uses the serialized broadcast books directly. The simulator requires no RFQ provider credentials; only the broadcaster connects to provider feeds.
 
@@ -43,14 +55,21 @@ Use the updated `simulator-manifest.toml` when deploying. Custom manifests must 
 
 ## Verification
 
-Validated after removing `/encode` and cleaning up its remaining dependencies/configuration on 2026-11-17 with Rust 1.95.0:
+Validated after adding Ethereum broadcasting on 2026-11-18 with Rust 1.95.0:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`: passed.
-- `cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4`: **926 passed, 102 skipped**. Includes the removed endpoint's 404 contract, RFQ-enabled simulator startup without provider credentials on Base/Ethereum, independent broadcaster TVL validation, and broadcaster/replay coverage.
+- `cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4`: **932 passed, 105 skipped**. Includes the removed endpoint's 404 contract, broadcaster credential/backend validation, all manifest decoder registrations, Hashflow quote/serialization parity, Titan state deadline/replay rejection, and provider termination/recovery behavior.
 - `cargo test --locked --workspace --all-features --doc`: passed (no doctests defined).
 - Lockfile inspection: simulation/common/client/ethereum each resolve once to crates.io `0.525.0`; no execution package, Git dependency, or local execution patch remains.
 - The earlier `cargo build --locked --workspace --bins --release` attempt was blocked by local disk exhaustion (`No space left on device`), including after removing this checkout's generated debug artifacts. Test-profile binaries compiled and all active tests passed; the release build still needs CI validation.
+
+Live Ethereum read-only checks on 2026-11-18:
+
+- Native/Metric: passed. With a WETH/USDC/WBTC token universe, Native published USDC/WETH, while Metric published WETH/USDC, WBTC/USDC, and WBTC/WETH books. Spot prices survive serialization exactly.
+- Hashflow: passed using runtime-only credentials. Maker books survive the RFQ broadcast wire path with unchanged spot prices. No firm quote or transaction was requested.
+- Titan: seven venues passed live spot-price, amount, and gas parity checks through serialized updates in the final 45-second window: FermiSwap, Kipseli, Bebop, Tempest, Goliath, Stelaxis, ElZorro. The strict eight-venue live test timed out waiting for TaurusFi; it was listed in `titan_getPammVenues` but absent from `titan_getPammBooks` on follow-up. An earlier run observed TaurusFi spot-price parity, then exposed a test assumption that every book had liquidity in both directions. The test now checks both directions and preserves refusals as well as available quotes. All eight remain explicitly registered; live availability is provider-dependent.
+- No full live Tycho on-chain bootstrap or production deployment was performed. On-chain coverage is verified against discovery and decoder registration tests.
 
 Additional verification recorded before the encoding removal for the broadcasting upgrade:
 
@@ -70,3 +89,6 @@ The published Tycho 0.525.0 crate identifies upstream commit `3158f791d3372f7534
 - [Provider RFQ implementations](https://github.com/propeller-heads/tycho/tree/3158f791d3372f7534459d10179d1290dd520328/crates/tycho-simulation/src/rfq/protocols)
 - [Metric implementation](https://github.com/propeller-heads/tycho/tree/3158f791d3372f7534459d10179d1290dd520328/crates/tycho-simulation/src/pamm/protocols/metric)
 - [Upstream feed DTO boundary](https://github.com/propeller-heads/tycho/blob/3158f791d3372f7534459d10179d1290dd520328/crates/tycho-client/src/feed/dto.rs)
+
+- [Titan venue registry and public feeds](https://docs.titanbuilder.xyz/propamms)
+- [Pinned Titan stream configuration](https://github.com/propeller-heads/tycho/blob/3158f791d3372f7534459d10179d1290dd520328/crates/tycho-simulation/src/price_level_stream/config.rs)

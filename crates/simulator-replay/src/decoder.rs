@@ -11,16 +11,24 @@ use tycho_simulation::{
             aero_basic::state::AeroBasicState,
             aerodrome_slipstreams::state::AerodromeSlipstreamsState,
             aerodrome_v1::state::AerodromeV1State,
+            balancer_v3::BalancerV3State,
             biconomy::state::BiconomyState,
             ekubo::state::EkuboState,
             ekubo_v3::{filter_fn as ekubo_v3_extension_filter, state::EkuboV3State},
             erc4626::state::ERC4626State,
-            filters::{balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter},
+            etherfi::state::EtherfiState,
+            filters::{
+                balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter,
+                liquidityparty_killed_pools_filter,
+            },
             fluid::FluidV1,
+            lido_v4::state::LidoV4State,
             lunarbase::state::LunarBaseState,
             pancakeswap_infinity_bin::state::PancakeswapInfinityBinState,
             pancakeswap_v2::state::PancakeswapV2State,
+            ring_swap_v2::state::RingSwapV2State,
             rocketpool::state::RocketpoolState,
+            sky::state::SkyState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::hooks::hook_handler_creator::initialize_hook_handlers,
@@ -620,9 +628,15 @@ fn register_native_decoder(
         ProtocolKind::UniswapV3 | ProtocolKind::PancakeswapV3 => {
             decoder.register_decoder::<UniswapV3State>(protocol.as_str())
         }
-        ProtocolKind::UniswapV4 | ProtocolKind::PancakeswapInfinityCl => {
+        ProtocolKind::UniswapV4
+        | ProtocolKind::UniswapV4Hooks
+        | ProtocolKind::PancakeswapInfinityCl => {
             decoder.register_decoder::<UniswapV4State>(protocol.as_str())
         }
+        ProtocolKind::RingSwapV2 => decoder.register_decoder::<RingSwapV2State>(protocol.as_str()),
+        ProtocolKind::Sky => decoder.register_decoder::<SkyState>(protocol.as_str()),
+        ProtocolKind::LidoV4 => decoder.register_decoder::<LidoV4State>(protocol.as_str()),
+        ProtocolKind::Etherfi => decoder.register_decoder::<EtherfiState>(protocol.as_str()),
         ProtocolKind::AeroBasic => decoder.register_decoder::<AeroBasicState>(protocol.as_str()),
         ProtocolKind::LunarBase => decoder.register_decoder::<LunarBaseState>(protocol.as_str()),
         ProtocolKind::Biconomy => decoder.register_decoder::<BiconomyState>(protocol.as_str()),
@@ -659,6 +673,13 @@ fn register_vm_decoder(
     protocol: ProtocolKind,
 ) -> Result<(), ReplayDecodeError> {
     match protocol {
+        ProtocolKind::BalancerV3 => {
+            decoder.register_decoder::<BalancerV3State>(protocol.as_str());
+        }
+        ProtocolKind::LiquidityParty => {
+            decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol.as_str());
+            decoder.register_filter(protocol.as_str(), liquidityparty_killed_pools_filter);
+        }
         ProtocolKind::BalancerV2 => {
             decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol.as_str());
             decoder.register_filter(protocol.as_str(), balancer_v2_pool_filter);

@@ -3,7 +3,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
-use futures::{future::ready, Stream, StreamExt};
+use futures::{
+    future::ready,
+    stream::{self, BoxStream},
+    Stream, StreamExt,
+};
 use simulator_core::models::protocol::ProtocolKind;
 use tracing::warn;
 use tycho_simulation::{
@@ -32,7 +36,36 @@ pub async fn build_rfq_stream(
     chain: Chain,
     protocols: &[ProtocolKind],
     config: RFQConfig,
-) -> Result<impl Stream<Item = Result<Update, StreamError>> + Unpin + Send> {
+) -> Result<BoxStream<'static, Result<Update, StreamError>>> {
+    let books = protocols
+        .iter()
+        .copied()
+        .filter(|protocol| protocol.titan_venue().is_none())
+        .collect::<Vec<_>>();
+    let titan = if protocols
+        .iter()
+        .any(|protocol| protocol.titan_venue().is_some())
+    {
+        super::titan_stream::build_titan_stream(
+            chain,
+            protocols,
+            token_stores.tokens.snapshot().await,
+        )?
+        .map(RfqEvent::Update)
+        .boxed()
+    } else {
+        stream::empty().boxed()
+    };
+    let books = build_book_stream(token_stores, chain, &books, config).await?;
+    Ok(merge_streams(books, titan))
+}
+
+async fn build_book_stream(
+    token_stores: RFQTokenStores,
+    chain: Chain,
+    protocols: &[ProtocolKind],
+    config: RFQConfig,
+) -> Result<BoxStream<'static, RfqEvent>> {
     let mut feeds = BookFeedStreams::new();
     let quote_tokens = Arc::new(
         usd_stablecoins_for_chain(chain)
@@ -114,18 +147,57 @@ pub async fn build_rfq_stream(
             other => bail!("Unknown RFQ provider: {other}"),
         }
     }
+    Ok(book_updates(feeds))
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "updates dominate; avoid allocating each update just for a terminal sentinel"
+)]
+enum RfqEvent {
+    Update(Update),
+    Ended,
+}
+
+fn merge_streams(
+    books: BoxStream<'static, RfqEvent>,
+    titan: BoxStream<'static, RfqEvent>,
+) -> BoxStream<'static, Result<Update, StreamError>> {
+    stream::select(books, titan)
+        .scan((), |(), event| {
+            ready(match event {
+                RfqEvent::Update(update) => Some(Ok(update)),
+                // Closing the whole stream lets the existing supervisor rebuild every feed with
+                // backoff. A surviving provider (including Titan) must not hide a terminal failure.
+                RfqEvent::Ended => None,
+            })
+        })
+        .boxed()
+}
+
+fn book_updates(
+    feeds: impl Stream<Item = (String, BookFeedEvent)> + Send + 'static,
+) -> BoxStream<'static, RfqEvent> {
     let mut books = ProviderBooks::default();
-    Ok(feeds.filter_map(move |(provider, event)| {
+    feeds.flat_map(move |(provider, event)| {
+        let ended = matches!(event, BookFeedEvent::Ended(_));
         let snapshot = match event {
             BookFeedEvent::Published(snapshot) => Some(snapshot),
             BookFeedEvent::Withdrawn => None,
             BookFeedEvent::Ended(outcome) => {
-                warn!(%provider, ?outcome, "RFQ provider ended; withdrawing its liquidity");
+                warn!(%provider, ?outcome, "RFQ provider ended; withdrawing liquidity and restarting feeds");
                 None
             }
         };
-        ready(books.replace(&provider, snapshot).map(Ok))
-    }))
+        let mut events = Vec::with_capacity(2);
+        if let Some(update) = books.replace(&provider, snapshot) {
+            events.push(RfqEvent::Update(update));
+        }
+        if ended {
+            events.push(RfqEvent::Ended);
+        }
+        stream::iter(events)
+    }).boxed()
 }
 
 #[derive(Default)]
@@ -180,7 +252,9 @@ mod tests {
     use tycho_simulation::{
         book::{Book, Books},
         pamm::protocols::metric::state::MetricState,
-        rfq::protocols::{bebop::state::BebopState, native::state::NativeState},
+        rfq::protocols::{
+            bebop::state::BebopState, hashflow::state::HashflowState, native::state::NativeState,
+        },
         tycho_common::{models::token::Token, simulation::protocol_sim::ProtocolSim, Bytes},
     };
 
@@ -192,10 +266,18 @@ mod tests {
                 18,
                 0,
                 &[],
-                Chain::Base,
+                Chain::Ethereum,
                 100,
             ),
-            Token::new(&Bytes::from([2u8; 20]), "USDC", 6, 0, &[], Chain::Base, 100),
+            Token::new(
+                &Bytes::from([2u8; 20]),
+                "USDC",
+                6,
+                0,
+                &[],
+                Chain::Ethereum,
+                100,
+            ),
         )
     }
 
@@ -211,6 +293,15 @@ mod tests {
                         "bids": {"levels": levels, "minimum_in": 0.0, "minimum_out": 0.0},
                         "asks": {"levels": levels, "minimum_in": 0.0, "minimum_out": 0.0}
                     }
+                }))
+                .unwrap(),
+            ),
+            "rfq:hashflow" => Arc::new(
+                serde_json::from_value::<HashflowState>(json!({
+                    "base_token": base, "quote_token": quote,
+                    "market_maker": format!("maker-{id}"),
+                    "levels": {"pair": {"baseToken": base.address, "quoteToken": quote.address},
+                               "levels": [{"p": "3000", "q": "1"}, {"p": "2990", "q": "10"}]}
                 }))
                 .unwrap(),
             ),
@@ -245,11 +336,12 @@ mod tests {
             provider.to_string(),
             match provider {
                 "rfq:native" => "native_relay_pool",
+                "rfq:hashflow" => "hashflow_pool",
                 "rfq:metric" => "metric_pool",
                 _ => "bebop_pool",
             }
             .to_string(),
-            Chain::Base,
+            Chain::Ethereum,
             vec![base, quote],
             Vec::new(),
             HashMap::new(),
@@ -271,11 +363,16 @@ mod tests {
 
     #[tokio::test]
     async fn providers_round_trip_through_broadcast_and_keep_exact_quotes() {
-        let cache = BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Rfq]);
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]);
         let mut providers = ProviderBooks::default();
         let (base, quote) = tokens();
         let amount = BigUint::from(1_000_000_000_000_000_000u64);
-        for (provider, id) in [("rfq:bebop", 3), ("rfq:native", 4), ("rfq:metric", 5)] {
+        for (provider, id) in [
+            ("rfq:bebop", 3),
+            ("rfq:native", 4),
+            ("rfq:metric", 5),
+            ("rfq:hashflow", 6),
+        ] {
             let original = book(provider, id);
             let expected = original
                 .state
@@ -323,9 +420,10 @@ mod tests {
             .flat_map(|partition| &partition.states)
             .map(|entry| entry.component.protocol_system.as_str())
             .collect();
-        assert_eq!(protocols.len(), 2);
+        assert_eq!(protocols.len(), 3);
         assert!(protocols.contains(&"rfq:bebop"));
         assert!(protocols.contains(&"rfq:metric"));
+        assert!(protocols.contains(&"rfq:hashflow"));
     }
 
     #[test]
@@ -358,34 +456,134 @@ mod tests {
         assert_eq!(resumed.new_pairs.len(), 1);
     }
     #[tokio::test]
+    async fn ended_provider_withdraws_then_ends_combined_stream_even_with_active_titan() {
+        use tycho_simulation::book::BookFeedOutcome;
+        for published_first in [false, true] {
+            let mut events = vec![(
+                "rfq:bebop".to_string(),
+                BookFeedEvent::Published(snapshot(vec![book("rfq:bebop", 3)])),
+            )];
+            if published_first {
+                events.push((
+                    "rfq:native".into(),
+                    BookFeedEvent::Published(snapshot(vec![book("rfq:native", 4)])),
+                ));
+            }
+            events.push((
+                "rfq:native".into(),
+                BookFeedEvent::Ended(BookFeedOutcome::RanOut),
+            ));
+            let books = book_updates(stream::iter(events));
+            let titan = stream::repeat_with(|| {
+                RfqEvent::Update(Update::new(
+                    current_time_ms(),
+                    HashMap::new(),
+                    HashMap::new(),
+                ))
+            })
+            .boxed();
+            let updates = merge_streams(books, titan)
+                .take(12)
+                .collect::<Vec<_>>()
+                .await;
+            assert!(
+                updates.len() < 12,
+                "Titan must not hide a terminal book failure"
+            );
+            let removed = updates
+                .into_iter()
+                .flat_map(|update| update.unwrap().removed_pairs.into_values())
+                .collect::<Vec<_>>();
+            assert_eq!(removed.len(), usize::from(published_first));
+            assert!(removed
+                .iter()
+                .all(|component| component.protocol_system == "rfq:native"));
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_withdrawal_keeps_feed_alive_for_republication() {
+        let events = stream::iter([
+            (
+                "rfq:native".into(),
+                BookFeedEvent::Published(snapshot(vec![book("rfq:native", 4)])),
+            ),
+            ("rfq:native".into(), BookFeedEvent::Withdrawn),
+            (
+                "rfq:native".into(),
+                BookFeedEvent::Published(snapshot(vec![book("rfq:native", 4)])),
+            ),
+        ]);
+        let updates = merge_streams(book_updates(events), stream::empty().boxed())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[1].as_ref().unwrap().removed_pairs.len(), 1);
+        assert_eq!(updates[2].as_ref().unwrap().new_pairs.len(), 1);
+    }
+
+    #[tokio::test]
     #[ignore = "requires NATIVE_API_KEY and METRIC_API_KEY; reads live Base books"]
     async fn live_base_native_and_metric_broadcast() -> Result<()> {
+        live_book_broadcast(
+            Chain::Base,
+            &[ProtocolKind::NativeRfq, ProtocolKind::Metric],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires NATIVE_API_KEY and METRIC_API_KEY; reads live Ethereum books"]
+    async fn live_ethereum_native_and_metric_broadcast() -> Result<()> {
+        live_book_broadcast(
+            Chain::Ethereum,
+            &[ProtocolKind::NativeRfq, ProtocolKind::Metric],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires HASHFLOW_USER and HASHFLOW_KEY; reads live Ethereum books"]
+    async fn live_ethereum_hashflow_broadcast() -> Result<()> {
+        live_book_broadcast(Chain::Ethereum, &[ProtocolKind::Hashflow]).await
+    }
+
+    async fn live_book_broadcast(chain: Chain, protocols: &[ProtocolKind]) -> Result<()> {
         use crate::models::tokens::TokenStore;
         use std::{collections::HashSet, str::FromStr, time::Duration};
-        let tokens: HashMap<_, _> = [
-            ("0x4200000000000000000000000000000000000006", "WETH", 18),
-            ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "USDC", 6),
-            ("0xcBb7C0000aB88B473b1f5aFd9ef808440eed33Bf", "cbBTC", 8),
-        ]
-        .into_iter()
-        .map(|(address, symbol, decimals)| {
-            let token = Token::new(
-                &Bytes::from_str(address).unwrap(),
-                symbol,
-                decimals,
-                0,
-                &[],
-                Chain::Base,
-                100,
-            );
-            (token.address.clone(), token)
-        })
-        .collect();
+        let addresses = match chain {
+            Chain::Base => [
+                ("0x4200000000000000000000000000000000000006", "WETH", 18),
+                ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "USDC", 6),
+                ("0xcBb7C0000aB88B473b1f5aFd9ef808440eed33Bf", "cbBTC", 8),
+            ],
+            Chain::Ethereum => [
+                ("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "WETH", 18),
+                ("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "USDC", 6),
+                ("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", "WBTC", 8),
+            ],
+            _ => bail!("unsupported test chain"),
+        };
+        let tokens: HashMap<_, _> = addresses
+            .into_iter()
+            .map(|(address, symbol, decimals)| {
+                let token = Token::new(
+                    &Bytes::from_str(address).unwrap(),
+                    symbol,
+                    decimals,
+                    0,
+                    &[],
+                    chain,
+                    100,
+                );
+                (token.address.clone(), token)
+            })
+            .collect();
         let store = Arc::new(TokenStore::new(
             tokens,
             String::new(),
             String::new(),
-            Chain::Base,
+            chain,
             Duration::from_secs(1),
         ));
         let mut stream = build_rfq_stream(
@@ -395,25 +593,28 @@ mod tests {
                 hashflow: store.clone(),
                 liquorice: store,
             },
-            Chain::Base,
-            &[ProtocolKind::NativeRfq, ProtocolKind::Metric],
+            chain,
+            protocols,
             RFQConfig {
-                native_key: std::env::var("NATIVE_API_KEY")?,
-                metric_key: std::env::var("METRIC_API_KEY")?,
+                native_key: std::env::var("NATIVE_API_KEY").unwrap_or_default(),
+                metric_key: std::env::var("METRIC_API_KEY").unwrap_or_default(),
                 min_tvl_usd: 100.0,
 
                 bebop_key: String::new(),
-                hashflow_user: String::new(),
-                hashflow_key: String::new(),
+                hashflow_user: std::env::var("HASHFLOW_USER").unwrap_or_default(),
+                hashflow_key: std::env::var("HASHFLOW_KEY").unwrap_or_default(),
                 liquorice_user: String::new(),
                 liquorice_key: String::new(),
             },
         )
         .await?;
-        let cache = BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Rfq]);
+        let cache = BroadcasterSnapshotCache::new(
+            if chain == Chain::Base { 8453 } else { 1 },
+            vec![BroadcasterBackend::Rfq],
+        );
         let mut seen = HashSet::new();
         tokio::time::timeout(Duration::from_secs(45), async {
-            while seen.len() < 2 {
+            while seen.len() < protocols.len() {
                 let update = stream
                     .next()
                     .await
@@ -445,7 +646,7 @@ mod tests {
                 assert!(before.is_finite() && before > 0.0);
                 providers.push(component.protocol_system.clone());
                 eprintln!(
-                    "Live Base broadcast round-trip: {} {} / {}",
+                    "Live broadcast round-trip: {} {} / {}",
                     component.protocol_system, base.symbol, quote.symbol
                 );
             }

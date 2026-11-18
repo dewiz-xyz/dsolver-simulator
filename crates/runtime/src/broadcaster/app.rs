@@ -404,7 +404,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     .with_chain_head_observer(
         chain_head_observer.clone(),
         config.chain_profile.broadcaster_native_protocols(),
-        config.chain_profile.vm_protocols.clone(),
+        config.chain_profile.broadcaster_vm_protocols(),
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
@@ -423,7 +423,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
             tokens: Arc::clone(&tokens),
             chain,
             token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
-            protocols: &config.chain_profile.rfq_protocols,
+            protocols: &config.chain_profile.broadcaster_rfq_protocols(),
             bebop_url: &config.bebop_url,
             hashflow_filename: &config.hashflow_filename,
             liquorice_url: config.liquorice_url.as_deref(),
@@ -611,7 +611,7 @@ async fn build_redis_publisher(
     )
     .with_required_protocols(
         config.chain_profile.broadcaster_native_protocols(),
-        config.chain_profile.vm_protocols.clone(),
+        config.chain_profile.broadcaster_vm_protocols(),
     );
     let publisher = match state_history {
         Some(state_history) => publisher.with_state_history(Arc::clone(state_history)),
@@ -662,7 +662,7 @@ fn raw_configured_backends(config: &BroadcasterConfig) -> Vec<BroadcasterBackend
     if !native_protocols.is_empty() {
         backends.push(BroadcasterBackend::Native);
     }
-    if !config.chain_profile.vm_protocols.is_empty() {
+    if !config.chain_profile.broadcaster_vm_protocols().is_empty() {
         backends.push(BroadcasterBackend::Vm);
     }
     backends
@@ -673,7 +673,7 @@ fn rfq_configured_backends(config: &BroadcasterConfig) -> Option<Vec<Broadcaster
 }
 
 fn effective_rfq_enabled(config: &BroadcasterConfig) -> bool {
-    config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty()
+    config.enable_rfq_pools && !config.chain_profile.broadcaster_rfq_protocols().is_empty()
 }
 
 fn build_supervisor_config(config: &BroadcasterConfig) -> StreamSupervisorConfig {
@@ -708,7 +708,7 @@ fn spawn_broadcaster_stream_task(
     let tvl_keep_threshold = config.tvl_keep_threshold;
     let protocols = BroadcasterProtocols {
         native: config.chain_profile.broadcaster_native_protocols(),
-        vm: config.chain_profile.vm_protocols.clone(),
+        vm: config.chain_profile.broadcaster_vm_protocols(),
     };
     let recovery_config = BroadcasterRecoveryConfig {
         initial_bootstrap_timeout: Duration::from_secs(
@@ -752,7 +752,7 @@ fn spawn_broadcaster_rfq_stream_task(
     stop: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let chain = config.chain_profile.chain;
-    let protocols = config.chain_profile.rfq_protocols.clone();
+    let protocols = config.chain_profile.broadcaster_rfq_protocols();
     let rfq_config = RFQConfig {
         native_key: config.native_key.clone(),
         metric_key: config.metric_key.clone(),
@@ -1180,6 +1180,8 @@ mod tests {
                 chain: Chain::Ethereum,
                 native_protocols: vec![ProtocolKind::UniswapV2],
                 broadcaster_only_native_protocols: Vec::new(),
+                broadcaster_only_vm_protocols: Vec::new(),
+                broadcaster_only_rfq_protocols: Vec::new(),
                 vm_protocols: Vec::new(),
                 rfq_protocols: vec![ProtocolKind::Bebop],
                 stream_initialization_timeout_secs: 25,

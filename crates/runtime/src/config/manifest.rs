@@ -55,7 +55,9 @@ struct ChainRegistryEntry {
     native_protocols: Vec<ProtocolKind>,
     broadcaster_only_native_protocols: Vec<ProtocolKind>,
     vm_protocols: Vec<ProtocolKind>,
+    broadcaster_only_vm_protocols: Vec<ProtocolKind>,
     rfq_protocols: Vec<ProtocolKind>,
+    broadcaster_only_rfq_protocols: Vec<ProtocolKind>,
     stream_initialization_timeout_secs: u64,
     chain_head_poll_interval_ms: u64,
     chain_head_rpc_request_timeout_ms: u64,
@@ -118,7 +120,11 @@ struct RawChain {
     #[serde(default)]
     broadcaster_only_native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
+    #[serde(default)]
+    broadcaster_only_vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
+    #[serde(default)]
+    broadcaster_only_rfq_protocols: Vec<String>,
     stream_initialization_timeout_secs: NonZeroU64,
     chain_head_poll_interval_ms: NonZeroU64,
     chain_head_rpc_request_timeout_ms: NonZeroU64,
@@ -177,7 +183,9 @@ pub(crate) fn resolve_chain_config(
             native_protocols: chain.native_protocols.clone(),
             broadcaster_only_native_protocols: chain.broadcaster_only_native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),
+            broadcaster_only_vm_protocols: chain.broadcaster_only_vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
+            broadcaster_only_rfq_protocols: chain.broadcaster_only_rfq_protocols.clone(),
             stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs,
             chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms,
             chain_head_rpc_request_timeout_ms: chain.chain_head_rpc_request_timeout_ms,
@@ -343,31 +351,35 @@ fn validate_chains(
             );
         }
 
-        let native_protocols = validate_backend_protocol_refs(
+        let (native_protocols, broadcaster_only_native_protocols) = validate_protocol_sets(
             chain.chain_id,
             BackendKind::Native,
             "native_protocols",
             &chain.native_protocols,
+            &chain.broadcaster_only_native_protocols,
             protocols,
         )?;
-        let broadcaster_only_native_protocols =
-            validate_broadcaster_only_native_protocols(chain, &native_protocols, protocols)?;
-        let vm_protocols = validate_backend_protocol_refs(
+        let (vm_protocols, broadcaster_only_vm_protocols) = validate_protocol_sets(
             chain.chain_id,
             BackendKind::Vm,
             "vm_protocols",
             &chain.vm_protocols,
+            &chain.broadcaster_only_vm_protocols,
             protocols,
         )?;
-        let rfq_protocols = validate_backend_protocol_refs(
+        let (rfq_protocols, broadcaster_only_rfq_protocols) = validate_protocol_sets(
             chain.chain_id,
             BackendKind::Rfq,
             "rfq_protocols",
             &chain.rfq_protocols,
+            &chain.broadcaster_only_rfq_protocols,
             protocols,
         )?;
-        let liquorice_url =
-            validate_liquorice_url(chain.chain_id, &rfq_protocols, &chain.liquorice_url)?;
+        let liquorice_url = validate_broadcaster_rfq_settings(
+            chain,
+            &rfq_protocols,
+            &broadcaster_only_rfq_protocols,
+        )?;
 
         registry.insert(
             chain.chain_id,
@@ -380,7 +392,9 @@ fn validate_chains(
                 native_protocols,
                 broadcaster_only_native_protocols,
                 vm_protocols,
+                broadcaster_only_vm_protocols,
                 rfq_protocols,
+                broadcaster_only_rfq_protocols,
                 stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs.get(),
                 chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms.get(),
                 chain_head_rpc_request_timeout_ms: chain.chain_head_rpc_request_timeout_ms.get(),
@@ -403,28 +417,38 @@ fn validate_chains(
     Ok(registry)
 }
 
-fn validate_broadcaster_only_native_protocols(
+fn validate_broadcaster_rfq_settings(
     chain: &RawChain,
-    native_protocols: &[ProtocolKind],
-    protocols: &HashMap<ProtocolKind, BackendKind>,
-) -> Result<Vec<ProtocolKind>> {
-    let broadcaster_only_native_protocols = validate_backend_protocol_refs(
-        chain.chain_id,
-        BackendKind::Native,
-        "broadcaster_only_native_protocols",
-        &chain.broadcaster_only_native_protocols,
-        protocols,
-    )?;
-    if let Some(protocol) = broadcaster_only_native_protocols
-        .iter()
-        .find(|protocol| native_protocols.contains(protocol))
+    selected: &[ProtocolKind],
+    extra: &[ProtocolKind],
+) -> Result<Option<String>> {
+    let protocols = selected.iter().chain(extra).copied().collect::<Vec<_>>();
+    if chain.chain_id != 1
+        && protocols
+            .iter()
+            .any(|protocol| protocol.titan_venue().is_some())
     {
-        bail!(
-            "chain {} lists protocol {protocol} in both native_protocols and broadcaster_only_native_protocols",
-            chain.chain_id
-        );
+        bail!("Titan price-level protocols are supported only on Ethereum");
     }
-    Ok(broadcaster_only_native_protocols)
+    validate_liquorice_url(chain.chain_id, &protocols, &chain.liquorice_url)
+}
+
+fn validate_protocol_sets(
+    chain_id: u64,
+    backend: BackendKind,
+    selected_field: &str,
+    selected: &[String],
+    extra: &[String],
+    protocols: &HashMap<ProtocolKind, BackendKind>,
+) -> Result<(Vec<ProtocolKind>, Vec<ProtocolKind>)> {
+    let selected =
+        validate_backend_protocol_refs(chain_id, backend, selected_field, selected, protocols)?;
+    let field = format!("broadcaster_only_{selected_field}");
+    let extra = validate_backend_protocol_refs(chain_id, backend, &field, extra, protocols)?;
+    if let Some(protocol) = extra.iter().find(|protocol| selected.contains(protocol)) {
+        bail!("chain {chain_id} lists protocol {protocol} in both {selected_field} and {field}");
+    }
+    Ok((selected, extra))
 }
 
 fn validate_backend_protocol_refs(
