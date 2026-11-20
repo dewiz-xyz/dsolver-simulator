@@ -635,7 +635,10 @@ where
         let built_stream = tokio::select! {
             biased;
             () = controls.stop.cancelled() => return None,
-            result = build_stream() => result,
+            result = async {
+                controls.service.prepare_rfq_connection().await?;
+                build_stream().await
+            } => result,
         };
         match built_stream {
             Ok(stream) => {

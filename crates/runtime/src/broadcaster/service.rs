@@ -594,9 +594,43 @@ impl BroadcasterServiceState {
             .any(|backend| *backend != simulator_core::broadcaster::BroadcasterBackend::Rfq)
         {
             self.cache.begin_same_generation_recovery().await;
-        } else {
-            self.cache.reset_same_generation().await;
+        } else if let Err(error) = self.withdraw_rfq_books().await {
+            warn!(%error, "Retrying RFQ withdrawals before the next feed connection");
         }
+    }
+
+    // The caller holds the lifecycle gate. Redis must receive these removals before
+    // the supervisor can make any book from the replacement stream available.
+    async fn withdraw_rfq_books(&self) -> Result<()> {
+        let mut batch_size = 128;
+        while let Some(update) = self.cache.rfq_withdrawal(batch_size).await {
+            let staged = self.cache.stage_update(&update).await?;
+            let message = staged
+                .message()
+                .context("RFQ withdrawal is missing its Redis payload")?;
+            match self
+                .publish_to_redis(BroadcasterPayload::Update(message.clone()))
+                .await
+            {
+                Ok(()) => self.cache.commit_staged_update(staged).await?,
+                Err(error)
+                    if batch_size > 1 && error.downcast_ref::<OversizedRedisEntry>().is_some() =>
+                {
+                    batch_size /= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.cache.reset_same_generation().await;
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_rfq_connection(&self) -> Result<()> {
+        if self.cache.configured_backends() == [BroadcasterBackend::Rfq] {
+            let _gate = self.lifecycle_gate.lock().await;
+            self.withdraw_rfq_books().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn mark_stream_disconnected_for_exit(
@@ -4694,6 +4728,47 @@ mod tests {
         assert_eq!(status.readiness, BroadcasterReadiness::SnapshotWarmingUp);
         assert!(status.snapshot.last_export_check_age_ms.is_none());
         assert!(status.snapshot.last_export_error.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfq_reconnect_withdraws_published_inventory_before_new_books() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(base_heads([BroadcasterBackend::Rfq]), "test")
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            1_000_000,
+            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Rfq]),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&rfq_only_update(10, "old-book", 1))
+            .await?;
+        service.mark_stream_disconnected("stale", None).await;
+        service.prepare_rfq_connection().await?;
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&rfq_only_update(20, "new-book", 2))
+            .await?;
+        let mut updates = Vec::new();
+        for entry in writer.appends().await {
+            let envelope: BroadcasterEnvelope = serde_json::from_str(&entry.payload_json)?;
+            if let BroadcasterPayload::Update(update) = envelope.payload {
+                updates.extend(update.partitions);
+            }
+        }
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].new_pairs[0].component_id, "old-book");
+        assert_eq!(updates[1].removed_pairs[0].component_id, "old-book");
+        assert_eq!(updates[2].new_pairs[0].component_id, "new-book");
         Ok(())
     }
 

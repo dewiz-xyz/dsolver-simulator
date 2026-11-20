@@ -1438,6 +1438,32 @@ route_policy = "default"
     }
 
     #[test]
+    fn ethereum_hook_pools_require_broadcaster_only_native_subscription() -> anyhow::Result<()> {
+        let manifest = fs::read_to_string(manifest_path())?;
+        let moved = manifest
+            .replacen(
+                r#""uniswap_v4", "uniswap_v4_hooks","#,
+                r#""uniswap_v4","#,
+                1,
+            )
+            .replacen(
+                "native_protocols = [",
+                "native_protocols = [\"uniswap_v4_hooks\",",
+                1,
+            );
+        let error = manifest::parse_manifest_registries(&moved)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unguarded hooks were accepted"))?;
+        assert!(
+            error
+                .to_string()
+                .contains("must stay in broadcaster_only_native_protocols"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn broadcaster_protocol_extensions_validate_backend_overlap_and_chain() {
         let manifest =
             fs::read_to_string(manifest_path()).unwrap_or_else(|error| unreachable!("{error}"));

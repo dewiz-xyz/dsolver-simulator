@@ -443,6 +443,9 @@ fn validate_protocol_sets(
 ) -> Result<(Vec<ProtocolKind>, Vec<ProtocolKind>)> {
     let selected =
         validate_backend_protocol_refs(chain_id, backend, selected_field, selected, protocols)?;
+    if chain_id == 1 && selected.contains(&ProtocolKind::UniswapV4Hooks) {
+        bail!("Ethereum uniswap_v4_hooks requires the shared Tycho database guard and must stay in broadcaster_only_native_protocols");
+    }
     let field = format!("broadcaster_only_{selected_field}");
     let extra = validate_backend_protocol_refs(chain_id, backend, &field, extra, protocols)?;
     if let Some(protocol) = extra.iter().find(|protocol| selected.contains(protocol)) {

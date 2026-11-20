@@ -27,7 +27,8 @@ pub use raw_state::{
 };
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
 pub use snapshot_reassembly::{
-    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError, SnapshotReassemblyError,
+    parse_selected_snapshot_payloads, parse_selected_update, parse_snapshot_payloads,
+    RawSnapshotReassembly, SnapshotPayloadsError, SnapshotReassemblyError,
 };
 
 // Producers and consumers must agree on the largest snapshot response they can exchange.

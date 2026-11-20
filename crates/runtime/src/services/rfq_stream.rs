@@ -192,6 +192,7 @@ impl ProviderBooks {
         let previous = self.pairs.entry(provider.to_string()).or_default();
         let mut pairs = HashMap::new();
         let mut states = HashMap::new();
+        let published = snapshot.is_some();
         if let Some(snapshot) = snapshot {
             for (id, book) in snapshot.books.iter() {
                 pairs.insert(id.clone(), book.component.clone());
@@ -209,7 +210,7 @@ impl ProviderBooks {
             .map(|(id, component)| (id.clone(), component.clone()))
             .collect();
         *previous = pairs;
-        if states.is_empty() && removed.is_empty() {
+        if !published && removed.is_empty() {
             return None;
         }
         Some(Update::new(current_time_ms(), states, added).set_removed_pairs(removed))
@@ -427,6 +428,14 @@ mod tests {
             .replace("rfq:native", Some(snapshot(vec![])))
             .unwrap();
         assert_eq!(empty.removed_pairs.len(), 2);
+        let heartbeat = providers
+            .replace("rfq:native", Some(snapshot(vec![])))
+            .unwrap();
+        assert!(
+            heartbeat.new_pairs.is_empty()
+                && heartbeat.states.is_empty()
+                && heartbeat.removed_pairs.is_empty()
+        );
         assert!(providers.replace("rfq:native", None).is_none());
         let resumed = providers
             .replace("rfq:native", Some(snapshot(vec![book("rfq:native", 4)])))

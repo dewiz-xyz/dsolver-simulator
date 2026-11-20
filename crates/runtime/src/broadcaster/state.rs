@@ -537,6 +537,30 @@ impl BroadcasterSnapshotCache {
         );
     }
 
+    /// Build removals from the committed cache, including Titan and any provider that
+    /// has yet to answer on the new connection. Only a successful publish removes them.
+    pub(crate) async fn rfq_withdrawal(&self, max_pairs: usize) -> Option<TychoUpdate> {
+        let guard = self.inner.read().await;
+        let partition = guard.partitions.get(&BroadcasterBackend::Rfq)?;
+        if partition.states.is_empty() {
+            return None;
+        }
+        let removed = partition
+            .states
+            .iter()
+            .take(max_pairs)
+            .map(|(id, entry)| (id.clone(), entry.component.clone()))
+            .collect();
+        Some(
+            TychoUpdate::new(
+                super::redis_publisher::current_time_ms(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .set_removed_pairs(removed),
+        )
+    }
+
     pub async fn reset_same_generation(&self) {
         let mut guard = self.inner.write().await;
         guard.partitions.clear();

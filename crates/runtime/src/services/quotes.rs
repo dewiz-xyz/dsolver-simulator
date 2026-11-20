@@ -1345,28 +1345,15 @@ fn filter_directional_rfq_candidates(
     candidates
         .into_iter()
         .filter(|(pool_id, _, component)| {
-            if !is_directional_rfq_component(component.as_ref()) {
-                return true;
-            }
-
-            if directional_rfq_candidate_matches_direction(
-                request_token_in,
-                request_token_out,
+            let (sim_token_in, sim_token_out) =
+                simulation_tokens_for_pool(request_token_in, request_token_out, component);
+            if simulator_replay::component_supports_direction(
                 component,
+                &sim_token_in.address,
+                &sim_token_out.address,
             ) {
                 return true;
             }
-
-            let (sim_token_in, sim_token_out) =
-                simulation_tokens_for_pool(request_token_in, request_token_out, component);
-            let expected_token_in = component
-                .tokens
-                .first()
-                .map(|token| token.address.to_string());
-            let expected_token_out = component
-                .tokens
-                .get(1)
-                .map(|token| token.address.to_string());
             debug!(
                 scope = "directional_rfq_filter",
                 pool_id = %pool_id,
@@ -1375,35 +1362,11 @@ fn filter_directional_rfq_candidates(
                 requested_token_out = %request_token_out.address,
                 simulation_token_in = %sim_token_in.address,
                 simulation_token_out = %sim_token_out.address,
-                expected_token_in = ?expected_token_in,
-                expected_token_out = ?expected_token_out,
                 "Skipping directional RFQ candidate whose stored direction does not match request"
             );
             false
         })
         .collect()
-}
-
-fn directional_rfq_candidate_matches_direction(
-    request_token_in: &Token,
-    request_token_out: &Token,
-    component: &ProtocolComponent,
-) -> bool {
-    let Some(expected_token_in) = component.tokens.first() else {
-        return false;
-    };
-    let Some(expected_token_out) = component.tokens.get(1) else {
-        return false;
-    };
-
-    // Some RFQ integrations store directional pools instead of symmetric pairs.
-    // Keep those candidates only when the ordered pool tokens line up with the
-    // remapped simulation direction for this request.
-    let (sim_token_in, sim_token_out) =
-        simulation_tokens_for_pool(request_token_in, request_token_out, component);
-
-    sim_token_in.address == expected_token_in.address
-        && sim_token_out.address == expected_token_out.address
 }
 
 fn simulation_tokens_for_pool_with_remap_log(
@@ -1461,16 +1424,6 @@ fn remap_request_token_for_pool(request_token: &Token, component: &ProtocolCompo
     }
 
     request_token.clone()
-}
-
-fn is_directional_rfq_component(component: &ProtocolComponent) -> bool {
-    matches!(
-        ProtocolKind::from_canonical_protocol_system(&component.protocol_system),
-        Some(ProtocolKind::Hashflow | ProtocolKind::Liquorice)
-    ) || matches!(
-        component.protocol_type_name.as_str(),
-        "hashflow_pool" | "liquorice_pool"
-    )
 }
 
 fn is_direct_native_wrapped_pair(
@@ -3271,6 +3224,8 @@ mod tests {
 
     #[test]
     fn directional_rfq_detection_preserves_exact_system_or_type_matching() {
+        let weth = make_token_with_decimals(&Bytes::from([1u8; 20]), "WETH", 18);
+        let usdc = make_token_with_decimals(&Bytes::from([2u8; 20]), "USDC", 6);
         for (system, type_name, directional) in [
             ("rfq:hashflow", "", true),
             ("rfq:liquorice", "", true),
@@ -3284,12 +3239,59 @@ mod tests {
                 "0x0000000000000000000000000000000000000009",
                 system,
                 type_name,
-                Vec::new(),
+                vec![weth.clone(), usdc.clone()],
             );
             assert_eq!(
-                is_directional_rfq_component(&component),
-                directional,
+                simulator_replay::component_supports_direction(
+                    &component,
+                    &usdc.address,
+                    &weth.address
+                ),
+                !directional,
                 "{system} / {type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_relay_schedules_only_advertised_book_sides() {
+        let river = make_token_with_decimals(&Bytes::from([1u8; 20]), "RIVER", 18);
+        let usdt = make_token_with_decimals(&Bytes::from([2u8; 20]), "USDT", 6);
+        let mut component = make_pair_component(
+            "0x0000000000000000000000000000000000000009",
+            "rfq:native",
+            "native_relay_pool",
+            vec![river.clone(), usdt.clone()],
+        );
+        let sim = Arc::new(StrictPairTokenSim {
+            expected_sell: river.address.clone(),
+            expected_buy: usdt.address.clone(),
+            limit_calls: Arc::default(),
+            quote_calls: Arc::default(),
+        });
+        let candidates = |component: &ProtocolComponent| -> Vec<CandidatePool> {
+            vec![(
+                "river-usdt".into(),
+                sim.clone(),
+                Arc::new(component.clone()),
+            )]
+        };
+        let bid = [river.address.as_ref(), usdt.address.as_ref()].concat();
+        assert_eq!(
+            filter_directional_rfq_candidates(candidates(&component), &usdt, &river).len(),
+            1
+        );
+        for (directions, forward) in [(bid, true), (Vec::new(), false), (vec![1], false)] {
+            component
+                .static_attributes
+                .insert("swap_directions".into(), directions.into());
+            assert!(
+                filter_directional_rfq_candidates(candidates(&component), &usdt, &river).is_empty()
+            );
+            assert_eq!(
+                !filter_directional_rfq_candidates(candidates(&component), &river, &usdt)
+                    .is_empty(),
+                forward
             );
         }
     }

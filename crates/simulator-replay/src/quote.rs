@@ -5,6 +5,7 @@ use alloy_primitives::U256;
 use num_bigint::BigUint;
 use thiserror::Error;
 use tycho_simulation::{
+    book::{decode_swap_directions, SWAP_DIRECTIONS_ATTRIBUTE},
     protocol::models::ProtocolComponent,
     tycho_common::{
         models::{token::Token, Chain},
@@ -153,13 +154,21 @@ fn remap_native_token_for_component(requested: Token, component: &ProtocolCompon
     }
 }
 
-fn component_supports_direction(
+pub fn component_supports_direction(
     component: &ProtocolComponent,
     token_in: &Bytes,
     token_out: &Bytes,
 ) -> bool {
     if token_in == token_out {
         return false;
+    }
+
+    if let Some(encoded) = component.static_attributes.get(SWAP_DIRECTIONS_ATTRIBUTE) {
+        return decode_swap_directions(encoded).is_ok_and(|directions| {
+            directions
+                .iter()
+                .any(|(sell, buy)| sell == token_in && buy == token_out)
+        });
     }
 
     if is_directional_rfq_component(component) {

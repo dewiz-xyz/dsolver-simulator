@@ -10,7 +10,30 @@ The branch is based directly on simulator master `45a984c4fd78fdc091e65a8fb313b4
 
 Validation uses an isolated copy of the active dsolver `codex/tycho-0525-router-migration` checkout at `dc353aebbb41eec6fbf01a7fa3de3c242ee074f7`, including its uncommitted migration changes. Only the copy's `broadcaster-replay-client` dependency is redirected to this branch. The user's dsolver checkout is not edited.
 
-Source compatibility does not imply mixed-version state compatibility. Tycho's serialized RFQ states now contain books instead of the former `price_data` and serialized client fields. Deploy matching 0.525.0 consumers and broadcaster together and bootstrap a fresh snapshot on a separate Redis stream. Existing retained RFQ records from older Tycho releases need their matching old reader; this branch explicitly tests rejection of the legacy Bebop state. No automatic historical-data migration is included.
+Tycho 0.525.0 serializes RFQ books differently from the older Bebop `price_data` representation. Native-only historical quotes and raw native snapshots can read mixed format 1 checkpoints and deltas. Requests that select legacy Bebop state still require its matching reader.
+
+### Base cutover with existing retained history
+
+Redis allocates generations per stream key. PostgreSQL and the checkpoint object keys identify history by chain and generation. For Base, keep the existing history database, bucket, and prefix and seed the new Redis counter before its first promotion.
+
+1. Upgrade retained-history readers to support formats 1 and 2. Prepare the matching 0.525.0 live reader and an unused stream key. Keep the new writer stopped.
+2. Stop all old Base writers, including standbys and automatic restarts. Allow the history writer to drain and record its last completed position. The old and new stream keys have independent writer leases, so this step prevents concurrent allocation for chain 8453.
+3. Read the old Redis counter with `GET <old-stream>:writer_generation` and the generation portion of `last-generated-id` from `XINFO STREAM <old-stream>`. Also read the highest Base generation from retained storage, including incomplete checkpoints and recorded gaps:
+
+   ```sql
+   SELECT GREATEST(
+       (SELECT max(generation) FROM state_history.checkpoints WHERE chain_id = 8453),
+       (SELECT max(generation) FROM state_history.deltas WHERE chain_id = 8453),
+       (SELECT max(generation) FROM state_history.gaps WHERE chain_id = 8453),
+       (SELECT max(source_generation) FROM state_history.block_times WHERE chain_id = 8453),
+       0
+   ) AS history_generation;
+   ```
+
+4. Set `G` to the greatest of those values. Confirm the new stream, `<new-stream>:writer`, and `<new-stream>:writer_generation` are absent. Run `SET <new-stream>:writer_generation <G> NX` and require `OK`. On an unexpected existing key, inspect its ownership and history before proceeding. Preserve the old stream and counters.
+5. Set `BROADCASTER_REDIS_STREAM_KEY` to the new key and start one writer. Promotion increments the seeded counter. Verify the first Redis entry is `(G+1)-1` with reason `active_writer_promoted`. At that position, require a complete boundary manifest, a format 2 archive, and a successful historical quote after a retained delta anchored at that boundary. Bootstrap the new live reader from the writer’s snapshot and verify a quote after a Redis update before routing traffic to it.
+6. If cutover stops after promotion, treat that generation as used. For rollback or a second cutover, stop and drain the current writer, recompute the maximum across every used stream and retained storage, and seed another unused key. Pair the chosen writer with its matching live reader. Keep the format 2 history reader for generations already recorded.
+
 
 ## Base sources
 

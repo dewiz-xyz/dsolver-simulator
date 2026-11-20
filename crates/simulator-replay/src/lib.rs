@@ -13,7 +13,9 @@ pub use execution::{
     VmWorldLease,
 };
 pub use payload::{DecodedReplay, ReplayBackend};
-pub use quote::{simulate_amount_out, ExactPoolQuote, ReplayQuoteError};
+pub use quote::{
+    component_supports_direction, simulate_amount_out, ExactPoolQuote, ReplayQuoteError,
+};
 pub use state::{
     ApplyReport, CanonicalComponentState, CanonicalState, CanonicalStateError, CanonicalTokenState,
     PoolEntry, ReplayWorld, StatePoint,

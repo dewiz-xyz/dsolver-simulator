@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{anyhow, ensure, Context};
 use simulator_core::broadcaster::{
-    apply_raw_protocol_messages, parse_snapshot_payloads, BroadcasterBackend, BroadcasterEnvelope,
-    BroadcasterPayload, BroadcasterProtocolSyncStatus, BroadcasterSnapshotPartition,
+    apply_raw_protocol_messages, parse_selected_snapshot_payloads, parse_selected_update,
+    BroadcasterBackend, BroadcasterProtocolSyncStatus, BroadcasterSnapshotPartition,
     RawSnapshotReassembly,
 };
 use thiserror::Error;
@@ -274,7 +274,8 @@ fn rebuild_partitions(
     deltas: &[StoredDelta],
     backends: &[BroadcasterBackend],
 ) -> anyhow::Result<Vec<BroadcasterSnapshotPartition>> {
-    let (start, chunks) = parse_snapshot_payloads(&archive.payloads_json)?;
+    let (start, chunks) =
+        parse_selected_snapshot_payloads(&archive.payloads_json, |b| backends.contains(&b))?;
     for backend in backends {
         ensure!(
             start.backends.contains(backend),
@@ -317,11 +318,9 @@ fn rebuild_partitions(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     for delta in deltas {
-        let envelope: BroadcasterEnvelope = serde_json::from_str(delta.raw_payload.get())
-            .with_context(|| format!("stored delta {:?} is not an envelope", delta.position))?;
-        let BroadcasterPayload::Update(update) = envelope.payload else {
-            bail!("stored delta {:?} is not an update", delta.position);
-        };
+        let update = parse_selected_update(&delta.raw_payload, |b| backends.contains(&b))
+            .with_context(|| format!("invalid stored delta {:?}", delta.position))?
+            .with_context(|| format!("stored delta {:?} is not an update", delta.position))?;
         for incoming in update.partitions {
             let Some(partition) = partitions
                 .iter_mut()
@@ -350,4 +349,52 @@ fn rebuild_partitions(
         }
     }
     Ok(partitions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_native_snapshot_reads_a_mixed_legacy_bebop_checkpoint() -> anyhow::Result<()> {
+        let legacy: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../simulator-core/tests/fixtures/wire/rfq_update_before_bebop_origin.json"
+        ))?;
+        let mut chunk: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../simulator-core/tests/fixtures/wire/snapshot_chunk.json"
+        ))?;
+        let rfq = &legacy["partitions"][0];
+        chunk["partitions"]
+            .as_array_mut()
+            .context("missing partitions")?
+            .push(serde_json::json!({
+                "backend":"rfq", "blockNumber":rfq["blockNumber"], "states":rfq["newPairs"]
+            }));
+        let archive = CheckpointArchive {
+            metadata: crate::ArchiveMetadata {
+                schema_version: 1,
+                chain_id: 8453,
+                position: StreamPosition {
+                    generation: 1,
+                    message_seq: 1,
+                },
+                state_version: None,
+                kind: crate::CheckpointKind::Boundary,
+                block_number: 100,
+                rfq_observed_at_ms: None,
+                backends: vec![Backend::Native, Backend::Rfq],
+            },
+            payloads_json: vec![
+                include_str!("../../../simulator-core/tests/fixtures/wire/snapshot_start.json")
+                    .into(),
+                chunk.to_string(),
+                include_str!("../../../simulator-core/tests/fixtures/wire/snapshot_end.json")
+                    .into(),
+            ],
+        };
+        let partitions = rebuild_partitions(&archive, &[], &[BroadcasterBackend::Native])?;
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].messages[0].protocol, "uniswap_v2");
+        Ok(())
+    }
 }

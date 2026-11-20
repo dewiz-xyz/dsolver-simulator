@@ -17,6 +17,56 @@ use tokio_util::sync::CancellationToken;
 use support::{native_quote_request, rfq_quote_request, FixtureSource};
 
 #[tokio::test]
+async fn native_quotes_replay_format_one_with_legacy_bebop_in_the_same_chunk_and_delta(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut source = FixtureSource::native()?;
+    let archive = source
+        .archives
+        .get_mut(&1)
+        .ok_or("missing native checkpoint")?;
+    archive.metadata.schema_version = 1;
+    archive.metadata.backends.push(state_history::Backend::Rfq);
+    let legacy: serde_json::Value = serde_json::from_str(include_str!(
+        "../../simulator-core/tests/fixtures/wire/rfq_update_before_bebop_origin.json"
+    ))?;
+    let rfq = &legacy["partitions"][0];
+    let mut start: serde_json::Value = serde_json::from_str(&archive.payloads_json[0])?;
+    start["backends"] = serde_json::json!(["native", "rfq"]);
+    archive.payloads_json[0] = start.to_string();
+    let mut chunk: serde_json::Value = serde_json::from_str(&archive.payloads_json[1])?;
+    chunk["partitions"]
+        .as_array_mut()
+        .ok_or("missing partitions")?
+        .push(serde_json::json!({
+            "backend":"rfq", "blockNumber":rfq["blockNumber"], "states":rfq["newPairs"]
+        }));
+    archive.payloads_json[1] = chunk.to_string();
+    let leg = &mut source.target_plan.legs[0];
+    leg.checkpoint.backends.push(state_history::Backend::Rfq);
+    let delta = &mut leg.deltas[0];
+    delta.payload_format_version = 1;
+    let mut payload: serde_json::Value = serde_json::from_str(delta.raw_payload.get())?;
+    payload["partitions"]
+        .as_array_mut()
+        .ok_or("missing partitions")?
+        .push(rfq.clone());
+    delta.raw_payload = serde_json::value::to_raw_value(&payload)?;
+    let result = executor(Arc::new(source))
+        .execute(
+            &native_quote_request(100, 100),
+            &CancellationToken::new(),
+            &(),
+        )
+        .await?;
+    let row = &result.results[0];
+    assert_ne!(
+        successful_amount(&row.start_outcome)?,
+        successful_amount(&row.targets[0].outcome)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn retained_protocol_alias_requires_its_exact_selector(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut source = FixtureSource::native()?;

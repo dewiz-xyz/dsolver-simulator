@@ -45,13 +45,13 @@ use tycho_simulation::{
 };
 
 use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
-    BroadcasterSnapshotPartition, BroadcasterTokenDto, BroadcasterUpdateMessage,
-    ProtocolHeadUpdate,
+    BroadcasterProtocolMessage, BroadcasterSnapshotChunk, BroadcasterSnapshotPartition,
+    BroadcasterTokenDto, BroadcasterUpdateMessage, ProtocolHeadUpdate,
 };
 
 use simulator_core::broadcaster::{
-    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError,
+    parse_selected_snapshot_payloads, parse_selected_update, RawSnapshotReassembly,
+    SnapshotPayloadsError,
 };
 use simulator_core::models::protocol::ProtocolKind;
 
@@ -329,7 +329,9 @@ impl ReplayDecoder {
             self.ensure_backend_configured(*backend)?;
         }
 
-        let (start, chunks) = parse_snapshot_payloads(payloads_json)?;
+        let (start, chunks) = parse_selected_snapshot_payloads(payloads_json, |b| {
+            selected.contains(&ReplayBackend::from(b))
+        })?;
         let advertised = start
             .backends
             .iter()
@@ -477,11 +479,11 @@ impl ReplayDecoder {
                 payload_format_version,
             ));
         }
-        let envelope: BroadcasterEnvelope = serde_json::from_str(payload.get())
-            .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
-        let BroadcasterPayload::Update(update) = envelope.payload else {
-            return Err(ReplayDecodeError::StoredDeltaIsNotUpdate);
-        };
+        let update = parse_selected_update(payload, |b| {
+            applicable_backends.contains(&ReplayBackend::from(b))
+        })
+        .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?
+        .ok_or(ReplayDecodeError::StoredDeltaIsNotUpdate)?;
         self.decode_live_delta(update, applicable_backends).await
     }
 
@@ -970,6 +972,7 @@ mod tests {
             Bytes::from((2u128 * 10u128.pow(21)).to_be_bytes().to_vec()),
         );
         raw.message.header.number += 1;
+        use simulator_core::broadcaster::{BroadcasterEnvelope, BroadcasterPayload};
         let envelope = BroadcasterEnvelope::new(
             "test",
             2,
