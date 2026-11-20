@@ -8,18 +8,27 @@ use tycho_simulation::{
         decoder::TychoStreamDecoder,
         engine_db::tycho_db::PreCachedDB,
         protocol::{
+            aero_basic::state::AeroBasicState,
             aerodrome_slipstreams::state::AerodromeSlipstreamsState,
             aerodrome_v1::state::AerodromeV1State,
+            balancer_v3::BalancerV3State,
+            biconomy::state::BiconomyState,
             ekubo::state::EkuboState,
-            ekubo_v3::state::EkuboV3State,
+            ekubo_v3::{filter_fn as ekubo_v3_extension_filter, state::EkuboV3State},
             erc4626::state::ERC4626State,
+            etherfi::state::EtherfiState,
             filters::{
-                balancer_v2_pool_filter, ekubo_v3_extension_filter, erc4626_filter,
-                fluid_v1_paused_pools_filter,
+                balancer_v2_pool_filter, erc4626_filter, fluid_v1_paused_pools_filter,
+                liquidityparty_killed_pools_filter,
             },
             fluid::FluidV1,
+            lido_v4::state::LidoV4State,
+            lunarbase::state::LunarBaseState,
+            pancakeswap_infinity_bin::state::PancakeswapInfinityBinState,
             pancakeswap_v2::state::PancakeswapV2State,
+            ring_swap_v2::state::RingSwapV2State,
             rocketpool::state::RocketpoolState,
+            sky::state::SkyState,
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
             uniswap_v4::hooks::hook_handler_creator::initialize_hook_handlers,
@@ -36,13 +45,13 @@ use tycho_simulation::{
 };
 
 use simulator_core::broadcaster::{
-    BroadcasterEnvelope, BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
-    BroadcasterSnapshotPartition, BroadcasterTokenDto, BroadcasterUpdateMessage,
-    ProtocolHeadUpdate,
+    BroadcasterProtocolMessage, BroadcasterSnapshotChunk, BroadcasterSnapshotPartition,
+    BroadcasterTokenDto, BroadcasterUpdateMessage, ProtocolHeadUpdate,
 };
 
 use simulator_core::broadcaster::{
-    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError,
+    parse_selected_snapshot_payloads, parse_selected_update, RawSnapshotReassembly,
+    SnapshotPayloadsError,
 };
 use simulator_core::models::protocol::ProtocolKind;
 
@@ -52,6 +61,7 @@ use crate::{DecodedReplay, ReplayBackend};
 pub type TokenMap = HashMap<Bytes, Token>;
 
 pub const RETAINED_DELTA_FORMAT_VERSION_V1: i16 = 1;
+pub const RETAINED_DELTA_FORMAT_VERSION_V2: i16 = 2;
 pub const RETAINED_TOKEN_QUALITY_V1: u32 = 0;
 
 const RETAINED_NATIVE_PROTOCOLS_V1: &[ProtocolKind] = &[
@@ -82,6 +92,7 @@ const RETAINED_RFQ_PROTOCOLS_V1: &[ProtocolKind] = &[
 
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
+    chain: Option<Chain>,
     min_token_quality: u32,
     protocols: BTreeMap<ReplayBackend, Vec<ProtocolKind>>,
     profile: DecoderProfile,
@@ -91,9 +102,19 @@ pub struct DecoderConfig {
 enum DecoderProfile {
     Live,
     RetainedV1,
+    RetainedV2,
 }
 
 impl DecoderConfig {
+    pub fn with_chain(mut self, chain: Chain) -> Self {
+        self.chain = Some(chain);
+        self
+    }
+
+    pub fn with_chain_id(self, chain_id: u64) -> Result<Self, ReplayDecodeError> {
+        Ok(self.with_chain(replay_chain(chain_id)?))
+    }
+
     pub fn new(
         min_token_quality: u32,
         protocols: impl IntoIterator<Item = (ReplayBackend, Vec<ProtocolKind>)>,
@@ -103,6 +124,7 @@ impl DecoderConfig {
             min_token_quality,
             protocols,
             profile: DecoderProfile::Live,
+            chain: None,
         }
     }
 
@@ -126,7 +148,59 @@ impl DecoderConfig {
             .map(|(backend, protocols)| (backend, protocols.to_vec()))
             .collect(),
             profile: DecoderProfile::RetainedV1,
+            chain: None,
         }
+    }
+
+    /// Tycho 0.525 retained recordings. Pin the supported systems independently of
+    /// the live manifest, including systems that a custom writer can select.
+    pub fn retained_v2() -> Self {
+        let mut config = Self::retained_v1();
+        for (backend, additions) in [
+            (
+                ReplayBackend::Native,
+                &[
+                    ProtocolKind::AeroBasic,
+                    ProtocolKind::AeroCl,
+                    ProtocolKind::LunarBase,
+                    ProtocolKind::PancakeswapInfinityCl,
+                    ProtocolKind::PancakeswapInfinityBin,
+                    ProtocolKind::Biconomy,
+                    ProtocolKind::UniswapV4Hooks,
+                    ProtocolKind::RingSwapV2,
+                    ProtocolKind::Sky,
+                    ProtocolKind::LidoV4,
+                    ProtocolKind::Etherfi,
+                ][..],
+            ),
+            (
+                ReplayBackend::Vm,
+                &[ProtocolKind::LiquidityParty, ProtocolKind::BalancerV3][..],
+            ),
+            (
+                ReplayBackend::Rfq,
+                &[
+                    ProtocolKind::NativeRfq,
+                    ProtocolKind::Metric,
+                    ProtocolKind::TitanFermiSwap,
+                    ProtocolKind::TitanKipseli,
+                    ProtocolKind::TitanBebop,
+                    ProtocolKind::TitanTaurusFi,
+                    ProtocolKind::TitanTempest,
+                    ProtocolKind::TitanGoliath,
+                    ProtocolKind::TitanStelaxis,
+                    ProtocolKind::TitanElZorro,
+                ][..],
+            ),
+        ] {
+            config
+                .protocols
+                .entry(backend)
+                .or_default()
+                .extend_from_slice(additions);
+        }
+        config.profile = DecoderProfile::RetainedV2;
+        config
     }
 
     pub const fn min_token_quality(&self) -> u32 {
@@ -149,6 +223,8 @@ impl DecoderConfig {
 
 #[derive(Debug, Error)]
 pub enum ReplayDecodeError {
+    #[error("replay decoder needs an explicit chain or a nonempty token catalog from one chain")]
+    MissingOrMixedChain,
     #[error("Unknown native protocol in chain profile: {0}")]
     UnknownNativeProtocol(ProtocolKind),
     #[error("Unknown VM protocol in chain profile: {0}")]
@@ -196,8 +272,15 @@ impl ReplayDecoder {
         config: DecoderConfig,
         mut tokens: TokenMap,
     ) -> Result<Self, ReplayDecodeError> {
+        let chain = config
+            .chain
+            .or_else(|| tokens.values().next().map(|token| token.chain))
+            .ok_or(ReplayDecodeError::MissingOrMixedChain)?;
+        if tokens.values().any(|token| token.chain != chain) {
+            return Err(ReplayDecodeError::MissingOrMixedChain);
+        }
         tokens.retain(|_, token| token.quality >= config.min_token_quality);
-        let mut decoder = TychoStreamDecoder::new();
+        let mut decoder = TychoStreamDecoder::new(chain);
         decoder.skip_state_decode_failures(true);
 
         for backend in config.configured_backends() {
@@ -246,7 +329,9 @@ impl ReplayDecoder {
             self.ensure_backend_configured(*backend)?;
         }
 
-        let (start, chunks) = parse_snapshot_payloads(payloads_json)?;
+        let (start, chunks) = parse_selected_snapshot_payloads(payloads_json, |b| {
+            selected.contains(&ReplayBackend::from(b))
+        })?;
         let advertised = start
             .backends
             .iter()
@@ -313,7 +398,7 @@ impl ReplayDecoder {
             ));
         }
         if let Some(update) = combined.as_mut() {
-            update.block_number_or_timestamp = block_number;
+            update.block_number = block_number;
         }
         Ok(DecodedReplay {
             had_applicable_partition: true,
@@ -353,7 +438,7 @@ impl ReplayDecoder {
         };
         let block_number = update
             .as_ref()
-            .map_or(block_number, |update| update.block_number_or_timestamp);
+            .map_or(block_number, |update| update.block_number);
         Ok(DecodedReplay {
             had_applicable_partition: true,
             block_number,
@@ -384,33 +469,25 @@ impl ReplayDecoder {
         payload: &RawValue,
         applicable_backends: &[ReplayBackend],
     ) -> Result<DecodedReplay, ReplayDecodeError> {
-        match payload_format_version {
-            RETAINED_DELTA_FORMAT_VERSION_V1 => {
-                if self.config.profile != DecoderProfile::RetainedV1 {
-                    return Err(ReplayDecodeError::RetainedDecoderProfileRequired(
-                        payload_format_version,
-                    ));
-                }
-                let envelope: BroadcasterEnvelope = serde_json::from_str(payload.get())
-                    .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?;
-                let BroadcasterPayload::Update(update) = envelope.payload else {
-                    return Err(ReplayDecodeError::StoredDeltaIsNotUpdate);
-                };
-                self.decode_delta_v1(update, applicable_backends).await
-            }
-            other => Err(ReplayDecodeError::UnsupportedDeltaFormat(other)),
+        let required_profile = match payload_format_version {
+            RETAINED_DELTA_FORMAT_VERSION_V1 => DecoderProfile::RetainedV1,
+            RETAINED_DELTA_FORMAT_VERSION_V2 => DecoderProfile::RetainedV2,
+            other => return Err(ReplayDecodeError::UnsupportedDeltaFormat(other)),
+        };
+        if self.config.profile != required_profile {
+            return Err(ReplayDecodeError::RetainedDecoderProfileRequired(
+                payload_format_version,
+            ));
         }
+        let update = parse_selected_update(payload, |b| {
+            applicable_backends.contains(&ReplayBackend::from(b))
+        })
+        .map_err(|error| ReplayDecodeError::PayloadDecode(error.to_string()))?
+        .ok_or(ReplayDecodeError::StoredDeltaIsNotUpdate)?;
+        self.decode_live_delta(update, applicable_backends).await
     }
 
     pub async fn decode_live_delta(
-        &self,
-        update: BroadcasterUpdateMessage,
-        applicable_backends: &[ReplayBackend],
-    ) -> Result<DecodedReplay, ReplayDecodeError> {
-        self.decode_delta_v1(update, applicable_backends).await
-    }
-
-    async fn decode_delta_v1(
         &self,
         update: BroadcasterUpdateMessage,
         applicable_backends: &[ReplayBackend],
@@ -466,12 +543,12 @@ impl ReplayDecoder {
                 decoded
             };
             if let Some(update) = &decoded {
-                block_number = block_number.max(update.block_number_or_timestamp);
+                block_number = block_number.max(update.block_number);
             }
             merge_update(&mut combined, decoded);
         }
         if let Some(update) = combined.as_mut() {
-            update.block_number_or_timestamp = block_number;
+            update.block_number = block_number;
         }
         Ok(DecodedReplay {
             had_applicable_partition,
@@ -540,20 +617,7 @@ pub fn decode_token_map(
     chain_id: u64,
     tokens: &serde_json::value::RawValue,
 ) -> Result<TokenMap, ReplayDecodeError> {
-    let chain = [
-        Chain::Ethereum,
-        Chain::Starknet,
-        Chain::ZkSync,
-        Chain::Arbitrum,
-        Chain::Base,
-        Chain::Bsc,
-        Chain::Unichain,
-        Chain::Polygon,
-        Chain::Plasma,
-    ]
-    .into_iter()
-    .find(|chain| chain.id() == chain_id)
-    .ok_or(ReplayDecodeError::UnsupportedTokenChain(chain_id))?;
+    let chain = replay_chain(chain_id)?;
     let decoded: Vec<BroadcasterTokenDto> = serde_json::from_str(tokens.get())
         .map_err(|error| ReplayDecodeError::TokenSnapshot(error.to_string()))?;
     let mut result = HashMap::with_capacity(decoded.len());
@@ -568,6 +632,23 @@ pub fn decode_token_map(
         }
     }
     Ok(result)
+}
+
+fn replay_chain(chain_id: u64) -> Result<Chain, ReplayDecodeError> {
+    [
+        Chain::Ethereum,
+        Chain::Starknet,
+        Chain::ZkSync,
+        Chain::Arbitrum,
+        Chain::Base,
+        Chain::Bsc,
+        Chain::Unichain,
+        Chain::Polygon,
+        Chain::Plasma,
+    ]
+    .into_iter()
+    .find(|chain| chain.id() == chain_id)
+    .ok_or(ReplayDecodeError::UnsupportedTokenChain(chain_id))
 }
 
 fn merge_update(current: &mut Option<Update>, incoming: Option<Update>) {
@@ -594,7 +675,21 @@ fn register_native_decoder(
         ProtocolKind::UniswapV3 | ProtocolKind::PancakeswapV3 => {
             decoder.register_decoder::<UniswapV3State>(protocol.as_str())
         }
-        ProtocolKind::UniswapV4 => decoder.register_decoder::<UniswapV4State>(protocol.as_str()),
+        ProtocolKind::UniswapV4
+        | ProtocolKind::UniswapV4Hooks
+        | ProtocolKind::PancakeswapInfinityCl => {
+            decoder.register_decoder::<UniswapV4State>(protocol.as_str())
+        }
+        ProtocolKind::RingSwapV2 => decoder.register_decoder::<RingSwapV2State>(protocol.as_str()),
+        ProtocolKind::Sky => decoder.register_decoder::<SkyState>(protocol.as_str()),
+        ProtocolKind::LidoV4 => decoder.register_decoder::<LidoV4State>(protocol.as_str()),
+        ProtocolKind::Etherfi => decoder.register_decoder::<EtherfiState>(protocol.as_str()),
+        ProtocolKind::AeroBasic => decoder.register_decoder::<AeroBasicState>(protocol.as_str()),
+        ProtocolKind::LunarBase => decoder.register_decoder::<LunarBaseState>(protocol.as_str()),
+        ProtocolKind::Biconomy => decoder.register_decoder::<BiconomyState>(protocol.as_str()),
+        ProtocolKind::PancakeswapInfinityBin => {
+            decoder.register_decoder::<PancakeswapInfinityBinState>(protocol.as_str())
+        }
         ProtocolKind::EkuboV2 => decoder.register_decoder::<EkuboState>(protocol.as_str()),
         ProtocolKind::FluidV1 => {
             decoder.register_decoder::<FluidV1>(protocol.as_str());
@@ -605,7 +700,7 @@ fn register_native_decoder(
             decoder.register_decoder::<EkuboV3State>(protocol.as_str());
             decoder.register_filter(protocol.as_str(), ekubo_v3_extension_filter);
         }
-        ProtocolKind::AerodromeSlipstreams => {
+        ProtocolKind::AerodromeSlipstreams | ProtocolKind::AeroCl => {
             decoder.register_decoder::<AerodromeSlipstreamsState>(protocol.as_str())
         }
         ProtocolKind::AerodromeV1 => {
@@ -625,6 +720,13 @@ fn register_vm_decoder(
     protocol: ProtocolKind,
 ) -> Result<(), ReplayDecodeError> {
     match protocol {
+        ProtocolKind::BalancerV3 => {
+            decoder.register_decoder::<BalancerV3State>(protocol.as_str());
+        }
+        ProtocolKind::LiquidityParty => {
+            decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol.as_str());
+            decoder.register_filter(protocol.as_str(), liquidityparty_killed_pools_filter);
+        }
         ProtocolKind::BalancerV2 => {
             decoder.register_decoder::<EVMPoolState<PreCachedDB>>(protocol.as_str());
             decoder.register_filter(protocol.as_str(), balancer_v2_pool_filter);
@@ -685,7 +787,8 @@ mod tests {
     #[tokio::test]
     async fn raw_selection_ignores_unknown_alias_and_unselected_protocols() -> anyhow::Result<()> {
         let decoder = ReplayDecoder::new(
-            DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0),
+            DecoderConfig::for_backend(ReplayBackend::Native, vec![ProtocolKind::UniswapV2], 0)
+                .with_chain(Chain::Ethereum),
             HashMap::new(),
         )
         .await?;
@@ -804,7 +907,8 @@ mod tests {
                 ReplayBackend::Native,
                 vec![ProtocolKind::AerodromeSlipstreams],
                 0,
-            ),
+            )
+            .with_chain(Chain::Base),
             HashMap::new(),
         )
         .await?;
@@ -813,6 +917,87 @@ mod tests {
             .await?;
         assert!(update.is_none());
         assert!(heads.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_v2_restores_and_updates_new_aero_basic_pools() -> anyhow::Result<()> {
+        use simulator_core::broadcaster::{BroadcasterBackend, BroadcasterUpdatePartition};
+        let token = |id| Token::new(&Bytes::from([id; 20]), "TEST", 18, 0, &[], Chain::Base, 100);
+        let (a, b) = (token(1), token(2));
+        let mut raw = aerodrome_v1_message(&a, &b);
+        raw.protocol = "aero_basic".to_owned();
+        for pool in raw.message.snapshots.states.values_mut() {
+            pool.component.protocol_system = raw.protocol.clone();
+            pool.state.attributes.extend([
+                ("custom_fee".into(), Bytes::from(0u32)),
+                ("default_fee".into(), Bytes::from(30u32)),
+                ("fee_module".into(), Bytes::from([0; 20])),
+                ("paused".into(), Bytes::from([0])),
+            ]);
+        }
+        let tokens = HashMap::from([
+            (a.address.clone(), a.clone()),
+            (b.address.clone(), b.clone()),
+        ]);
+        let decoder = ReplayDecoder::new(DecoderConfig::retained_v2(), tokens).await?;
+        let partition = BroadcasterSnapshotPartition::with_messages(
+            BroadcasterBackend::Native,
+            123,
+            vec![raw.clone()],
+            BTreeMap::new(),
+        );
+        let restored = decoder
+            .decode_snapshot_partition(partition)
+            .await?
+            .update
+            .ok_or_else(|| anyhow::anyhow!("checkpoint skipped Aero Basic"))?;
+        let quote = |update: &Update| -> anyhow::Result<_> {
+            Ok(update
+                .states
+                .get("0x01")
+                .ok_or_else(|| anyhow::anyhow!("missing Aero Basic pool"))?
+                .get_amount_out(1_000_000u64.into(), &a, &b)?
+                .amount)
+        };
+        let before = quote(&restored)?;
+        let pool = raw
+            .message
+            .snapshots
+            .states
+            .get_mut("0x01")
+            .ok_or_else(|| anyhow::anyhow!("missing pool fixture"))?;
+        pool.state.attributes.insert(
+            "reserve1".into(),
+            Bytes::from((2u128 * 10u128.pow(21)).to_be_bytes().to_vec()),
+        );
+        raw.message.header.number += 1;
+        use simulator_core::broadcaster::{BroadcasterEnvelope, BroadcasterPayload};
+        let envelope = BroadcasterEnvelope::new(
+            "test",
+            2,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage {
+                partitions: vec![BroadcasterUpdatePartition::with_messages(
+                    BroadcasterBackend::Native,
+                    124,
+                    vec![raw],
+                    BTreeMap::new(),
+                )],
+            }),
+        );
+        let payload = serde_json::value::to_raw_value(&envelope)?;
+        let delta = decoder
+            .decode_delta(2, &payload, &[ReplayBackend::Native])
+            .await?
+            .update
+            .ok_or_else(|| anyhow::anyhow!("delta skipped Aero Basic"))?;
+        assert!(quote(&delta)? > before);
+        assert!(matches!(
+            decoder
+                .decode_delta(1, &payload, &[ReplayBackend::Native])
+                .await,
+            Err(ReplayDecodeError::RetainedDecoderProfileRequired(1))
+        ));
         Ok(())
     }
 
@@ -905,7 +1090,9 @@ mod tests {
 
     #[tokio::test]
     async fn ekubo_v3_leaves_out_signed_exclusive_swap_pools() -> anyhow::Result<()> {
-        let mut decoder = TychoStreamDecoder::<BlockHeader>::new();
+        let mut decoder = TychoStreamDecoder::<BlockHeader>::new(
+            tycho_simulation::tycho_common::models::Chain::Ethereum,
+        );
         register_native_decoder(&mut decoder, ProtocolKind::EkuboV3)?;
         let signed_exclusive_swap: Bytes = "0x55b703eED01b35641963da2FB2E14885993605A3".parse()?;
 
@@ -1002,7 +1189,9 @@ mod tests {
         )?;
         let decoder = ReplayDecoder::with_decoder(
             DecoderConfig::for_backend(ReplayBackend::Native, Vec::new(), 100),
-            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+                tycho_simulation::tycho_common::models::Chain::Ethereum,
+            )),
         );
 
         let Err(error) = decoder
@@ -1022,7 +1211,9 @@ mod tests {
     fn test_decoder() -> ReplayDecoder {
         ReplayDecoder::with_decoder(
             DecoderConfig::retained_v1(),
-            Arc::new(TychoStreamDecoder::<BlockHeader>::new()),
+            Arc::new(TychoStreamDecoder::<BlockHeader>::new(
+                tycho_simulation::tycho_common::models::Chain::Ethereum,
+            )),
         )
     }
 }

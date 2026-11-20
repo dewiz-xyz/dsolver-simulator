@@ -4,7 +4,7 @@ State history records the broadcaster as ordered segments. A stream position is 
 
 A reader starts from the newest complete checkpoint at or before the requested start block, then selects deltas using each backend's own block or timestamp cursor. A replay plan can contain multiple legs. Each leg starts from one checkpoint and applies its deltas in `(generation, message_seq)` order.
 
-Boundary checkpoints start new segments after writer promotion and recovery commits. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
+Boundary checkpoints start new segments after writer promotion and recovery commits. At startup promotion the writer retains the same pinned snapshot and token catalog used to establish the new generation, at the Redis reset position. It persists startup handoff updates as deltas at their assigned Redis positions. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
 
 ## Terminology
 
@@ -48,7 +48,7 @@ The uncompressed JSON envelope has this shape:
 }
 ```
 
-`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION` and the delta payload format. All three retained formats are currently `1`.
+`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION` and the delta payload format. Token snapshots use version `1`. The Tycho 0.525 writer emits version `2` for checkpoint archives and deltas.
 
 Canonical encoding sorts tokens by address and rejects duplicate addresses. Serde emits deterministic JSON from the fixed envelope and token DTO fields. The writer computes SHA-256 over those uncompressed canonical bytes, then compresses them with Zstandard level 3. The manifest `token_bytes` column records the uncompressed canonical JSON length. `TokenSnapshotCodecError` provides the typed `Sha256Mismatch`, `UnsupportedSchemaVersion`, and `DuplicateTokenAddress` variants.
 
@@ -79,12 +79,14 @@ One row represents one accepted update. `(chain_id, generation, message_seq)` is
 | `observed_at_ms` | Time the update was observed, in Unix milliseconds. |
 | `payload` | Zstandard-compressed serialized update payload. |
 | `payload_sha256` | SHA-256 digest of the uncompressed serialized payload. |
-| `payload_format_version` | Complete retained delta payload and decoder profile version. Existing and new rows default to version `1`. |
+| `payload_format_version` | Complete retained delta payload and decoder profile version. The writer explicitly records version `2`. The database default for legacy inserts is `1`. |
 | `created_at` | Time PostgreSQL inserted the row. |
 
 ### Retained payload formats
 
 Checkpoint archives, token snapshots, and deltas dispatch through explicit stored-version matches. Unknown versions fail closed. Delta payload format 1 means the current broadcaster update envelope plus the fixed `DecoderConfig::retained_v1()` profile. That profile registers every protocol implementation a format 1 writer could emit and pins token quality to `0`; it never reads the current simulator manifest.
+
+Format 2 checkpoints select `DecoderConfig::retained_v2()`. Format 2 deltas require the same profile. It includes the expanded Tycho 0.525 protocol set, including protocols that are currently disabled in the live manifest. Start a fresh broadcaster generation with a matching boundary checkpoint when switching formats. Legacy RFQ books written by pre-0.525 Tycho still require their matching historical reader.
 
 When state history is enabled, broadcaster startup refuses `BROADCASTER_TOKEN_MIN_QUALITY` values other than `0`. Any JSON-shape, protocol-decoder, or decoder-setting change that changes retained decoding requires a new delta payload format before its writer can be enabled.
 
@@ -416,5 +418,4 @@ PostgreSQL and MinIO services on loopback, and run the storage checks. The scrip
 removes the containers and volumes when it exits.
 
 [Dockerfile.state-history-minio](../Dockerfile.state-history-minio) builds pinned
-MinIO source because upstream does not publish an image for this release. Compose
-pins the client and PostgreSQL images by digest.
+MinIO source because upstream does not publish an image for this release. The same image includes a client built from its pinned release source. Compose pins PostgreSQL by digest.

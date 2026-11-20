@@ -5,7 +5,7 @@
 <h1 align="center">DSolver Simulator</h1>
 
 <p align="center">
-  DeFi swap simulation and route encoding using live Tycho state.
+  DeFi swap simulation using live Tycho state.
 </p>
 
 <p align="center">
@@ -40,10 +40,14 @@
 </p>
 
 DSolver Simulator subscribes to the internal Tycho broadcaster, maintains pool state in memory,
-and exposes HTTP endpoints for quotes, route encoding, and readiness. It uses `tycho-simulation`
-for pricing and `tycho-execution` for calldata. `/simulate` reports usable quotes, partial
-coverage, warmup states, and request failures; `/encode` resimulates routes before generating
-settlement interactions. The local analyzer records readiness, latency, and request evidence.
+and exposes HTTP endpoints for quotes and readiness. It uses `tycho-simulation` for pricing.
+`/simulate` reports usable quotes, partial coverage, warmup states, and request failures.
+The local analyzer records readiness, latency, and request evidence.
+
+`POST /encode` has been removed and returns `404 Not Found`. Consumers generate settlement
+calldata themselves. The workspace retains the agreed `tycho-execution = "=0.525.0"` pin,
+but the simulator and broadcaster no longer build it. The private fork and vendored patch
+have been removed.
 
 ## At A Glance
 
@@ -52,11 +56,21 @@ settlement interactions. The local analyzer records readiness, latency, and requ
 | Language | Rust 2021 |
 | Runtime | Axum + Tokio |
 | Binary | `dsolver-simulator-service` |
-| Endpoints | `GET /status`, `GET /ready`, `POST /simulate`, `POST /encode` |
+| Endpoints | `GET /status`, `GET /ready`, `POST /simulate` |
 | Supported chains | Defined in `simulator-manifest.toml` |
 | Required inputs | `CHAIN_ID`, `TYCHO_BROADCASTER_URL`, Redis connection settings; the broadcaster also requires `TYCHO_API_KEY` |
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
+
+## Tycho 0.525.0 broadcasting
+
+This branch preserves the current replay bootstrap API and enables 12 hosted on-chain feeds on Base and 21 on Ethereum. Balancer V2 and V3 are disabled. The Ethereum broadcaster subscribes to the three VM systems selected in the manifest.
+
+With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed once; Titan Bebop and Bebop RFQ have distinct identities.
+
+Set `CHAIN_ID=8453` or `1`, and supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`. Ethereum also requires `HASHFLOW_USER` and `HASHFLOW_KEY`. Titan's public stream needs no API key. The optional `RFQ_MIN_TVL_USD` defaults to 100 USD for direct book providers.
+
+Consumers must use the matching Tycho 0.525.0 state format and bootstrap fresh snapshots during rollout. Titan snapshots and deltas preserve quote expiry; receiving or replaying a book does not renew it. Downstream consumers own routing and settlement encoding. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list and verification results.
 
 ## Quick Start
 
@@ -82,7 +96,7 @@ Required runtime inputs:
 Common optional inputs:
 
 - `RPC_URL` to enable on-chain helpers that need JSON-RPC access, such as ERC4626 deposits
-- `ENABLE_VM_POOLS` to enable or disable VM-backed pool feeds
+- `ENABLE_VM_POOLS` to enable the standalone simulator’s shared database backend (VM pools on Ethereum, Uniswap V4 on Base)
 - `ENABLE_RFQ_POOLS` to enable or disable RFQ pool feeds (defaults to `false`)
 - `BEBOP_KEY` as Bebop's single Bearer credential, plus `HASHFLOW_USER`, `HASHFLOW_KEY`, `LIQUORICE_USER`, and `LIQUORICE_KEY`, only when `ENABLE_RFQ_POOLS=true` for chains that enable those RFQ providers
 - `HOST` and `PORT` to change the bind address
@@ -136,16 +150,12 @@ Redis append and snapshot-session creation are fenced so stale writers cannot pu
 ## API Surface
 
 - `POST /simulate` returns per-pool quotes across the requested amounts plus `meta` describing quote completeness, failures, and readiness-adjacent request outcomes.
-- `POST /encode` accepts a client-provided route, re-simulates the swaps internally, and returns ordered settlement `interactions[]`.
 - `GET /status` is a liveness endpoint that always reports the current state with HTTP `200`.
 - `GET /ready` uses HTTP `200` or `503` for native traffic readiness and includes the same backend detail.
-
-`/encode` keeps its current HTTP control flow, but the server emits one structured completion log per request with route shape, protocol summary, and failure-stage fields. Detailed resimulation traces stay available at `debug`.
 
 Detailed integration docs:
 
 - [docs/simulate_example.md](docs/simulate_example.md) for `/simulate` request and response shape
-- [docs/encode_example.md](docs/encode_example.md) for `/encode` request and response shape
 
 ## Quote Outcome Semantics
 
@@ -223,9 +233,8 @@ Treat `"0"` in `amounts_out` as "this requested amount did not produce a usable 
 Each broadcaster and simulator observes `eth_getBlockByNumber("latest", false)` through its required
 `RPC_URL`, verifying that the endpoint matches `CHAIN_ID`. Native and VM state each need a complete
 block number and hash for their own configured protocols. Their availability remains separate:
-a stale VM backend is skipped by native-only quoting, while encoding requires every backend used
-by its route. On Base, Uniswap V4 uses the VM/shared-database state store even though its wire
-protocol is native.
+a stale VM backend is skipped by native-only quoting. On Base, Uniswap V4 uses the VM/shared-database
+state store even though its wire protocol is native.
 
 Native and VM entries in `/status` and `/ready` include `observation_age_ms` after the first
 successful RPC observation. It measures elapsed time from that observation's request start,
@@ -269,12 +278,9 @@ Timeout behavior differs by endpoint:
 
 - `/simulate` request-guard timeouts return `200 OK` with a contract-valid payload whose `meta.status=ready`, `meta.result_quality=request_level_failure`, and `meta.failures` includes a `timeout`
 - `/simulate` router-boundary timeouts also return `200 OK` with `result_quality=request_level_failure`
-- `/encode` router-boundary timeouts return `408 Request Timeout` with `{ "error": "..." }`, plus `requestId` when it is available
 - `/status` and `/ready` are not wrapped in the router timeout layer
 
-For ops, `/encode` timeout and failure logs include stable `encode_error_kind` and `failure_stage` fields so CloudWatch queries can separate validation, readiness, normalization, resimulation, encoding, `handler_timeout`, and `router_timeout` paths.
-
-If you are integrating against `/simulate`, inspect `meta` on every successful HTTP response. If you are integrating against `/encode`, normal HTTP success and error handling is still the right control flow.
+If you are integrating against `/simulate`, inspect `meta` on every successful HTTP response.
 
 ## Deployments
 
@@ -340,15 +346,15 @@ cargo test --locked --release -p runtime mainnet_vm_liquidity_survives_snapshot_
   -- --ignored --nocapture --test-threads=1
 ```
 
-The test first decodes the snapshot and checks Curve and Balancer quotes. It then allows
+The test first decodes the snapshot and checks Curve and Maverick V2 quotes. It then allows
 up to 20 minutes for live Redis deltas that produce non-zero quotes for both protocols.
 Snapshot initialization adds time before that deadline starts.
 
 Container builds:
 
 ```bash
-docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.simulator-service -t dsolver-simulator-service .
-docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
+docker build -f Dockerfile.simulator-service -t dsolver-simulator-service .
+docker build -f Dockerfile.broadcaster-service -t dsolver-tycho-broadcaster-service .
 docker build -f Dockerfile.historical-quote-service -t historical-quote-service:test .
 ```
 
@@ -360,12 +366,11 @@ Useful helpers:
 - `scripts/stop_server.sh` to stop services started by the repo helper
 - `cargo run -p apps --bin sim-analysis -- ...` to generate a JSON and markdown local behavior report
 
-The analyzer is intentionally reporting-first. It exercises representative `/simulate` and `/encode` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so reviewers can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness. On Base, RFQ-enabled runs also include a Bebop partial-fill encode diagnostic that inspects router calldata for the packed `originalFilledTakerAmount` token-in invariant.
+The analyzer is intentionally reporting-first. It exercises representative `/simulate` flows, plus latency and light stress probes, then writes artifacts under `logs/simulation-reports/`, including simulator and broadcaster log excerpts, so reviewers can inspect anomalies, compare against previous local runs, and decide what matters instead of relying on a rigid pass or fail harness.
 
 ## Docs Map
 
 - [docs/simulate_example.md](docs/simulate_example.md): `/simulate` API examples and integration notes
-- [docs/encode_example.md](docs/encode_example.md): `/encode` API examples and route-shape notes
 - [docs/quote_service.md](docs/quote_service.md): maintainer deep dive for quote lifecycle, classification, observability, and integrations
 - [docs/historical_pool_quote_client.md](docs/historical_pool_quote_client.md): client guide for historical Base pool quotes through `dsolver-history`
 - [docs/historical_pool_quote_api.md](docs/historical_pool_quote_api.md): service architecture, HTTP API, limits, and operator workflow

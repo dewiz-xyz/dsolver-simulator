@@ -1119,7 +1119,7 @@ async fn preflight_delta_payloads(
     limits.check_compressed(compressed_bytes)?;
     if let Some(format) = payload_formats
         .into_iter()
-        .find(|format| *format != crate::DELTA_PAYLOAD_FORMAT_VERSION)
+        .find(|format| !matches!(format, 1 | 2))
     {
         return Err(StoredPayloadError::UnsupportedDeltaFormat(format).into());
     }
@@ -1352,8 +1352,8 @@ fn decode_delta_row_with_limit(
     max_decoded_bytes: u64,
 ) -> anyhow::Result<(DeltaRow, u64)> {
     let payload_json = match row.payload_format_version {
-        crate::DELTA_PAYLOAD_FORMAT_VERSION => {
-            decode_zstd_with_limit(row.payload.as_slice(), max_decoded_bytes, "delta format 1")?
+        1 | 2 => {
+            decode_zstd_with_limit(row.payload.as_slice(), max_decoded_bytes, "retained delta")?
         }
         other => return Err(StoredPayloadError::UnsupportedDeltaFormat(other).into()),
     };
@@ -4710,7 +4710,7 @@ mod tests {
         let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
         let archive = CheckpointArchive {
             metadata: ArchiveMetadata {
-                schema_version: 1,
+                schema_version: crate::ARCHIVE_SCHEMA_VERSION,
                 chain_id: capture.chain_id(),
                 position: capture.position(),
                 state_version: capture.state_version(),

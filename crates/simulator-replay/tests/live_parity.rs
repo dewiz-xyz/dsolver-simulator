@@ -83,7 +83,7 @@ async fn extracted_native_and_rfq_paths_match_characterized_results() -> Result<
     assert_eq!(rfq.amount_out, U256::from(1_995_000_000_u64));
     assert_eq!(
         rfq.state_digest,
-        "e61eec744107cc67994fce061e007b27ec7037e40ebb0544ee9edc5ded2d3f76"
+        "e23c543028cd884cb3687027a66abe10d636989107fa9e3525d52a0b9b4c77a3"
     );
     Ok(())
 }
@@ -194,7 +194,8 @@ async fn mixed_delta_preserves_every_partition_state() -> Result<()> {
                 (ReplayBackend::Native, vec![ProtocolKind::UniswapV2]),
                 (ReplayBackend::Rfq, vec![ProtocolKind::Bebop]),
             ],
-        ),
+        )
+        .with_chain(Chain::Base),
         HashMap::new(),
     )
     .await?;
@@ -209,7 +210,7 @@ async fn mixed_delta_preserves_every_partition_state() -> Result<()> {
     let update = decoded
         .update
         .ok_or_else(|| anyhow!("delta did not decode"))?;
-    assert_eq!(update.block_number_or_timestamp, decoded.block_number);
+    assert_eq!(update.block_number, decoded.block_number);
     let actual = update
         .states
         .into_iter()

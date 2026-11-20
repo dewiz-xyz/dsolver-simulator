@@ -225,7 +225,7 @@ impl ReplayWorld {
 
     pub fn apply(&mut self, mut update: Update) -> ApplyReport {
         let state = Arc::make_mut(&mut self.state);
-        let block_number = update.block_number_or_timestamp;
+        let block_number = update.block_number;
         state.block_number = block_number;
         let mut stats = UpdateAccumulator::default();
 
@@ -1066,7 +1066,9 @@ mod tests {
     #[test]
     fn exact_quote_remaps_native_and_wrapped_tokens_to_the_selected_component() {
         let native = Chain::Ethereum.native_token();
-        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"));
         let token_out = token(53, "TKNX");
         let tokens = HashMap::from([
             (native.address.clone(), native.clone()),

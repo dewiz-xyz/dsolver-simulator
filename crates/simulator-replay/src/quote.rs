@@ -5,6 +5,7 @@ use alloy_primitives::U256;
 use num_bigint::BigUint;
 use thiserror::Error;
 use tycho_simulation::{
+    book::{decode_swap_directions, SWAP_DIRECTIONS_ATTRIBUTE},
     protocol::models::ProtocolComponent,
     tycho_common::{
         models::{token::Token, Chain},
@@ -129,7 +130,9 @@ fn remap_native_token_for_component(requested: Token, component: &ProtocolCompon
     }
 
     let native = requested.chain.native_token();
-    let wrapped = requested.chain.wrapped_native_token();
+    let Some(wrapped) = requested.chain.wrapped_native_token() else {
+        return requested;
+    };
     if native.address == wrapped.address {
         return requested;
     }
@@ -151,13 +154,21 @@ fn remap_native_token_for_component(requested: Token, component: &ProtocolCompon
     }
 }
 
-fn component_supports_direction(
+pub fn component_supports_direction(
     component: &ProtocolComponent,
     token_in: &Bytes,
     token_out: &Bytes,
 ) -> bool {
     if token_in == token_out {
         return false;
+    }
+
+    if let Some(encoded) = component.static_attributes.get(SWAP_DIRECTIONS_ATTRIBUTE) {
+        return decode_swap_directions(encoded).is_ok_and(|directions| {
+            directions
+                .iter()
+                .any(|(sell, buy)| sell == token_in && buy == token_out)
+        });
     }
 
     if is_directional_rfq_component(component) {
@@ -244,7 +255,9 @@ mod tests {
     #[test]
     fn remapping_preserves_metadata_without_alias_substitution() -> Result<(), serde_json::Error> {
         let native = Chain::Ethereum.native_token();
-        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         let ordinary = Token::new(&Bytes::from([2; 20]), "OTHER", 18, 0, &[], Chain::Base, 100);
         let starknet_native = Chain::Starknet.native_token();
         let cases = [
@@ -292,7 +305,9 @@ mod tests {
     #[test]
     fn alias_substitution_uses_canonical_chain_metadata() -> Result<(), serde_json::Error> {
         let native = Chain::Ethereum.native_token();
-        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("test chain has a wrapped native token"));
         for (requested, expected) in [(wrapped.clone(), native.clone()), (native, wrapped)] {
             let requested = distinctive_metadata(requested);
             let component = component(vec![distinctive_metadata(expected.clone())]);

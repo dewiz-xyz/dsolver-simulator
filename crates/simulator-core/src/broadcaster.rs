@@ -19,6 +19,7 @@ use crate::models::protocol::ProtocolKind;
 mod raw_state;
 mod redis_streams;
 mod snapshot_reassembly;
+mod state_wire;
 
 pub use raw_state::{
     apply_raw_protocol_messages, fold_account_update_into_snapshot, merge_shared_vm_accounts,
@@ -26,7 +27,8 @@ pub use raw_state::{
 };
 pub use redis_streams::{BroadcasterRedisReplayBoundary, BroadcasterRedisStreamEntry};
 pub use snapshot_reassembly::{
-    parse_snapshot_payloads, RawSnapshotReassembly, SnapshotPayloadsError, SnapshotReassemblyError,
+    parse_selected_snapshot_payloads, parse_selected_update, parse_snapshot_payloads,
+    RawSnapshotReassembly, SnapshotPayloadsError, SnapshotReassemblyError,
 };
 
 // Producers and consumers must agree on the largest snapshot response they can exchange.
@@ -215,6 +217,30 @@ impl From<Token> for BroadcasterTokenDto {
 }
 
 impl BroadcasterBackend {
+    pub const fn from_protocol_kind(kind: ProtocolKind) -> Self {
+        match kind {
+            ProtocolKind::Curve
+            | ProtocolKind::BalancerV2
+            | ProtocolKind::MaverickV2
+            | ProtocolKind::BalancerV3
+            | ProtocolKind::LiquidityParty => Self::Vm,
+            ProtocolKind::Hashflow
+            | ProtocolKind::Bebop
+            | ProtocolKind::Liquorice
+            | ProtocolKind::NativeRfq
+            | ProtocolKind::Metric
+            | ProtocolKind::TitanFermiSwap
+            | ProtocolKind::TitanKipseli
+            | ProtocolKind::TitanBebop
+            | ProtocolKind::TitanTaurusFi
+            | ProtocolKind::TitanTempest
+            | ProtocolKind::TitanGoliath
+            | ProtocolKind::TitanStelaxis
+            | ProtocolKind::TitanElZorro => Self::Rfq,
+            _ => Self::Native,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
@@ -716,7 +742,7 @@ impl BroadcasterUpdateMessage {
             .map(|(backend, partition)| {
                 BroadcasterUpdatePartition::new(
                     backend,
-                    update.block_number_or_timestamp,
+                    update.block_number,
                     partition.new_pairs,
                     partition.updated_states,
                     partition.removed_pairs,
@@ -1071,6 +1097,7 @@ impl BroadcasterBackendHead {
 pub struct BroadcasterStateEntry {
     pub component_id: String,
     pub component: ProtocolComponent,
+    #[serde(with = "state_wire")]
     pub state: Box<dyn ProtocolSim>,
 }
 
@@ -1093,6 +1120,7 @@ impl BroadcasterStateEntry {
 pub struct BroadcasterStateDelta {
     pub component_id: String,
     pub backend: BroadcasterBackend,
+    #[serde(with = "state_wire")]
     pub state: Box<dyn ProtocolSim>,
 }
 
@@ -1835,7 +1863,7 @@ fn backend_for_component(
             component_id: component_id.to_string(),
         });
     };
-    Ok(backend_for_kind(kind))
+    Ok(BroadcasterBackend::from_protocol_kind(kind))
 }
 
 fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, BroadcasterContractError> {
@@ -1844,19 +1872,7 @@ fn backend_for_sync_state(protocol: &str) -> Result<BroadcasterBackend, Broadcas
             protocol: protocol.to_string(),
         });
     };
-    Ok(backend_for_kind(kind))
-}
-
-fn backend_for_kind(kind: ProtocolKind) -> BroadcasterBackend {
-    match kind {
-        ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => {
-            BroadcasterBackend::Vm
-        }
-        ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => {
-            BroadcasterBackend::Rfq
-        }
-        _ => BroadcasterBackend::Native,
-    }
+    Ok(BroadcasterBackend::from_protocol_kind(kind))
 }
 
 fn deserialize_unique_backends<'de, D>(deserializer: D) -> Result<Vec<BroadcasterBackend>, D::Error>

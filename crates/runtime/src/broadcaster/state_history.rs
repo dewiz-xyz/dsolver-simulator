@@ -56,7 +56,7 @@ impl StateHistoryUpdateProjection {
                 BroadcasterBackend::Rfq => DeltaBackendCursor {
                     backend: Backend::Rfq,
                     block_number: None,
-                    observed_at_ms: Some(seconds_to_ms(partition.block_number)?),
+                    observed_at_ms: Some(checked_rfq_timestamp_ms(partition.block_number)?),
                 },
             };
             backends.push(cursor);
@@ -125,9 +125,12 @@ impl StateHistoryRuntime {
     }
 
     pub(crate) fn observe_rfq_update(&self, update: &StateHistoryUpdateProjection) {
-        if let Some(observed_at_ms) = update.rfq_observed_at_ms() {
-            self.rfq_high_water_ms
-                .fetch_max(observed_at_ms, Ordering::AcqRel);
+        self.observe_rfq_timestamp(update.rfq_observed_at_ms());
+    }
+
+    pub(crate) fn observe_rfq_timestamp(&self, observed: Option<u64>) {
+        if let Some(observed) = observed {
+            self.rfq_high_water_ms.fetch_max(observed, Ordering::AcqRel);
         }
     }
 
@@ -136,10 +139,7 @@ impl StateHistoryRuntime {
     }
 
     pub fn observe_rfq_export(&self, export: &BroadcasterSnapshotExport) -> Result<()> {
-        if let Some(observed_at_ms) = rfq_observed_at_ms_from_export(export)? {
-            self.rfq_high_water_ms
-                .fetch_max(observed_at_ms, Ordering::AcqRel);
-        }
+        self.observe_rfq_timestamp(rfq_observed_at_ms_from_export(export)?);
         Ok(())
     }
 
@@ -308,13 +308,32 @@ pub fn captured_state_from_export(
     block_number: u64,
     rfq_observed_at_ms: Option<u64>,
 ) -> Result<CapturedState> {
+    captured_state_from_payloads(
+        kind,
+        export.payloads.iter(),
+        position,
+        state_version,
+        block_number,
+        rfq_observed_at_ms,
+    )
+}
+
+pub(crate) fn captured_state_from_payloads<'a>(
+    kind: CheckpointKind,
+    payloads: impl ExactSizeIterator<Item = &'a BroadcasterPayload>,
+    position: StreamPosition,
+    state_version: u64,
+    block_number: u64,
+    mut rfq_observed_at_ms: Option<u64>,
+) -> Result<CapturedState> {
     let mut chain_id = None;
     let mut backends = Vec::new();
     let mut backend_heads = BTreeMap::new();
     let mut block_times = BTreeMap::new();
-    let mut payloads_json = Vec::with_capacity(export.payloads.len());
+    let mut payloads_json = Vec::with_capacity(payloads.len());
 
-    for payload in &export.payloads {
+    for payload in payloads {
+        rfq_observed_at_ms = rfq_observed_at_ms.max(rfq_cursor(payload));
         payloads_json.push(
             serde_json::to_string(payload).context("failed to serialize checkpoint payload")?,
         );
@@ -356,40 +375,49 @@ pub fn captured_state_from_export(
         );
     }
     let chain_id = chain_id.context("checkpoint export is missing snapshot_start")?;
-    let rfq_observed_at_ms = match (rfq_observed_at_ms, rfq_observed_at_ms_from_export(export)?) {
-        (Some(recorded), Some(snapshot)) => Some(recorded.max(snapshot)),
-        (recorded, snapshot) => recorded.or(snapshot),
-    };
     Ok(CapturedState::new(
         chain_id,
         position,
         Some(state_version),
         kind,
         block_number,
-        rfq_observed_at_ms,
+        rfq_observed_at_ms
+            .map(checked_rfq_timestamp_ms)
+            .transpose()?,
         backends,
         payloads_json,
         block_times.into_values().collect(),
     )?)
 }
 
-fn rfq_observed_at_ms_from_export(export: &BroadcasterSnapshotExport) -> Result<Option<u64>> {
+pub(crate) fn rfq_observed_at_ms_from_export(
+    export: &BroadcasterSnapshotExport,
+) -> Result<Option<u64>> {
     export
         .payloads
         .iter()
-        .filter_map(|payload| match payload {
-            BroadcasterPayload::SnapshotChunk(chunk) => Some(&chunk.partitions),
-            _ => None,
-        })
-        .flatten()
+        .filter_map(rfq_cursor)
+        .max()
+        .map(checked_rfq_timestamp_ms)
+        .transpose()
+}
+
+fn checked_rfq_timestamp_ms(value: u64) -> Result<u64> {
+    i64::try_from(value).context("RFQ observation time exceeds the PostgreSQL bigint range")?;
+    Ok(value)
+}
+
+// The RFQ partition cursor on the broadcast wire is Unix milliseconds.
+fn rfq_cursor(payload: &BroadcasterPayload) -> Option<u64> {
+    let BroadcasterPayload::SnapshotChunk(chunk) = payload else {
+        return None;
+    };
+    chunk
+        .partitions
+        .iter()
         .filter(|partition| partition.backend == BroadcasterBackend::Rfq)
-        .map(|partition| seconds_to_ms(partition.block_number))
-        .try_fold(None, |current, observed| {
-            let observed = observed?;
-            Ok(Some(
-                current.map_or(observed, |current: u64| current.max(observed)),
-            ))
-        })
+        .map(|partition| partition.block_number)
+        .max()
 }
 
 fn collect_message_block_times(
@@ -548,10 +576,11 @@ mod tests {
     #[test]
     fn rfq_partition_maps_to_observed_at_ms_cursor() -> Result<()> {
         let envelope: BroadcasterEnvelope = serde_json::from_str(RFQ_UPDATE)?;
-        let BroadcasterPayload::Update(update) = envelope.payload else {
+        let BroadcasterPayload::Update(mut update) = envelope.payload else {
             unreachable!();
         };
 
+        update.partitions[0].block_number = 1_710_000_000_000;
         let projection = StateHistoryUpdateProjection::from_update(&update)?;
         let entry = delta_entry_from_update(
             8453,

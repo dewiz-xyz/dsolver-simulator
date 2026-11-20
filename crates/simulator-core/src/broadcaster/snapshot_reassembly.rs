@@ -2,12 +2,15 @@ use std::collections::{
     btree_map::Entry as BTreeEntry, hash_map::Entry as HashEntry, BTreeMap, HashMap,
 };
 
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::value::RawValue;
 use thiserror::Error;
 use tycho_simulation::tycho_common::{models::contract::Account, Bytes};
 
 use super::{
-    BroadcasterPayload, BroadcasterProtocolMessage, BroadcasterSnapshotChunk,
-    BroadcasterSnapshotStart,
+    BroadcasterBackend, BroadcasterMessageKind, BroadcasterProtocolMessage,
+    BroadcasterSnapshotChunk, BroadcasterSnapshotEnd, BroadcasterSnapshotStart,
+    BroadcasterUpdateMessage,
 };
 
 #[derive(Debug, Error)]
@@ -32,8 +35,80 @@ impl SnapshotReassemblyError {
     }
 }
 
+// Read the backend tag before constructing any Tycho state. An unselected partition can
+// contain states written by an older Tycho version with a different Serde representation.
+fn selected_partitions<T: DeserializeOwned>(
+    raw: Vec<&RawValue>,
+    selected: impl Fn(BroadcasterBackend) -> bool,
+) -> serde_json::Result<Vec<T>> {
+    #[derive(Deserialize)]
+    struct Tag {
+        backend: BroadcasterBackend,
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut partitions = Vec::new();
+    for value in raw {
+        let Tag { backend } = serde_json::from_str(value.get())?;
+        if !seen.insert(backend) {
+            return Err(serde::de::Error::custom(format!(
+                "duplicate partition for {backend}"
+            )));
+        }
+        if selected(backend) {
+            partitions.push(serde_json::from_str(value.get())?);
+        }
+    }
+    Ok(partitions)
+}
+
+pub fn parse_selected_update(
+    raw: &RawValue,
+    selected: impl Fn(BroadcasterBackend) -> bool,
+) -> serde_json::Result<Option<BroadcasterUpdateMessage>> {
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(rename = "stream_id")]
+        _stream_id: String,
+        #[serde(rename = "message_seq")]
+        _message_seq: u64,
+        kind: BroadcasterMessageKind,
+        #[serde(borrow)]
+        partitions: Option<Vec<&'a RawValue>>,
+    }
+    let envelope: Envelope = serde_json::from_str(raw.get())?;
+    if envelope.kind != BroadcasterMessageKind::Update {
+        return Ok(None);
+    }
+    let raw = envelope
+        .partitions
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            <serde_json::Error as serde::de::Error>::custom("missing update partitions")
+        })?;
+    let partitions = selected_partitions(raw, selected)?;
+    if partitions.is_empty() {
+        return Ok(Some(BroadcasterUpdateMessage { partitions }));
+    }
+    BroadcasterUpdateMessage::new(partitions)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 pub fn parse_snapshot_payloads(
     payloads_json: &[String],
+) -> Result<
+    (
+        BroadcasterSnapshotStart,
+        BTreeMap<u32, BroadcasterSnapshotChunk>,
+    ),
+    SnapshotPayloadsError,
+> {
+    parse_selected_snapshot_payloads(payloads_json, |_| true)
+}
+
+pub fn parse_selected_snapshot_payloads(
+    payloads_json: &[String],
+    selected: impl Fn(BroadcasterBackend) -> bool,
 ) -> Result<
     (
         BroadcasterSnapshotStart,
@@ -45,17 +120,41 @@ pub fn parse_snapshot_payloads(
     let mut chunks = BTreeMap::new();
     let mut end = None;
     for payload_json in payloads_json {
-        let payload: BroadcasterPayload = serde_json::from_str(payload_json)?;
-        match payload {
-            BroadcasterPayload::SnapshotStart(value) if start.is_none() => start = Some(value),
-            BroadcasterPayload::SnapshotChunk(value) => {
+        #[derive(Deserialize)]
+        struct Header {
+            kind: BroadcasterMessageKind,
+        }
+        match serde_json::from_str::<Header>(payload_json)?.kind {
+            BroadcasterMessageKind::SnapshotStart if start.is_none() => {
+                start = Some(serde_json::from_str::<BroadcasterSnapshotStart>(
+                    payload_json,
+                )?);
+            }
+            BroadcasterMessageKind::SnapshotChunk => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Chunk<'a> {
+                    snapshot_id: String,
+                    chunk_index: u32,
+                    #[serde(default, borrow)]
+                    partitions: Vec<&'a RawValue>,
+                }
+                let raw: Chunk = serde_json::from_str(payload_json)?;
+                let partitions = selected_partitions(raw.partitions, &selected)?;
+                let value =
+                    BroadcasterSnapshotChunk::new(raw.snapshot_id, raw.chunk_index, partitions)
+                        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
                 if chunks.insert(value.chunk_index, value).is_some() {
                     return Err(SnapshotPayloadsError::Layout(
                         "duplicate snapshot chunk index",
                     ));
                 }
             }
-            BroadcasterPayload::SnapshotEnd(value) if end.is_none() => end = Some(value),
+            BroadcasterMessageKind::SnapshotEnd if end.is_none() => {
+                end = Some(serde_json::from_str::<BroadcasterSnapshotEnd>(
+                    payload_json,
+                )?);
+            }
             _ => {
                 return Err(SnapshotPayloadsError::Layout(
                     "archive must contain one snapshot start, chunks, and one snapshot end",

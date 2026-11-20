@@ -738,7 +738,7 @@ async fn persist_checkpoint(
     let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
     let archive = CheckpointArchive {
         metadata: ArchiveMetadata {
-            schema_version: 1,
+            schema_version: state_history::ARCHIVE_SCHEMA_VERSION,
             chain_id: capture.chain_id(),
             position: capture.position(),
             state_version: capture.state_version(),
