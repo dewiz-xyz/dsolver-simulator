@@ -139,7 +139,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .await
             .context("failed to acquire state history read connection")?;
         let mut transaction = begin_range_transaction(&mut connection).await?;
-        if !request.includes_rfq() {
+        if !request.includes_book() {
             let range = resolve_range_in_transaction(
                 &mut transaction,
                 &request.range_request(None),
@@ -272,6 +272,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
                 && metadata.kind == manifest.kind
                 && metadata.block_number == manifest.block_number
                 && metadata.rfq_observed_at_ms == manifest.rfq_observed_at_ms
+                && metadata.prop_amm_observed_at_ms == manifest.prop_amm_observed_at_ms
                 && metadata.backends == manifest.backends,
             "checkpoint manifest {} metadata does not match its archive",
             manifest.id
@@ -411,8 +412,10 @@ impl BacktestRequest {
         })
     }
 
-    fn includes_rfq(&self) -> bool {
-        self.backends.binary_search(&Backend::Rfq).is_ok()
+    fn includes_book(&self) -> bool {
+        self.backends
+            .iter()
+            .any(|backend| backend.uses_observation_time())
     }
 
     fn range_request(&self, rfq_bounds: Option<(u64, u64)>) -> RangeRequest {
@@ -488,7 +491,11 @@ impl RangeRequest {
     }
 
     fn rfq_bounds(&self) -> Result<Option<(u64, u64)>, ModelError> {
-        if self.backends.binary_search(&Backend::Rfq).is_err() {
+        if !self
+            .backends
+            .iter()
+            .any(|backend| backend.uses_observation_time())
+        {
             return Ok(None);
         }
         match (self.rfq_start_ms, self.rfq_end_ms) {
@@ -774,9 +781,20 @@ pub(super) async fn resolve_range_in_transaction(
     )
     .await?;
     let gaps = fetch_gap_rows(&mut *transaction, request, &anchor, rfq_bounds).await?;
-    let (legs, gaps) = build_legs(anchor, delta_fetch.rows, boundaries, gaps, request);
+    let mut plan = replay_segments(anchor, &delta_fetch.rows, &boundaries, &gaps, request);
+    for &backend in &request.backends {
+        let Some(gap) = incomplete_tail_gap(backend, request, &plan.legs, &delta_fetch.rows) else {
+            continue;
+        };
+        if let (Some(leg), Some(cutoff)) = (plan.legs.last(), gap.to_observed_at_ms) {
+            if book_observed_through(transaction, &leg.checkpoint, backend, cutoff).await? {
+                continue;
+            }
+        }
+        plan.gaps.push(gap);
+    }
     Ok(RangeResolution {
-        plan: RangePlan { legs, gaps },
+        plan,
         estimated_decoded_bytes: checkpoint_decoded_bytes
             .checked_add(delta_fetch.decoded_bytes)
             .context("state history decoded byte estimate overflowed")?,
@@ -1010,7 +1028,7 @@ async fn fetch_anchor(
     let requested_backends = database_backends(&request.backends);
     let row = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                 status, error
          FROM state_history.checkpoints
@@ -1018,14 +1036,14 @@ async fn fetch_anchor(
            AND status = 'complete'
            AND block_number <= $2
            AND backends @> $3::text[]
-           AND ($4::boolean = false OR rfq_observed_at_ms <= $5)
+           AND (NOT ('rfq' = ANY($3)) OR rfq_observed_at_ms <= $4)
+           AND (NOT ('prop_amm' = ANY($3)) OR prop_amm_observed_at_ms <= $4)
          ORDER BY generation DESC, message_seq DESC
          LIMIT 1",
     )
     .bind(database_i64(request.chain_id, "range chain_id")?)
     .bind(database_i64(request.start_block, "range start_block")?)
     .bind(requested_backends)
-    .bind(rfq_start_ms.is_some())
     .bind(
         rfq_start_ms
             .map(|value| database_i64(value, "range RFQ start_ms"))
@@ -1090,9 +1108,9 @@ async fn preflight_delta_payloads(
                WHERE matched.delta_id = d.id
                  AND matched.backend = ANY($4::text[])
                  AND (
-                     (matched.backend <> 'rfq' AND matched.block_number <= $5)
+                     (matched.backend NOT IN ('rfq', 'prop_amm') AND matched.block_number <= $5)
                      OR
-                     (matched.backend = 'rfq' AND matched.observed_at_ms <= $6)
+                     (matched.backend IN ('rfq', 'prop_amm') AND matched.observed_at_ms <= $6)
                  )
            )",
     )
@@ -1119,7 +1137,7 @@ async fn preflight_delta_payloads(
     limits.check_compressed(compressed_bytes)?;
     if let Some(format) = payload_formats
         .into_iter()
-        .find(|format| *format != crate::DELTA_PAYLOAD_FORMAT_VERSION)
+        .find(|format| !matches!(format, 1 | 2))
     {
         return Err(StoredPayloadError::UnsupportedDeltaFormat(format).into());
     }
@@ -1144,9 +1162,9 @@ async fn fetch_encoded_deltas(
                WHERE matched.delta_id = d.id
                  AND matched.backend = ANY($4::text[])
                  AND (
-                     (matched.backend <> 'rfq' AND matched.block_number <= $5)
+                     (matched.backend NOT IN ('rfq', 'prop_amm') AND matched.block_number <= $5)
                      OR
-                     (matched.backend = 'rfq' AND matched.observed_at_ms <= $6)
+                     (matched.backend IN ('rfq', 'prop_amm') AND matched.observed_at_ms <= $6)
                  )
            )
          ORDER BY d.generation, d.message_seq",
@@ -1215,7 +1233,7 @@ async fn fetch_boundaries(
 ) -> anyhow::Result<Vec<ManifestRow>> {
     let rows = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                 status, error
          FROM state_history.checkpoints
@@ -1252,10 +1270,8 @@ fn boundary_fits_request_end(manifest: &CheckpointManifest, request: &RangeReque
         }
         match backend {
             Backend::Native | Backend::Vm => manifest.block_number <= request.end_block,
-            Backend::Rfq => request.rfq_end_ms.is_some_and(|end| {
-                manifest
-                    .rfq_observed_at_ms
-                    .is_some_and(|cursor| cursor <= end)
+            Backend::Rfq | Backend::PropAmm => request.rfq_end_ms.is_some_and(|end| {
+                checkpoint_cursor(manifest, *backend).is_some_and(|cursor| cursor <= end)
             }),
         }
     })
@@ -1271,11 +1287,10 @@ async fn fetch_gap_rows(
         .backends
         .iter()
         .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
-    let anchor_rfq_observed_at_ms = rfq_bounds
+    let anchor_book_observed_at_ms = rfq_bounds
         .map(|_| {
-            anchor
-                .rfq_observed_at_ms
-                .context("RFQ range anchor is missing its observed-at cursor")
+            first_book_cursor(anchor, &request.backends)
+                .context("range anchor is missing its book observation cursor")
         })
         .transpose()?;
     let rows = sqlx::query(
@@ -1317,7 +1332,7 @@ async fn fetch_gap_rows(
     .bind(database_i64(request.end_block, "range end_block")?)
     .bind(rfq_bounds.is_some())
     .bind(
-        anchor_rfq_observed_at_ms
+        anchor_book_observed_at_ms
             .map(|value| database_i64(value, "anchor RFQ observed_at_ms"))
             .transpose()?,
     )
@@ -1352,8 +1367,8 @@ fn decode_delta_row_with_limit(
     max_decoded_bytes: u64,
 ) -> anyhow::Result<(DeltaRow, u64)> {
     let payload_json = match row.payload_format_version {
-        crate::DELTA_PAYLOAD_FORMAT_VERSION => {
-            decode_zstd_with_limit(row.payload.as_slice(), max_decoded_bytes, "delta format 1")?
+        1 | 2 => {
+            decode_zstd_with_limit(row.payload.as_slice(), max_decoded_bytes, "retained delta")?
         }
         other => return Err(StoredPayloadError::UnsupportedDeltaFormat(other).into()),
     };
@@ -1397,6 +1412,10 @@ fn manifest_from_row(row: &PgRow) -> anyhow::Result<CheckpointManifest> {
         rfq_observed_at_ms: optional_database_u64(
             row.try_get("rfq_observed_at_ms")?,
             "checkpoint rfq_observed_at_ms",
+        )?,
+        prop_amm_observed_at_ms: optional_database_u64(
+            row.try_get("prop_amm_observed_at_ms")?,
+            "checkpoint prop_amm_observed_at_ms",
         )?,
         backends: backend_values
             .into_iter()
@@ -1496,17 +1515,50 @@ fn optional_database_u64(value: Option<i64>, field: &str) -> anyhow::Result<Opti
     value.map(|value| database_u64(value, field)).transpose()
 }
 
-fn build_legs(
+// The next observation proves that the preceding price remained the last known
+// price through the cutoff. Only its cursor is read; its payload is never replayed.
+async fn book_observed_through(
+    connection: &mut PgConnection,
+    anchor: &CheckpointManifest,
+    backend: Backend,
+    end_ms: u64,
+) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM state_history.delta_backends witness
+             WHERE witness.chain_id = $1 AND witness.generation = $2 AND witness.message_seq > $3
+               AND witness.backend = $4 AND witness.observed_at_ms >= $5
+               AND NOT EXISTS (SELECT 1 FROM state_history.checkpoints
+                 WHERE chain_id = $1 AND generation = $2 AND kind = 'boundary'
+                   AND message_seq > $3 AND message_seq <= witness.message_seq)
+               AND NOT EXISTS (SELECT 1 FROM state_history.gaps
+                 WHERE chain_id = $1 AND generation = $2
+                   AND to_message_seq > $3 AND from_message_seq <= witness.message_seq)
+         )",
+    )
+    .bind(database_i64(anchor.chain_id, "chain_id")?)
+    .bind(database_i64(anchor.position.generation, "generation")?)
+    .bind(database_i64(
+        anchor.position.message_seq,
+        "checkpoint sequence",
+    )?)
+    .bind(backend.as_str())
+    .bind(database_i64(end_ms, "end timestamp")?)
+    .fetch_one(connection)
+    .await
+    .context("failed to check retained book coverage")
+}
+
+fn replay_segments(
     anchor: CheckpointManifest,
-    mut deltas: Vec<DeltaRow>,
-    boundaries: Vec<ManifestRow>,
-    gaps: Vec<GapRow>,
+    deltas: &[DeltaRow],
+    boundaries: &[ManifestRow],
+    gaps: &[GapRow],
     request: &RangeRequest,
-) -> (Vec<RangeLeg>, Vec<RangeGap>) {
-    deltas.sort_by_key(|delta| delta.position);
+) -> RangePlan {
     let anchor_block_number = anchor.block_number;
-    let anchor_rfq_observed_at_ms = anchor.rfq_observed_at_ms;
-    let breaks = break_positions(&anchor, &deltas, &boundaries, &gaps, request);
+    let anchor_book_observed_at_ms = first_book_cursor(&anchor, &request.backends);
+    let breaks = break_positions(&anchor, deltas, boundaries, gaps, request);
     let mut legs = Vec::with_capacity(breaks.len() + 1);
     let mut range_gaps = Vec::new();
 
@@ -1525,7 +1577,7 @@ fn build_legs(
                 delta.position >= position && next_break.is_none_or(|next| delta.position < next)
             })
             .collect::<Vec<_>>();
-        let checkpoint = complete_boundary_at(&boundaries, position, request);
+        let checkpoint = complete_boundary_at(boundaries, position, request);
         if let Some(checkpoint) = checkpoint {
             let replayable = segment
                 .into_iter()
@@ -1539,14 +1591,15 @@ fn build_legs(
     }
 
     range_gaps.extend(recorded_range_gaps(
-        &gaps,
+        gaps,
         request,
         anchor_block_number,
-        anchor_rfq_observed_at_ms,
+        anchor_book_observed_at_ms,
     ));
-    range_gaps.extend(incomplete_tail_gaps(request, &legs, &deltas));
-
-    (legs, range_gaps)
+    RangePlan {
+        legs,
+        gaps: range_gaps,
+    }
 }
 
 fn break_positions(
@@ -1595,7 +1648,7 @@ fn break_positions(
                             gap,
                             request,
                             anchor.block_number,
-                            anchor.rfq_observed_at_ms,
+                            first_book_cursor(anchor, &request.backends),
                         )
                 })
                 .map(|gap| {
@@ -1685,7 +1738,7 @@ fn stored_delta(row: &DeltaRow, request: &RangeRequest) -> StoredDelta {
                         Backend::Native | Backend::Vm => cursor
                             .block_number
                             .is_none_or(|block_number| block_number <= request.end_block),
-                        Backend::Rfq => cursor
+                        Backend::Rfq | Backend::PropAmm => cursor
                             .observed_at_ms
                             .zip(request.rfq_end_ms)
                             .is_none_or(|(observed_at_ms, end_ms)| observed_at_ms <= end_ms),
@@ -1740,7 +1793,7 @@ fn recorded_range_gaps(
     gaps: &[GapRow],
     request: &RangeRequest,
     anchor_block_number: u64,
-    anchor_rfq_observed_at_ms: Option<u64>,
+    anchor_book_observed_at_ms: Option<u64>,
 ) -> Vec<RangeGap> {
     gaps.iter()
         .filter(|gap| {
@@ -1749,7 +1802,7 @@ fn recorded_range_gaps(
                     gap,
                     request,
                     anchor_block_number,
-                    anchor_rfq_observed_at_ms,
+                    anchor_book_observed_at_ms,
                 )
         })
         .cloned()
@@ -1761,7 +1814,7 @@ fn gap_overlaps_request(
     gap: &GapRow,
     request: &RangeRequest,
     anchor_block_number: u64,
-    anchor_rfq_observed_at_ms: Option<u64>,
+    anchor_book_observed_at_ms: Option<u64>,
 ) -> bool {
     let block_overlap = request
         .backends
@@ -1773,7 +1826,7 @@ fn gap_overlaps_request(
             anchor_block_number,
             request.end_block,
         );
-    let rfq_overlap = anchor_rfq_observed_at_ms
+    let rfq_overlap = anchor_book_observed_at_ms
         .zip(request.rfq_end_ms)
         .is_some_and(|(anchor_start, request_end)| {
             ranges_overlap(
@@ -1806,44 +1859,43 @@ fn ranges_overlap(
         })
 }
 
-fn incomplete_tail_gaps(
+fn incomplete_tail_gap(
+    backend: Backend,
     request: &RangeRequest,
     legs: &[RangeLeg],
     deltas: &[DeltaRow],
-) -> Vec<RangeGap> {
-    request
-        .backends
-        .iter()
-        .filter_map(|backend| {
-            let covered = covered_cursor(*backend, legs, deltas);
-            let requested_end = match backend {
-                Backend::Native | Backend::Vm => Some(request.end_block),
-                Backend::Rfq => request.rfq_end_ms,
-            }?;
-            (covered.is_none_or(|head| head < requested_end)).then(|| RangeGap {
-                kind: RangeGapKind::IncompleteTail,
-                generation: None,
-                from_message_seq: None,
-                to_message_seq: None,
-                from_position: None,
-                to_position: None,
-                from_block: matches!(backend, Backend::Native | Backend::Vm)
-                    .then_some(covered.map_or(request.start_block, |head| head.saturating_add(1))),
-                to_block_inclusive: matches!(backend, Backend::Native | Backend::Vm)
-                    .then_some(request.end_block),
-                from_observed_at_ms: (*backend == Backend::Rfq).then_some(
-                    covered.map_or(request.rfq_start_ms.unwrap_or_default(), |head| {
-                        head.saturating_add(1)
-                    }),
-                ),
-                to_observed_at_ms: (*backend == Backend::Rfq).then_some(requested_end),
-                reason: incomplete_tail_reason(*backend, covered, requested_end),
-            })
-        })
-        .collect()
+) -> Option<RangeGap> {
+    let requested_end = match backend {
+        Backend::Native | Backend::Vm => request.end_block,
+        Backend::Rfq | Backend::PropAmm => request.rfq_end_ms?,
+    };
+    let covered = covered_cursor(backend, legs, deltas, requested_end);
+    (covered.is_none_or(|head| head < requested_end)).then(|| RangeGap {
+        kind: RangeGapKind::IncompleteTail,
+        generation: None,
+        from_message_seq: None,
+        to_message_seq: None,
+        from_position: None,
+        to_position: None,
+        from_block: (!backend.uses_observation_time())
+            .then_some(covered.map_or(request.start_block, |head| head.saturating_add(1))),
+        to_block_inclusive: (!backend.uses_observation_time()).then_some(request.end_block),
+        from_observed_at_ms: backend.uses_observation_time().then_some(
+            covered.map_or(request.rfq_start_ms.unwrap_or_default(), |head| {
+                head.saturating_add(1)
+            }),
+        ),
+        to_observed_at_ms: backend.uses_observation_time().then_some(requested_end),
+        reason: incomplete_tail_reason(backend, covered, requested_end),
+    })
 }
 
-fn covered_cursor(backend: Backend, legs: &[RangeLeg], deltas: &[DeltaRow]) -> Option<u64> {
+fn covered_cursor(
+    backend: Backend,
+    legs: &[RangeLeg],
+    deltas: &[DeltaRow],
+    requested_end: u64,
+) -> Option<u64> {
     let checkpoint_coverage = legs
         .iter()
         .filter(|leg| leg.checkpoint.backends.binary_search(&backend).is_ok())
@@ -1855,27 +1907,42 @@ fn covered_cursor(backend: Backend, legs: &[RangeLeg], deltas: &[DeltaRow]) -> O
             .filter(move |cursor| cursor.backend == backend)
             .filter_map(move |cursor| delta_cursor(cursor, backend))
     });
-    checkpoint_coverage.chain(delta_coverage).max()
+    checkpoint_coverage
+        .chain(delta_coverage)
+        // A mixed update may carry a future cursor from a different replay segment.
+        .filter(|cursor| !backend.uses_observation_time() || *cursor <= requested_end)
+        .max()
+}
+
+// Gap records carry a shared observation interval. A gap can still overlap the
+// slower selected book after the faster book has passed it.
+fn first_book_cursor(manifest: &CheckpointManifest, requested: &[Backend]) -> Option<u64> {
+    requested
+        .iter()
+        .filter(|backend| backend.uses_observation_time())
+        .filter_map(|backend| checkpoint_cursor(manifest, *backend))
+        .min()
 }
 
 const fn checkpoint_cursor(manifest: &CheckpointManifest, backend: Backend) -> Option<u64> {
     match backend {
         Backend::Native | Backend::Vm => Some(manifest.block_number),
         Backend::Rfq => manifest.rfq_observed_at_ms,
+        Backend::PropAmm => manifest.prop_amm_observed_at_ms,
     }
 }
 
 const fn delta_cursor(cursor: &DeltaBackendCursor, backend: Backend) -> Option<u64> {
     match backend {
         Backend::Native | Backend::Vm => cursor.block_number,
-        Backend::Rfq => cursor.observed_at_ms,
+        Backend::Rfq | Backend::PropAmm => cursor.observed_at_ms,
     }
 }
 
 fn incomplete_tail_reason(backend: Backend, covered: Option<u64>, requested_end: u64) -> String {
     let cursor_kind = match backend {
         Backend::Native | Backend::Vm => "block",
-        Backend::Rfq => "timestamp",
+        Backend::Rfq | Backend::PropAmm => "timestamp",
     };
     match covered {
         Some(head) => format!(
@@ -1906,6 +1973,24 @@ mod tests {
         EncodedArchiveInfo, GapReason, GapRecord, StateHistoryStore, TokenSnapshot,
         TokenSnapshotCodecError, TokenSnapshotRef, TOKEN_SNAPSHOT_SCHEMA_VERSION,
     };
+
+    fn build_legs(
+        anchor: CheckpointManifest,
+        mut deltas: Vec<DeltaRow>,
+        boundaries: Vec<ManifestRow>,
+        gaps: Vec<GapRow>,
+        request: &RangeRequest,
+    ) -> (Vec<RangeLeg>, Vec<RangeGap>) {
+        deltas.sort_by_key(|d| d.position);
+        let mut plan = replay_segments(anchor, &deltas, &boundaries, &gaps, request);
+        plan.gaps.extend(
+            request
+                .backends
+                .iter()
+                .filter_map(|&backend| incomplete_tail_gap(backend, request, &plan.legs, &deltas)),
+        );
+        (plan.legs, plan.gaps)
+    }
 
     mod backtest {
         use super::*;
@@ -4501,6 +4586,7 @@ mod tests {
             kind,
             block_number,
             rfq_observed_at_ms: None,
+            prop_amm_observed_at_ms: None,
             backends: vec![Backend::Native],
             s3_key: (status == CheckpointStatus::Complete).then(|| "checkpoint.zst".to_owned()),
             archive_sha256: (status == CheckpointStatus::Complete).then(|| "sha256".to_owned()),
@@ -4689,7 +4775,7 @@ mod tests {
     ) -> anyhow::Result<CheckpointManifest> {
         let row = sqlx::query(
             "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                    rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                    rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                     compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                     status, error
              FROM state_history.checkpoints
@@ -4710,13 +4796,14 @@ mod tests {
         let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
         let archive = CheckpointArchive {
             metadata: ArchiveMetadata {
-                schema_version: 1,
+                schema_version: crate::ARCHIVE_SCHEMA_VERSION,
                 chain_id: capture.chain_id(),
                 position: capture.position(),
                 state_version: capture.state_version(),
                 kind: capture.kind(),
                 block_number: capture.block_number(),
                 rfq_observed_at_ms: capture.rfq_observed_at_ms(),
+                prop_amm_observed_at_ms: capture.prop_amm_observed_at_ms(),
                 backends: capture.backends().to_vec(),
             },
             payloads_json: capture.payloads_json().to_vec(),
@@ -4744,6 +4831,7 @@ mod tests {
             kind: capture.kind(),
             block_number: capture.block_number(),
             rfq_observed_at_ms: capture.rfq_observed_at_ms(),
+            prop_amm_observed_at_ms: capture.prop_amm_observed_at_ms(),
             backends: capture.backends().to_vec(),
             s3_key: Some(key),
             archive_sha256: Some(encoded.info.sha256),

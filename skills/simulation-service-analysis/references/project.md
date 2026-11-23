@@ -2,14 +2,14 @@
 
 ## What this service does
 - DSolver Simulator is a fast simulation API for DeFi swaps and routing, built on Tycho state.
-- Rust Axum service that consumes a Tycho broadcaster stream, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation and route encoding.
-- Main local binaries: `dsolver-tycho-broadcaster-service` feeds the local stream, and `dsolver-simulator-service` exposes `/status`, `/ready`, `/simulate`, and `/encode`.
+- Rust Axum service that consumes a Tycho broadcaster stream, keeps an in-memory pool state, and exposes HTTP endpoints for quote simulation.
+- Main local binaries: `dsolver-tycho-broadcaster-service` feeds the local stream, and `dsolver-simulator-service` exposes `/status`, `/ready`, and `/simulate`.
 
 ## Local run
 - Create `.env` from `.env.example` and set `TYCHO_API_KEY` (required).
 - Keep `TYCHO_BROADCASTER_URL` pointed at the broadcaster HTTP base URL and configure `BROADCASTER_REDIS_URL` plus `BROADCASTER_REDIS_STREAM_KEY` for Redis deltas. The local default lets the lifecycle helper start the broadcaster on port `3001` before the simulator.
-- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and read the selected chain's `rfq_protocols` in `simulator-manifest.toml` for the actual provider set.
-- When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
+- RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and use [the protocol inventory](protocols.md) to inspect the simulator and broadcaster selections for the chain.
+- The broadcaster requires credentials for its enabled RFQ providers. The simulator consumes the broadcaster books without provider credentials.
 - Set `CHAIN_ID` (`1` for Ethereum, `8453` for Base) or pass `--chain-id` to the analyzer.
 - Tycho health checks expect `Authorization: <TYCHO_API_KEY>` (no `Bearer` prefix).
 - Start the local stack:
@@ -33,9 +33,7 @@
 - Run the reporting-first analyzer:
   - `cargo run -p apps --bin sim-analysis -- --chain-id 1 --stop`
   - `cargo run -p apps --bin sim-analysis -- --chain-id 8453 --stop`
-- The analyzer starts or reuses the local broadcaster plus simulator stack, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` probes and the balanced `/encode` route matrix, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
-- The `/encode` matrix uses live `/simulate` prep hops to assemble 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain. Prep hops are reported separately as `encode-prep` scenarios.
-- On Base with RFQ enabled and ready, the encode probes include a Bebop partial-fill diagnostic that checks router calldata for the packed `originalFilledTakerAmount` token-in invariant.
+- The analyzer starts or reuses the local broadcaster plus simulator stack, waits for service health, confirms native readiness first, auto-checks VM and RFQ backends when they are enabled, runs representative `/simulate` probes, executes latency and light stress sweeps, then writes artifacts under `logs/simulation-reports/`.
 - Default output root:
   - `logs/simulation-reports/<chain-id>/balanced/<timestamp>/`
 - Main artifacts:
@@ -43,7 +41,7 @@
   - `report.json` for exact metrics and scenario breakdowns
   - `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts
 - Redis replay fields from simulator `/status` subscriptions are preserved in `report.json` and summarized in `summary.md` when present.
-- RFQ-enabled runs should also surface RFQ readiness, RFQ-visibility findings, and any Bebop encode-inspection findings in `summary.md` and `report.json`.
+- RFQ-enabled runs should also surface RFQ readiness, RFQ-visibility findings in `summary.md` and `report.json`.
 - Baseline comparison is meant to be flexible. Use the latest saved run when it helps, disable it with `--baseline none` when you want a clean one-off read.
 - The analyzer does not act like a branch gate. It reports healthy, degraded, and errored behavior so a reviewer can investigate.
 
@@ -63,7 +61,6 @@
 
 ## API docs
 - [docs/simulate_example.md](../../../docs/simulate_example.md)
-- [docs/encode_example.md](../../../docs/encode_example.md)
 - [docs/quote_service.md](../../../docs/quote_service.md)
 
 ## Deployment context

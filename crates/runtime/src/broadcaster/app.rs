@@ -404,7 +404,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
     .with_chain_head_observer(
         chain_head_observer.clone(),
         config.chain_profile.broadcaster_native_protocols(),
-        config.chain_profile.vm_protocols.clone(),
+        config.chain_profile.broadcaster_vm_protocols(),
     );
     let raw_health = Arc::new(StreamHealth::new());
     let supervisor_cfg = build_supervisor_config(&config);
@@ -423,7 +423,7 @@ pub async fn build_broadcaster_service() -> Result<BroadcasterServiceParts> {
             tokens: Arc::clone(&tokens),
             chain,
             token_refresh_timeout: Duration::from_millis(config.token_refresh_timeout_ms),
-            protocols: &config.chain_profile.rfq_protocols,
+            protocols: &config.chain_profile.broadcaster_rfq_protocols(),
             bebop_url: &config.bebop_url,
             hashflow_filename: &config.hashflow_filename,
             liquorice_url: config.liquorice_url.as_deref(),
@@ -553,7 +553,7 @@ fn validate_retained_history_decoder_profile(
     if state_history_enabled {
         anyhow::ensure!(
             token_min_quality == RETAINED_TOKEN_QUALITY_V1,
-            "state history delta format 1 requires BROADCASTER_TOKEN_MIN_QUALITY={RETAINED_TOKEN_QUALITY_V1}; got {token_min_quality}"
+            "state history requires BROADCASTER_TOKEN_MIN_QUALITY={RETAINED_TOKEN_QUALITY_V1}; got {token_min_quality}"
         );
     }
     Ok(())
@@ -611,7 +611,7 @@ async fn build_redis_publisher(
     )
     .with_required_protocols(
         config.chain_profile.broadcaster_native_protocols(),
-        config.chain_profile.vm_protocols.clone(),
+        config.chain_profile.broadcaster_vm_protocols(),
     );
     let publisher = match state_history {
         Some(state_history) => publisher.with_state_history(Arc::clone(state_history)),
@@ -662,18 +662,28 @@ fn raw_configured_backends(config: &BroadcasterConfig) -> Vec<BroadcasterBackend
     if !native_protocols.is_empty() {
         backends.push(BroadcasterBackend::Native);
     }
-    if !config.chain_profile.vm_protocols.is_empty() {
+    if !config.chain_profile.broadcaster_vm_protocols().is_empty() {
         backends.push(BroadcasterBackend::Vm);
     }
     backends
 }
 
 fn rfq_configured_backends(config: &BroadcasterConfig) -> Option<Vec<BroadcasterBackend>> {
-    effective_rfq_enabled(config).then_some(vec![BroadcasterBackend::Rfq])
+    effective_rfq_enabled(config).then(|| {
+        let mut backends: Vec<_> = config
+            .chain_profile
+            .broadcaster_rfq_protocols()
+            .into_iter()
+            .map(BroadcasterBackend::from_protocol_kind)
+            .collect();
+        backends.sort_unstable();
+        backends.dedup();
+        backends
+    })
 }
 
 fn effective_rfq_enabled(config: &BroadcasterConfig) -> bool {
-    config.enable_rfq_pools && !config.chain_profile.rfq_protocols.is_empty()
+    config.enable_rfq_pools && !config.chain_profile.broadcaster_rfq_protocols().is_empty()
 }
 
 fn build_supervisor_config(config: &BroadcasterConfig) -> StreamSupervisorConfig {
@@ -708,7 +718,7 @@ fn spawn_broadcaster_stream_task(
     let tvl_keep_threshold = config.tvl_keep_threshold;
     let protocols = BroadcasterProtocols {
         native: config.chain_profile.broadcaster_native_protocols(),
-        vm: config.chain_profile.vm_protocols.clone(),
+        vm: config.chain_profile.broadcaster_vm_protocols(),
     };
     let recovery_config = BroadcasterRecoveryConfig {
         initial_bootstrap_timeout: Duration::from_secs(
@@ -752,9 +762,11 @@ fn spawn_broadcaster_rfq_stream_task(
     stop: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let chain = config.chain_profile.chain;
-    let tvl_threshold = config.tvl_threshold;
-    let protocols = config.chain_profile.rfq_protocols.clone();
+    let protocols = config.chain_profile.broadcaster_rfq_protocols();
     let rfq_config = RFQConfig {
+        native_key: config.native_key.clone(),
+        metric_key: config.metric_key.clone(),
+        min_tvl_usd: config.rfq_min_tvl_usd,
         bebop_key: config.bebop_key.clone(),
         hashflow_user: config.hashflow_user.clone(),
         hashflow_key: config.hashflow_key.clone(),
@@ -770,10 +782,7 @@ fn spawn_broadcaster_rfq_stream_task(
                 let token_stores = token_stores.clone();
                 let protocols = protocols.clone();
                 let rfq_config = rfq_config.clone();
-                async move {
-                    build_rfq_stream(tvl_threshold, token_stores, chain, &protocols, rfq_config)
-                        .await
-                }
+                async move { build_rfq_stream(token_stores, chain, &protocols, rfq_config).await }
             },
             health,
             supervisor_cfg,
@@ -823,7 +832,7 @@ fn spawn_chain_tip_telemetry_task(
                 let label = match backend {
                     BroadcasterBackend::Native => "native",
                     BroadcasterBackend::Vm => "vm",
-                    BroadcasterBackend::Rfq => return None,
+                    BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => return None,
                 };
                 Some((
                     backend,
@@ -930,12 +939,17 @@ fn spawn_promotion_task(
                 "Broadcaster active writer promoted"
             );
             refreshing_recovered_snapshot = mode == BroadcasterRedisPublisherMode::Unhealthy;
+            // Normal promotion retained the same snapshot it installed for HTTP bootstrap.
+            // Reacquiring a lost writer has no prepared startup snapshot.
+            if !refreshing_recovered_snapshot {
+                continue;
+            }
             let Some(state_history) = &state_history else {
                 continue;
             };
             let requested_block_number =
                 BroadcasterServiceState::state_history_aligned_head(&services).await;
-            let requested_rfq_observed_at_ms = state_history.rfq_high_water_ms();
+            let requested_book_observations = state_history.book_observations();
             let position = StreamPosition {
                 generation: boundary.generation,
                 message_seq: boundary.exclusive_message_seq,
@@ -945,7 +959,7 @@ fn spawn_promotion_task(
                 CheckpointKind::Boundary,
                 Some(position),
                 requested_block_number,
-                requested_rfq_observed_at_ms,
+                requested_book_observations,
             )
             .await;
             // Mirrors the recovery commit path: a promotion boundary that never
@@ -955,7 +969,8 @@ fn spawn_promotion_task(
                     services[0].chain_id(),
                     position,
                     requested_block_number,
-                    requested_rfq_observed_at_ms,
+                    requested_book_observations.rfq,
+                    requested_book_observations.prop_amm,
                 );
             }
             match checkpoint {
@@ -1036,7 +1051,7 @@ fn spawn_state_history_checkpoint_task(
                         CheckpointKind::Boundary,
                         Some(request.position),
                         request.complete_native_block,
-                        request.rfq_high_water_ms,
+                        request.book_observations,
                     )
                     .await;
                     StateHistoryRuntime::respond_to_boundary_request(request, result);
@@ -1060,7 +1075,7 @@ fn spawn_state_history_checkpoint_task(
                         CheckpointKind::Interval,
                         None,
                         None,
-                        None,
+                        Default::default(),
                     )
                     .await
                     {
@@ -1092,7 +1107,6 @@ fn spawn_state_history_checkpoint_task(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1100,7 +1114,7 @@ mod tests {
     use simulator_core::broadcaster::BroadcasterBackend;
     use simulator_core::models::protocol::ProtocolKind;
     use tokio_util::sync::CancellationToken;
-    use tycho_simulation::tycho_common::{models::Chain, Bytes};
+    use tycho_simulation::tycho_common::models::Chain;
 
     use super::{
         raw_configured_backends, rfq_configured_backends,
@@ -1175,10 +1189,15 @@ mod tests {
 
     fn test_config() -> BroadcasterConfig {
         BroadcasterConfig {
+            native_key: String::new(),
+            metric_key: String::new(),
+            rfq_min_tvl_usd: 100.0,
             chain_profile: ChainProfile {
                 chain: Chain::Ethereum,
                 native_protocols: vec![ProtocolKind::UniswapV2],
                 broadcaster_only_native_protocols: Vec::new(),
+                broadcaster_only_vm_protocols: Vec::new(),
+                broadcaster_only_rfq_protocols: Vec::new(),
                 vm_protocols: Vec::new(),
                 rfq_protocols: vec![ProtocolKind::Bebop],
                 stream_initialization_timeout_secs: 25,
@@ -1189,8 +1208,6 @@ mod tests {
                 tycho_head_mismatch_recovery_timeout_secs: 60,
                 recovery_max_buffered_native_blocks: 8,
                 token_max_days_since_last_trade: 1,
-                native_token_protocol_allowlist: Vec::new(),
-                reset_allowance_tokens: HashMap::<u64, HashSet<Bytes>>::new(),
                 erc4626_pair_policies: Vec::new(),
             },
             tycho_url: "http://localhost:4242".to_string(),
@@ -1264,6 +1281,22 @@ mod tests {
         assert_eq!(
             rfq_configured_backends(&config),
             Some(vec![BroadcasterBackend::Rfq])
+        );
+    }
+
+    #[test]
+    fn book_partitions_follow_all_broadcaster_protocols() {
+        let mut config = test_config();
+        config.chain_profile.rfq_protocols = vec![ProtocolKind::Metric];
+        assert_eq!(
+            rfq_configured_backends(&config),
+            Some(vec![BroadcasterBackend::PropAmm])
+        );
+        config.chain_profile.broadcaster_only_rfq_protocols =
+            vec![ProtocolKind::TitanBebop, ProtocolKind::Bebop];
+        assert_eq!(
+            rfq_configured_backends(&config),
+            Some(vec![BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm])
         );
     }
 

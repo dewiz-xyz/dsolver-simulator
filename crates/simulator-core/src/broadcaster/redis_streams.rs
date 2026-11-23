@@ -358,6 +358,7 @@ fn parse_redis_backend(value: &str) -> Result<BroadcasterBackend, BroadcasterCon
         "native" => Ok(BroadcasterBackend::Native),
         "vm" => Ok(BroadcasterBackend::Vm),
         "rfq" => Ok(BroadcasterBackend::Rfq),
+        "prop_amm" => Ok(BroadcasterBackend::PropAmm),
         _ => Err(BroadcasterContractError::RedisBackendScopeInvalid {
             backend_scope: value.to_string(),
         }),
@@ -431,19 +432,22 @@ fn redis_entry_observed_timestamp_ms(payload: &BroadcasterPayload) -> Option<u64
         BroadcasterPayload::Update(update) => update
             .partitions
             .iter()
-            .find(|partition| partition.backend == BroadcasterBackend::Rfq)
-            .map(|partition| partition.block_number),
+            .filter(|partition| partition.backend.is_book())
+            .map(|partition| partition.block_number)
+            .max(),
         BroadcasterPayload::RecoveryCatchUp(catch_up) => catch_up
             .update
             .partitions
             .iter()
-            .find(|partition| partition.backend == BroadcasterBackend::Rfq)
-            .map(|partition| partition.block_number),
+            .filter(|partition| partition.backend.is_book())
+            .map(|partition| partition.block_number)
+            .max(),
         BroadcasterPayload::Heartbeat(heartbeat) => heartbeat
             .backend_heads
             .iter()
-            .find(|head| head.backend == BroadcasterBackend::Rfq)
-            .map(|head| head.block_number),
+            .filter(|head| head.backend.is_book())
+            .map(|head| head.block_number)
+            .max(),
         BroadcasterPayload::Progress(_)
         | BroadcasterPayload::RecoveryStart(_)
         | BroadcasterPayload::RecoveryChunk(_)

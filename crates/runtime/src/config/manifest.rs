@@ -55,7 +55,9 @@ struct ChainRegistryEntry {
     native_protocols: Vec<ProtocolKind>,
     broadcaster_only_native_protocols: Vec<ProtocolKind>,
     vm_protocols: Vec<ProtocolKind>,
+    broadcaster_only_vm_protocols: Vec<ProtocolKind>,
     rfq_protocols: Vec<ProtocolKind>,
+    broadcaster_only_rfq_protocols: Vec<ProtocolKind>,
     stream_initialization_timeout_secs: u64,
     chain_head_poll_interval_ms: u64,
     chain_head_rpc_request_timeout_ms: u64,
@@ -69,8 +71,6 @@ struct ChainRegistryEntry {
 
 #[derive(Clone, Debug)]
 struct RoutePolicyRegistryEntry {
-    native_token_protocol_allowlist: Vec<ProtocolKind>,
-    reset_allowance_tokens: HashSet<Bytes>,
     erc4626_pair_policies: Vec<Erc4626PairPolicy>,
 }
 
@@ -93,8 +93,6 @@ struct RawProtocol {
 #[serde(deny_unknown_fields)]
 struct RawRoutePolicy {
     id: String,
-    native_token_protocol_allowlist: Vec<String>,
-    reset_allowance_tokens: Vec<String>,
     #[serde(default)]
     erc4626_pairs: Vec<RawErc4626PairPolicy>,
 }
@@ -102,8 +100,6 @@ struct RawRoutePolicy {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawErc4626PairPolicy {
-    asset_symbol: String,
-    share_symbol: String,
     asset: String,
     share: String,
     allow_asset_to_share: bool,
@@ -124,7 +120,11 @@ struct RawChain {
     #[serde(default)]
     broadcaster_only_native_protocols: Vec<String>,
     vm_protocols: Vec<String>,
+    #[serde(default)]
+    broadcaster_only_vm_protocols: Vec<String>,
     rfq_protocols: Vec<String>,
+    #[serde(default)]
+    broadcaster_only_rfq_protocols: Vec<String>,
     stream_initialization_timeout_secs: NonZeroU64,
     chain_head_poll_interval_ms: NonZeroU64,
     chain_head_rpc_request_timeout_ms: NonZeroU64,
@@ -149,7 +149,7 @@ pub(crate) fn parse_manifest_registries(contents: &str) -> Result<ManifestRegist
 
     // Build the registries in dependency order so validation can stay strict and local.
     let protocols = validate_protocols(&manifest.protocols)?;
-    let route_policies = validate_route_policies(&manifest.route_policies, &protocols)?;
+    let route_policies = validate_route_policies(&manifest.route_policies)?;
     let chains = validate_chains(&manifest.chains, &protocols, &route_policies)?;
 
     Ok(ManifestRegistries {
@@ -177,20 +177,15 @@ pub(crate) fn resolve_chain_config(
             )
         })?;
 
-    let mut reset_allowance_tokens = HashMap::new();
-    // Route policies are shared in the manifest, but the runtime still consumes reset allowances
-    // keyed by the active chain id.
-    if !route_policy.reset_allowance_tokens.is_empty() {
-        reset_allowance_tokens.insert(chain.chain_id, route_policy.reset_allowance_tokens.clone());
-    }
-
     Ok(ResolvedChainConfig {
         chain_profile: ChainProfile {
             chain: chain_from_id(chain.chain_id)?,
             native_protocols: chain.native_protocols.clone(),
             broadcaster_only_native_protocols: chain.broadcaster_only_native_protocols.clone(),
             vm_protocols: chain.vm_protocols.clone(),
+            broadcaster_only_vm_protocols: chain.broadcaster_only_vm_protocols.clone(),
             rfq_protocols: chain.rfq_protocols.clone(),
+            broadcaster_only_rfq_protocols: chain.broadcaster_only_rfq_protocols.clone(),
             stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs,
             chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms,
             chain_head_rpc_request_timeout_ms: chain.chain_head_rpc_request_timeout_ms,
@@ -200,8 +195,6 @@ pub(crate) fn resolve_chain_config(
                 .tycho_head_mismatch_recovery_timeout_secs,
             recovery_max_buffered_native_blocks: chain.recovery_max_buffered_native_blocks,
             token_max_days_since_last_trade: chain.token_max_days_since_last_trade,
-            native_token_protocol_allowlist: route_policy.native_token_protocol_allowlist.clone(),
-            reset_allowance_tokens,
             erc4626_pair_policies: route_policy.erc4626_pair_policies.clone(),
         },
         tycho_url: chain.tycho_url.clone(),
@@ -250,7 +243,6 @@ fn validate_protocols(protocols: &[RawProtocol]) -> Result<HashMap<ProtocolKind,
 
 fn validate_route_policies(
     route_policies: &[RawRoutePolicy],
-    protocols: &HashMap<ProtocolKind, BackendKind>,
 ) -> Result<HashMap<String, RoutePolicyRegistryEntry>> {
     let mut registry = HashMap::new();
 
@@ -260,46 +252,10 @@ fn validate_route_policies(
             bail!("duplicate route-policy id {policy_id}");
         }
 
-        let mut native_token_protocol_allowlist =
-            Vec::with_capacity(policy.native_token_protocol_allowlist.len());
-        for protocol_id in &policy.native_token_protocol_allowlist {
-            let protocol_id = required_string(
-                &format!("route_policies[{policy_id}].native_token_protocol_allowlist"),
-                protocol_id,
-            )?;
-            let protocol_kind = parse_protocol_id(protocol_id)?;
-            let backend = protocols.get(&protocol_kind).ok_or_else(|| {
-                anyhow!("route policy {policy_id} references unknown protocol {protocol_id}")
-            })?;
-            if *backend != BackendKind::Native {
-                bail!("route policy {policy_id} allowlists non-native protocol {protocol_id}");
-            }
-            native_token_protocol_allowlist.push(protocol_kind);
-        }
-
-        let mut reset_allowance_tokens = HashSet::new();
-        for token in &policy.reset_allowance_tokens {
-            let address = parse_address(
-                &format!("route_policies[{policy_id}].reset_allowance_tokens"),
-                token,
-            )?;
-            if !reset_allowance_tokens.insert(address) {
-                bail!("duplicate reset-allowance token in route policy {policy_id}");
-            }
-        }
-
         let mut erc4626_pair_policies = Vec::with_capacity(policy.erc4626_pairs.len());
         // ERC4626 direction rules live with the route policy because they affect routing behavior,
         // not whether the protocol exists for a chain at all.
         for pair in &policy.erc4626_pairs {
-            let asset_symbol = required_string(
-                &format!("route_policies[{policy_id}].erc4626_pairs.asset_symbol"),
-                &pair.asset_symbol,
-            )?;
-            let share_symbol = required_string(
-                &format!("route_policies[{policy_id}].erc4626_pairs.share_symbol"),
-                &pair.share_symbol,
-            )?;
             let asset = parse_address(
                 &format!("route_policies[{policy_id}].erc4626_pairs.asset"),
                 &pair.asset,
@@ -318,8 +274,6 @@ fn validate_route_policies(
             }
 
             erc4626_pair_policies.push(Erc4626PairPolicy {
-                asset_symbol: asset_symbol.to_string(),
-                share_symbol: share_symbol.to_string(),
                 asset,
                 share,
                 allow_asset_to_share: pair.allow_asset_to_share,
@@ -330,8 +284,6 @@ fn validate_route_policies(
         registry.insert(
             policy_id.to_string(),
             RoutePolicyRegistryEntry {
-                native_token_protocol_allowlist,
-                reset_allowance_tokens,
                 erc4626_pair_policies,
             },
         );
@@ -399,31 +351,35 @@ fn validate_chains(
             );
         }
 
-        let native_protocols = validate_backend_protocol_refs(
+        let (native_protocols, broadcaster_only_native_protocols) = validate_protocol_sets(
             chain.chain_id,
             BackendKind::Native,
             "native_protocols",
             &chain.native_protocols,
+            &chain.broadcaster_only_native_protocols,
             protocols,
         )?;
-        let broadcaster_only_native_protocols =
-            validate_broadcaster_only_native_protocols(chain, &native_protocols, protocols)?;
-        let vm_protocols = validate_backend_protocol_refs(
+        let (vm_protocols, broadcaster_only_vm_protocols) = validate_protocol_sets(
             chain.chain_id,
             BackendKind::Vm,
             "vm_protocols",
             &chain.vm_protocols,
+            &chain.broadcaster_only_vm_protocols,
             protocols,
         )?;
-        let rfq_protocols = validate_backend_protocol_refs(
+        let (rfq_protocols, broadcaster_only_rfq_protocols) = validate_protocol_sets(
             chain.chain_id,
             BackendKind::Rfq,
             "rfq_protocols",
             &chain.rfq_protocols,
+            &chain.broadcaster_only_rfq_protocols,
             protocols,
         )?;
-        let liquorice_url =
-            validate_liquorice_url(chain.chain_id, &rfq_protocols, &chain.liquorice_url)?;
+        let liquorice_url = validate_broadcaster_rfq_settings(
+            chain,
+            &rfq_protocols,
+            &broadcaster_only_rfq_protocols,
+        )?;
 
         registry.insert(
             chain.chain_id,
@@ -436,7 +392,9 @@ fn validate_chains(
                 native_protocols,
                 broadcaster_only_native_protocols,
                 vm_protocols,
+                broadcaster_only_vm_protocols,
                 rfq_protocols,
+                broadcaster_only_rfq_protocols,
                 stream_initialization_timeout_secs: chain.stream_initialization_timeout_secs.get(),
                 chain_head_poll_interval_ms: chain.chain_head_poll_interval_ms.get(),
                 chain_head_rpc_request_timeout_ms: chain.chain_head_rpc_request_timeout_ms.get(),
@@ -459,28 +417,41 @@ fn validate_chains(
     Ok(registry)
 }
 
-fn validate_broadcaster_only_native_protocols(
+fn validate_broadcaster_rfq_settings(
     chain: &RawChain,
-    native_protocols: &[ProtocolKind],
-    protocols: &HashMap<ProtocolKind, BackendKind>,
-) -> Result<Vec<ProtocolKind>> {
-    let broadcaster_only_native_protocols = validate_backend_protocol_refs(
-        chain.chain_id,
-        BackendKind::Native,
-        "broadcaster_only_native_protocols",
-        &chain.broadcaster_only_native_protocols,
-        protocols,
-    )?;
-    if let Some(protocol) = broadcaster_only_native_protocols
-        .iter()
-        .find(|protocol| native_protocols.contains(protocol))
+    selected: &[ProtocolKind],
+    extra: &[ProtocolKind],
+) -> Result<Option<String>> {
+    let protocols = selected.iter().chain(extra).copied().collect::<Vec<_>>();
+    if chain.chain_id != 1
+        && protocols
+            .iter()
+            .any(|protocol| protocol.titan_venue().is_some())
     {
-        bail!(
-            "chain {} lists protocol {protocol} in both native_protocols and broadcaster_only_native_protocols",
-            chain.chain_id
-        );
+        bail!("Titan price-level protocols are supported only on Ethereum");
     }
-    Ok(broadcaster_only_native_protocols)
+    validate_liquorice_url(chain.chain_id, &protocols, &chain.liquorice_url)
+}
+
+fn validate_protocol_sets(
+    chain_id: u64,
+    backend: BackendKind,
+    selected_field: &str,
+    selected: &[String],
+    extra: &[String],
+    protocols: &HashMap<ProtocolKind, BackendKind>,
+) -> Result<(Vec<ProtocolKind>, Vec<ProtocolKind>)> {
+    let selected =
+        validate_backend_protocol_refs(chain_id, backend, selected_field, selected, protocols)?;
+    if chain_id == 1 && selected.contains(&ProtocolKind::UniswapV4Hooks) {
+        bail!("Ethereum uniswap_v4_hooks requires the shared Tycho database guard and must stay in broadcaster_only_native_protocols");
+    }
+    let field = format!("broadcaster_only_{selected_field}");
+    let extra = validate_backend_protocol_refs(chain_id, backend, &field, extra, protocols)?;
+    if let Some(protocol) = extra.iter().find(|protocol| selected.contains(protocol)) {
+        bail!("chain {chain_id} lists protocol {protocol} in both {selected_field} and {field}");
+    }
+    Ok((selected, extra))
 }
 
 fn validate_backend_protocol_refs(

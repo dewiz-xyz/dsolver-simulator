@@ -1,43 +1,24 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use futures::StreamExt;
 use simulator_core::broadcaster::BroadcasterBackend;
 use simulator_core::models::protocol::ProtocolKind;
 use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 use crate::models::tokens::TokenStore;
 use tycho_simulation::{
-    protocol::models::Update,
-    rfq::{
-        protocols::{
-            bebop::{client_builder::BebopClientBuilder, state::BebopState},
-            hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
-            liquorice::{client_builder::LiquoriceClientBuilder, state::LiquoriceState},
-        },
-        stream::RFQStreamBuilder,
-    },
     tycho_client::feed::component_tracker::ComponentFilter,
     tycho_client::{
         feed::{BlockHeader, FeedMessage},
         stream::{RetryConfiguration, TychoStreamBuilder},
     },
-    tycho_common::{
-        models::{token::Token, Chain},
-        Bytes,
-    },
+    tycho_common::models::Chain,
 };
 
-pub(crate) const RFQ_POLL_TIME: Duration = Duration::from_secs(5);
 pub(crate) const RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(5);
-// Upper cap for the firm-quote timeout on hydrated encode clients. Firm quotes block the encode
-// task through block_in_place/block_on, so the request guard cannot interrupt them; the encode path
-// additionally clamps this below the configured guard. Streaming clients keep RFQ_QUOTE_TIMEOUT
-// because they do not request firm quotes.
-pub(crate) const ENCODE_RFQ_QUOTE_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const LIQUORICE_QUOTE_EXPIRY_SECS: u64 = 300;
 
 pub async fn build_broadcaster_raw_stream(
@@ -85,14 +66,46 @@ pub async fn build_broadcaster_subscription_decoder(
     backend: BroadcasterBackend,
     protocols: &[ProtocolKind],
 ) -> Result<Arc<ReplayDecoder>> {
-    let config = DecoderConfig::for_backend(ReplayBackend::from(backend), protocols.to_vec(), 0);
+    let config = subscription_decoder_config(backend, protocols).with_chain(tokens.chain());
     Ok(Arc::new(
         ReplayDecoder::new(config, tokens.snapshot().await).await?,
     ))
 }
 
+pub(crate) fn subscription_decoder_config(
+    backend: BroadcasterBackend,
+    protocols: &[ProtocolKind],
+) -> DecoderConfig {
+    if backend == BroadcasterBackend::Rfq {
+        // The standalone simulator keeps one selected book store. A legacy snapshot
+        // can put every configured book under RFQ, while new snapshots split it.
+        DecoderConfig::new(
+            0,
+            [
+                (ReplayBackend::Rfq, protocols.to_vec()),
+                (
+                    ReplayBackend::PropAmm,
+                    protocols
+                        .iter()
+                        .copied()
+                        .filter(|kind| {
+                            BroadcasterBackend::from_protocol_kind(*kind)
+                                == BroadcasterBackend::PropAmm
+                        })
+                        .collect(),
+                ),
+            ],
+        )
+    } else {
+        DecoderConfig::for_backend(ReplayBackend::from(backend), protocols.to_vec(), 0)
+    }
+}
+
 #[derive(Clone)]
 pub struct RFQConfig {
+    pub native_key: String,
+    pub metric_key: String,
+    pub min_tvl_usd: f64,
     pub bebop_key: String,
     pub hashflow_user: String,
     pub hashflow_key: String,
@@ -114,110 +127,7 @@ pub struct BroadcasterProtocols {
     pub vm: Vec<ProtocolKind>,
 }
 
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "keep the three ordered provider setups together so credentials, polling, and quote timeouts stay visible"
-)]
-pub async fn build_rfq_stream(
-    tvl_add_threshold: f64,
-    token_stores: RFQTokenStores,
-    chain: Chain,
-    protocols: &[ProtocolKind],
-    rfq_config: RFQConfig,
-) -> Result<
-    impl futures::Stream<
-            Item = Result<
-                tycho_simulation::protocol::models::Update,
-                Box<dyn std::error::Error + Send + Sync + 'static>,
-            >,
-        > + Unpin
-        + Send,
-> {
-    let mut rfq_builder = RFQStreamBuilder::new();
-
-    if protocols.contains(&ProtocolKind::Bebop) {
-        info!("Setting up Bebop RFQ client...\n");
-        let rfq_tokens_bebop = token_stores.bebop.snapshot().await.into_keys().collect();
-        let bebop_client = BebopClientBuilder::new(chain, rfq_config.bebop_key)
-            .tokens(rfq_tokens_bebop)
-            .tvl_threshold(tvl_add_threshold)
-            .quote_timeout(RFQ_QUOTE_TIMEOUT)
-            .build()
-            .map_err(|err| anyhow::anyhow!("failed to create Bebop RFQ client: {err}"))?;
-        rfq_builder = rfq_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
-    }
-
-    if protocols.contains(&ProtocolKind::Hashflow) {
-        info!("Setting up Hashflow RFQ client...\n");
-        let (user, key) = (rfq_config.hashflow_user, rfq_config.hashflow_key);
-        let rfq_tokens_hashflow = token_stores.hashflow.snapshot().await.into_keys().collect();
-        let hashflow_client = HashflowClientBuilder::new(chain, user, key)
-            .tokens(rfq_tokens_hashflow)
-            .tvl_threshold(tvl_add_threshold)
-            .poll_time(RFQ_POLL_TIME)
-            .quote_timeout(RFQ_QUOTE_TIMEOUT)
-            .build()
-            .map_err(|err| anyhow::anyhow!("failed to create Hashflow RFQ client: {err}"))?;
-        rfq_builder =
-            rfq_builder.add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
-    }
-
-    if protocols.contains(&ProtocolKind::Liquorice) {
-        info!("Setting up Liquorice RFQ client...\n");
-        let (user, key) = (rfq_config.liquorice_user, rfq_config.liquorice_key);
-        let rfq_tokens_liquorice = token_stores
-            .liquorice
-            .snapshot()
-            .await
-            .into_keys()
-            .collect();
-        let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
-            .tokens(rfq_tokens_liquorice)
-            .tvl_threshold(tvl_add_threshold)
-            .poll_time(RFQ_POLL_TIME)
-            .quote_timeout(RFQ_QUOTE_TIMEOUT)
-            .quote_expiry_secs(LIQUORICE_QUOTE_EXPIRY_SECS)
-            .build()
-            .map_err(|err| anyhow::anyhow!("failed to create Liquorice RFQ client: {err}"))?;
-        rfq_builder =
-            rfq_builder.add_client::<LiquoriceState>("liquorice", Box::new(liquorice_client));
-    }
-
-    info!("Building RFQ Stream...\n");
-    let (tx, rx) = mpsc::channel::<Update>(100);
-
-    let decoder_tokens = rfq_decoder_tokens(
-        &token_stores.tokens,
-        &token_stores.bebop,
-        &token_stores.hashflow,
-        &token_stores.liquorice,
-    )
-    .await;
-    rfq_builder = rfq_builder.set_tokens(decoder_tokens).await;
-    tokio::spawn(rfq_builder.build(tx));
-    info!("Connected to RFQs! Streaming live price levels...\n");
-
-    Ok(ReceiverStream::new(rx).map(Ok).boxed())
-}
-
-async fn rfq_decoder_tokens(
-    tokens: &TokenStore,
-    bebop_tokens: &TokenStore,
-    hashflow_tokens: &TokenStore,
-    liquorice_tokens: &TokenStore,
-) -> HashMap<Bytes, Token> {
-    let mut snapshot = tokens.snapshot().await;
-    merge_missing_tokens(&mut snapshot, bebop_tokens.snapshot().await);
-    merge_missing_tokens(&mut snapshot, hashflow_tokens.snapshot().await);
-    merge_missing_tokens(&mut snapshot, liquorice_tokens.snapshot().await);
-    snapshot
-}
-
-fn merge_missing_tokens(tokens: &mut HashMap<Bytes, Token>, extra: HashMap<Bytes, Token>) {
-    for (address, token) in extra {
-        tokens.entry(address).or_insert(token);
-    }
-}
+pub use super::rfq_stream::build_rfq_stream;
 
 fn raw_base_builder(
     tycho_url: &str,
@@ -258,21 +168,12 @@ mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         path::PathBuf,
-        str::FromStr,
-        sync::Arc,
-        time::Duration,
     };
 
-    use super::{merge_missing_tokens, rfq_decoder_tokens};
     use crate::config::{load_manifest_registries, resolve_chain_config, MANIFEST_PATH};
     use simulator_core::models::protocol::ProtocolKind;
     use simulator_replay::{DecoderConfig, ReplayBackend, ReplayDecoder};
-    use tycho_simulation::tycho_common::{
-        models::{token::Token, Chain},
-        Bytes,
-    };
-
-    use crate::models::tokens::TokenStore;
+    use tycho_simulation::tycho_common::models::Chain;
 
     fn manifest_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -288,30 +189,25 @@ mod tests {
 
         (
             resolved.chain_profile.broadcaster_native_protocols(),
-            resolved.chain_profile.vm_protocols,
+            resolved.chain_profile.broadcaster_vm_protocols(),
         )
     }
 
-    fn test_token(address: &str, symbol: &str) -> Token {
-        let address = match Bytes::from_str(address) {
-            Ok(address) => address,
-            Err(err) => panic!("test token address must parse: {err}"),
-        };
-        Token::new(&address, symbol, 18, 0, &[], Chain::Ethereum, 100)
-    }
-
-    fn test_token_store(tokens: impl IntoIterator<Item = Token>) -> Arc<TokenStore> {
-        let initial_tokens = tokens
-            .into_iter()
-            .map(|token| (token.address.clone(), token))
-            .collect();
-        Arc::new(TokenStore::new(
-            initial_tokens,
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ))
+    #[test]
+    fn retained_writer_profile_covers_every_configured_onchain_feed() {
+        let profile = DecoderConfig::retained_v2();
+        for chain_id in [1, 8453] {
+            let (native, vm) = chain_protocols(chain_id);
+            for (backend, published) in [(ReplayBackend::Native, native), (ReplayBackend::Vm, vm)] {
+                let retained = profile.protocols(backend).unwrap_or_default();
+                for protocol in published {
+                    assert!(
+                        retained.contains(&protocol),
+                        "missing retained decoder for {chain_id}/{protocol}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -327,7 +223,8 @@ mod tests {
             .collect();
 
         let result = ReplayDecoder::new(
-            DecoderConfig::for_backend(ReplayBackend::Native, protocols, 0),
+            DecoderConfig::for_backend(ReplayBackend::Native, protocols, 0)
+                .with_chain(Chain::Ethereum),
             HashMap::new(),
         )
         .await;
@@ -348,48 +245,11 @@ mod tests {
             .collect();
 
         let result = ReplayDecoder::new(
-            DecoderConfig::for_backend(ReplayBackend::Vm, protocols, 0),
+            DecoderConfig::for_backend(ReplayBackend::Vm, protocols, 0).with_chain(Chain::Ethereum),
             HashMap::new(),
         )
         .await;
 
         assert!(result.is_ok(), "expected all VM protocols to register");
-    }
-
-    #[test]
-    fn merge_missing_tokens_keeps_existing_entries() {
-        let shared = test_token("0x0000000000000000000000000000000000000001", "BASE");
-        let replacement = test_token("0x0000000000000000000000000000000000000001", "RFQ");
-        let mut tokens = HashMap::from([(shared.address.clone(), shared.clone())]);
-
-        merge_missing_tokens(
-            &mut tokens,
-            HashMap::from([(replacement.address.clone(), replacement)]),
-        );
-
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[&shared.address].symbol, shared.symbol);
-    }
-
-    #[tokio::test]
-    async fn rfq_decoder_tokens_include_rfq_only_assets() {
-        let base = test_token("0x0000000000000000000000000000000000000001", "BASE");
-        let bebop_only = test_token("0x0000000000000000000000000000000000000002", "BEBOP");
-        let hashflow_only = test_token("0x0000000000000000000000000000000000000003", "HASH");
-        let liquorice_only = test_token("0x0000000000000000000000000000000000000004", "LIQ");
-
-        let tokens = test_token_store(vec![base.clone()]);
-        let bebop_tokens = test_token_store(vec![bebop_only.clone()]);
-        let hashflow_tokens = test_token_store(vec![hashflow_only.clone()]);
-        let liquorice_tokens = test_token_store(vec![liquorice_only.clone()]);
-
-        let merged =
-            rfq_decoder_tokens(&tokens, &bebop_tokens, &hashflow_tokens, &liquorice_tokens).await;
-
-        assert_eq!(merged.len(), 4);
-        assert!(merged.contains_key(&base.address));
-        assert!(merged.contains_key(&bebop_only.address));
-        assert!(merged.contains_key(&hashflow_only.address));
-        assert!(merged.contains_key(&liquorice_only.address));
     }
 }

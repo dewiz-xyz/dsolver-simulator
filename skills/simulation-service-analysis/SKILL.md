@@ -1,6 +1,6 @@
 ---
 name: simulation-service-analysis
-description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the local broadcaster plus simulator stack, inspect /status and wait for /ready, exercise representative /simulate and /encode flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
+description: Analyze the local DSolver Simulator service in this repo with a reporting-first Rust CLI. Use when you want to start or reuse the local broadcaster plus simulator stack, inspect /status and wait for /ready, exercise representative /simulate flows, run latency and light stress probes, save standardized JSON/markdown reports, compare against previous local runs, and investigate anomalies without relying on strict pass/fail business assertions.
 metadata:
   short-description: DSolver Simulator local analysis
 ---
@@ -13,7 +13,7 @@ metadata:
 2. Create `.env` from `.env.example` and set `TYCHO_API_KEY`, `TYCHO_BROADCASTER_URL`, `BROADCASTER_REDIS_URL`, and `BROADCASTER_REDIS_STREAM_KEY`. Read `simulator-manifest.toml` for the selected chain and configure any additional enabled-provider credentials.
    The default loopback broadcaster URL lets the lifecycle helper start the broadcaster before the simulator, while Redis carries deltas after each HTTP snapshot replay boundary.
    RFQ feeds default to off. For RFQ analysis, set `ENABLE_RFQ_POOLS=true` and derive the active providers from that chain's `rfq_protocols` list instead of relying on this skill for a copied protocol list.
-   When `ENABLE_RFQ_POOLS=true` and the manifest lists `rfq_protocols`, the simulator requires every listed provider credential pair at startup and aborts if any are missing. `/encode` signs RFQ firm quotes with those credentials.
+   The broadcaster requires credentials for its enabled RFQ providers. The simulator consumes the broadcaster books without provider credentials.
 3. Pick a chain context for the run (`--chain-id 1` for Ethereum, `--chain-id 8453` for Base).
 4. Run the analyzer:
    ```bash
@@ -36,8 +36,6 @@ metadata:
 - Reads `/status` for service state, then waits on `/ready` for native readiness and adds VM and RFQ checks when those pool backends are enabled.
 - Fresh VM-pool or RFQ warmups can take much longer than native readiness. Budget up to 10 minutes before treating either backend as stuck.
 - Runs a balanced `/simulate` sweep across representative pairs.
-- Builds the balanced `/encode` route matrix from live `/simulate` prep hops, covering 3 SimpleSwap routes, 3 MultiSwap routes, and 2 MegaSwap routes per supported chain.
-- On Base with RFQ enabled and ready, runs a Bebop partial-fill `/encode` diagnostic and inspects router calldata for the packed `originalFilledTakerAmount` token-in invariant.
 - Runs latency and light stress sweeps.
 - Saves sampled request/response artifacts plus simulator and broadcaster log excerpts.
 - Optionally compares the current run against the latest compatible saved report.
@@ -119,7 +117,7 @@ from the mere presence of a simulator ECS service.
 After the analyzer runs:
 
 1. Read `summary.md` first for the high-level picture.
-2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, encode inspections, and any RFQ readiness or RFQ-visibility findings.
+2. Use `report.json` for exact counts, latencies, status/result-quality splits, protocol visibility, and any RFQ readiness or RFQ-visibility findings.
 3. Open the files under `evidence/` for sampled request/response bodies, readiness snapshots, and simulator/broadcaster log excerpts.
 4. If the current behavior looks suspicious, compare it with the saved baseline before deciding whether the change is actually novel.
 5. If something still looks off, continue with targeted manual requests, log inspection, or deeper domain research.
@@ -127,6 +125,5 @@ After the analyzer runs:
 ## References
 
 - `references/project.md` – repo commands, outputs, and analysis flow.
-- `references/encode.md` – `/encode` schema and route-probe notes.
 - `references/protocols.md` – chain protocol context and VM notes that help interpret findings.
 - `references/tycho-deps.md` – Tycho/Propeller Heads context and docs.

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use super::state_history::BookObservations;
 use alloy_primitives::keccak256;
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -35,7 +36,8 @@ use crate::metrics::{emit_broadcaster_recovery_outcome, emit_broadcaster_snapsho
 use simulator_core::broadcaster::{
     BlockIdentity, BroadcasterBackend, BroadcasterBackendHead, BroadcasterEnvelope,
     BroadcasterPayload, BroadcasterRedisReplayBoundary, BroadcasterSnapshotSessionResponse,
-    BroadcasterUpdateMessage, ProtocolStateHeads, BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
+    BroadcasterTokenDto, BroadcasterUpdateMessage, ProtocolStateHeads,
+    BROADCASTER_SNAPSHOT_ENVELOPE_MAX_BYTES,
 };
 use simulator_core::models::protocol::ProtocolKind;
 
@@ -338,7 +340,14 @@ struct CachedSnapshotBoundaryRetention {
 }
 
 #[derive(Debug)]
+struct PromotionCheckpoint {
+    block_number: u64,
+    tokens: Vec<BroadcasterTokenDto>,
+}
+
+#[derive(Debug)]
 struct BroadcasterSnapshotCandidate {
+    checkpoint: Option<PromotionCheckpoint>,
     chain_id: u64,
     export: BroadcasterSnapshotExport,
     base_heads: Vec<BroadcasterBackendHead>,
@@ -353,6 +362,7 @@ struct BroadcasterSnapshotCandidate {
 
 #[derive(Debug)]
 struct StartupCandidateCapture {
+    checkpoint: Option<PromotionCheckpoint>,
     chain_id: u64,
     handoff_id: u64,
     captured: Vec<(
@@ -580,14 +590,50 @@ impl BroadcasterServiceState {
         self.cancel_recovery_publication().await;
         self.upstream.mark_disconnected(reason, last_error).await;
         let backends = self.cache.configured_backends();
-        if backends
-            .iter()
-            .any(|backend| *backend != simulator_core::broadcaster::BroadcasterBackend::Rfq)
-        {
+        if backends.iter().any(|backend| !backend.is_book()) {
             self.cache.begin_same_generation_recovery().await;
-        } else {
-            self.cache.reset_same_generation().await;
+        } else if let Err(error) = self.withdraw_rfq_books().await {
+            warn!(%error, "Retrying RFQ withdrawals before the next feed connection");
         }
+    }
+
+    // The caller holds the lifecycle gate. Redis must receive these removals before
+    // the supervisor can make any book from the replacement stream available.
+    async fn withdraw_rfq_books(&self) -> Result<()> {
+        let mut batch_size = 128;
+        while let Some(update) = self.cache.rfq_withdrawal(batch_size).await {
+            let staged = self.cache.stage_update(&update).await?;
+            let message = staged
+                .message()
+                .context("RFQ withdrawal is missing its Redis payload")?;
+            match self
+                .publish_to_redis(BroadcasterPayload::Update(message.clone()))
+                .await
+            {
+                Ok(()) => self.cache.commit_staged_update(staged).await?,
+                Err(error)
+                    if batch_size > 1 && error.downcast_ref::<OversizedRedisEntry>().is_some() =>
+                {
+                    batch_size /= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.cache.reset_same_generation().await;
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_rfq_connection(&self) -> Result<()> {
+        if self
+            .cache
+            .configured_backends()
+            .iter()
+            .all(|backend| backend.is_book())
+        {
+            let _gate = self.lifecycle_gate.lock().await;
+            self.withdraw_rfq_books().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn mark_stream_disconnected_for_exit(
@@ -803,7 +849,7 @@ impl BroadcasterServiceState {
         kind: CheckpointKind,
         position: Option<StreamPosition>,
         requested_block_number: Option<u64>,
-        requested_rfq_observed_at_ms: Option<u64>,
+        requested_book_observations: BookObservations,
     ) -> Result<Option<u64>> {
         anyhow::ensure!(
             !services.is_empty(),
@@ -860,7 +906,7 @@ impl BroadcasterServiceState {
         // The catalog clone follows every state pin under the lifecycle gate so it cannot miss
         // tokens already referenced by the pinned state.
         let token_catalog = state_history.clone_token_catalog().await;
-        let rfq_observed_at_ms = state_history.rfq_high_water_ms();
+        let book_observations = state_history.book_observations();
         drop(gate);
 
         let export = tokio::task::spawn_blocking(move || {
@@ -896,7 +942,7 @@ impl BroadcasterServiceState {
         };
         drop(gate);
 
-        state_history.observe_rfq_export(&export)?;
+        state_history.observe_book_export(&export)?;
         // Only the pinned boundary version is guaranteed to describe this exported world.
         let state = crate::broadcaster::state_history::captured_state_from_export(
             kind,
@@ -904,7 +950,7 @@ impl BroadcasterServiceState {
             capture_position,
             boundary.state_version,
             block_number,
-            rfq_observed_at_ms,
+            book_observations,
         )?;
         let capture = state_history.checkpoint_capture(state, token_catalog);
         anyhow::ensure!(
@@ -917,12 +963,12 @@ impl BroadcasterServiceState {
             position.map(|position| BoundaryCheckpointCursor {
                 position,
                 block_number: requested_block_number,
-                rfq_observed_at_ms: requested_rfq_observed_at_ms,
+                book_observations: requested_book_observations,
             }),
             BoundaryCheckpointCursor {
                 position: capture_position,
                 block_number: Some(block_number),
-                rfq_observed_at_ms,
+                book_observations,
             },
         );
         Ok(Some(block_number))
@@ -1440,16 +1486,17 @@ impl BroadcasterServiceState {
                 return;
             };
             let block_number = finish.complete_native_block;
-            let rfq_observed_at_ms = state_history.rfq_high_water_ms();
+            let book_observations = state_history.book_observations();
             let checkpoint = state_history
-                .request_boundary_checkpoint(commit_position, block_number, rfq_observed_at_ms)
+                .request_boundary_checkpoint(commit_position, block_number, book_observations)
                 .await;
             if !matches!(checkpoint, Ok(Some(_))) {
                 state_history.handle.record_boundary_failure_gap(
                     self.cache.chain_id(),
                     commit_position,
                     block_number,
-                    rfq_observed_at_ms,
+                    book_observations.rfq,
+                    book_observations.prop_amm,
                 );
                 match checkpoint {
                     Ok(None) => warn!(
@@ -1961,8 +2008,20 @@ impl BroadcasterServiceState {
                 return Ok(None);
             }
         }
+        let checkpoint = if let Some(history) = services[0].redis_publisher.state_history() {
+            let Some(block_number) = aligned_onchain_head(&base_heads) else {
+                return Ok(None);
+            };
+            Some(PromotionCheckpoint {
+                block_number,
+                tokens: history.clone_token_catalog().await,
+            })
+        } else {
+            None
+        };
         let handoff_id = services[0].redis_publisher.begin_startup_handoff().await?;
         Ok(Some(StartupCandidateCapture {
+            checkpoint,
             chain_id,
             handoff_id,
             captured,
@@ -2190,7 +2249,7 @@ fn retain_current_checkpoint_capture<T>(
 struct BoundaryCheckpointCursor {
     position: StreamPosition,
     block_number: Option<u64>,
-    rfq_observed_at_ms: Option<u64>,
+    book_observations: BookObservations,
 }
 
 fn record_boundary_slip_gap_if_any(
@@ -2221,35 +2280,40 @@ fn record_boundary_slip_gap_if_any(
         },
         capture.position,
         (requested.block_number, capture.block_number),
-        (
-            capture.rfq_observed_at_ms.and(requested.rfq_observed_at_ms),
-            capture.rfq_observed_at_ms,
-        ),
+        requested
+            .book_observations
+            .gap_to(capture.book_observations),
     );
 }
 
 async fn state_history_aligned_backend_head(services: &[BroadcasterServiceState]) -> Option<u64> {
-    let mut aligned_head = None;
+    let mut heads = Vec::new();
     for service in services {
-        for head in service.cache.backend_heads().await {
-            if matches!(
-                head.backend,
-                simulator_core::broadcaster::BroadcasterBackend::Native
-                    | simulator_core::broadcaster::BroadcasterBackend::Vm
-            ) {
-                if aligned_head.is_some_and(|current| current != head.block_number) {
-                    warn!(
-                        event = "state_history_checkpoint_skipped",
-                        reason = "backend_skew",
-                        "State history checkpoint skipped because backend heads are not aligned"
-                    );
-                    return None;
-                }
-                aligned_head = Some(head.block_number);
-            }
-        }
+        heads.extend(service.cache.backend_heads().await);
     }
-    aligned_head
+    aligned_onchain_head(&heads)
+}
+
+fn aligned_onchain_head(heads: &[BroadcasterBackendHead]) -> Option<u64> {
+    let mut blocks = heads
+        .iter()
+        .filter(|head| {
+            matches!(
+                head.backend,
+                BroadcasterBackend::Native | BroadcasterBackend::Vm
+            )
+        })
+        .map(|head| head.block_number);
+    let block = blocks.next()?;
+    if blocks.any(|other| other != block) {
+        warn!(
+            event = "state_history_checkpoint_skipped",
+            reason = "backend_skew",
+            "State history checkpoint skipped because backend heads are not aligned"
+        );
+        return None;
+    }
+    Some(block)
 }
 
 pub(crate) struct BroadcasterFeedApply {
@@ -2272,6 +2336,7 @@ async fn prepare_startup_snapshot_candidate(
         return Ok(None);
     };
     let StartupCandidateCapture {
+        checkpoint,
         chain_id,
         handoff_id,
         captured,
@@ -2297,6 +2362,7 @@ async fn prepare_startup_snapshot_candidate(
             protocol_heads,
             recovery_work_ids,
             handoff_id,
+            checkpoint,
         )
     });
     let result = match tokio::time::timeout(STARTUP_HANDOFF_ABORT_AFTER, worker).await {
@@ -2352,10 +2418,10 @@ async fn prepare_startup_snapshot_candidate(
 
 async fn promote_prepared_startup_candidate(
     services: &[BroadcasterServiceState],
-    candidate: BroadcasterSnapshotCandidate,
+    mut candidate: BroadcasterSnapshotCandidate,
     reason: String,
 ) -> Result<BroadcasterRedisReplayBoundary> {
-    let _gate = services[0].lifecycle_gate.lock().await;
+    let gate = services[0].lifecycle_gate.lock().await;
     anyhow::ensure!(
         services[0].redis_publisher.mode().await == BroadcasterRedisPublisherMode::Passive,
         "startup snapshot candidate can only promote a passive publisher"
@@ -2369,6 +2435,15 @@ async fn promote_prepared_startup_candidate(
     services[0]
         .redis_publisher
         .set_deployment_phase(BroadcasterDeploymentPhase::Promoting, None);
+    let checkpoint = services[0]
+        .redis_publisher
+        .state_history()
+        .zip(candidate.checkpoint.take());
+    let book_observations = if checkpoint.is_some() {
+        super::state_history::book_observations_from_export(&candidate.export)?
+    } else {
+        BookObservations::default()
+    };
     let boundary = services[0]
         .redis_publisher
         .promote(candidate.base_heads.clone(), reason)
@@ -2381,6 +2456,9 @@ async fn promote_prepared_startup_candidate(
         .redis_publisher
         .set_deployment_phase(BroadcasterDeploymentPhase::ArtifactFinalizing, None);
     let published_heads = candidate.protocol_heads.clone();
+    if let Some((history, _)) = &checkpoint {
+        history.observe_books(book_observations);
+    }
     let artifact = Arc::new(finalize_snapshot_candidate(candidate, boundary.clone()));
     for service in services {
         *service.snapshot_artifact.write().await = Some(Arc::clone(&artifact));
@@ -2390,12 +2468,69 @@ async fn promote_prepared_startup_candidate(
         .install_published_snapshot_heads(published_heads)
         .await;
 
-    services[0]
+    let drained = services[0]
         .redis_publisher
         .drain_startup_handoff(frozen_handoff)
-        .await?;
-    services[0].redis_publisher.admit_deployment();
+        .await;
+    if drained.is_ok() {
+        services[0].redis_publisher.admit_deployment();
+    }
+    drop(gate);
+
+    // Redis and HTTP already refer to this immutable snapshot. Catch-up or a change in
+    // live readiness must not move the starting position of the historical segment.
+    if let Some((history, checkpoint)) = checkpoint {
+        persist_promotion_checkpoint(history, artifact, checkpoint, book_observations).await;
+    }
+    drained?;
     Ok(boundary)
+}
+
+async fn persist_promotion_checkpoint(
+    history: Arc<super::state_history::StateHistoryRuntime>,
+    artifact: Arc<BroadcasterSnapshotArtifact>,
+    checkpoint: PromotionCheckpoint,
+    book_observations: BookObservations,
+) {
+    let chain_id = artifact.chain_id;
+    let boundary = &artifact.redis_replay_boundary;
+    let position = StreamPosition {
+        generation: boundary.generation,
+        message_seq: boundary.exclusive_message_seq,
+    };
+    let block_number = checkpoint.block_number;
+    let result = tokio::task::spawn_blocking(move || {
+        super::state_history::captured_state_from_payloads(
+            CheckpointKind::Boundary,
+            artifact.payloads.iter().map(|envelope| &envelope.payload),
+            position,
+            artifact.redis_replay_boundary.state_version,
+            block_number,
+            BookObservations::default(),
+        )
+    })
+    .await
+    .context("promotion checkpoint worker failed")
+    .and_then(std::convert::identity)
+    .and_then(|state| {
+        anyhow::ensure!(
+            history
+                .handle
+                .request_checkpoint(history.checkpoint_capture(state, checkpoint.tokens)),
+            "state history checkpoint queue rejected the capture"
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        history.handle.record_boundary_failure_gap(
+            chain_id,
+            position,
+            Some(block_number),
+            book_observations.rfq,
+            book_observations.prop_amm,
+        );
+        warn!(event = "state_history_boundary_checkpoint_failed", generation = position.generation, message_seq = position.message_seq, %error, "Could not retain the promoted snapshot");
+    }
 }
 
 async fn ensure_recovery_work_ids_current(
@@ -2423,6 +2558,7 @@ fn build_snapshot_candidate(
     protocol_heads: BTreeMap<BroadcasterBackend, ProtocolStateHeads>,
     captured_recovery_work_ids: Vec<u64>,
     handoff_id: u64,
+    checkpoint: Option<PromotionCheckpoint>,
 ) -> Result<BroadcasterSnapshotCandidate> {
     let placeholder_stream_id = format_redis_stream_id(chain_id, u64::MAX);
     let placeholder_snapshot_id = format_redis_snapshot_id(chain_id, u64::MAX);
@@ -2461,6 +2597,7 @@ fn build_snapshot_candidate(
         .count() as u32;
 
     Ok(BroadcasterSnapshotCandidate {
+        checkpoint,
         chain_id,
         export,
         base_heads,
@@ -3563,7 +3700,7 @@ mod tests {
                 state_history::CheckpointKind::Boundary,
                 Some(request.position),
                 request.complete_native_block,
-                request.rfq_high_water_ms,
+                request.book_observations,
             )
             .await;
             StateHistoryRuntime::respond_to_boundary_request(request, result);
@@ -3613,6 +3750,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promotion_retains_the_bootstrap_snapshot_and_every_buffered_update() -> Result<()> {
+        let (history, probe) =
+            test_state_history_runtime_with_tokens(8, vec![dummy_token(7, "SEVEN")]);
+        let publisher = Arc::new(
+            BroadcasterRedisPublisher::new(
+                publisher_config(),
+                Arc::new(ServiceFakeRedisWriter::default()),
+            )
+            .with_state_history(Arc::clone(&history)),
+        );
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            8_388_608,
+            BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Native]),
+            BroadcasterUpstreamState::default(),
+            Arc::clone(&publisher),
+            Arc::new(Mutex::new(())),
+        )
+        .with_chain_head_observer(
+            ChainHeadObserver::ready_for_test(BlockIdentity {
+                number: 12,
+                hash: Bytes::from([12; 32]),
+            }),
+            vec![ProtocolKind::UniswapV2],
+            Vec::new(),
+        );
+        service.mark_upstream_connected().await;
+        service.apply_feed_message(&raw_feed(10, 10, 9)).await?;
+        let services = std::slice::from_ref(&service);
+        let candidate = super::prepare_startup_snapshot_candidate(services)
+            .await?
+            .ok_or_else(|| anyhow!("missing promotion snapshot"))?;
+        service.apply_feed_message(&raw_feed(11, 11, 10)).await?;
+        let boundary =
+            super::promote_prepared_startup_candidate(services, candidate, "test_active".into())
+                .await?;
+        let tail = publisher.replay_boundary().await?;
+        assert!(tail.exclusive_message_seq > boundary.exclusive_message_seq);
+        assert_ne!(
+            service.status_snapshot().await.readiness,
+            BroadcasterReadiness::Ready
+        );
+        timeout(Duration::from_secs(2), async {
+            while history.handle.status().checkpoints_completed != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let checkpoints = probe.checkpoints();
+        let checkpoint = &checkpoints[0];
+        assert_eq!(checkpoint.kind(), state_history::CheckpointKind::Boundary);
+        assert_eq!(checkpoint.block_number(), 10);
+        assert_eq!(
+            checkpoint.position(),
+            state_history::StreamPosition {
+                generation: boundary.generation,
+                message_seq: boundary.exclusive_message_seq
+            }
+        );
+        assert_eq!(checkpoint.state_version(), Some(boundary.state_version));
+        let artifact = service
+            .snapshot_artifact
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("missing HTTP snapshot"))?;
+        let payloads = artifact
+            .payloads
+            .iter()
+            .map(|envelope| serde_json::to_string(&envelope.payload))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(checkpoint.payloads_json(), payloads);
+        assert_eq!(
+            probe.token_snapshots()[0].tokens[0].address,
+            dummy_token(7, "SEVEN").address
+        );
+        assert_eq!(
+            history.handle.status().last_persisted,
+            Some(state_history::StreamPosition {
+                generation: tail.generation,
+                message_seq: tail.exclusive_message_seq
+            })
+        );
+        assert!(probe.gaps().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checkpoint_capture_enqueues_the_catalog_without_publishing() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
         let token = dummy_token(7, "SEVEN");
@@ -3644,7 +3868,7 @@ mod tests {
             state_history::CheckpointKind::Interval,
             None,
             None,
-            None,
+            Default::default(),
         )
         .await?;
 
@@ -3714,7 +3938,7 @@ mod tests {
             state_history::CheckpointKind::Interval,
             None,
             None,
-            None,
+            Default::default(),
         )
         .await?;
 
@@ -3769,7 +3993,7 @@ mod tests {
                     state_history::CheckpointKind::Boundary,
                     Some(request.position),
                     request.complete_native_block,
-                    request.rfq_high_water_ms,
+                    request.book_observations,
                 )
                 .await
             }
@@ -3844,7 +4068,7 @@ mod tests {
                     message_seq: 5,
                 },
                 block_number: None,
-                rfq_observed_at_ms: None,
+                book_observations: Default::default(),
             }),
             super::BoundaryCheckpointCursor {
                 position: state_history::StreamPosition {
@@ -3852,7 +4076,10 @@ mod tests {
                     message_seq: 8,
                 },
                 block_number: Some(120),
-                rfq_observed_at_ms: Some(9_000),
+                book_observations: super::BookObservations {
+                    rfq: Some(9_000),
+                    prop_amm: None,
+                },
             },
         );
 
@@ -3931,7 +4158,7 @@ mod tests {
                 message_seq: promotion_boundary.exclusive_message_seq,
             }),
             Some(10),
-            None,
+            Default::default(),
         )
         .await?;
 
@@ -4508,6 +4735,60 @@ mod tests {
         assert_eq!(status.readiness, BroadcasterReadiness::SnapshotWarmingUp);
         assert!(status.snapshot.last_export_check_age_ms.is_none());
         assert!(status.snapshot.last_export_error.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn book_reconnect_withdraws_both_partitions_before_new_books() -> Result<()> {
+        let writer = ServiceFakeRedisWriter::default();
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            publisher_config(),
+            Arc::new(writer.clone()),
+        ));
+        publisher
+            .promote(
+                base_heads([BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm]),
+                "test",
+            )
+            .await?;
+        let service = BroadcasterServiceState::with_lifecycle_gate(
+            1_000_000,
+            BroadcasterSnapshotCache::new(
+                8453,
+                vec![BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm],
+            ),
+            BroadcasterUpstreamState::default(),
+            publisher,
+            Arc::new(Mutex::new(())),
+        );
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&rfq_only_update(10, "old-book", 1))
+            .await?;
+        service
+            .apply_update(&book_update(11, "old-metric", 2, "rfq:metric"))
+            .await?;
+        service.mark_stream_disconnected("stale", None).await;
+        service.prepare_rfq_connection().await?;
+        service.mark_upstream_connected().await;
+        service
+            .apply_update(&rfq_only_update(20, "new-book", 2))
+            .await?;
+        let mut updates = Vec::new();
+        for entry in writer.appends().await {
+            let envelope: BroadcasterEnvelope = serde_json::from_str(&entry.payload_json)?;
+            if let BroadcasterPayload::Update(update) = envelope.payload {
+                updates.extend(update.partitions);
+            }
+        }
+        assert_eq!(updates.len(), 5);
+        assert_eq!(updates[0].new_pairs[0].component_id, "old-book");
+        assert_eq!(updates[1].new_pairs[0].component_id, "old-metric");
+        assert_eq!(updates[2].backend, BroadcasterBackend::Rfq);
+        assert_eq!(updates[2].removed_pairs[0].component_id, "old-book");
+        assert_eq!(updates[3].backend, BroadcasterBackend::PropAmm);
+        assert_eq!(updates[3].removed_pairs[0].component_id, "old-metric");
+        assert_eq!(updates[4].new_pairs[0].component_id, "new-book");
         Ok(())
     }
 
@@ -5772,6 +6053,7 @@ mod tests {
             BTreeMap::new(),
             vec![3],
             9,
+            None,
         )?;
         assert_eq!(
             candidate.export.stream_id,
@@ -6033,7 +6315,10 @@ mod tests {
     }
 
     fn rfq_only_update(block_number: u64, component_id: &str, seed: u8) -> Update {
-        let protocol = "rfq:hashflow";
+        book_update(block_number, component_id, seed, "rfq:hashflow")
+    }
+
+    fn book_update(block_number: u64, component_id: &str, seed: u8, protocol: &str) -> Update {
         let mut new_pairs = HashMap::new();
         new_pairs.insert(
             component_id.to_string(),

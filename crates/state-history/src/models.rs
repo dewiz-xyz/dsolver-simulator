@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub const DELTA_PAYLOAD_FORMAT_VERSION: i16 = 1;
+pub const DELTA_PAYLOAD_FORMAT_VERSION: i16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StreamPosition {
@@ -16,14 +16,20 @@ pub enum Backend {
     Native,
     Vm,
     Rfq,
+    PropAmm,
 }
 
 impl Backend {
+    pub const fn uses_observation_time(self) -> bool {
+        matches!(self, Self::Rfq | Self::PropAmm)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
             Self::Vm => "vm",
             Self::Rfq => "rfq",
+            Self::PropAmm => "prop_amm",
         }
     }
 }
@@ -36,6 +42,7 @@ impl FromStr for Backend {
             "native" => Ok(Self::Native),
             "vm" => Ok(Self::Vm),
             "rfq" => Ok(Self::Rfq),
+            "prop_amm" => Ok(Self::PropAmm),
             _ => Err(ModelError::InvalidBackend(value.to_owned())),
         }
     }
@@ -226,6 +233,8 @@ pub struct CapturedState {
     kind: CheckpointKind,
     block_number: u64,
     rfq_observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prop_amm_observed_at_ms: Option<u64>,
     backends: Vec<Backend>,
     payloads_json: Vec<String>,
     block_times: Vec<BlockTimeObservation>,
@@ -243,6 +252,36 @@ impl CapturedState {
         kind: CheckpointKind,
         block_number: u64,
         rfq_observed_at_ms: Option<u64>,
+        backends: Vec<Backend>,
+        payloads_json: Vec<String>,
+        block_times: Vec<BlockTimeObservation>,
+    ) -> Result<Self, ModelError> {
+        Self::new_with_book_observations(
+            chain_id,
+            position,
+            state_version,
+            kind,
+            block_number,
+            rfq_observed_at_ms,
+            None,
+            backends,
+            payloads_json,
+            block_times,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The validated capture constructor preserves its public field-oriented API"
+    )]
+    pub fn new_with_book_observations(
+        chain_id: u64,
+        position: StreamPosition,
+        state_version: Option<u64>,
+        kind: CheckpointKind,
+        block_number: u64,
+        rfq_observed_at_ms: Option<u64>,
+        prop_amm_observed_at_ms: Option<u64>,
         mut backends: Vec<Backend>,
         payloads_json: Vec<String>,
         block_times: Vec<BlockTimeObservation>,
@@ -260,6 +299,9 @@ impl CapturedState {
         if backends.binary_search(&Backend::Rfq).is_ok() && rfq_observed_at_ms.is_none() {
             return Err(ModelError::MissingRfqObservedAt);
         }
+        if backends.contains(&Backend::PropAmm) && prop_amm_observed_at_ms.is_none() {
+            return Err(ModelError::MissingPropAmmObservedAt);
+        }
 
         Ok(Self {
             chain_id,
@@ -268,6 +310,7 @@ impl CapturedState {
             kind,
             block_number,
             rfq_observed_at_ms,
+            prop_amm_observed_at_ms,
             backends,
             payloads_json,
             block_times,
@@ -298,6 +341,10 @@ impl CapturedState {
         self.rfq_observed_at_ms
     }
 
+    pub const fn prop_amm_observed_at_ms(&self) -> Option<u64> {
+        self.prop_amm_observed_at_ms
+    }
+
     pub fn backends(&self) -> &[Backend] {
         &self.backends
     }
@@ -319,6 +366,8 @@ struct UncheckedCapturedState {
     kind: CheckpointKind,
     block_number: u64,
     rfq_observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prop_amm_observed_at_ms: Option<u64>,
     backends: Vec<Backend>,
     payloads_json: Vec<String>,
     block_times: Vec<BlockTimeObservation>,
@@ -328,13 +377,14 @@ impl TryFrom<UncheckedCapturedState> for CapturedState {
     type Error = ModelError;
 
     fn try_from(state: UncheckedCapturedState) -> Result<Self, Self::Error> {
-        Self::new(
+        Self::new_with_book_observations(
             state.chain_id,
             state.position,
             state.state_version,
             state.kind,
             state.block_number,
             state.rfq_observed_at_ms,
+            state.prop_amm_observed_at_ms,
             state.backends,
             state.payloads_json,
             state.block_times,
@@ -359,6 +409,8 @@ pub struct CheckpointManifest {
     pub kind: CheckpointKind,
     pub block_number: u64,
     pub rfq_observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prop_amm_observed_at_ms: Option<u64>,
     pub backends: Vec<Backend>,
     pub s3_key: Option<String>,
     pub archive_sha256: Option<String>,
@@ -393,6 +445,8 @@ pub enum ModelError {
     EmptyCheckpointPayloads,
     #[error("RFQ checkpoints require an observation timestamp")]
     MissingRfqObservedAt,
+    #[error("Prop AMM checkpoints require an observation timestamp")]
+    MissingPropAmmObservedAt,
 }
 
 #[cfg(test)]
@@ -418,6 +472,7 @@ mod tests {
             (Backend::Native, "native"),
             (Backend::Vm, "vm"),
             (Backend::Rfq, "rfq"),
+            (Backend::PropAmm, "prop_amm"),
         ] {
             assert_eq!(backend.as_str(), s);
             assert_eq!(s.parse::<Backend>(), Ok(backend));
@@ -457,6 +512,26 @@ mod tests {
             vec![],
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn old_captures_round_trip_without_a_prop_amm_cursor() -> anyhow::Result<()> {
+        let old = serde_json::json!({
+            "chain_id":8453, "position":{"generation":1,"message_seq":2}, "state_version":null,
+            "kind":"boundary", "block_number":100, "rfq_observed_at_ms":90000,
+            "backends":["rfq"], "payloads_json":["{}"], "block_times":[]
+        });
+        let capture: CapturedState = serde_json::from_value(old.clone())?;
+        assert_eq!(capture.prop_amm_observed_at_ms(), None);
+        assert_eq!(serde_json::to_value(&capture)?, old);
+        let mut split = old;
+        split["backends"] = serde_json::json!(["rfq", "prop_amm"]);
+        assert!(serde_json::from_value::<CapturedState>(split.clone()).is_err());
+        split["prop_amm_observed_at_ms"] = serde_json::json!(70000);
+        let capture: CapturedState = serde_json::from_value(split)?;
+        assert_eq!(capture.rfq_observed_at_ms(), Some(90000));
+        assert_eq!(capture.prop_amm_observed_at_ms(), Some(70000));
+        Ok(())
     }
 
     #[test]

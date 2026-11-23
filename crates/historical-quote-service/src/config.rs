@@ -344,6 +344,7 @@ fn parse_backends(value: &str) -> Result<Vec<Backend>, ConfigError> {
             "native" => Backend::Native,
             "vm" => Backend::Vm,
             "rfq" => Backend::Rfq,
+            "prop_amm" => Backend::PropAmm,
             _ => return Err(ConfigError::Malformed("DSOLVER_HISTORY_ENABLED_BACKENDS")),
         };
         if !distinct.insert(backend) {

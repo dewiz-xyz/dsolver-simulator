@@ -27,10 +27,33 @@ pub enum ProtocolKind {
     Hashflow,
     Bebop,
     Liquorice,
+    AeroBasic,
+    AeroCl,
+    PancakeswapInfinityCl,
+    PancakeswapInfinityBin,
+    LunarBase,
+    Biconomy,
+    NativeRfq,
+    Metric,
+    UniswapV4Hooks,
+    RingSwapV2,
+    Sky,
+    LidoV4,
+    Etherfi,
+    BalancerV3,
+    LiquidityParty,
+    TitanFermiSwap,
+    TitanKipseli,
+    TitanBebop,
+    TitanTaurusFi,
+    TitanTempest,
+    TitanGoliath,
+    TitanStelaxis,
+    TitanElZorro,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 19] = [
+    pub const ALL: [ProtocolKind; 42] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -50,7 +73,35 @@ impl ProtocolKind {
         ProtocolKind::Hashflow,
         ProtocolKind::Bebop,
         ProtocolKind::Liquorice,
+        ProtocolKind::AeroBasic,
+        ProtocolKind::AeroCl,
+        ProtocolKind::PancakeswapInfinityCl,
+        ProtocolKind::PancakeswapInfinityBin,
+        ProtocolKind::LunarBase,
+        ProtocolKind::Biconomy,
+        ProtocolKind::NativeRfq,
+        ProtocolKind::Metric,
+        ProtocolKind::UniswapV4Hooks,
+        ProtocolKind::RingSwapV2,
+        ProtocolKind::Sky,
+        ProtocolKind::LidoV4,
+        ProtocolKind::Etherfi,
+        ProtocolKind::BalancerV3,
+        ProtocolKind::LiquidityParty,
+        ProtocolKind::TitanFermiSwap,
+        ProtocolKind::TitanKipseli,
+        ProtocolKind::TitanBebop,
+        ProtocolKind::TitanTaurusFi,
+        ProtocolKind::TitanTempest,
+        ProtocolKind::TitanGoliath,
+        ProtocolKind::TitanStelaxis,
+        ProtocolKind::TitanElZorro,
     ];
+
+    /// A named venue on Titan's Ethereum price-level stream.
+    pub fn titan_venue(self) -> Option<&'static str> {
+        self.as_str().strip_prefix("pricelevelstream:")
+    }
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -73,6 +124,29 @@ impl ProtocolKind {
             ProtocolKind::Hashflow => "rfq:hashflow",
             ProtocolKind::Bebop => "rfq:bebop",
             ProtocolKind::Liquorice => "rfq:liquorice",
+            ProtocolKind::AeroBasic => "aero_basic",
+            ProtocolKind::AeroCl => "aero_cl",
+            ProtocolKind::PancakeswapInfinityCl => "pancakeswap_infinity_cl",
+            ProtocolKind::PancakeswapInfinityBin => "pancakeswap_infinity_bin",
+            ProtocolKind::LunarBase => "lunarbase",
+            ProtocolKind::Biconomy => "biconomy",
+            ProtocolKind::NativeRfq => "rfq:native",
+            ProtocolKind::Metric => "rfq:metric",
+            ProtocolKind::UniswapV4Hooks => "uniswap_v4_hooks",
+            ProtocolKind::RingSwapV2 => "ring_swap_v2",
+            ProtocolKind::Sky => "sky",
+            ProtocolKind::LidoV4 => "lido_v4",
+            ProtocolKind::Etherfi => "etherfi",
+            ProtocolKind::BalancerV3 => "vm:balancer_v3",
+            ProtocolKind::LiquidityParty => "vm:liquidityparty",
+            ProtocolKind::TitanFermiSwap => "pricelevelstream:fermiswap",
+            ProtocolKind::TitanKipseli => "pricelevelstream:kipseli",
+            ProtocolKind::TitanBebop => "pricelevelstream:bebop",
+            ProtocolKind::TitanTaurusFi => "pricelevelstream:taurusfi",
+            ProtocolKind::TitanTempest => "pricelevelstream:tempest",
+            ProtocolKind::TitanGoliath => "pricelevelstream:goliath",
+            ProtocolKind::TitanStelaxis => "pricelevelstream:stelaxis",
+            ProtocolKind::TitanElZorro => "pricelevelstream:elzorro",
         }
     }
 
@@ -120,6 +194,10 @@ impl ProtocolKind {
             "erc4626_pool" => Some(ProtocolKind::ERC4626),
             "hashflow_pool" => Some(ProtocolKind::Hashflow),
             "bebop_pool" => Some(ProtocolKind::Bebop),
+            "native_relay_pool" => Some(ProtocolKind::NativeRfq),
+            "metric_pool" => Some(ProtocolKind::Metric),
+            "pancakeswap_infinity_bin_pool" => Some(ProtocolKind::PancakeswapInfinityBin),
+            "lunarbase" => Some(ProtocolKind::LunarBase),
             "liquorice_pool" => Some(ProtocolKind::Liquorice),
             _ => None,
         }
@@ -146,6 +224,29 @@ impl ProtocolKind {
             "rfq:hashflow" => Some(ProtocolKind::Hashflow),
             "rfq:bebop" => Some(ProtocolKind::Bebop),
             "rfq:liquorice" => Some(ProtocolKind::Liquorice),
+            "aero_basic" => Some(ProtocolKind::AeroBasic),
+            "aero_cl" => Some(ProtocolKind::AeroCl),
+            "pancakeswap_infinity_cl" => Some(ProtocolKind::PancakeswapInfinityCl),
+            "pancakeswap_infinity_bin" => Some(ProtocolKind::PancakeswapInfinityBin),
+            "lunarbase" => Some(ProtocolKind::LunarBase),
+            "biconomy" => Some(ProtocolKind::Biconomy),
+            "rfq:native" => Some(ProtocolKind::NativeRfq),
+            "rfq:metric" => Some(ProtocolKind::Metric),
+            "uniswap_v4_hooks" => Some(ProtocolKind::UniswapV4Hooks),
+            "ring_swap_v2" => Some(ProtocolKind::RingSwapV2),
+            "sky" => Some(ProtocolKind::Sky),
+            "lido_v4" => Some(ProtocolKind::LidoV4),
+            "etherfi" => Some(ProtocolKind::Etherfi),
+            "vm:balancer_v3" => Some(ProtocolKind::BalancerV3),
+            "vm:liquidityparty" => Some(ProtocolKind::LiquidityParty),
+            "pricelevelstream:fermiswap" => Some(ProtocolKind::TitanFermiSwap),
+            "pricelevelstream:kipseli" => Some(ProtocolKind::TitanKipseli),
+            "pricelevelstream:bebop" => Some(ProtocolKind::TitanBebop),
+            "pricelevelstream:taurusfi" => Some(ProtocolKind::TitanTaurusFi),
+            "pricelevelstream:tempest" => Some(ProtocolKind::TitanTempest),
+            "pricelevelstream:goliath" => Some(ProtocolKind::TitanGoliath),
+            "pricelevelstream:stelaxis" => Some(ProtocolKind::TitanStelaxis),
+            "pricelevelstream:elzorro" => Some(ProtocolKind::TitanElZorro),
             _ => None,
         }
     }
@@ -170,7 +271,7 @@ mod tests {
 
     use super::*;
 
-    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 19] = [
+    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 42] = [
         ("uniswap_v2", ProtocolKind::UniswapV2),
         ("sushiswap_v2", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
@@ -190,9 +291,38 @@ mod tests {
         ("rfq:hashflow", ProtocolKind::Hashflow),
         ("rfq:bebop", ProtocolKind::Bebop),
         ("rfq:liquorice", ProtocolKind::Liquorice),
+        ("aero_basic", ProtocolKind::AeroBasic),
+        ("aero_cl", ProtocolKind::AeroCl),
+        (
+            "pancakeswap_infinity_cl",
+            ProtocolKind::PancakeswapInfinityCl,
+        ),
+        (
+            "pancakeswap_infinity_bin",
+            ProtocolKind::PancakeswapInfinityBin,
+        ),
+        ("lunarbase", ProtocolKind::LunarBase),
+        ("biconomy", ProtocolKind::Biconomy),
+        ("rfq:native", ProtocolKind::NativeRfq),
+        ("rfq:metric", ProtocolKind::Metric),
+        ("uniswap_v4_hooks", ProtocolKind::UniswapV4Hooks),
+        ("ring_swap_v2", ProtocolKind::RingSwapV2),
+        ("sky", ProtocolKind::Sky),
+        ("lido_v4", ProtocolKind::LidoV4),
+        ("etherfi", ProtocolKind::Etherfi),
+        ("vm:balancer_v3", ProtocolKind::BalancerV3),
+        ("vm:liquidityparty", ProtocolKind::LiquidityParty),
+        ("pricelevelstream:fermiswap", ProtocolKind::TitanFermiSwap),
+        ("pricelevelstream:kipseli", ProtocolKind::TitanKipseli),
+        ("pricelevelstream:bebop", ProtocolKind::TitanBebop),
+        ("pricelevelstream:taurusfi", ProtocolKind::TitanTaurusFi),
+        ("pricelevelstream:tempest", ProtocolKind::TitanTempest),
+        ("pricelevelstream:goliath", ProtocolKind::TitanGoliath),
+        ("pricelevelstream:stelaxis", ProtocolKind::TitanStelaxis),
+        ("pricelevelstream:elzorro", ProtocolKind::TitanElZorro),
     ];
 
-    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 16] = [
+    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 20] = [
         ("uniswap_v2_pool", ProtocolKind::UniswapV2),
         ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
@@ -208,6 +338,13 @@ mod tests {
         ("erc4626_pool", ProtocolKind::ERC4626),
         ("hashflow_pool", ProtocolKind::Hashflow),
         ("bebop_pool", ProtocolKind::Bebop),
+        ("native_relay_pool", ProtocolKind::NativeRfq),
+        ("metric_pool", ProtocolKind::Metric),
+        (
+            "pancakeswap_infinity_bin_pool",
+            ProtocolKind::PancakeswapInfinityBin,
+        ),
+        ("lunarbase", ProtocolKind::LunarBase),
         ("liquorice_pool", ProtocolKind::Liquorice),
     ];
 
@@ -329,11 +466,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_uniswap_v4_hooks() {
-        assert_rejected_everywhere("uniswap_v4_hooks");
-    }
-
-    #[test]
     fn rejects_non_canonical_aliases() {
         for alias in NON_CANONICAL_ALIASES {
             assert_rejected_everywhere(alias);
@@ -341,8 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn from_sync_state_key_rejects_protocol_type_names() {
+    fn from_sync_state_key_rejects_type_only_names() {
         for (type_name, _) in CANONICAL_PROTOCOL_TYPE_CASES {
+            if CANONICAL_PROTOCOL_SYSTEM_CASES
+                .iter()
+                .any(|(name, _)| *name == type_name)
+            {
+                continue;
+            }
             assert_eq!(ProtocolKind::from_sync_state_key(type_name), None);
         }
     }

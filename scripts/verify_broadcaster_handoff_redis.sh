@@ -59,8 +59,11 @@ redis_address="$(docker port "$container_name" 6379/tcp | head -n 1)"
 redis_port="${redis_address##*:}"
 (
   cd "$repo"
-  BROADCASTER_REDIS_HANDOFF_TEST_URL="redis://127.0.0.1:${redis_port}/0" \
-    cargo test --locked -p runtime \
-      broadcaster::redis_publisher::tests::two_broadcasters_handoff_without_loss_or_duplication_on_real_redis \
-      -- --ignored --exact --nocapture
+  export BROADCASTER_REDIS_HANDOFF_TEST_URL="redis://127.0.0.1:${redis_port}/0"
+  cargo test --locked -p runtime \
+    broadcaster::redis_publisher::tests::two_broadcasters_handoff_without_loss_or_duplication_on_real_redis \
+    -- --ignored --exact --nocapture
+  cargo test --locked -p rpc \
+    api::broadcaster::tests::base_reader_bootstraps_and_replays_metric_books \
+    -- --ignored --exact --nocapture
 )

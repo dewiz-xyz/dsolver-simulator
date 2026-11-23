@@ -266,7 +266,7 @@ async fn fetch_boundaries_between(
 ) -> anyhow::Result<Vec<CheckpointManifest>> {
     let rows = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                 status, error
          FROM state_history.checkpoints

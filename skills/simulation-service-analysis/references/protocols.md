@@ -5,7 +5,7 @@ of truth is `simulator-manifest.toml`:
 
 - `[[protocols]]` declares every known protocol and its backend.
 - `[[chains]]` selects `native_protocols`, `vm_protocols`, and `rfq_protocols`
-  for each chain.
+  for each chain. The broadcaster adds the corresponding `broadcaster_only_*_protocols` entries.
 - `[[route_policies]]` owns chain-specific routing details.
 - `crates/runtime/src/config/manifest.rs` validates those relationships and
   builds the effective runtime configuration.
@@ -22,18 +22,21 @@ with open("simulator-manifest.toml", "rb") as handle:
 for chain in manifest["chains"]:
     print(f"chain {chain['chain_id']}")
     for backend in ("native", "vm", "rfq"):
-        print(f"  {backend}: {', '.join(chain[f'{backend}_protocols']) or '(none)'}")
+        selected = chain[f"{backend}_protocols"]
+        broadcast = selected + chain.get(f"broadcaster_only_{backend}_protocols", [])
+        print(f"  {backend} simulator: {', '.join(selected) or '(none)'}")
+        print(f"  {backend} broadcaster: {', '.join(broadcast) or '(none)'}")
 PY
 ```
 
 ## Effective backend enablement
 
 - Native readiness is always evaluated for the selected chain.
-- VM is effective only when `ENABLE_VM_POOLS=true` and the selected chain's
-  `vm_protocols` is non-empty.
-- RFQ is effective only when `ENABLE_RFQ_POOLS=true` and the selected chain's
-  `rfq_protocols` is non-empty.
-- When RFQ is effective, startup requires the credential set associated with
+- The broadcaster subscribes to every VM system selected for broadcast in the manifest.
+- `ENABLE_VM_POOLS` gates the simulator's shared database backend. It serves VM pools
+  on Ethereum and Uniswap V4 on Base.
+- Each service enables RFQ when `ENABLE_RFQ_POOLS=true` and its own RFQ list is non-empty.
+- When RFQ is effective, broadcaster startup requires the credential set associated with
   every selected RFQ provider. Derive that mapping from runtime config and tests;
   do not copy provider assumptions into this reference.
 

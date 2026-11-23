@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,8 +38,6 @@ fn native_token_address() -> Bytes {
 pub struct AppState {
     pub chain: Chain,
     pub chain_head_observer: Arc<ChainHeadObserver>,
-    pub rfq_client_config: Arc<RfqClientConfig>,
-    pub native_token_protocol_allowlist: Arc<Vec<ProtocolKind>>,
     pub tokens: Arc<TokenStore>,
     pub native_broadcaster_subscription: BroadcasterSubscriptionStatus,
     pub vm_broadcaster_subscription: BroadcasterSubscriptionStatus,
@@ -61,17 +59,6 @@ pub struct AppState {
     pub slippage: SlippageConfig,
     pub erc4626_deposits_enabled: bool,
     pub erc4626_pair_policies: Arc<Vec<Erc4626PairPolicy>>,
-    pub reset_allowance_tokens: Arc<HashMap<u64, HashSet<Bytes>>>,
-}
-
-#[derive(Clone, Default)]
-pub struct RfqClientConfig {
-    pub tvl_threshold: f64,
-    pub bebop_key: String,
-    pub hashflow_user: String,
-    pub hashflow_key: String,
-    pub liquorice_user: String,
-    pub liquorice_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,12 +72,6 @@ pub struct ConfiguredBackends {
 pub(crate) struct SimulationRebuildGuard {
     _vm_read_guard: Option<OwnedRwLockReadGuard<()>>,
     _rfq_read_guard: Option<OwnedRwLockReadGuard<()>>,
-}
-
-impl SimulationRebuildGuard {
-    pub(crate) const fn blocks_required_rebuilds(&self, uses_vm: bool, uses_rfq: bool) -> bool {
-        (!uses_vm || self._vm_read_guard.is_some()) && (!uses_rfq || self._rfq_read_guard.is_some())
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,11 +136,6 @@ pub struct BroadcasterSubscriptionSnapshot {
 }
 
 impl BroadcasterSubscriptionStatus {
-    #[cfg(test)]
-    pub(crate) async fn hold_readiness_for_test(&self) -> impl Drop + Send {
-        Arc::clone(&self.inner).write_owned().await
-    }
-
     pub async fn mark_connected(&self) {
         let mut guard = self.inner.write().await;
         guard.connected = true;
@@ -518,66 +494,6 @@ pub struct SimulatorBackendSubscriptionSnapshot {
     pub redis_transport_last_error: Option<String>,
     pub restart_count: u64,
     pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncodeAvailability {
-    Ready,
-    NativeWarmingUp,
-    NativeStale,
-    VmDisabled,
-    VmWarmingUp,
-    VmRebuilding,
-    VmStale,
-    RfqDisabled,
-    RfqWarmingUp,
-    RfqRebuilding,
-    RfqStale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeFenceStatus {
-    Current,
-    Changed,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeRouteFenceCheck {
-    pub(crate) status: NativeFenceStatus,
-    pub(crate) current_generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NativePoolFenceStatus {
-    Available(HashSet<String>),
-    Unavailable,
-}
-
-impl EncodeAvailability {
-    pub const fn availability_message(self) -> Option<&'static str> {
-        match self {
-            Self::Ready => None,
-            Self::NativeWarmingUp => Some("Encode unavailable: native state warming up"),
-            Self::NativeStale => Some("Encode unavailable: native state stale"),
-            Self::VmDisabled => Some("Encode unavailable: VM pools disabled for requested route"),
-            Self::RfqDisabled => Some("Encode unavailable: RFQ pools disabled for requested route"),
-            Self::VmWarmingUp => {
-                Some("Encode unavailable: VM state warming up for requested route")
-            }
-            Self::RfqWarmingUp => {
-                Some("Encode unavailable: RFQ state warming up for requested route")
-            }
-            Self::VmRebuilding => {
-                Some("Encode unavailable: VM state rebuilding for requested route")
-            }
-            Self::RfqRebuilding => {
-                Some("Encode unavailable: RFQ state rebuilding for requested route")
-            }
-            Self::VmStale => Some("Encode unavailable: VM state stale for requested route"),
-            Self::RfqStale => Some("Encode unavailable: RFQ state stale for requested route"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -976,45 +892,6 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn native_route_fence_status(
-        &self,
-        pinned: &PublishedStatePin,
-        pool_ids: &HashSet<String>,
-    ) -> NativeRouteFenceCheck {
-        let current = self.native_state_store.pin().await;
-        let status = match self
-            .native_pool_fence_status(pinned, &current, pool_ids)
-            .await
-        {
-            NativePoolFenceStatus::Available(changed_pool_ids) if changed_pool_ids.is_empty() => {
-                NativeFenceStatus::Current
-            }
-            NativePoolFenceStatus::Available(_) => NativeFenceStatus::Changed,
-            NativePoolFenceStatus::Unavailable => NativeFenceStatus::Unavailable,
-        };
-        NativeRouteFenceCheck {
-            status,
-            current_generation: current.request_generation(),
-        }
-    }
-
-    pub(crate) async fn native_pool_fence_status(
-        &self,
-        pinned: &PublishedStatePin,
-        current: &PublishedStatePin,
-        pool_ids: &HashSet<String>,
-    ) -> NativePoolFenceStatus {
-        if self
-            .backend_assessment_for_pin(SimulatorBackendKind::Native, current)
-            .await
-            .readiness
-            != SimulatorBackendReadiness::Ready
-        {
-            return NativePoolFenceStatus::Unavailable;
-        }
-        NativePoolFenceStatus::Available(pinned.changed_pool_ids(current, pool_ids))
-    }
-
     pub async fn vm_readiness(&self) -> VmReadiness {
         let pinned = self.vm_state_store.pin().await;
         match self
@@ -1051,43 +928,6 @@ impl AppState {
         } else {
             RfqReadiness::Ready
         }
-    }
-
-    pub(crate) async fn encode_availability(
-        &self,
-        uses_native: bool,
-        uses_vm: bool,
-        uses_rfq: bool,
-    ) -> EncodeAvailability {
-        if uses_native {
-            match self.native_readiness().await {
-                NativeReadiness::Ready => {}
-                NativeReadiness::WarmingUp => return EncodeAvailability::NativeWarmingUp,
-                NativeReadiness::Stale => return EncodeAvailability::NativeStale,
-            }
-        }
-
-        if uses_vm {
-            match self.vm_readiness().await {
-                VmReadiness::Disabled => return EncodeAvailability::VmDisabled,
-                VmReadiness::WarmingUp => return EncodeAvailability::VmWarmingUp,
-                VmReadiness::Rebuilding => return EncodeAvailability::VmRebuilding,
-                VmReadiness::Ready => {}
-                VmReadiness::Stale => return EncodeAvailability::VmStale,
-            }
-        }
-
-        if uses_rfq {
-            match self.rfq_readiness().await {
-                RfqReadiness::Disabled => return EncodeAvailability::RfqDisabled,
-                RfqReadiness::WarmingUp => return EncodeAvailability::RfqWarmingUp,
-                RfqReadiness::Rebuilding => return EncodeAvailability::RfqRebuilding,
-                RfqReadiness::Ready => {}
-                RfqReadiness::Stale => return EncodeAvailability::RfqStale,
-            }
-        }
-
-        EncodeAvailability::Ready
     }
 
     pub async fn wait_for_readiness(&self, wait: Duration) -> bool {
@@ -1143,75 +983,6 @@ impl AppState {
             _vm_read_guard: vm_read_guard,
             _rfq_read_guard: rfq_read_guard,
         })
-    }
-
-    pub(crate) async fn pool_rebuild_guard_requirements(
-        &self,
-        id: &str,
-    ) -> Result<Option<(bool, bool)>, EncodeAvailability> {
-        if self.native_state_store.has_pool(id).await {
-            return match self.native_readiness().await {
-                NativeReadiness::Ready => Ok(Some((false, false))),
-                NativeReadiness::WarmingUp => Err(EncodeAvailability::NativeWarmingUp),
-                NativeReadiness::Stale => Err(EncodeAvailability::NativeStale),
-            };
-        }
-
-        if self.vm_state_store.has_pool(id).await {
-            return match self.vm_readiness().await {
-                VmReadiness::Disabled => Err(EncodeAvailability::VmDisabled),
-                VmReadiness::WarmingUp => Err(EncodeAvailability::VmWarmingUp),
-                VmReadiness::Rebuilding => Err(EncodeAvailability::VmRebuilding),
-                VmReadiness::Ready => Ok(Some((true, false))),
-                VmReadiness::Stale => Err(EncodeAvailability::VmStale),
-            };
-        }
-
-        if self.rfq_state_store.has_pool(id).await {
-            return match self.rfq_readiness().await {
-                RfqReadiness::Disabled => Err(EncodeAvailability::RfqDisabled),
-                RfqReadiness::WarmingUp => Err(EncodeAvailability::RfqWarmingUp),
-                RfqReadiness::Rebuilding => Err(EncodeAvailability::RfqRebuilding),
-                RfqReadiness::Ready => Ok(Some((false, true))),
-                RfqReadiness::Stale => Err(EncodeAvailability::RfqStale),
-            };
-        }
-
-        Ok(None)
-    }
-
-    pub async fn pool_by_id(&self, id: &str) -> Result<Option<PoolEntry>, EncodeAvailability> {
-        if self.native_state_store.has_pool(id).await {
-            return match self.native_readiness().await {
-                NativeReadiness::Ready => Ok(self.native_state_store.pool_by_id(id).await),
-                NativeReadiness::WarmingUp => Err(EncodeAvailability::NativeWarmingUp),
-                NativeReadiness::Stale => Err(EncodeAvailability::NativeStale),
-            };
-        }
-
-        // Route hints can miss VM/RFQ backends, so encode lookup needs the actual backend
-        // readiness here to distinguish "unavailable" from "pool not found".
-        if self.vm_state_store.has_pool(id).await {
-            return match self.vm_readiness().await {
-                VmReadiness::Disabled => Err(EncodeAvailability::VmDisabled),
-                VmReadiness::WarmingUp => Err(EncodeAvailability::VmWarmingUp),
-                VmReadiness::Rebuilding => Err(EncodeAvailability::VmRebuilding),
-                VmReadiness::Ready => Ok(self.vm_state_store.pool_by_id(id).await),
-                VmReadiness::Stale => Err(EncodeAvailability::VmStale),
-            };
-        }
-
-        if self.rfq_state_store.has_pool(id).await {
-            return match self.rfq_readiness().await {
-                RfqReadiness::Disabled => Err(EncodeAvailability::RfqDisabled),
-                RfqReadiness::WarmingUp => Err(EncodeAvailability::RfqWarmingUp),
-                RfqReadiness::Rebuilding => Err(EncodeAvailability::RfqRebuilding),
-                RfqReadiness::Ready => Ok(self.rfq_state_store.pool_by_id(id).await),
-                RfqReadiness::Stale => Err(EncodeAvailability::RfqStale),
-            };
-        }
-
-        Ok(None)
     }
 
     pub async fn vm_ready(&self) -> bool {
@@ -1313,7 +1084,6 @@ struct PublishedStateStore {
     applied_head: Option<BlockIdentity>,
     protocol_heads: ProtocolStateHeads,
     head_revision: u64,
-    request_generation: u64,
     requests_allowed: bool,
     point: StatePoint,
     ready: bool,
@@ -1330,7 +1100,6 @@ impl PublishedStateStore {
             applied_head: None,
             protocol_heads: ProtocolStateHeads::new(required_protocols),
             head_revision: 0,
-            request_generation: 0,
             requests_allowed: false,
             point: ReplayWorld::new(tokens, wrapped_native_token).pin(),
             ready: false,
@@ -1365,10 +1134,6 @@ impl PublishedStatePin {
         self.state.version
     }
 
-    pub(crate) fn request_generation(&self) -> u64 {
-        self.state.request_generation
-    }
-
     pub(crate) fn current_block(&self) -> u64 {
         self.state.point.current_block()
     }
@@ -1394,20 +1159,6 @@ impl PublishedStatePin {
     pub(crate) fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         self.state.point.pool_by_id(id)
     }
-
-    /// Pointer identity is a valid fence because updates replace state and component Arcs instead
-    /// of mutating them. `get_amount_out` borrows state and returns a separate state after the
-    /// swap, while delta application requires `&mut self` upstream. Native protocol states do not
-    /// use interior mutability, which the invariant test below enforces with a real implementation.
-    pub(crate) fn changed_pool_ids(
-        &self,
-        current: &Self,
-        pool_ids: &HashSet<String>,
-    ) -> HashSet<String> {
-        self.state
-            .point
-            .changed_pool_ids(&current.state.point, pool_ids)
-    }
 }
 
 pub type UpdateMetrics = ApplyReport;
@@ -1432,12 +1183,6 @@ impl StateStore {
     ) -> Self {
         let initial_tokens = tokens.initial_snapshot();
         Self::new_with_token_publication(tokens, initial_tokens, true, required_protocols)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_private(tokens: Arc<TokenStore>) -> Self {
-        let initial_tokens = tokens.initial_snapshot();
-        Self::new_with_token_publication(tokens, initial_tokens, false, Vec::new())
     }
 
     pub(crate) fn new_private_with_snapshot(
@@ -1477,11 +1222,6 @@ impl StateStore {
 
     pub(crate) async fn state_version(&self) -> u64 {
         self.published.read().await.version
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn request_generation(&self) -> u64 {
-        self.published.read().await.request_generation
     }
 
     pub(crate) async fn fence_requests(&self) {
@@ -1626,7 +1366,7 @@ impl StateStore {
         state_version: u64,
     ) -> UpdateMetrics {
         if let Some(head) = &replacement.applied_head {
-            update.block_number_or_timestamp = head.number;
+            update.block_number = head.number;
         }
         let mut world = ReplayWorld::from_point(&replacement.point);
         let report = world.apply(update);
@@ -1650,7 +1390,6 @@ impl StateStore {
         } else {
             replacement.head_revision = replacement.head_revision.max(current.head_revision);
         }
-        replacement.request_generation = current.request_generation.saturating_add(1);
         let ready = replacement.ready;
         let previous_ready = current.ready;
         *self.published.write().await = Arc::new(replacement);
@@ -1730,6 +1469,7 @@ impl StateStore {
             .matching_pools_by_addresses(token_in, token_out)
     }
 
+    #[cfg(test)]
     pub(crate) async fn pool_by_id(&self, id: &str) -> Option<PoolEntry> {
         self.pin().await.pool_by_id(id)
     }
@@ -1748,6 +1488,7 @@ impl StateStore {
 mod tests {
     use super::*;
     use std::any::Any;
+    use std::collections::HashSet;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1949,8 +1690,6 @@ mod tests {
         AppState {
             chain_head_observer: Arc::new(ChainHeadObserver::ready_for_test(test_block_head(1, 1))),
             chain: Chain::Ethereum,
-            rfq_client_config: Arc::new(RfqClientConfig::default()),
-            native_token_protocol_allowlist: Arc::new(vec![ProtocolKind::Rocketpool]),
             tokens: stores.token_store,
             native_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
             vm_broadcaster_subscription: BroadcasterSubscriptionStatus::ready_for_test(),
@@ -1975,7 +1714,6 @@ mod tests {
             slippage: SlippageConfig::default(),
             erc4626_deposits_enabled: false,
             erc4626_pair_policies: Arc::new(Vec::new()),
-            reset_allowance_tokens: Arc::new(HashMap::new()),
         }
     }
 
@@ -2192,14 +1930,6 @@ mod tests {
             .await;
         assert_eq!(state.native_readiness().await, NativeReadiness::Ready);
         assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
-        assert_eq!(
-            state.encode_availability(true, false, false).await,
-            EncodeAvailability::Ready
-        );
-        assert_eq!(
-            state.encode_availability(true, true, false).await,
-            EncodeAvailability::VmStale
-        );
 
         state
             .vm_state_store
@@ -2207,10 +1937,6 @@ mod tests {
             .await;
         state.native_state_store.set_applied_head(None).await;
         assert_eq!(state.native_readiness().await, NativeReadiness::Stale);
-        assert_eq!(
-            state.encode_availability(false, true, false).await,
-            EncodeAvailability::Ready
-        );
     }
 
     #[tokio::test]
@@ -2719,10 +2445,6 @@ mod tests {
             .await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
-        assert_eq!(
-            state.encode_availability(false, true, false).await,
-            EncodeAvailability::VmWarmingUp
-        );
 
         state.vm_broadcaster_subscription.mark_connected().await;
         assert_eq!(state.vm_readiness().await, VmReadiness::WarmingUp);
@@ -2748,10 +2470,6 @@ mod tests {
             .await;
 
         assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
-        assert_eq!(
-            state.encode_availability(false, true, false).await,
-            EncodeAvailability::Ready
-        );
     }
 
     #[tokio::test]
@@ -2828,173 +2546,6 @@ mod tests {
             subscription.last_error.as_deref(),
             Some("rfq broadcaster dropped")
         );
-    }
-
-    #[tokio::test]
-    async fn encode_availability_gates_backends_by_route_shape() {
-        let native_ready_vm_and_rfq_disabled = build_readiness_test_state(false, false).await;
-        native_ready_vm_and_rfq_disabled
-            .native_stream_health
-            .record_update(1)
-            .await;
-
-        assert_eq!(
-            native_ready_vm_and_rfq_disabled
-                .encode_availability(true, false, false)
-                .await,
-            EncodeAvailability::Ready
-        );
-        assert_eq!(
-            native_ready_vm_and_rfq_disabled
-                .encode_availability(false, true, false)
-                .await,
-            EncodeAvailability::VmDisabled
-        );
-        assert_eq!(
-            native_ready_vm_and_rfq_disabled
-                .encode_availability(true, true, false)
-                .await,
-            EncodeAvailability::VmDisabled
-        );
-
-        let token_store = Arc::new(TokenStore::new(
-            HashMap::new(),
-            "http://localhost".to_string(),
-            "test".to_string(),
-            Chain::Ethereum,
-            Duration::from_millis(10),
-        ));
-        let native_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let vm_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let rfq_state_store = Arc::new(StateStore::new(Arc::clone(&token_store)));
-        let native_warming_vm_ready = build_test_app_state(
-            TestAppStateStores {
-                token_store,
-                native_state_store,
-                vm_state_store: Arc::clone(&vm_state_store),
-                rfq_state_store: Arc::clone(&rfq_state_store),
-            },
-            PoolFlags {
-                enable_vm_pools: true,
-                enable_rfq_pools: true,
-            },
-        );
-        vm_state_store
-            .apply_update_with_head(
-                mk_update(vec![(
-                    "pool-vm".to_string(),
-                    mk_component(
-                        31,
-                        "vm:curve",
-                        "curve_pool",
-                        vec![mk_token(32, "TKNA"), mk_token(33, "TKNB")],
-                    ),
-                    Box::new(DummySim),
-                )]),
-                Some(test_block_head(1, 1)),
-            )
-            .await;
-        native_warming_vm_ready
-            .vm_stream_health
-            .record_update(1)
-            .await;
-
-        assert_eq!(
-            native_warming_vm_ready
-                .encode_availability(true, false, false)
-                .await,
-            EncodeAvailability::NativeWarmingUp
-        );
-        assert_eq!(
-            native_warming_vm_ready
-                .encode_availability(false, true, false)
-                .await,
-            EncodeAvailability::Ready
-        );
-        assert_eq!(
-            native_warming_vm_ready
-                .encode_availability(true, true, false)
-                .await,
-            EncodeAvailability::NativeWarmingUp
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pool_by_id_only_exposes_encode_ready_vm_and_rfq_entries() {
-        let mut state = build_readiness_test_state(true, true).await;
-
-        state
-            .vm_state_store
-            .apply_update_with_head(
-                mk_update(vec![(
-                    "pool-vm".to_string(),
-                    mk_component(
-                        36,
-                        "vm:curve",
-                        "curve_pool",
-                        vec![mk_token(34, "TKNA"), mk_token(35, "TKNB")],
-                    ),
-                    Box::new(DummySim),
-                )]),
-                Some(test_block_head(1, 1)),
-            )
-            .await;
-        state
-            .rfq_state_store
-            .apply_update(mk_update(vec![(
-                "pool-rfq".to_string(),
-                mk_component(
-                    37,
-                    "rfq:hashflow",
-                    "hashflow_pool",
-                    vec![mk_token(36, "TKNA"), mk_token(37, "TKNB")],
-                ),
-                Box::new(DummySim),
-            )]))
-            .await;
-
-        state.vm_stream_health.record_update(1).await;
-        state.rfq_stream_health.record_update(1).await;
-
-        assert_eq!(state.vm_readiness().await, VmReadiness::Ready);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
-        assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
-        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
-
-        {
-            let mut vm_status = state.vm_stream.write().await;
-            vm_status.rebuilding = true;
-        }
-
-        assert_eq!(state.vm_readiness().await, VmReadiness::Rebuilding);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Ready);
-        assert!(matches!(
-            state.pool_by_id("pool-vm").await,
-            Err(EncodeAvailability::VmRebuilding)
-        ));
-        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
-
-        {
-            let mut vm_status = state.vm_stream.write().await;
-            vm_status.rebuilding = false;
-        }
-
-        assert!(matches!(state.pool_by_id("pool-vm").await, Ok(Some(_))));
-        assert!(matches!(state.pool_by_id("pool-rfq").await, Ok(Some(_))));
-
-        state.optional_backend_stale = Duration::ZERO;
-        expire_chain_observation(&mut state).await;
-
-        assert_eq!(state.vm_readiness().await, VmReadiness::Stale);
-        assert_eq!(state.rfq_readiness().await, RfqReadiness::Stale);
-        assert!(matches!(
-            state.pool_by_id("pool-vm").await,
-            Err(EncodeAvailability::VmStale)
-        ));
-        assert!(matches!(
-            state.pool_by_id("pool-rfq").await,
-            Err(EncodeAvailability::RfqStale)
-        ));
     }
 
     #[tokio::test]
@@ -3210,10 +2761,6 @@ mod tests {
 
         assert_eq!(app_state.vm_readiness().await, VmReadiness::Rebuilding);
         assert_eq!(app_state.native_readiness().await, NativeReadiness::Ready);
-        assert_eq!(
-            app_state.encode_availability(false, true, false).await,
-            EncodeAvailability::VmRebuilding
-        );
     }
 
     enum RequestTokenIn {
@@ -3342,93 +2889,6 @@ mod tests {
         }
     }
 
-    async fn build_native_identity_fence_state() -> AppState {
-        let state = build_readiness_test_state(false, false).await;
-        state
-            .native_state_store
-            .apply_update_with_head(
-                mk_update(vec![(
-                    "pool-b".to_string(),
-                    mk_component(
-                        31,
-                        "uniswap_v2",
-                        "uniswap_v2_pool",
-                        vec![mk_token(32, "TKNC"), mk_token(33, "TKND")],
-                    ),
-                    Box::new(DummySim),
-                )]),
-                Some(test_block_head(1, 1)),
-            )
-            .await;
-        state
-    }
-
-    #[tokio::test]
-    async fn native_route_fence_tracks_touched_pool_identity_only() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-        let (pinned_a_state, pinned_a_component) = pinned
-            .pool_by_id("pool-native")
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-        let (pinned_b_state, pinned_b_component) = pinned
-            .pool_by_id("pool-b")
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-
-        state
-            .native_state_store
-            .apply_update_with_head(
-                Update::new(
-                    1,
-                    HashMap::from([(
-                        "pool-native".to_string(),
-                        Box::new(DummySim) as Box<dyn ProtocolSim>,
-                    )]),
-                    HashMap::new(),
-                ),
-                Some(test_block_head(1, 1)),
-            )
-            .await;
-
-        let current = state.native_state_store.pin().await;
-        let (current_a_state, current_a_component) = current
-            .pool_by_id("pool-native")
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-        let (current_b_state, current_b_component) = current
-            .pool_by_id("pool-b")
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-        assert!(!Arc::ptr_eq(&pinned_a_state, &current_a_state));
-        assert!(Arc::ptr_eq(&pinned_a_component, &current_a_component));
-        assert!(Arc::ptr_eq(&pinned_b_state, &current_b_state));
-        assert!(Arc::ptr_eq(&pinned_b_component, &current_b_component));
-
-        let pool_a = HashSet::from(["pool-native".to_string()]);
-        let pool_b = HashSet::from(["pool-b".to_string()]);
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &pool_a)
-                .await
-                .status,
-            NativeFenceStatus::Changed
-        );
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &pool_b)
-                .await
-                .status,
-            NativeFenceStatus::Current
-        );
-        assert_eq!(
-            state
-                .native_pool_fence_status(
-                    &pinned,
-                    &current,
-                    &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
-                )
-                .await,
-            NativePoolFenceStatus::Available(HashSet::from(["pool-native".to_string()]))
-        );
-    }
-
     #[tokio::test]
     async fn get_amount_out_preserves_published_pool_identity_and_result() {
         const SNAPSHOTS_JSON: &str =
@@ -3530,163 +2990,6 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("repeated fixture swap succeeds: {error}"));
         assert_eq!(first.amount, repeated.amount);
         assert_eq!(first.gas, repeated.gas);
-    }
-
-    #[tokio::test]
-    async fn native_route_fence_distinguishes_missing_removed_and_added_pools() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-        let removed_component = pinned
-            .pool_by_id("pool-native")
-            .map(|(_, component)| component.as_ref().clone())
-            .unwrap_or_else(|| unreachable!("fixture pool exists"));
-        let added_component = mk_component(
-            34,
-            "uniswap_v2",
-            "uniswap_v2_pool",
-            vec![mk_token(35, "TKNE"), mk_token(36, "TKNF")],
-        );
-
-        state
-            .native_state_store
-            .apply_update_with_head(
-                mk_update(vec![(
-                    "pool-added".to_string(),
-                    added_component,
-                    Box::new(DummySim),
-                )])
-                .set_removed_pairs(HashMap::from([(
-                    "pool-native".to_string(),
-                    removed_component,
-                )])),
-                Some(test_block_head(1, 1)),
-            )
-            .await;
-
-        let missing_pool = HashSet::from(["pool-missing".to_string()]);
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &missing_pool)
-                .await
-                .status,
-            NativeFenceStatus::Current
-        );
-        let current = state.native_state_store.pin().await;
-        assert_eq!(
-            state
-                .native_pool_fence_status(&pinned, &current, &missing_pool)
-                .await,
-            NativePoolFenceStatus::Available(HashSet::new())
-        );
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Changed
-        );
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-added".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Changed
-        );
-    }
-
-    #[tokio::test]
-    async fn native_pool_identity_marks_full_reset_changed() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-
-        state.native_state_store.reset().await;
-        let current = state.native_state_store.pin().await;
-
-        assert_eq!(
-            pinned.changed_pool_ids(
-                &current,
-                &HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
-            ),
-            HashSet::from(["pool-native".to_string(), "pool-b".to_string()])
-        );
-    }
-
-    #[tokio::test]
-    async fn native_route_fence_ignores_bootstrap_version_alignment() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-
-        state
-            .native_state_store
-            .align_bootstrap_state_version(pinned.version())
-            .await;
-
-        let current = state.native_state_store.pin().await;
-        assert_ne!(
-            pinned.request_generation(),
-            current.request_generation(),
-            "alignment should still advance the request generation"
-        );
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Current
-        );
-    }
-
-    #[tokio::test]
-    async fn native_route_fence_marks_recovery_candidate_changed() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-        let candidate_store = StateStore::new_private(Arc::clone(&state.tokens));
-        candidate_store
-            .apply_update_with_head(
-                mk_update(vec![(
-                    "pool-native".to_string(),
-                    mk_component(
-                        28,
-                        "uniswap_v2",
-                        "uniswap_v2_pool",
-                        vec![mk_token(29, "TKNA"), mk_token(30, "TKNB")],
-                    ),
-                    Box::new(DummySim),
-                )]),
-                Some(test_block_head(1, 1)),
-            )
-            .await;
-        let candidate = candidate_store.pin().await;
-
-        state
-            .native_state_store
-            .publish_candidate(candidate, pinned.version().saturating_add(1))
-            .await
-            .unwrap_or_else(|error| unreachable!("newer candidate publishes: {error}"));
-
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Changed
-        );
-    }
-
-    #[tokio::test]
-    async fn native_route_fence_reports_fenced_requests_unavailable() {
-        let state = build_native_identity_fence_state().await;
-        let pinned = state.native_state_store.pin().await;
-
-        state.native_state_store.fence_requests().await;
-
-        assert_eq!(
-            state
-                .native_route_fence_status(&pinned, &HashSet::from(["pool-native".to_string()]))
-                .await
-                .status,
-            NativeFenceStatus::Unavailable
-        );
     }
 
     #[tokio::test]

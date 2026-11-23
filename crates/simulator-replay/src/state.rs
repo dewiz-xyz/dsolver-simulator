@@ -47,10 +47,18 @@ impl ReplayState {
 
 #[derive(Clone)]
 pub struct StatePoint {
+    legacy_book_partition: bool,
     state: Arc<ReplayState>,
 }
 
 impl StatePoint {
+    pub(crate) fn stored_backend(&self, kind: ProtocolKind) -> ReplayBackend {
+        match ReplayBackend::from_protocol_kind(kind) {
+            ReplayBackend::PropAmm if self.legacy_book_partition => ReplayBackend::Rfq,
+            backend => backend,
+        }
+    }
+
     pub fn current_block(&self) -> u64 {
         self.state.block_number
     }
@@ -133,7 +141,7 @@ impl StatePoint {
         let mut backend_counts = BTreeMap::new();
 
         for (kind, shard) in &self.state.shards {
-            let backend = ReplayBackend::from_protocol_kind(*kind);
+            let backend = self.stored_backend(*kind);
             if !selected.contains(&backend) {
                 continue;
             }
@@ -202,18 +210,21 @@ impl StatePoint {
 }
 
 pub struct ReplayWorld {
+    legacy_book_partition: bool,
     state: Arc<ReplayState>,
 }
 
 impl ReplayWorld {
     pub fn new(tokens: HashMap<Bytes, Token>, wrapped_native_token: Option<Bytes>) -> Self {
         Self {
+            legacy_book_partition: false,
             state: Arc::new(ReplayState::empty(tokens, wrapped_native_token)),
         }
     }
 
     pub fn from_point(point: &StatePoint) -> Self {
         Self {
+            legacy_book_partition: point.legacy_book_partition,
             state: Arc::clone(&point.state),
         }
     }
@@ -225,7 +236,7 @@ impl ReplayWorld {
 
     pub fn apply(&mut self, mut update: Update) -> ApplyReport {
         let state = Arc::make_mut(&mut self.state);
-        let block_number = update.block_number_or_timestamp;
+        let block_number = update.block_number;
         state.block_number = block_number;
         let mut stats = UpdateAccumulator::default();
 
@@ -291,8 +302,14 @@ impl ReplayWorld {
 
     pub fn pin(&self) -> StatePoint {
         StatePoint {
+            legacy_book_partition: self.legacy_book_partition,
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// Restore pool-executed book identities as stored in a pre-split history generation.
+    pub fn set_legacy_book_partition(&mut self, legacy: bool) {
+        self.legacy_book_partition = legacy;
     }
 
     pub fn set_current_block(&mut self, block_number: u64) {
@@ -1066,7 +1083,9 @@ mod tests {
     #[test]
     fn exact_quote_remaps_native_and_wrapped_tokens_to_the_selected_component() {
         let native = Chain::Ethereum.native_token();
-        let wrapped = Chain::Ethereum.wrapped_native_token();
+        let wrapped = Chain::Ethereum
+            .wrapped_native_token()
+            .unwrap_or_else(|| unreachable!("Ethereum has WETH"));
         let token_out = token(53, "TKNX");
         let tokens = HashMap::from([
             (native.address.clone(), native.clone()),

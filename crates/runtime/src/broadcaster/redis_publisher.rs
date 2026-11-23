@@ -1148,7 +1148,7 @@ impl BroadcasterRedisPublisher {
         let append_failures_before = guard.append_failure_count;
         for payload in handoff.payloads {
             let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
-            let Err(error) = self.append_live_payload_locked(&mut guard, payload).await else {
+            let Err(error) = self.append_retained_live_payload(&mut guard, payload).await else {
                 continue;
             };
             let message = format!("{error:#}");
@@ -1196,17 +1196,7 @@ impl BroadcasterRedisPublisher {
         recovery_id
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "recovery queuing and active append ordering stay in one publication path"
-    )]
     pub async fn publish_accepted_payload(&self, payload: BroadcasterPayload) -> Result<()> {
-        let history_update = self.state_history.as_ref().and_then(|_| match &payload {
-            BroadcasterPayload::Update(update) => {
-                Some(StateHistoryUpdateProjection::from_update(update))
-            }
-            _ => None,
-        });
         let mut recovery_gate = self.recovery_gate.lock().await;
         if recovery_gate.open_recovery_id.is_some() {
             if matches!(payload, BroadcasterPayload::Heartbeat(_)) {
@@ -1288,13 +1278,8 @@ impl BroadcasterRedisPublisher {
         }
         let payload = normalize_live_payload(payload, &guard.snapshot_id)?;
         let append_failures_before = guard.append_failure_count;
-        match self.append_live_payload_locked(&mut guard, payload).await {
-            Ok((entry, _)) => {
-                if let (Some(state_history), Some(update)) = (&self.state_history, history_update) {
-                    enqueue_state_history_update(state_history, &guard, entry, update);
-                }
-                Ok(())
-            }
+        match self.append_retained_live_payload(&mut guard, payload).await {
+            Ok(()) => Ok(()),
             Err(error) => {
                 if error.downcast_ref::<OversizedRedisEntry>().is_some() {
                     return Err(error);
@@ -1498,7 +1483,7 @@ impl BroadcasterRedisPublisher {
         });
         self.drain_pending_payloads_locked(&mut guard).await?;
         if let Some(state_history) = &self.state_history {
-            state_history.reset_rfq_high_water();
+            state_history.reset_book_observations();
         }
         let replay_boundary = self.replay_boundary_locked(&guard)?;
 
@@ -1990,7 +1975,7 @@ impl BroadcasterRedisPublisher {
             }
         });
         if let Some(state_history) = &self.state_history {
-            state_history.reset_rfq_high_water();
+            state_history.reset_book_observations();
         }
         warn!(
             event = "redis_writer_promoted",
@@ -2001,6 +1986,29 @@ impl BroadcasterRedisPublisher {
             "Redis broadcaster generation promoted"
         );
         self.replay_boundary_locked(&guard)
+    }
+
+    // Both ordinary updates and the startup handoff follow the promoted snapshot in history.
+    // Recovery catch-up has its own boundary checkpoint covering its buffered updates.
+    async fn append_retained_live_payload(
+        &self,
+        guard: &mut BroadcasterRedisPublisherState,
+        payload: BroadcasterPayload,
+    ) -> Result<()> {
+        let projection = self
+            .state_history
+            .as_ref()
+            .and_then(|history| match &payload {
+                BroadcasterPayload::Update(update) => {
+                    Some((history, StateHistoryUpdateProjection::from_update(update)))
+                }
+                _ => None,
+            });
+        let (entry, _) = self.append_live_payload_locked(guard, payload).await?;
+        if let Some((history, update)) = projection {
+            enqueue_state_history_update(history, guard, entry, update);
+        }
+        Ok(())
     }
 
     async fn append_live_payload_locked(
@@ -2282,7 +2290,7 @@ fn enqueue_state_history_update(
     update: Result<StateHistoryUpdateProjection>,
 ) {
     let result = update.and_then(|update| {
-        state_history.observe_rfq_update(&update);
+        state_history.observe_book_update(&update);
         delta_entry_from_update(
             entry.chain_id,
             publisher.generation,

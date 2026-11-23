@@ -15,7 +15,7 @@ This document describes the `/simulate` request and response shape.
 - POST a quote request to `/simulate`.
 - Inspect `meta.status`, `meta.result_quality`, `meta.partial_kind`, `meta.failures`, and `meta.pool_results`.
 - Keep only responses with usable quotes when selecting pools for execution or route building.
-- If you need calldata, feed selected pools into `/encode`, which re-simulates the route internally.
+- Consumers generate settlement calldata separately; this service only simulates quotes.
 
 ## Request body (shape)
 

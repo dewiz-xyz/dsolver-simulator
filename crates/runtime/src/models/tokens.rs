@@ -45,6 +45,10 @@ enum TokenFetchSource {
 }
 
 impl TokenStore {
+    pub fn chain(&self) -> Chain {
+        self.chain
+    }
+
     pub fn new(
         initial: HashMap<Bytes, Token>,
         tycho_url: String,
@@ -114,7 +118,7 @@ impl TokenStore {
     }
 
     pub fn wrapped_native_token(&self) -> Option<Bytes> {
-        let address = self.chain.wrapped_native_token().address;
+        let address = self.chain.wrapped_native_token()?.address;
         (address != native_token_address()).then_some(address)
     }
 

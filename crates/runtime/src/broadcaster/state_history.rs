@@ -1,5 +1,4 @@
 use std::collections::{btree_map::Entry, BTreeMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -26,7 +25,7 @@ pub struct StateHistoryRuntime {
     pub handle: WriterHandle,
     tokens: Arc<TokenStore>,
     token_s3_prefix: String,
-    rfq_high_water_ms: AtomicU64,
+    book_observations: Mutex<BookObservations>,
     checkpoint_task: Mutex<Option<StateHistoryCheckpointTask>>,
     boundary_requests: mpsc::UnboundedSender<BoundaryCheckpointRequest>,
     boundary_request_receiver: Mutex<Option<mpsc::UnboundedReceiver<BoundaryCheckpointRequest>>>,
@@ -53,14 +52,14 @@ impl StateHistoryUpdateProjection {
                     block_number: Some(partition.block_number),
                     observed_at_ms: None,
                 },
-                BroadcasterBackend::Rfq => DeltaBackendCursor {
-                    backend: Backend::Rfq,
+                BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => DeltaBackendCursor {
+                    backend: backend(partition.backend),
                     block_number: None,
-                    observed_at_ms: Some(seconds_to_ms(partition.block_number)?),
+                    observed_at_ms: Some(checked_book_timestamp_ms(partition.block_number)?),
                 },
             };
             backends.push(cursor);
-            if partition.backend != BroadcasterBackend::Rfq {
+            if !partition.backend.is_book() {
                 collect_message_block_times(&partition.messages, &mut block_times)?;
             }
         }
@@ -69,20 +68,66 @@ impl StateHistoryUpdateProjection {
             block_times: block_times.into_values().collect(),
         })
     }
+}
 
-    fn rfq_observed_at_ms(&self) -> Option<u64> {
-        self.backends
-            .iter()
-            .filter(|cursor| cursor.backend == Backend::Rfq)
-            .filter_map(|cursor| cursor.observed_at_ms)
-            .max()
+/// Independent observation clocks for the decoded book partitions on one generation.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct BookObservations {
+    pub rfq: Option<u64>,
+    pub prop_amm: Option<u64>,
+}
+
+impl BookObservations {
+    fn observe(&mut self, other: Self) {
+        self.rfq = self.rfq.max(other.rfq);
+        self.prop_amm = self.prop_amm.max(other.prop_amm);
+    }
+
+    fn observe_cursor(&mut self, backend: Backend, observed: u64) {
+        let cursor = match backend {
+            Backend::Rfq => &mut self.rfq,
+            Backend::PropAmm => &mut self.prop_amm,
+            Backend::Native | Backend::Vm => return,
+        };
+        *cursor = (*cursor).max(Some(observed));
+    }
+
+    fn observe_snapshot(&mut self, payload: &BroadcasterPayload) -> Result<()> {
+        if let BroadcasterPayload::SnapshotChunk(chunk) = payload {
+            for partition in &chunk.partitions {
+                // Empty partitions have a zero head until the first book observation.
+                if partition.backend.is_book() {
+                    self.observe_cursor(
+                        backend(partition.backend),
+                        checked_book_timestamp_ms(partition.block_number)?,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // A coarse retained gap covers every book clock that advanced. An unknown
+    // requested floor for an observed partition is filled by the history store.
+    pub(crate) fn gap_to(self, capture: Self) -> (Option<u64>, Option<u64>) {
+        let until = capture.rfq.max(capture.prop_amm);
+        let mut from = None;
+        for (requested, captured) in [(self.rfq, capture.rfq), (self.prop_amm, capture.prop_amm)] {
+            if captured.is_some() {
+                let Some(requested) = requested else {
+                    return (None, until);
+                };
+                from = Some(from.map_or(requested, |old: u64| old.min(requested)));
+            }
+        }
+        (from, until)
     }
 }
 
 pub(crate) struct BoundaryCheckpointRequest {
     pub(crate) position: StreamPosition,
     pub(crate) complete_native_block: Option<u64>,
-    pub(crate) rfq_high_water_ms: Option<u64>,
+    pub(crate) book_observations: BookObservations,
     response: oneshot::Sender<Result<Option<u64>>>,
 }
 
@@ -93,7 +138,7 @@ impl StateHistoryRuntime {
             handle,
             tokens,
             token_s3_prefix,
-            rfq_high_water_ms: AtomicU64::new(0),
+            book_observations: Mutex::new(BookObservations::default()),
             checkpoint_task: Mutex::new(None),
             boundary_requests,
             boundary_request_receiver: Mutex::new(Some(boundary_request_receiver)),
@@ -117,29 +162,29 @@ impl StateHistoryRuntime {
         CheckpointCapture::new(state, tokens, self.token_s3_prefix.clone())
     }
 
-    pub fn rfq_high_water_ms(&self) -> Option<u64> {
-        match self.rfq_high_water_ms.load(Ordering::Acquire) {
-            0 => None,
-            value => Some(value),
+    pub fn book_observations(&self) -> BookObservations {
+        *lock(&self.book_observations)
+    }
+
+    pub(crate) fn observe_book_update(&self, update: &StateHistoryUpdateProjection) {
+        let mut high_water = lock(&self.book_observations);
+        for cursor in &update.backends {
+            if let Some(observed) = cursor.observed_at_ms {
+                high_water.observe_cursor(cursor.backend, observed);
+            }
         }
     }
 
-    pub(crate) fn observe_rfq_update(&self, update: &StateHistoryUpdateProjection) {
-        if let Some(observed_at_ms) = update.rfq_observed_at_ms() {
-            self.rfq_high_water_ms
-                .fetch_max(observed_at_ms, Ordering::AcqRel);
-        }
+    pub(crate) fn observe_books(&self, observed: BookObservations) {
+        lock(&self.book_observations).observe(observed);
     }
 
-    pub fn reset_rfq_high_water(&self) {
-        self.rfq_high_water_ms.store(0, Ordering::Release);
+    pub fn reset_book_observations(&self) {
+        *lock(&self.book_observations) = BookObservations::default();
     }
 
-    pub fn observe_rfq_export(&self, export: &BroadcasterSnapshotExport) -> Result<()> {
-        if let Some(observed_at_ms) = rfq_observed_at_ms_from_export(export)? {
-            self.rfq_high_water_ms
-                .fetch_max(observed_at_ms, Ordering::AcqRel);
-        }
+    pub fn observe_book_export(&self, export: &BroadcasterSnapshotExport) -> Result<()> {
+        self.observe_books(book_observations_from_export(export)?);
         Ok(())
     }
 
@@ -163,14 +208,14 @@ impl StateHistoryRuntime {
         &self,
         position: StreamPosition,
         complete_native_block: Option<u64>,
-        rfq_high_water_ms: Option<u64>,
+        book_observations: BookObservations,
     ) -> Result<Option<u64>> {
         let (response, receiver) = oneshot::channel();
         self.boundary_requests
             .send(BoundaryCheckpointRequest {
                 position,
                 complete_native_block,
-                rfq_high_water_ms,
+                book_observations,
                 response,
             })
             .context("state history checkpoint task is not running")?;
@@ -306,15 +351,34 @@ pub fn captured_state_from_export(
     position: StreamPosition,
     state_version: u64,
     block_number: u64,
-    rfq_observed_at_ms: Option<u64>,
+    book_observations: BookObservations,
+) -> Result<CapturedState> {
+    captured_state_from_payloads(
+        kind,
+        export.payloads.iter(),
+        position,
+        state_version,
+        block_number,
+        book_observations,
+    )
+}
+
+pub(crate) fn captured_state_from_payloads<'a>(
+    kind: CheckpointKind,
+    payloads: impl ExactSizeIterator<Item = &'a BroadcasterPayload>,
+    position: StreamPosition,
+    state_version: u64,
+    block_number: u64,
+    mut book_observations: BookObservations,
 ) -> Result<CapturedState> {
     let mut chain_id = None;
     let mut backends = Vec::new();
     let mut backend_heads = BTreeMap::new();
     let mut block_times = BTreeMap::new();
-    let mut payloads_json = Vec::with_capacity(export.payloads.len());
+    let mut payloads_json = Vec::with_capacity(payloads.len());
 
-    for payload in &export.payloads {
+    for payload in payloads {
+        book_observations.observe_snapshot(payload)?;
         payloads_json.push(
             serde_json::to_string(payload).context("failed to serialize checkpoint payload")?,
         );
@@ -356,40 +420,39 @@ pub fn captured_state_from_export(
         );
     }
     let chain_id = chain_id.context("checkpoint export is missing snapshot_start")?;
-    let rfq_observed_at_ms = match (rfq_observed_at_ms, rfq_observed_at_ms_from_export(export)?) {
-        (Some(recorded), Some(snapshot)) => Some(recorded.max(snapshot)),
-        (recorded, snapshot) => recorded.or(snapshot),
-    };
-    Ok(CapturedState::new(
+    Ok(CapturedState::new_with_book_observations(
         chain_id,
         position,
         Some(state_version),
         kind,
         block_number,
-        rfq_observed_at_ms,
+        book_observations
+            .rfq
+            .map(checked_book_timestamp_ms)
+            .transpose()?,
+        book_observations
+            .prop_amm
+            .map(checked_book_timestamp_ms)
+            .transpose()?,
         backends,
         payloads_json,
         block_times.into_values().collect(),
     )?)
 }
 
-fn rfq_observed_at_ms_from_export(export: &BroadcasterSnapshotExport) -> Result<Option<u64>> {
-    export
-        .payloads
-        .iter()
-        .filter_map(|payload| match payload {
-            BroadcasterPayload::SnapshotChunk(chunk) => Some(&chunk.partitions),
-            _ => None,
-        })
-        .flatten()
-        .filter(|partition| partition.backend == BroadcasterBackend::Rfq)
-        .map(|partition| seconds_to_ms(partition.block_number))
-        .try_fold(None, |current, observed| {
-            let observed = observed?;
-            Ok(Some(
-                current.map_or(observed, |current: u64| current.max(observed)),
-            ))
-        })
+pub(crate) fn book_observations_from_export(
+    export: &BroadcasterSnapshotExport,
+) -> Result<BookObservations> {
+    let mut observations = BookObservations::default();
+    for payload in &export.payloads {
+        observations.observe_snapshot(payload)?;
+    }
+    Ok(observations)
+}
+
+fn checked_book_timestamp_ms(value: u64) -> Result<u64> {
+    i64::try_from(value).context("book observation time exceeds the PostgreSQL bigint range")?;
+    Ok(value)
 }
 
 fn collect_message_block_times(
@@ -423,6 +486,7 @@ const fn backend(backend: BroadcasterBackend) -> Backend {
         BroadcasterBackend::Native => Backend::Native,
         BroadcasterBackend::Vm => Backend::Vm,
         BroadcasterBackend::Rfq => Backend::Rfq,
+        BroadcasterBackend::PropAmm => Backend::PropAmm,
     }
 }
 
@@ -546,12 +610,63 @@ mod tests {
     }
 
     #[test]
-    fn rfq_partition_maps_to_observed_at_ms_cursor() -> Result<()> {
+    fn split_book_observations_stay_independent_in_retained_history() -> Result<()> {
+        use simulator_core::broadcaster::{BroadcasterSnapshotChunk, BroadcasterSnapshotPartition};
+        let mut observed = super::BookObservations::default();
+        for (backend, time) in [
+            (BroadcasterBackend::Rfq, 100),
+            (BroadcasterBackend::PropAmm, 80),
+            (BroadcasterBackend::PropAmm, 90),
+            (BroadcasterBackend::Rfq, 0),
+        ] {
+            let chunk = BroadcasterSnapshotChunk::new(
+                "books",
+                0,
+                vec![BroadcasterSnapshotPartition::new(
+                    backend,
+                    time,
+                    vec![],
+                    Default::default(),
+                )],
+            )?;
+            observed.observe_snapshot(&BroadcasterPayload::SnapshotChunk(chunk))?;
+        }
+        assert_eq!(observed.rfq, Some(100));
+        assert_eq!(observed.prop_amm, Some(90));
+        let earlier = super::BookObservations {
+            rfq: Some(95),
+            prop_amm: Some(70),
+        };
+        assert_eq!(earlier.gap_to(observed), (Some(70), Some(100)));
+        assert_eq!(
+            super::BookObservations::default().gap_to(observed),
+            (None, Some(100))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn book_partitions_map_to_independent_observed_at_ms_cursors() -> Result<()> {
         let envelope: BroadcasterEnvelope = serde_json::from_str(RFQ_UPDATE)?;
-        let BroadcasterPayload::Update(update) = envelope.payload else {
+        let BroadcasterPayload::Update(mut update) = envelope.payload else {
             unreachable!();
         };
 
+        update.partitions[0].block_number = 1_710_000_000_000;
+        let status =
+            simulator_core::broadcaster::BroadcasterProtocolSyncStatus::from_synchronizer_state(
+                &tycho_simulation::tycho_client::feed::SynchronizerState::Started,
+            );
+        update.partitions.push(
+            simulator_core::broadcaster::BroadcasterUpdatePartition::new(
+                BroadcasterBackend::PropAmm,
+                1_709_999_999_000,
+                vec![],
+                vec![],
+                vec![],
+                std::collections::BTreeMap::from([("rfq:metric".into(), status)]),
+            ),
+        );
         let projection = StateHistoryUpdateProjection::from_update(&update)?;
         let entry = delta_entry_from_update(
             8453,
@@ -563,7 +678,10 @@ mod tests {
         )?
         .context("state-changing update was skipped")?;
 
-        assert_eq!(entry.backends().len(), 1);
+        assert_eq!(entry.backends().len(), 2);
+        assert_eq!(entry.backends()[1].backend, Backend::PropAmm);
+        assert_eq!(entry.backends()[1].block_number, None);
+        assert_eq!(entry.backends()[1].observed_at_ms, Some(1_709_999_999_000));
         assert_eq!(entry.backends()[0].backend, Backend::Rfq);
         assert_eq!(entry.backends()[0].block_number, None);
         assert_eq!(entry.backends()[0].observed_at_ms, Some(1_710_000_000_000));
@@ -593,7 +711,10 @@ mod tests {
             },
             7,
             block_number,
-            Some(1_710_000_000_000),
+            super::BookObservations {
+                rfq: Some(1_710_000_000_000),
+                prop_amm: None,
+            },
         ) else {
             anyhow::bail!("mismatched native and VM heads were accepted");
         };
@@ -614,7 +735,10 @@ mod tests {
             },
             7,
             19_000_000,
-            Some(1_710_000_000_000),
+            super::BookObservations {
+                rfq: Some(1_710_000_000_000),
+                prop_amm: None,
+            },
         )?;
 
         let kinds = capture

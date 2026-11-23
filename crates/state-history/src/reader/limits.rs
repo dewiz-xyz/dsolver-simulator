@@ -273,6 +273,7 @@ fn validate_checkpoint_bytes(
             && metadata.kind == manifest.kind
             && metadata.block_number == manifest.block_number
             && metadata.rfq_observed_at_ms == manifest.rfq_observed_at_ms
+            && metadata.prop_amm_observed_at_ms == manifest.prop_amm_observed_at_ms
             && metadata.backends == manifest.backends,
         "checkpoint manifest {} metadata does not match its archive",
         manifest.id

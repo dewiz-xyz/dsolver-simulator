@@ -362,7 +362,7 @@ async fn checkpoint_capture(
         capture_position,
         3,
         block_number,
-        None,
+        Default::default(),
     )?;
     let tokens = token_store
         .snapshot()
@@ -738,13 +738,14 @@ async fn persist_checkpoint(
     let id = StateHistoryStore::create_checkpoint(&mut connection, &capture).await?;
     let archive = CheckpointArchive {
         metadata: ArchiveMetadata {
-            schema_version: 1,
+            schema_version: state_history::ARCHIVE_SCHEMA_VERSION,
             chain_id: capture.chain_id(),
             position: capture.position(),
             state_version: capture.state_version(),
             kind: capture.kind(),
             block_number: capture.block_number(),
             rfq_observed_at_ms: capture.rfq_observed_at_ms(),
+            prop_amm_observed_at_ms: capture.prop_amm_observed_at_ms(),
             backends: capture.backends().to_vec(),
         },
         payloads_json: capture.payloads_json().to_vec(),

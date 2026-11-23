@@ -205,6 +205,7 @@ fn quote_state(
                     rfq_observation_cursor: state.provenance.rfq_observation_cursor,
                     rfq_observed_at: state.provenance.rfq_observed_at,
                     rfq_observation_age_ms: state.provenance.rfq_observation_age_ms,
+                    prop_amm_observation: state.provenance.prop_amm_observation.clone(),
                 },
             }
         }

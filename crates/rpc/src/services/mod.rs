@@ -1,1 +1,1 @@
-pub use runtime::services::{encode, quotes};
+pub use runtime::services::quotes;

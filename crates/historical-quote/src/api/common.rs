@@ -28,6 +28,14 @@ pub enum Backend {
     Vm,
     /// Stored RFQ price levels.
     Rfq,
+    /// Indicative price levels executed directly against a pool.
+    PropAmm,
+}
+
+impl Backend {
+    pub fn is_book(self) -> bool {
+        matches!(self, Self::Rfq | Self::PropAmm)
+    }
 }
 
 /// One ordered position in state history.

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::reader::{decode_zstd_with_limit, ReadLimitError};
 use crate::{Backend, CheckpointKind, EncodedArchiveInfo, StreamPosition};
 
-pub const ARCHIVE_SCHEMA_VERSION: u32 = 1;
+pub const ARCHIVE_SCHEMA_VERSION: u32 = 2;
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -31,6 +31,8 @@ pub struct ArchiveMetadata {
     pub kind: CheckpointKind,
     pub block_number: u64,
     pub rfq_observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prop_amm_observed_at_ms: Option<u64>,
     pub backends: Vec<Backend>,
 }
 
@@ -110,8 +112,8 @@ pub(crate) fn decode_archive_with_info(
     let envelope: ArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
     match envelope.schema_version {
-        ARCHIVE_SCHEMA_VERSION => {
-            decode_archive_v1(envelope, archive_json, bytes).map_err(anyhow::Error::from)
+        1 | 2 => {
+            decode_archive_envelope(envelope, archive_json, bytes).map_err(anyhow::Error::from)
         }
         other => Err(ArchiveCodecError::UnsupportedSchemaVersion(other).into()),
     }
@@ -133,14 +135,14 @@ pub(crate) fn decode_archive_with_info_and_limit(
     let envelope: ArchiveEnvelope =
         serde_json::from_slice(&archive_json).context("failed to parse checkpoint archive")?;
     match envelope.schema_version {
-        ARCHIVE_SCHEMA_VERSION => decode_archive_v1(envelope, archive_json, bytes),
+        1 | 2 => decode_archive_envelope(envelope, archive_json, bytes),
         other => Err(ReadLimitError::Read(
             ArchiveCodecError::UnsupportedSchemaVersion(other).into(),
         )),
     }
 }
 
-fn decode_archive_v1(
+fn decode_archive_envelope(
     envelope: ArchiveEnvelope,
     archive_json: Vec<u8>,
     compressed: &[u8],
@@ -324,6 +326,21 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn reads_legacy_checkpoint_envelopes() -> anyhow::Result<()> {
+        let mut metadata = test_metadata();
+        metadata.schema_version = 1;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "metadata": metadata, "payloads": [{"k": 1}]
+        }))?;
+        let sha256 = hex::encode(Sha256::digest(&raw));
+        let bytes = zstd::stream::encode_all(raw.as_slice(), ZSTD_COMPRESSION_LEVEL)?;
+        let decoded = decode_archive_with_info_and_limit(&bytes, &sha256, 4096)?;
+        assert_eq!(decoded.archive.metadata, metadata);
+        assert_eq!(decoded.archive.payloads_json, [r#"{"k":1}"#]);
+        Ok(())
+    }
+
     #[expect(
         clippy::expect_used,
         clippy::unwrap_used,
@@ -392,6 +409,7 @@ mod tests {
             kind: CheckpointKind::Interval,
             block_number: 20_000_000,
             rfq_observed_at_ms: None,
+            prop_amm_observed_at_ms: None,
             backends: vec![Backend::Native, Backend::Vm],
         }
     }

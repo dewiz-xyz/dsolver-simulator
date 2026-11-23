@@ -4,7 +4,15 @@ State history records the broadcaster as ordered segments. A stream position is 
 
 A reader starts from the newest complete checkpoint at or before the requested start block, then selects deltas using each backend's own block or timestamp cursor. A replay plan can contain multiple legs. Each leg starts from one checkpoint and applies its deltas in `(generation, message_seq)` order.
 
-Boundary checkpoints start new segments after writer promotion and recovery commits. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
+Boundary checkpoints start new segments after writer promotion and recovery commits. At startup promotion the writer retains the same pinned snapshot and token catalog used to establish the new generation, at the Redis reset position. It persists startup handoff updates as deltas at their assigned Redis positions. Interval checkpoints reduce replay work but do not split an existing segment. A missing or failed boundary stops replay across that boundary and appears as a gap. Updates drained from the recovery buffer at a recovery commit are appended directly to Redis and do not become delta rows. The boundary checkpoint's exported cache state covers them.
+
+## Book partition rollout
+
+Direct Native, Hashflow, Bebop and Liquorice use `rfq`. Direct Metric and the eight named Titan price-level venues use `prop_amm`. Both partition heads carry Unix milliseconds. The writer retains an independent cursor for each in checkpoints and deltas.
+
+1. Apply the state-history migration and deploy readers that recognize both tags. The upgraded stream readers continue accepting Metric and Titan books from an existing Tycho 0.525 writer’s `rfq` partition.
+2. Promote the upgraded writer onto a fresh Redis generation with a new boundary checkpoint. Keep the chain’s Redis generation counter monotonic because history keys include the generation and sequence. Check the HTTP snapshot’s declared partitions and the corresponding Redis backend scopes. A chain with only one configured book family declares just that family.
+3. Historical requests for pre-cutover mixed books use their recorded `rfq` backend. Use `prop_amm` for Metric or Titan on the new generation. Historical records retain their original wire identity.
 
 ## Terminology
 
@@ -48,7 +56,7 @@ The uncompressed JSON envelope has this shape:
 }
 ```
 
-`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION` and the delta payload format. All three retained formats are currently `1`.
+`TOKEN_SNAPSHOT_SCHEMA_VERSION` is the token snapshot schema constant. It is independent of `ARCHIVE_SCHEMA_VERSION` and the delta payload format. Token snapshots use version `1`. The Tycho 0.525 writer emits version `2` for checkpoint archives and deltas.
 
 Canonical encoding sorts tokens by address and rejects duplicate addresses. Serde emits deterministic JSON from the fixed envelope and token DTO fields. The writer computes SHA-256 over those uncompressed canonical bytes, then compresses them with Zstandard level 3. The manifest `token_bytes` column records the uncompressed canonical JSON length. `TokenSnapshotCodecError` provides the typed `Sha256Mismatch`, `UnsupportedSchemaVersion`, and `DuplicateTokenAddress` variants.
 
@@ -79,12 +87,14 @@ One row represents one accepted update. `(chain_id, generation, message_seq)` is
 | `observed_at_ms` | Time the update was observed, in Unix milliseconds. |
 | `payload` | Zstandard-compressed serialized update payload. |
 | `payload_sha256` | SHA-256 digest of the uncompressed serialized payload. |
-| `payload_format_version` | Complete retained delta payload and decoder profile version. Existing and new rows default to version `1`. |
+| `payload_format_version` | Complete retained delta payload and decoder profile version. The writer explicitly records version `2`. The database default for legacy inserts is `1`. |
 | `created_at` | Time PostgreSQL inserted the row. |
 
 ### Retained payload formats
 
 Checkpoint archives, token snapshots, and deltas dispatch through explicit stored-version matches. Unknown versions fail closed. Delta payload format 1 means the current broadcaster update envelope plus the fixed `DecoderConfig::retained_v1()` profile. That profile registers every protocol implementation a format 1 writer could emit and pins token quality to `0`; it never reads the current simulator manifest.
+
+Format 2 checkpoints select `DecoderConfig::retained_v2()`. Format 2 deltas require the same profile. It includes the expanded Tycho 0.525 protocol set, including protocols that are currently disabled in the live manifest. Start a fresh broadcaster generation with a matching boundary checkpoint when switching formats. Legacy RFQ books written by pre-0.525 Tycho still require their matching historical reader.
 
 When state history is enabled, broadcaster startup refuses `BROADCASTER_TOKEN_MIN_QUALITY` values other than `0`. Any JSON-shape, protocol-decoder, or decoder-setting change that changes retained decoding requires a new delta payload format before its writer can be enabled.
 
@@ -98,7 +108,7 @@ One row maps a delta to one affected backend. Range queries use these backend cu
 | --- | --- |
 | `delta_id` | Referenced `deltas.id`. Deleting the delta deletes this row. |
 | `chain_id` | Chain copied from the parent delta for indexed range queries. |
-| `backend` | Affected backend. Allowed values are `native`, `vm`, and `rfq`. |
+| `backend` | Affected backend. Allowed values are `native`, `vm`, `rfq`, and `prop_amm`. |
 | `generation` | Writer generation copied from the parent delta. |
 | `message_seq` | Message sequence copied from the parent delta. |
 | `block_number` | Backend block cursor, when the backend advances by block. |
@@ -119,7 +129,8 @@ One row is the PostgreSQL manifest for a full-state checkpoint archive in S3.
 | `state_version` | Redis committed state version for the capture, when available. |
 | `kind` | Checkpoint purpose. Allowed values are `boundary` and `interval`. |
 | `block_number` | Aligned native and VM head captured by the checkpoint. |
-| `rfq_observed_at_ms` | Highest RFQ observation time covered by the checkpoint, in Unix milliseconds. |
+| `rfq_observed_at_ms` | Highest observation time in the RFQ partition, in Unix milliseconds. |
+| `prop_amm_observed_at_ms` | Highest observation time in the proprietary AMM partition, in Unix milliseconds. Legacy checkpoints omit this cursor. |
 | `backends` | Backend names included in the checkpoint archive. |
 | `s3_key` | Object key for the completed archive. |
 | `archive_sha256` | SHA-256 digest of the uncompressed checkpoint archive JSON. |
@@ -160,7 +171,7 @@ Rows record losses known to the writer.
 
 `from_message_seq` cannot exceed `to_message_seq`. The full gap identity is unique, including nullable block and time bounds.
 
-Block bounds come only from block backend cursors. Observation time bounds come only from RFQ provider cursors, never from Redis publication time. A bound stays `NULL` when the lost payload has no corresponding cursor. Boundary checkpoint failures use the capture block number and RFQ high water for both sides of their bounds. Boundary slip bounds start at the request-time cursors and end at the capture cursors. Rows with all four bounds `NULL` are still selected by stream position.
+Block bounds come only from block backend cursors. Observation time bounds come from the RFQ and proprietary AMM partition cursors. A bound stays `NULL` when the lost payload has no corresponding cursor. Boundary checkpoint failures record the capture block number and the earliest and latest captured book cursors. Boundary slip bounds start at the request-time cursors and end at the capture cursors. Rows with all four bounds `NULL` are still selected by stream position.
 
 `boundary_slip` records a same generation recovery boundary checkpoint that pins after its requested commit position. Its stream span starts at the requested message sequence plus one and ends at the pinned capture position, so replay across any slipped position fails closed.
 
@@ -284,7 +295,7 @@ ORDER BY db.backend;
 
 ## Reader API
 
-`StateHistoryReader::resolve_backtest_range(&BacktestRequest)` returns a `BacktestPlan`. Native and VM requests get informational start and end timestamps when rows exist. Requests that include RFQ require continuous `block_times` rows through `end_block + 1`, which the reader uses to derive inclusive RFQ timestamp bounds.
+`StateHistoryReader::resolve_backtest_range(&BacktestRequest)` returns a `BacktestPlan`. Native and VM requests get informational start and end timestamps when rows exist. Requests that include either book partition require continuous `block_times` rows through `end_block + 1` to derive inclusive observation-time bounds.
 
 Each `RangeLeg` contains a `CheckpointManifest` and zero or more ordered deltas to apply after that checkpoint. Boundary discovery uses the request end rather than the last stored delta. For every requested backend represented by a boundary, its checkpoint cursor must be at or below that backend's requested end. A trailing boundary can therefore close a range without a later delta, producing a leg with zero deltas.
 
@@ -341,9 +352,9 @@ Construct the reader with `StateHistoryReader::new(PgPool, CheckpointObjectStore
 
 A rebuild that passes these checks is exact only when history holds every update up to the position, and the checks cannot prove that yet. A lost update's gap can be stored after later deltas or not at all. A recovery commit's boundary checkpoint is stored after the export that follows the commit, so until it lands the updates after the commit fold onto the state from before the recovery. When that export pins later than the commit, a gap covers the positions after the commit up to the boundary, but the commit position itself stays rebuildable from the state before the recovery for good.
 
-`coverage` returns continuous safe block intervals and `visible_through_block` separately. Replica delay only lowers that cutoff; it never becomes a stored gap. Stored gaps retain their complete stream-position, block, and RFQ observation-time bounds. A gap without block or time cursors fails closed from the prior compatible boundary through the next compatible boundary.
+`coverage` returns continuous safe block intervals and `visible_through_block` separately. Replica delay only lowers that cutoff; it never becomes a stored gap. Stored gaps retain their complete stream-position, block, and book observation-time bounds. A gap without block or time cursors fails closed from the prior compatible boundary through the next compatible boundary.
 
-`plan_targets` returns observations for every unique target block and, for RFQ, each target's next block. It validates canonical parent/hash lineage across the requested span and reports unsafe lineage intervals separately from stored gaps. `resolve_checkpoint_pairs` returns adjacent complete checkpoints without crossing a boundary, while explicit pairs must resolve to exact, ordered positions in one segment. `select_token_anchor` uses the selected checkpoint's token snapshot or the newest earlier token snapshot after the same segment boundary; it never attaches a token snapshot across a boundary.
+`plan_targets` returns observations for every unique target block and, for either book partition, each target's next block. It validates canonical parent/hash lineage across the requested span and reports unsafe lineage intervals separately from stored gaps. `resolve_checkpoint_pairs` returns adjacent complete checkpoints without crossing a boundary, while explicit pairs must resolve to exact, ordered positions in one segment. `select_token_anchor` uses the selected checkpoint's token snapshot or the newest earlier token snapshot after the same segment boundary; it never attaches a token snapshot across a boundary.
 
 Use `ReadLimits` with target planning and the bounded object fetch methods. Planning sums manifest sizes and SQL `octet_length(payload)` before selecting compressed delta bodies. Object fetches reject an oversized manifest or S3 content length before reading the body, and all Zstandard decoders use counted readers capped at the remaining decoded-byte limit.
 
@@ -416,5 +427,4 @@ PostgreSQL and MinIO services on loopback, and run the storage checks. The scrip
 removes the containers and volumes when it exits.
 
 [Dockerfile.state-history-minio](../Dockerfile.state-history-minio) builds pinned
-MinIO source because upstream does not publish an image for this release. Compose
-pins the client and PostgreSQL images by digest.
+MinIO source because upstream does not publish an image for this release. The same image includes a client built from its pinned release source. Compose pins PostgreSQL by digest.

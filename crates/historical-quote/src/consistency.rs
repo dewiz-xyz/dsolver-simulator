@@ -171,9 +171,11 @@ impl<S: HistorySource> ConsistencyChecker<S> {
                 "checkpoint pair produced a deterministic apply anomaly".to_owned(),
             ));
         }
-        replayed
-            .world
-            .set_current_block(target_world_marker(&plan.pair.target, &request.backends));
+        replayed.world.set_current_block(target_world_marker(
+            &plan.pair.target,
+            &request.backends,
+            direct.archive_schema_version,
+        ));
 
         let replay_backends = request
             .backends
@@ -350,7 +352,9 @@ fn validate_applicable_backends(
                 state_history::Backend::Native | state_history::Backend::Vm => {
                     cursor.block_number.is_some()
                 }
-                state_history::Backend::Rfq => cursor.observed_at_ms.is_some(),
+                state_history::Backend::Rfq | state_history::Backend::PropAmm => {
+                    cursor.observed_at_ms.is_some()
+                }
             };
         if !cursor_is_valid {
             return Err(invalid_storage(
@@ -587,7 +591,11 @@ fn quote_status(
     }
 }
 
-fn target_world_marker(manifest: &state_history::CheckpointManifest, backends: &[Backend]) -> u64 {
+fn target_world_marker(
+    manifest: &state_history::CheckpointManifest,
+    backends: &[Backend],
+    archive_schema_version: u32,
+) -> u64 {
     let mut marker = 0;
     if backends
         .iter()
@@ -596,7 +604,17 @@ fn target_world_marker(manifest: &state_history::CheckpointManifest, backends: &
         marker = marker.max(manifest.block_number);
     }
     if backends.contains(&Backend::Rfq) {
-        marker = marker.max(manifest.rfq_observed_at_ms.unwrap_or_default() / 1_000);
+        let observed_ms = manifest.rfq_observed_at_ms.unwrap_or_default();
+        // V1 book states use seconds; the V2 broadcaster keeps the wire cursor in milliseconds.
+        let rfq_marker = if archive_schema_version == 1 {
+            observed_ms / 1_000
+        } else {
+            observed_ms
+        };
+        marker = marker.max(rfq_marker);
+    }
+    if backends.contains(&Backend::PropAmm) {
+        marker = marker.max(manifest.prop_amm_observed_at_ms.unwrap_or_default());
     }
     marker
 }
@@ -625,6 +643,7 @@ fn canonical_summary(state: &CanonicalState) -> CanonicalStateSummary {
                         simulator_replay::ReplayBackend::Native => Backend::Native,
                         simulator_replay::ReplayBackend::Vm => Backend::Vm,
                         simulator_replay::ReplayBackend::Rfq => Backend::Rfq,
+                        simulator_replay::ReplayBackend::PropAmm => Backend::PropAmm,
                     },
                     u64::try_from(*count).unwrap_or(u64::MAX),
                 )
@@ -831,5 +850,6 @@ fn public_replay_backend(backend: simulator_replay::ReplayBackend) -> Backend {
         simulator_replay::ReplayBackend::Native => Backend::Native,
         simulator_replay::ReplayBackend::Vm => Backend::Vm,
         simulator_replay::ReplayBackend::Rfq => Backend::Rfq,
+        simulator_replay::ReplayBackend::PropAmm => Backend::PropAmm,
     }
 }

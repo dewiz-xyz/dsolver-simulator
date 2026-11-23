@@ -20,6 +20,7 @@ pub enum ReplayBackend {
     Native,
     Vm,
     Rfq,
+    PropAmm,
 }
 
 impl ReplayBackend {
@@ -28,25 +29,31 @@ impl ReplayBackend {
             Self::Native => "native",
             Self::Vm => "vm",
             Self::Rfq => "rfq",
+            Self::PropAmm => "prop_amm",
         }
     }
 
+    pub const fn is_book(self) -> bool {
+        matches!(self, Self::Rfq | Self::PropAmm)
+    }
+
     pub const fn from_protocol_kind(kind: ProtocolKind) -> Self {
-        match kind {
-            ProtocolKind::Curve | ProtocolKind::BalancerV2 | ProtocolKind::MaverickV2 => Self::Vm,
-            ProtocolKind::Hashflow | ProtocolKind::Bebop | ProtocolKind::Liquorice => Self::Rfq,
-            _ => Self::Native,
+        Self::from_broadcaster_backend(BroadcasterBackend::from_protocol_kind(kind))
+    }
+
+    const fn from_broadcaster_backend(value: BroadcasterBackend) -> Self {
+        match value {
+            BroadcasterBackend::Native => Self::Native,
+            BroadcasterBackend::Vm => Self::Vm,
+            BroadcasterBackend::Rfq => Self::Rfq,
+            BroadcasterBackend::PropAmm => Self::PropAmm,
         }
     }
 }
 
 impl From<BroadcasterBackend> for ReplayBackend {
     fn from(value: BroadcasterBackend) -> Self {
-        match value {
-            BroadcasterBackend::Native => Self::Native,
-            BroadcasterBackend::Vm => Self::Vm,
-            BroadcasterBackend::Rfq => Self::Rfq,
-        }
+        Self::from_broadcaster_backend(value)
     }
 }
 
@@ -56,6 +63,7 @@ impl From<ReplayBackend> for BroadcasterBackend {
             ReplayBackend::Native => Self::Native,
             ReplayBackend::Vm => Self::Vm,
             ReplayBackend::Rfq => Self::Rfq,
+            ReplayBackend::PropAmm => Self::PropAmm,
         }
     }
 }
