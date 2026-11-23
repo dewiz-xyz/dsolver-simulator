@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use super::state_history::BookObservations;
 use alloy_primitives::keccak256;
 use anyhow::{Context, Result};
 use futures::FutureExt;
@@ -589,10 +590,7 @@ impl BroadcasterServiceState {
         self.cancel_recovery_publication().await;
         self.upstream.mark_disconnected(reason, last_error).await;
         let backends = self.cache.configured_backends();
-        if backends
-            .iter()
-            .any(|backend| *backend != simulator_core::broadcaster::BroadcasterBackend::Rfq)
-        {
+        if backends.iter().any(|backend| !backend.is_book()) {
             self.cache.begin_same_generation_recovery().await;
         } else if let Err(error) = self.withdraw_rfq_books().await {
             warn!(%error, "Retrying RFQ withdrawals before the next feed connection");
@@ -626,7 +624,12 @@ impl BroadcasterServiceState {
     }
 
     pub(crate) async fn prepare_rfq_connection(&self) -> Result<()> {
-        if self.cache.configured_backends() == [BroadcasterBackend::Rfq] {
+        if self
+            .cache
+            .configured_backends()
+            .iter()
+            .all(|backend| backend.is_book())
+        {
             let _gate = self.lifecycle_gate.lock().await;
             self.withdraw_rfq_books().await?;
         }
@@ -846,7 +849,7 @@ impl BroadcasterServiceState {
         kind: CheckpointKind,
         position: Option<StreamPosition>,
         requested_block_number: Option<u64>,
-        requested_rfq_observed_at_ms: Option<u64>,
+        requested_book_observations: BookObservations,
     ) -> Result<Option<u64>> {
         anyhow::ensure!(
             !services.is_empty(),
@@ -903,7 +906,7 @@ impl BroadcasterServiceState {
         // The catalog clone follows every state pin under the lifecycle gate so it cannot miss
         // tokens already referenced by the pinned state.
         let token_catalog = state_history.clone_token_catalog().await;
-        let rfq_observed_at_ms = state_history.rfq_high_water_ms();
+        let book_observations = state_history.book_observations();
         drop(gate);
 
         let export = tokio::task::spawn_blocking(move || {
@@ -939,7 +942,7 @@ impl BroadcasterServiceState {
         };
         drop(gate);
 
-        state_history.observe_rfq_export(&export)?;
+        state_history.observe_book_export(&export)?;
         // Only the pinned boundary version is guaranteed to describe this exported world.
         let state = crate::broadcaster::state_history::captured_state_from_export(
             kind,
@@ -947,7 +950,7 @@ impl BroadcasterServiceState {
             capture_position,
             boundary.state_version,
             block_number,
-            rfq_observed_at_ms,
+            book_observations,
         )?;
         let capture = state_history.checkpoint_capture(state, token_catalog);
         anyhow::ensure!(
@@ -960,12 +963,12 @@ impl BroadcasterServiceState {
             position.map(|position| BoundaryCheckpointCursor {
                 position,
                 block_number: requested_block_number,
-                rfq_observed_at_ms: requested_rfq_observed_at_ms,
+                book_observations: requested_book_observations,
             }),
             BoundaryCheckpointCursor {
                 position: capture_position,
                 block_number: Some(block_number),
-                rfq_observed_at_ms,
+                book_observations,
             },
         );
         Ok(Some(block_number))
@@ -1483,16 +1486,17 @@ impl BroadcasterServiceState {
                 return;
             };
             let block_number = finish.complete_native_block;
-            let rfq_observed_at_ms = state_history.rfq_high_water_ms();
+            let book_observations = state_history.book_observations();
             let checkpoint = state_history
-                .request_boundary_checkpoint(commit_position, block_number, rfq_observed_at_ms)
+                .request_boundary_checkpoint(commit_position, block_number, book_observations)
                 .await;
             if !matches!(checkpoint, Ok(Some(_))) {
                 state_history.handle.record_boundary_failure_gap(
                     self.cache.chain_id(),
                     commit_position,
                     block_number,
-                    rfq_observed_at_ms,
+                    book_observations.rfq,
+                    book_observations.prop_amm,
                 );
                 match checkpoint {
                     Ok(None) => warn!(
@@ -2245,7 +2249,7 @@ fn retain_current_checkpoint_capture<T>(
 struct BoundaryCheckpointCursor {
     position: StreamPosition,
     block_number: Option<u64>,
-    rfq_observed_at_ms: Option<u64>,
+    book_observations: BookObservations,
 }
 
 fn record_boundary_slip_gap_if_any(
@@ -2276,10 +2280,9 @@ fn record_boundary_slip_gap_if_any(
         },
         capture.position,
         (requested.block_number, capture.block_number),
-        (
-            capture.rfq_observed_at_ms.and(requested.rfq_observed_at_ms),
-            capture.rfq_observed_at_ms,
-        ),
+        requested
+            .book_observations
+            .gap_to(capture.book_observations),
     );
 }
 
@@ -2436,10 +2439,10 @@ async fn promote_prepared_startup_candidate(
         .redis_publisher
         .state_history()
         .zip(candidate.checkpoint.take());
-    let rfq_observed_at_ms = if checkpoint.is_some() {
-        super::state_history::rfq_observed_at_ms_from_export(&candidate.export)?
+    let book_observations = if checkpoint.is_some() {
+        super::state_history::book_observations_from_export(&candidate.export)?
     } else {
-        None
+        BookObservations::default()
     };
     let boundary = services[0]
         .redis_publisher
@@ -2454,7 +2457,7 @@ async fn promote_prepared_startup_candidate(
         .set_deployment_phase(BroadcasterDeploymentPhase::ArtifactFinalizing, None);
     let published_heads = candidate.protocol_heads.clone();
     if let Some((history, _)) = &checkpoint {
-        history.observe_rfq_timestamp(rfq_observed_at_ms);
+        history.observe_books(book_observations);
     }
     let artifact = Arc::new(finalize_snapshot_candidate(candidate, boundary.clone()));
     for service in services {
@@ -2477,7 +2480,7 @@ async fn promote_prepared_startup_candidate(
     // Redis and HTTP already refer to this immutable snapshot. Catch-up or a change in
     // live readiness must not move the starting position of the historical segment.
     if let Some((history, checkpoint)) = checkpoint {
-        persist_promotion_checkpoint(history, artifact, checkpoint, rfq_observed_at_ms).await;
+        persist_promotion_checkpoint(history, artifact, checkpoint, book_observations).await;
     }
     drained?;
     Ok(boundary)
@@ -2487,7 +2490,7 @@ async fn persist_promotion_checkpoint(
     history: Arc<super::state_history::StateHistoryRuntime>,
     artifact: Arc<BroadcasterSnapshotArtifact>,
     checkpoint: PromotionCheckpoint,
-    rfq_observed_at_ms: Option<u64>,
+    book_observations: BookObservations,
 ) {
     let chain_id = artifact.chain_id;
     let boundary = &artifact.redis_replay_boundary;
@@ -2503,7 +2506,7 @@ async fn persist_promotion_checkpoint(
             position,
             artifact.redis_replay_boundary.state_version,
             block_number,
-            None,
+            BookObservations::default(),
         )
     })
     .await
@@ -2523,7 +2526,8 @@ async fn persist_promotion_checkpoint(
             chain_id,
             position,
             Some(block_number),
-            rfq_observed_at_ms,
+            book_observations.rfq,
+            book_observations.prop_amm,
         );
         warn!(event = "state_history_boundary_checkpoint_failed", generation = position.generation, message_seq = position.message_seq, %error, "Could not retain the promoted snapshot");
     }
@@ -3696,7 +3700,7 @@ mod tests {
                 state_history::CheckpointKind::Boundary,
                 Some(request.position),
                 request.complete_native_block,
-                request.rfq_high_water_ms,
+                request.book_observations,
             )
             .await;
             StateHistoryRuntime::respond_to_boundary_request(request, result);
@@ -3864,7 +3868,7 @@ mod tests {
             state_history::CheckpointKind::Interval,
             None,
             None,
-            None,
+            Default::default(),
         )
         .await?;
 
@@ -3934,7 +3938,7 @@ mod tests {
             state_history::CheckpointKind::Interval,
             None,
             None,
-            None,
+            Default::default(),
         )
         .await?;
 
@@ -3989,7 +3993,7 @@ mod tests {
                     state_history::CheckpointKind::Boundary,
                     Some(request.position),
                     request.complete_native_block,
-                    request.rfq_high_water_ms,
+                    request.book_observations,
                 )
                 .await
             }
@@ -4064,7 +4068,7 @@ mod tests {
                     message_seq: 5,
                 },
                 block_number: None,
-                rfq_observed_at_ms: None,
+                book_observations: Default::default(),
             }),
             super::BoundaryCheckpointCursor {
                 position: state_history::StreamPosition {
@@ -4072,7 +4076,10 @@ mod tests {
                     message_seq: 8,
                 },
                 block_number: Some(120),
-                rfq_observed_at_ms: Some(9_000),
+                book_observations: super::BookObservations {
+                    rfq: Some(9_000),
+                    prop_amm: None,
+                },
             },
         );
 
@@ -4151,7 +4158,7 @@ mod tests {
                 message_seq: promotion_boundary.exclusive_message_seq,
             }),
             Some(10),
-            None,
+            Default::default(),
         )
         .await?;
 
@@ -4732,18 +4739,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rfq_reconnect_withdraws_published_inventory_before_new_books() -> Result<()> {
+    async fn book_reconnect_withdraws_both_partitions_before_new_books() -> Result<()> {
         let writer = ServiceFakeRedisWriter::default();
         let publisher = Arc::new(BroadcasterRedisPublisher::new(
             publisher_config(),
             Arc::new(writer.clone()),
         ));
         publisher
-            .promote(base_heads([BroadcasterBackend::Rfq]), "test")
+            .promote(
+                base_heads([BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm]),
+                "test",
+            )
             .await?;
         let service = BroadcasterServiceState::with_lifecycle_gate(
             1_000_000,
-            BroadcasterSnapshotCache::new(8453, vec![BroadcasterBackend::Rfq]),
+            BroadcasterSnapshotCache::new(
+                8453,
+                vec![BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm],
+            ),
             BroadcasterUpstreamState::default(),
             publisher,
             Arc::new(Mutex::new(())),
@@ -4751,6 +4764,9 @@ mod tests {
         service.mark_upstream_connected().await;
         service
             .apply_update(&rfq_only_update(10, "old-book", 1))
+            .await?;
+        service
+            .apply_update(&book_update(11, "old-metric", 2, "rfq:metric"))
             .await?;
         service.mark_stream_disconnected("stale", None).await;
         service.prepare_rfq_connection().await?;
@@ -4765,10 +4781,14 @@ mod tests {
                 updates.extend(update.partitions);
             }
         }
-        assert_eq!(updates.len(), 3);
+        assert_eq!(updates.len(), 5);
         assert_eq!(updates[0].new_pairs[0].component_id, "old-book");
-        assert_eq!(updates[1].removed_pairs[0].component_id, "old-book");
-        assert_eq!(updates[2].new_pairs[0].component_id, "new-book");
+        assert_eq!(updates[1].new_pairs[0].component_id, "old-metric");
+        assert_eq!(updates[2].backend, BroadcasterBackend::Rfq);
+        assert_eq!(updates[2].removed_pairs[0].component_id, "old-book");
+        assert_eq!(updates[3].backend, BroadcasterBackend::PropAmm);
+        assert_eq!(updates[3].removed_pairs[0].component_id, "old-metric");
+        assert_eq!(updates[4].new_pairs[0].component_id, "new-book");
         Ok(())
     }
 
@@ -6295,7 +6315,10 @@ mod tests {
     }
 
     fn rfq_only_update(block_number: u64, component_id: &str, seed: u8) -> Update {
-        let protocol = "rfq:hashflow";
+        book_update(block_number, component_id, seed, "rfq:hashflow")
+    }
+
+    fn book_update(block_number: u64, component_id: &str, seed: u8, protocol: &str) -> Update {
         let mut new_pairs = HashMap::new();
         new_pairs.insert(
             component_id.to_string(),

@@ -139,7 +139,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .await
             .context("failed to acquire state history read connection")?;
         let mut transaction = begin_range_transaction(&mut connection).await?;
-        if !request.includes_rfq() {
+        if !request.includes_book() {
             let range = resolve_range_in_transaction(
                 &mut transaction,
                 &request.range_request(None),
@@ -272,6 +272,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
                 && metadata.kind == manifest.kind
                 && metadata.block_number == manifest.block_number
                 && metadata.rfq_observed_at_ms == manifest.rfq_observed_at_ms
+                && metadata.prop_amm_observed_at_ms == manifest.prop_amm_observed_at_ms
                 && metadata.backends == manifest.backends,
             "checkpoint manifest {} metadata does not match its archive",
             manifest.id
@@ -411,8 +412,10 @@ impl BacktestRequest {
         })
     }
 
-    fn includes_rfq(&self) -> bool {
-        self.backends.binary_search(&Backend::Rfq).is_ok()
+    fn includes_book(&self) -> bool {
+        self.backends
+            .iter()
+            .any(|backend| backend.uses_observation_time())
     }
 
     fn range_request(&self, rfq_bounds: Option<(u64, u64)>) -> RangeRequest {
@@ -488,7 +491,11 @@ impl RangeRequest {
     }
 
     fn rfq_bounds(&self) -> Result<Option<(u64, u64)>, ModelError> {
-        if self.backends.binary_search(&Backend::Rfq).is_err() {
+        if !self
+            .backends
+            .iter()
+            .any(|backend| backend.uses_observation_time())
+        {
             return Ok(None);
         }
         match (self.rfq_start_ms, self.rfq_end_ms) {
@@ -1010,7 +1017,7 @@ async fn fetch_anchor(
     let requested_backends = database_backends(&request.backends);
     let row = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                 status, error
          FROM state_history.checkpoints
@@ -1018,14 +1025,14 @@ async fn fetch_anchor(
            AND status = 'complete'
            AND block_number <= $2
            AND backends @> $3::text[]
-           AND ($4::boolean = false OR rfq_observed_at_ms <= $5)
+           AND (NOT ('rfq' = ANY($3)) OR rfq_observed_at_ms <= $4)
+           AND (NOT ('prop_amm' = ANY($3)) OR prop_amm_observed_at_ms <= $4)
          ORDER BY generation DESC, message_seq DESC
          LIMIT 1",
     )
     .bind(database_i64(request.chain_id, "range chain_id")?)
     .bind(database_i64(request.start_block, "range start_block")?)
     .bind(requested_backends)
-    .bind(rfq_start_ms.is_some())
     .bind(
         rfq_start_ms
             .map(|value| database_i64(value, "range RFQ start_ms"))
@@ -1090,9 +1097,9 @@ async fn preflight_delta_payloads(
                WHERE matched.delta_id = d.id
                  AND matched.backend = ANY($4::text[])
                  AND (
-                     (matched.backend <> 'rfq' AND matched.block_number <= $5)
+                     (matched.backend NOT IN ('rfq', 'prop_amm') AND matched.block_number <= $5)
                      OR
-                     (matched.backend = 'rfq' AND matched.observed_at_ms <= $6)
+                     (matched.backend IN ('rfq', 'prop_amm') AND matched.observed_at_ms <= $6)
                  )
            )",
     )
@@ -1144,9 +1151,9 @@ async fn fetch_encoded_deltas(
                WHERE matched.delta_id = d.id
                  AND matched.backend = ANY($4::text[])
                  AND (
-                     (matched.backend <> 'rfq' AND matched.block_number <= $5)
+                     (matched.backend NOT IN ('rfq', 'prop_amm') AND matched.block_number <= $5)
                      OR
-                     (matched.backend = 'rfq' AND matched.observed_at_ms <= $6)
+                     (matched.backend IN ('rfq', 'prop_amm') AND matched.observed_at_ms <= $6)
                  )
            )
          ORDER BY d.generation, d.message_seq",
@@ -1215,7 +1222,7 @@ async fn fetch_boundaries(
 ) -> anyhow::Result<Vec<ManifestRow>> {
     let rows = sqlx::query(
         "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                 compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                 status, error
          FROM state_history.checkpoints
@@ -1252,10 +1259,8 @@ fn boundary_fits_request_end(manifest: &CheckpointManifest, request: &RangeReque
         }
         match backend {
             Backend::Native | Backend::Vm => manifest.block_number <= request.end_block,
-            Backend::Rfq => request.rfq_end_ms.is_some_and(|end| {
-                manifest
-                    .rfq_observed_at_ms
-                    .is_some_and(|cursor| cursor <= end)
+            Backend::Rfq | Backend::PropAmm => request.rfq_end_ms.is_some_and(|end| {
+                checkpoint_cursor(manifest, *backend).is_some_and(|cursor| cursor <= end)
             }),
         }
     })
@@ -1271,11 +1276,10 @@ async fn fetch_gap_rows(
         .backends
         .iter()
         .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
-    let anchor_rfq_observed_at_ms = rfq_bounds
+    let anchor_book_observed_at_ms = rfq_bounds
         .map(|_| {
-            anchor
-                .rfq_observed_at_ms
-                .context("RFQ range anchor is missing its observed-at cursor")
+            first_book_cursor(anchor, &request.backends)
+                .context("range anchor is missing its book observation cursor")
         })
         .transpose()?;
     let rows = sqlx::query(
@@ -1317,7 +1321,7 @@ async fn fetch_gap_rows(
     .bind(database_i64(request.end_block, "range end_block")?)
     .bind(rfq_bounds.is_some())
     .bind(
-        anchor_rfq_observed_at_ms
+        anchor_book_observed_at_ms
             .map(|value| database_i64(value, "anchor RFQ observed_at_ms"))
             .transpose()?,
     )
@@ -1397,6 +1401,10 @@ fn manifest_from_row(row: &PgRow) -> anyhow::Result<CheckpointManifest> {
         rfq_observed_at_ms: optional_database_u64(
             row.try_get("rfq_observed_at_ms")?,
             "checkpoint rfq_observed_at_ms",
+        )?,
+        prop_amm_observed_at_ms: optional_database_u64(
+            row.try_get("prop_amm_observed_at_ms")?,
+            "checkpoint prop_amm_observed_at_ms",
         )?,
         backends: backend_values
             .into_iter()
@@ -1505,7 +1513,7 @@ fn build_legs(
 ) -> (Vec<RangeLeg>, Vec<RangeGap>) {
     deltas.sort_by_key(|delta| delta.position);
     let anchor_block_number = anchor.block_number;
-    let anchor_rfq_observed_at_ms = anchor.rfq_observed_at_ms;
+    let anchor_book_observed_at_ms = first_book_cursor(&anchor, &request.backends);
     let breaks = break_positions(&anchor, &deltas, &boundaries, &gaps, request);
     let mut legs = Vec::with_capacity(breaks.len() + 1);
     let mut range_gaps = Vec::new();
@@ -1542,7 +1550,7 @@ fn build_legs(
         &gaps,
         request,
         anchor_block_number,
-        anchor_rfq_observed_at_ms,
+        anchor_book_observed_at_ms,
     ));
     range_gaps.extend(incomplete_tail_gaps(request, &legs, &deltas));
 
@@ -1595,7 +1603,7 @@ fn break_positions(
                             gap,
                             request,
                             anchor.block_number,
-                            anchor.rfq_observed_at_ms,
+                            first_book_cursor(anchor, &request.backends),
                         )
                 })
                 .map(|gap| {
@@ -1685,7 +1693,7 @@ fn stored_delta(row: &DeltaRow, request: &RangeRequest) -> StoredDelta {
                         Backend::Native | Backend::Vm => cursor
                             .block_number
                             .is_none_or(|block_number| block_number <= request.end_block),
-                        Backend::Rfq => cursor
+                        Backend::Rfq | Backend::PropAmm => cursor
                             .observed_at_ms
                             .zip(request.rfq_end_ms)
                             .is_none_or(|(observed_at_ms, end_ms)| observed_at_ms <= end_ms),
@@ -1740,7 +1748,7 @@ fn recorded_range_gaps(
     gaps: &[GapRow],
     request: &RangeRequest,
     anchor_block_number: u64,
-    anchor_rfq_observed_at_ms: Option<u64>,
+    anchor_book_observed_at_ms: Option<u64>,
 ) -> Vec<RangeGap> {
     gaps.iter()
         .filter(|gap| {
@@ -1749,7 +1757,7 @@ fn recorded_range_gaps(
                     gap,
                     request,
                     anchor_block_number,
-                    anchor_rfq_observed_at_ms,
+                    anchor_book_observed_at_ms,
                 )
         })
         .cloned()
@@ -1761,7 +1769,7 @@ fn gap_overlaps_request(
     gap: &GapRow,
     request: &RangeRequest,
     anchor_block_number: u64,
-    anchor_rfq_observed_at_ms: Option<u64>,
+    anchor_book_observed_at_ms: Option<u64>,
 ) -> bool {
     let block_overlap = request
         .backends
@@ -1773,7 +1781,7 @@ fn gap_overlaps_request(
             anchor_block_number,
             request.end_block,
         );
-    let rfq_overlap = anchor_rfq_observed_at_ms
+    let rfq_overlap = anchor_book_observed_at_ms
         .zip(request.rfq_end_ms)
         .is_some_and(|(anchor_start, request_end)| {
             ranges_overlap(
@@ -1818,7 +1826,7 @@ fn incomplete_tail_gaps(
             let covered = covered_cursor(*backend, legs, deltas);
             let requested_end = match backend {
                 Backend::Native | Backend::Vm => Some(request.end_block),
-                Backend::Rfq => request.rfq_end_ms,
+                Backend::Rfq | Backend::PropAmm => request.rfq_end_ms,
             }?;
             (covered.is_none_or(|head| head < requested_end)).then(|| RangeGap {
                 kind: RangeGapKind::IncompleteTail,
@@ -1831,12 +1839,12 @@ fn incomplete_tail_gaps(
                     .then_some(covered.map_or(request.start_block, |head| head.saturating_add(1))),
                 to_block_inclusive: matches!(backend, Backend::Native | Backend::Vm)
                     .then_some(request.end_block),
-                from_observed_at_ms: (*backend == Backend::Rfq).then_some(
+                from_observed_at_ms: backend.uses_observation_time().then_some(
                     covered.map_or(request.rfq_start_ms.unwrap_or_default(), |head| {
                         head.saturating_add(1)
                     }),
                 ),
-                to_observed_at_ms: (*backend == Backend::Rfq).then_some(requested_end),
+                to_observed_at_ms: backend.uses_observation_time().then_some(requested_end),
                 reason: incomplete_tail_reason(*backend, covered, requested_end),
             })
         })
@@ -1858,24 +1866,35 @@ fn covered_cursor(backend: Backend, legs: &[RangeLeg], deltas: &[DeltaRow]) -> O
     checkpoint_coverage.chain(delta_coverage).max()
 }
 
+// Gap records carry a shared observation interval. A gap can still overlap the
+// slower selected book after the faster book has passed it.
+fn first_book_cursor(manifest: &CheckpointManifest, requested: &[Backend]) -> Option<u64> {
+    requested
+        .iter()
+        .filter(|backend| backend.uses_observation_time())
+        .filter_map(|backend| checkpoint_cursor(manifest, *backend))
+        .min()
+}
+
 const fn checkpoint_cursor(manifest: &CheckpointManifest, backend: Backend) -> Option<u64> {
     match backend {
         Backend::Native | Backend::Vm => Some(manifest.block_number),
         Backend::Rfq => manifest.rfq_observed_at_ms,
+        Backend::PropAmm => manifest.prop_amm_observed_at_ms,
     }
 }
 
 const fn delta_cursor(cursor: &DeltaBackendCursor, backend: Backend) -> Option<u64> {
     match backend {
         Backend::Native | Backend::Vm => cursor.block_number,
-        Backend::Rfq => cursor.observed_at_ms,
+        Backend::Rfq | Backend::PropAmm => cursor.observed_at_ms,
     }
 }
 
 fn incomplete_tail_reason(backend: Backend, covered: Option<u64>, requested_end: u64) -> String {
     let cursor_kind = match backend {
         Backend::Native | Backend::Vm => "block",
-        Backend::Rfq => "timestamp",
+        Backend::Rfq | Backend::PropAmm => "timestamp",
     };
     match covered {
         Some(head) => format!(
@@ -4501,6 +4520,7 @@ mod tests {
             kind,
             block_number,
             rfq_observed_at_ms: None,
+            prop_amm_observed_at_ms: None,
             backends: vec![Backend::Native],
             s3_key: (status == CheckpointStatus::Complete).then(|| "checkpoint.zst".to_owned()),
             archive_sha256: (status == CheckpointStatus::Complete).then(|| "sha256".to_owned()),
@@ -4689,7 +4709,7 @@ mod tests {
     ) -> anyhow::Result<CheckpointManifest> {
         let row = sqlx::query(
             "SELECT id, chain_id, generation, message_seq, state_version, kind, block_number,
-                    rfq_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
+                    rfq_observed_at_ms, prop_amm_observed_at_ms, backends, s3_key, archive_sha256, archive_bytes,
                     compressed_bytes, token_s3_key, token_sha256, token_count, token_bytes,
                     status, error
              FROM state_history.checkpoints
@@ -4717,6 +4737,7 @@ mod tests {
                 kind: capture.kind(),
                 block_number: capture.block_number(),
                 rfq_observed_at_ms: capture.rfq_observed_at_ms(),
+                prop_amm_observed_at_ms: capture.prop_amm_observed_at_ms(),
                 backends: capture.backends().to_vec(),
             },
             payloads_json: capture.payloads_json().to_vec(),
@@ -4744,6 +4765,7 @@ mod tests {
             kind: capture.kind(),
             block_number: capture.block_number(),
             rfq_observed_at_ms: capture.rfq_observed_at_ms(),
+            prop_amm_observed_at_ms: capture.prop_amm_observed_at_ms(),
             backends: capture.backends().to_vec(),
             s3_key: Some(key),
             archive_sha256: Some(encoded.info.sha256),

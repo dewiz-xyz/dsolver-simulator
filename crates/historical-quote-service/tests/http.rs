@@ -1091,6 +1091,7 @@ impl HistorySource for RawHistory {
                 kind: state_history::CheckpointKind::Interval,
                 block_number: 7,
                 rfq_observed_at_ms: None,
+                prop_amm_observed_at_ms: None,
                 backends: query.backends,
                 s3_key: None,
                 archive_sha256: None,

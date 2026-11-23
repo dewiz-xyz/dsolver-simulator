@@ -184,6 +184,7 @@ pub enum UnavailableReason {
     ReplicaCutoff,
     TokenSnapshotMissing,
     RfqObservationMissing,
+    PropAmmObservationMissing,
     BlockBoundaryMissing,
     CanonicalLineageInvalid,
     StateApplicationInvalid,
@@ -198,6 +199,15 @@ pub enum QuoteFailureReason {
     InsufficientLiquidity,
     ZeroOutput,
     SimulationFailed,
+}
+
+/// Last accepted observation in a provider-timestamped partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BookObservation {
+    pub cursor: StreamPosition,
+    pub observed_at: DateTime<Utc>,
+    pub age_ms: u64,
 }
 
 /// State provenance for one successful historical quote.
@@ -216,6 +226,8 @@ pub struct QuoteProvenance {
     pub rfq_observed_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rfq_observation_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prop_amm_observation: Option<BookObservation>,
 }
 
 pub(crate) fn validate_amounts(amounts: &[UnsignedAmount]) -> Result<(), String> {

@@ -1,4 +1,4 @@
-//! Titan's Ethereum books share the RFQ broadcast partition, but retain their own identities.
+//! Titan's named Ethereum venues publish decoded books on the proprietary AMM partition.
 
 use std::{collections::HashMap, str::FromStr};
 
@@ -143,7 +143,7 @@ mod tests {
         .collect();
         let protocols = protocols();
         let mut stream = build_titan_stream(Chain::Ethereum, &protocols, tokens)?;
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]);
+        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::PropAmm]);
         let mut seen = HashSet::new();
         let mut components = HashMap::new();
         let result = tokio::time::timeout(Duration::from_secs(45), async {
@@ -179,7 +179,7 @@ mod tests {
     ) -> Result<()> {
         components.extend(update.new_pairs.clone());
         for partition in replay.partitions {
-            assert_eq!(partition.backend, BroadcasterBackend::Rfq);
+            assert_eq!(partition.backend, BroadcasterBackend::PropAmm);
             let states = partition
                 .new_pairs
                 .into_iter()

@@ -13,9 +13,9 @@ use sqlx::PgPool;
 use state_history::{
     encode_archive, ArchiveMetadata, Backend, BlockInterval, CheckpointArchive, CheckpointKind,
     CheckpointManifest, CheckpointPairQuery, CheckpointPairSelection, CheckpointStatus,
-    CoverageQuery, ExplicitCheckpointPair, PositionRangeQuery, RawSnapshotError, RawSnapshotQuery,
-    ReadLimitError, ReadLimits, StateHistoryReader, StoredPayloadError, StreamPosition,
-    TargetPlanQuery, TokenAnchor, ARCHIVE_SCHEMA_VERSION,
+    CoverageQuery, ExplicitCheckpointPair, PositionRangeQuery, RangeRequest, RawSnapshotError,
+    RawSnapshotQuery, ReadLimitError, ReadLimits, StateHistoryReader, StoredPayloadError,
+    StreamPosition, TargetPlanQuery, TokenAnchor, ARCHIVE_SCHEMA_VERSION,
 };
 use tycho_simulation::{
     tycho_client::feed::{
@@ -57,8 +57,68 @@ async fn existing_delta_rows_are_format_one(pool: PgPool) -> anyhow::Result<()> 
     .fetch_one(&pool)
     .await?;
 
-    assert_eq!(schema_version, 2);
+    assert_eq!(schema_version, state_history::STATE_HISTORY_SCHEMA_VERSION);
     assert_eq!(payload_format_version, 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
+async fn independent_book_observations_select_anchors_and_delta_partitions(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let books = [Backend::Rfq, Backend::PropAmm];
+    seed_block_times(&pool, 98, 105).await?;
+    // An older combined publication is still RFQ history. It cannot anchor a
+    // Prop AMM request. The first tagged checkpoint covers both partitions.
+    seed_checkpoint_with_backends(
+        &pool,
+        1,
+        1,
+        98,
+        CheckpointKind::Boundary,
+        false,
+        &[Backend::Rfq],
+    )
+    .await?;
+    let initial =
+        seed_checkpoint_with_backends(&pool, 1, 2, 99, CheckpointKind::Boundary, false, &books)
+            .await?;
+    let ahead =
+        seed_checkpoint_with_backends(&pool, 1, 3, 100, CheckpointKind::Interval, false, &books)
+            .await?;
+    sqlx::query("UPDATE state_history.checkpoints SET prop_amm_observed_at_ms=103000 WHERE id=$1")
+        .bind(ahead.id)
+        .execute(&pool)
+        .await?;
+    seed_delta(&pool, 1, 4, 101, 1, &books).await?;
+    sqlx::query("UPDATE state_history.delta_backends SET observed_at_ms=103500 WHERE backend='prop_amm' AND generation=1 AND message_seq=4")
+        .execute(&pool).await?;
+
+    let reader = StateHistoryReader::new(pool, object_store().await);
+    let selected = |backends: Vec<Backend>| {
+        RangeRequest::new(CHAIN_ID, 100, 101, backends)?.with_rfq_bounds(100_000, 101_000)
+    };
+    let rfq = reader.resolve_range(&selected(vec![Backend::Rfq])?).await?;
+    let prop = reader
+        .resolve_range(&selected(vec![Backend::PropAmm])?)
+        .await?;
+    let both = reader.resolve_range(&selected(books.to_vec())?).await?;
+    assert_eq!(rfq.legs[0].checkpoint.id, ahead.id);
+    assert_eq!(prop.legs[0].checkpoint.id, initial.id);
+    assert_eq!(both.legs[0].checkpoint.id, initial.id);
+    assert!(prop.legs[0].deltas.is_empty());
+    let [delta] = both.legs[0].deltas.as_slice() else {
+        anyhow::bail!("expected one mixed delta")
+    };
+    let [applicable] = delta.applicable_backends.as_slice() else {
+        anyhow::bail!("expected one eligible book")
+    };
+    assert_eq!(applicable.backend, Backend::Rfq);
+    assert_eq!(applicable.observed_at_ms, Some(101_000));
+    let before_split = RangeRequest::new(CHAIN_ID, 98, 98, vec![Backend::PropAmm])?
+        .with_rfq_bounds(98_000, 98_000)?;
+    assert!(reader.resolve_range(&before_split).await?.legs.is_empty());
     Ok(())
 }
 
@@ -2030,10 +2090,10 @@ async fn insert_complete_checkpoint(
     let token = checkpoint.token_reference.as_ref();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO state_history.checkpoints
-            (chain_id, generation, message_seq, kind, block_number, rfq_observed_at_ms,
+            (chain_id, generation, message_seq, kind, block_number, rfq_observed_at_ms, prop_amm_observed_at_ms,
              backends, s3_key, archive_sha256, archive_bytes, compressed_bytes,
              token_s3_key, token_sha256, token_count, token_bytes, status, completed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                  'complete', now())
          RETURNING id",
     )
@@ -2047,6 +2107,9 @@ async fn insert_complete_checkpoint(
             .contains(&Backend::Rfq)
             .then(|| database_i64(checkpoint.block_number * 1_000))
             .transpose()?,
+    )
+    .bind(
+        backends.contains(&Backend::PropAmm).then(|| database_i64(checkpoint.block_number * 1_000)).transpose()?,
     )
     .bind(backend_values)
     .bind(checkpoint.s3_key.as_deref())
@@ -2132,7 +2195,7 @@ async fn seed_delta_payload(
     for backend in backends {
         let (block_cursor, time_cursor) = match backend {
             Backend::Native | Backend::Vm => (Some(block_number), None),
-            Backend::Rfq => (None, Some(block_number * 1_000)),
+            Backend::Rfq | Backend::PropAmm => (None, Some(block_number * 1_000)),
         };
         sqlx::query(
             "INSERT INTO state_history.delta_backends
@@ -2244,6 +2307,7 @@ fn manifest(
         kind,
         block_number,
         rfq_observed_at_ms: None,
+        prop_amm_observed_at_ms: None,
         backends: vec![Backend::Native],
         s3_key: Some(format!(
             "reader/chain={CHAIN_ID}/gen={generation}/seq={message_seq}/kind={}/checkpoint.zst",
@@ -2315,6 +2379,7 @@ async fn seed_raw_checkpoint_for(
             kind: CheckpointKind::Interval,
             block_number,
             rfq_observed_at_ms: None,
+            prop_amm_observed_at_ms: None,
             backends: vec![history_backend],
         },
         payloads_json: payloads
@@ -2350,6 +2415,7 @@ fn history_backend(backend: BroadcasterBackend) -> Backend {
         BroadcasterBackend::Native => Backend::Native,
         BroadcasterBackend::Vm => Backend::Vm,
         BroadcasterBackend::Rfq => Backend::Rfq,
+        BroadcasterBackend::PropAmm => Backend::PropAmm,
     }
 }
 

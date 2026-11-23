@@ -1483,7 +1483,7 @@ impl BroadcasterRedisPublisher {
         });
         self.drain_pending_payloads_locked(&mut guard).await?;
         if let Some(state_history) = &self.state_history {
-            state_history.reset_rfq_high_water();
+            state_history.reset_book_observations();
         }
         let replay_boundary = self.replay_boundary_locked(&guard)?;
 
@@ -1975,7 +1975,7 @@ impl BroadcasterRedisPublisher {
             }
         });
         if let Some(state_history) = &self.state_history {
-            state_history.reset_rfq_high_water();
+            state_history.reset_book_observations();
         }
         warn!(
             event = "redis_writer_promoted",
@@ -2290,7 +2290,7 @@ fn enqueue_state_history_update(
     update: Result<StateHistoryUpdateProjection>,
 ) {
     let result = update.and_then(|update| {
-        state_history.observe_rfq_update(&update);
+        state_history.observe_book_update(&update);
         delta_entry_from_update(
             entry.chain_id,
             publisher.generation,

@@ -1233,7 +1233,16 @@ mod tests {
                     BroadcasterBackend::Native => {
                         service.apply_update(&native_only_update()).await?
                     }
-                    BroadcasterBackend::Rfq => service.apply_update(&rfq_only_update()).await?,
+                    BroadcasterBackend::Rfq => {
+                        service
+                            .apply_update(&book_only_update("rfq:hashflow"))
+                            .await?
+                    }
+                    BroadcasterBackend::PropAmm => {
+                        service
+                            .apply_update(&book_only_update("rfq:metric"))
+                            .await?
+                    }
                     BroadcasterBackend::Vm => unreachable!("vm test service is not used"),
                 }
             }
@@ -1496,12 +1505,9 @@ mod tests {
         )]))
     }
 
-    fn rfq_only_update() -> Update {
+    fn book_only_update(protocol: &str) -> Update {
         let mut new_pairs = HashMap::new();
-        new_pairs.insert(
-            "rfq-1".to_string(),
-            native_component("rfq-1", "rfq:hashflow"),
-        );
+        new_pairs.insert("rfq-1".to_string(), native_component("rfq-1", protocol));
 
         let mut states = HashMap::new();
         states.insert(
@@ -1510,7 +1516,7 @@ mod tests {
         );
 
         Update::new(12, states, new_pairs).set_sync_states(HashMap::from([(
-            "rfq:hashflow".to_string(),
+            protocol.to_string(),
             SynchronizerState::Ready(block_header(12, 1)),
         )]))
     }

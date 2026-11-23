@@ -541,16 +541,17 @@ impl BroadcasterSnapshotCache {
     /// has yet to answer on the new connection. Only a successful publish removes them.
     pub(crate) async fn rfq_withdrawal(&self, max_pairs: usize) -> Option<TychoUpdate> {
         let guard = self.inner.read().await;
-        let partition = guard.partitions.get(&BroadcasterBackend::Rfq)?;
-        if partition.states.is_empty() {
-            return None;
-        }
-        let removed = partition
-            .states
+        let removed: HashMap<_, _> = guard
+            .partitions
             .iter()
+            .filter(|(backend, _)| backend.is_book())
+            .flat_map(|(_, partition)| partition.states.iter())
             .take(max_pairs)
             .map(|(id, entry)| (id.clone(), entry.component.clone()))
             .collect();
+        if removed.is_empty() {
+            return None;
+        }
         Some(
             TychoUpdate::new(
                 super::redis_publisher::current_time_ms(),

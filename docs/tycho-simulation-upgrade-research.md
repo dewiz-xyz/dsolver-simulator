@@ -44,7 +44,7 @@ The Base broadcaster subscribes to all 12 on-chain systems advertised by the aut
 
 Aerodrome V1 was already broadcast-only in the master baseline. The other six expand that baseline's coverage. Infinity Bin and Biconomy have canonical identities and decoders registered but remain disabled because the hosted Base endpoint did not advertise them. The standalone simulator's quoting selection remains explicit in the manifest; downstream consumers own router/executor support.
 
-Base RFQ broadcasting enables **Bebop, Native, and Metric**. Metric uses Tycho's pAMM book feed but travels through the same decoded-state snapshot and Redis contract as the RFQ providers.
+Base RFQ broadcasting enables **Bebop, Native, and Metric**. Metric uses Tycho’s pAMM feed and the `prop_amm` partition. Direct Native and Bebop use the `rfq` partition. Both carry decoded states in snapshots and Redis deltas.
 
 The adapter publishes complete serialized states and diffs consecutive complete provider books. Missing pairs are removed. Temporary withdrawals remove only that provider's liquidity. A terminal feed event withdraws that provider’s books and reconnects its feed after a delay. Peers continue diffing their own books throughout the restart. Tests check replacement, empty books, idempotent withdrawal, provider isolation, and exact quote preservation after serialization.
 
@@ -56,7 +56,7 @@ Direct book providers are **Bebop, Native, Metric, and Hashflow**. Hashflow uses
 
 The **eight Titan propAMMs** are **FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro**. They are selected explicitly from Tycho 0.525.0's named registry. Metric is omitted from Titan because it is already subscribed directly. Unknown/new Titan venues are not automatically enabled. Fermi uses Titan's current router `0xf6d5b2fefec7b420d9990b95790adfd3d4c4f977`, replacing the old address in the pinned crate. Gas estimates otherwise remain the upstream estimates; no new execution-gas calibration is claimed.
 
-Titan's incremental updates are multiplexed with the complete-book provider adapter. They retain `pricelevelstream:<venue>` identities and explicit upstream removals, use observed Unix milliseconds for the shared RFQ cursor, and preserve the upstream simulation overrides. Fallback-router identities are disabled because downstream consumers choose the execution path.
+Titan's incremental updates are multiplexed with the complete-book provider adapter. They retain `pricelevelstream:<venue>` identities and explicit upstream removals, use observed Unix milliseconds for the `prop_amm` partition cursor, and preserve the upstream simulation overrides. Fallback-router identities are disabled because downstream consumers choose the execution path.
 
 Tycho skips its process-local Titan quote deadline during ordinary serde. The broadcaster's state wire adapter adds `quote_expires_at_unix_ms` and reconstructs the remaining monotonic lifetime on receipt, capped at the upstream quote TTL. Delayed snapshots and replay therefore cannot renew expired liquidity. A Titan state with no deadline is rejected. Broadcaster and consumer hosts need synchronized clocks, and consumers must use this updated replay client; older readers do not enforce the new wire deadline. New history checkpoints and deltas use format 2, which registers the added protocols for historical reconstruction. Format 1 retains its original on-chain decoder selection.
 

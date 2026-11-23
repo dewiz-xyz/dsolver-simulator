@@ -278,7 +278,7 @@ pub fn normalize_stored_messages_request(
 
 fn validate_raw_backends(backends: &[Backend]) -> Result<(), String> {
     validate_backends(backends)?;
-    if backends.contains(&Backend::Rfq) {
+    if backends.iter().any(|backend| backend.is_book()) {
         return Err("backends must be kept as raw messages, native or vm".to_owned());
     }
     Ok(())

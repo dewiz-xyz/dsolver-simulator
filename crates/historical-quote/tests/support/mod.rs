@@ -492,6 +492,7 @@ pub fn manifest(
         kind: CheckpointKind::Interval,
         block_number,
         rfq_observed_at_ms,
+        prop_amm_observed_at_ms: None,
         backends: vec![backend],
         s3_key: Some(format!("fixture/{id}.json.zst")),
         archive_sha256: Some(format!("archive-{id}")),
@@ -556,6 +557,7 @@ pub fn archive(
             kind: manifest.kind,
             block_number: manifest.block_number,
             rfq_observed_at_ms: manifest.rfq_observed_at_ms,
+            prop_amm_observed_at_ms: manifest.prop_amm_observed_at_ms,
             backends: manifest.backends.clone(),
         },
         payloads_json: vec![

@@ -31,6 +31,8 @@ pub struct ArchiveMetadata {
     pub kind: CheckpointKind,
     pub block_number: u64,
     pub rfq_observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prop_amm_observed_at_ms: Option<u64>,
     pub backends: Vec<Backend>,
 }
 
@@ -407,6 +409,7 @@ mod tests {
             kind: CheckpointKind::Interval,
             block_number: 20_000_000,
             rfq_observed_at_ms: None,
+            prop_amm_observed_at_ms: None,
             backends: vec![Backend::Native, Backend::Vm],
         }
     }

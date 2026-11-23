@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -9,17 +9,17 @@ use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::Instant;
 use tracing::{info, warn};
 use tycho_simulation::evm::engine_db::SHARED_TYCHO_DB;
-use tycho_simulation::protocol::models::{ProtocolComponent, Update};
+use tycho_simulation::protocol::models::ProtocolComponent;
 
 #[cfg(test)]
-use simulator_replay::DecoderConfig;
+use crate::services::stream_builder::subscription_decoder_config;
 #[cfg(test)]
 use tycho_simulation::{evm::decoder::TychoStreamDecoder, tycho_client::feed::BlockHeader};
 
 use simulator_core::broadcaster::{
     BroadcasterBackend, BroadcasterEnvelope, BroadcasterPayload, BroadcasterRedisReplayBoundary,
-    BroadcasterRedisStreamEntry, BroadcasterSnapshotPartition, BroadcasterSnapshotStart,
-    BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
+    BroadcasterRedisStreamEntry, BroadcasterRemovedPair, BroadcasterSnapshotPartition,
+    BroadcasterSnapshotStart, BroadcasterSubscriptionTracker, BroadcasterUpdateMessage,
 };
 
 use crate::broadcaster::redis_publisher::current_time_ms;
@@ -49,6 +49,7 @@ pub(super) struct BroadcasterSubscriptionProcessor {
     expected_chain_id: u64,
     pub(super) controls: BroadcasterSubscriptionControls,
     decoder: Arc<ReplayDecoder>,
+    wire_backends: Vec<BroadcasterBackend>,
     tracker: BroadcasterSubscriptionTracker,
     raw_snapshot: RawSnapshotReassembly,
     bootstrap_redis_replay_boundary: Option<BroadcasterRedisReplayBoundary>,
@@ -63,11 +64,7 @@ impl BroadcasterSubscriptionProcessor {
         rebuild: Option<SubscriptionRebuildState>,
     ) -> Self {
         let decoder = ReplayDecoder::with_decoder(
-            DecoderConfig::for_backend(
-                ReplayBackend::from(controls.backend()),
-                controls.protocols().to_vec(),
-                0,
-            ),
+            subscription_decoder_config(controls.backend(), controls.protocols()),
             Arc::new(TychoStreamDecoder::<BlockHeader>::new(
                 controls.tokens().chain(),
             )),
@@ -86,6 +83,7 @@ impl BroadcasterSubscriptionProcessor {
     ) -> Self {
         Self {
             expected_chain_id,
+            wire_backends: vec![controls.backend()],
             controls,
             decoder,
             tracker: BroadcasterSubscriptionTracker::new(),
@@ -110,6 +108,7 @@ impl BroadcasterSubscriptionProcessor {
             expected_chain_id: self.expected_chain_id,
             controls: self.controls.recovery_copy().await,
             decoder: Arc::clone(&self.decoder),
+            wire_backends: self.wire_backends.clone(),
             tracker: BroadcasterSubscriptionTracker::new(),
             raw_snapshot: RawSnapshotReassembly::default(),
             bootstrap_redis_replay_boundary: Some(replay_boundary),
@@ -144,7 +143,7 @@ impl BroadcasterSubscriptionProcessor {
     ) -> Result<()> {
         if let BroadcasterPayload::SnapshotStart(start) = &envelope.payload {
             self.ensure_snapshot_chain_id(start.chain_id)?;
-            self.ensure_snapshot_includes_backend(start)?;
+            self.wire_backends = self.snapshot_backends(start)?;
         }
 
         self.tracker
@@ -161,7 +160,7 @@ impl BroadcasterSubscriptionProcessor {
             }
             BroadcasterPayload::SnapshotChunk(chunk) => {
                 for partition in chunk.partitions {
-                    if partition.backend == self.controls.backend() {
+                    if self.wire_backends.contains(&partition.backend) {
                         self.buffer_snapshot_partition(partition).await?;
                     }
                 }
@@ -206,7 +205,11 @@ impl BroadcasterSubscriptionProcessor {
         entry: &BroadcasterRedisStreamEntry,
         envelope: &BroadcasterEnvelope,
     ) -> Result<()> {
-        if redis_entry_scope_contains(entry, self.controls.backend()) {
+        if self
+            .wire_backends
+            .iter()
+            .any(|backend| redis_entry_scope_contains(entry, *backend))
+        {
             let native_progress_block = if self.controls.backend() == BroadcasterBackend::Native {
                 match &envelope.payload {
                     BroadcasterPayload::Update(update) => update.complete_native_block(),
@@ -255,16 +258,59 @@ impl BroadcasterSubscriptionProcessor {
         self.apply_live_update(update, None).await
     }
 
-    fn ensure_snapshot_includes_backend(&self, start: &BroadcasterSnapshotStart) -> Result<()> {
-        let backend = self.controls.backend();
-        if !start.backends.contains(&backend) {
-            return Err(anyhow!(
+    fn snapshot_backends(
+        &self,
+        start: &BroadcasterSnapshotStart,
+    ) -> Result<Vec<BroadcasterBackend>> {
+        let mut selected = match &self.controls {
+            BroadcasterSubscriptionControls::Rfq(controls) if !controls.protocols.is_empty() => {
+                controls
+                    .protocols
+                    .iter()
+                    .map(|kind| {
+                        let canonical = BroadcasterBackend::from_protocol_kind(*kind);
+                        if canonical == BroadcasterBackend::PropAmm
+                            && !start.backends.contains(&canonical)
+                        {
+                            BroadcasterBackend::Rfq
+                        } else {
+                            canonical
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![self.controls.backend()],
+        };
+        selected.sort_unstable();
+        selected.dedup();
+        for backend in &selected {
+            anyhow::ensure!(
+                start.backends.contains(backend),
                 "broadcaster snapshot start {} does not include {} backend",
                 start.snapshot_id,
                 backend
-            ));
+            );
         }
-        Ok(())
+        Ok(selected)
+    }
+
+    pub(super) fn participates_in_recovery(&self, backends: &[BroadcasterBackend]) -> Result<bool> {
+        if self
+            .wire_backends
+            .iter()
+            .all(|backend| !backends.contains(backend))
+        {
+            return Ok(false);
+        }
+        // A full bootstrap preserves the other half of a mixed book store when the
+        // writer recovers only one of its partitions.
+        anyhow::ensure!(
+            self.wire_backends
+                .iter()
+                .all(|backend| backends.contains(backend)),
+            "partial book partition recovery requires a fresh snapshot"
+        );
+        Ok(true)
     }
 
     fn ensure_snapshot_chain_id(&self, chain_id: u64) -> Result<()> {
@@ -295,12 +341,19 @@ impl BroadcasterSubscriptionProcessor {
 
     async fn buffer_snapshot_partition(
         &mut self,
-        partition: BroadcasterSnapshotPartition,
+        mut partition: BroadcasterSnapshotPartition,
     ) -> Result<()> {
         if partition.messages.is_empty() {
+            if let BroadcasterSubscriptionControls::Rfq(controls) = &self.controls {
+                partition.states.retain(|entry| {
+                    self.selects_book(controls, partition.backend, &entry.component)
+                });
+                if partition.states.is_empty() {
+                    return Ok(());
+                }
+            }
             let decoded = self.decoder.decode_snapshot_partition(partition).await?;
-            if let Some(mut update) = decoded.update {
-                self.retain_selected_rfq_entries(&mut update).await;
+            if let Some(update) = decoded.update {
                 self.controls
                     .state_store()
                     .apply_update_with_protocol_heads(update, &decoded.protocol_head_updates)
@@ -344,40 +397,74 @@ impl BroadcasterSubscriptionProcessor {
         Ok(())
     }
 
-    async fn retain_selected_rfq_entries(&self, update: &mut Update) {
+    fn selects_book(
+        &self,
+        controls: &RfqBroadcasterSubscriptionControls,
+        wire: BroadcasterBackend,
+        component: &ProtocolComponent,
+    ) -> bool {
+        let Some(kind) = ProtocolKind::from_canonical_protocol_system(&component.protocol_system)
+        else {
+            return false;
+        };
+        let canonical = BroadcasterBackend::from_protocol_kind(kind);
+        controls.protocols.contains(&kind)
+            && (wire == canonical
+                || (wire == BroadcasterBackend::Rfq
+                    && canonical == BroadcasterBackend::PropAmm
+                    && !self.wire_backends.contains(&BroadcasterBackend::PropAmm)))
+    }
+
+    async fn retain_selected_books(&self, update: &mut BroadcasterUpdateMessage) {
         let BroadcasterSubscriptionControls::Rfq(controls) = &self.controls else {
             return;
         };
-        let selected = |component: &ProtocolComponent| {
-            ProtocolKind::from_canonical_protocol_system(&component.protocol_system)
-                .is_some_and(|kind| controls.protocols.contains(&kind))
-        };
         let previous = controls.state_store.pin().await;
-        update
-            .removed_pairs
-            .retain(|_, component| selected(component));
-        update.new_pairs.retain(|id, component| {
-            if selected(component) {
-                return true;
+        update.partitions.retain_mut(|partition| {
+            if !self.wire_backends.contains(&partition.backend) {
+                return false;
             }
-            update.states.remove(id);
-            if let Some((_, old_component)) = previous.pool_by_id(id) {
-                update
-                    .removed_pairs
-                    .insert(id.clone(), (*old_component).clone());
+            let selected = |component: &ProtocolComponent| {
+                self.selects_book(controls, partition.backend, component)
+            };
+            partition
+                .removed_pairs
+                .retain(|entry| selected(&entry.component));
+            partition.new_pairs.retain(|entry| {
+                if selected(&entry.component) {
+                    return true;
+                }
+                if let Some((_, old)) = previous.pool_by_id(&entry.component_id) {
+                    partition.removed_pairs.push(BroadcasterRemovedPair::new(
+                        entry.component_id.clone(),
+                        (*old).clone(),
+                    ));
+                }
+                false
+            });
+            if !partition.updated_states.is_empty() {
+                let added: HashSet<_> = partition
+                    .new_pairs
+                    .iter()
+                    .map(|entry| &entry.component_id)
+                    .collect();
+                partition.updated_states.retain(|entry| {
+                    added.contains(&entry.component_id)
+                        || previous
+                            .pool_by_id(&entry.component_id)
+                            .is_some_and(|(_, component)| selected(&component))
+                });
             }
-            false
+            !partition.new_pairs.is_empty()
+                || !partition.updated_states.is_empty()
+                || !partition.removed_pairs.is_empty()
+                || !partition.messages.is_empty()
         });
-        // State-only deltas have no provider field. Only previously admitted books or
-        // a selected new pair in this update can receive them.
-        update
-            .states
-            .retain(|id, _| update.new_pairs.contains_key(id) || previous.pool_by_id(id).is_some());
     }
 
     async fn apply_live_update(
         &self,
-        update: BroadcasterUpdateMessage,
+        mut update: BroadcasterUpdateMessage,
         state_version: Option<u64>,
     ) -> Result<()> {
         let _shared_db_guard = match &self.controls {
@@ -387,24 +474,21 @@ impl BroadcasterSubscriptionProcessor {
             _ => None,
         };
 
-        let backend = ReplayBackend::from(self.controls.backend());
-        let decoded = self.decoder.decode_live_delta(update, &[backend]).await?;
+        self.retain_selected_books(&mut update).await;
+        let backends: Vec<_> = self
+            .wire_backends
+            .iter()
+            .copied()
+            .map(ReplayBackend::from)
+            .collect();
+        let decoded = self.decoder.decode_live_delta(update, &backends).await?;
         if !decoded.had_applicable_partition {
             return Ok(());
         }
         if decoded.update.is_none() && decoded.protocol_head_updates.is_empty() {
             return Ok(());
         }
-        if let Some(mut update) = decoded.update {
-            self.retain_selected_rfq_entries(&mut update).await;
-            if backend == ReplayBackend::Rfq
-                && update.states.is_empty()
-                && update.removed_pairs.is_empty()
-            {
-                // The replay tracker has consumed this envelope. Unselected books do not
-                // advance the standalone RFQ store or refresh its quote readiness.
-                return Ok(());
-            }
+        if let Some(update) = decoded.update {
             match state_version {
                 Some(state_version) => {
                     self.controls
@@ -430,7 +514,7 @@ impl BroadcasterSubscriptionProcessor {
                 .await;
         }
         match self.controls.backend() {
-            BroadcasterBackend::Rfq => {
+            BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => {
                 self.controls
                     .stream_health()
                     .record_update(decoded.block_number)
@@ -455,7 +539,7 @@ impl BroadcasterSubscriptionProcessor {
     }
 
     fn ensure_raw_messages_supported(&self) -> Result<()> {
-        if self.controls.backend() == BroadcasterBackend::Rfq {
+        if self.controls.backend().is_book() {
             return Err(anyhow!(
                 "raw RFQ broadcaster messages are unsupported; expected decoded RFQ state partitions"
             ));

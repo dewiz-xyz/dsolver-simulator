@@ -177,10 +177,10 @@ impl DecoderConfig {
                 ReplayBackend::Vm,
                 &[ProtocolKind::LiquidityParty, ProtocolKind::BalancerV3][..],
             ),
+            (ReplayBackend::Rfq, &[ProtocolKind::NativeRfq][..]),
             (
-                ReplayBackend::Rfq,
+                ReplayBackend::PropAmm,
                 &[
-                    ProtocolKind::NativeRfq,
                     ProtocolKind::Metric,
                     ProtocolKind::TitanFermiSwap,
                     ProtocolKind::TitanKipseli,
@@ -296,7 +296,7 @@ impl ReplayDecoder {
                         register_vm_decoder(&mut decoder, *protocol)?;
                     }
                 }
-                ReplayBackend::Rfq => {}
+                ReplayBackend::Rfq | ReplayBackend::PropAmm => {}
             }
         }
 
@@ -417,7 +417,7 @@ impl ReplayDecoder {
         self.ensure_backend_configured(backend)?;
         let block_number = partition.block_number;
         let (update, protocol_head_updates) = if partition.messages.is_empty() {
-            let head_updates = if backend != ReplayBackend::Rfq && !partition.states.is_empty() {
+            let head_updates = if !backend.is_book() && !partition.states.is_empty() {
                 self.config
                     .protocols(backend)
                     .unwrap_or_default()
@@ -520,7 +520,7 @@ impl ReplayDecoder {
                 let has_state_payload = !partition.new_pairs.is_empty()
                     || !partition.updated_states.is_empty()
                     || !partition.removed_pairs.is_empty();
-                if backend != ReplayBackend::Rfq && has_state_payload {
+                if !backend.is_book() && has_state_payload {
                     protocol_head_updates.extend(
                         self.config
                             .protocols(backend)
@@ -532,8 +532,7 @@ impl ReplayDecoder {
                             }),
                     );
                 }
-                (backend == ReplayBackend::Rfq || has_state_payload)
-                    .then(|| live_partition_update(partition))
+                (backend.is_book() || has_state_payload).then(|| live_partition_update(partition))
             } else {
                 self.ensure_raw_messages_supported(backend)?;
                 let (decoded, head_updates) = self
@@ -604,7 +603,7 @@ impl ReplayDecoder {
         &self,
         backend: ReplayBackend,
     ) -> Result<(), ReplayDecodeError> {
-        if backend == ReplayBackend::Rfq {
+        if backend.is_book() {
             Err(ReplayDecodeError::RawRfqUnsupported)
         } else {
             Ok(())

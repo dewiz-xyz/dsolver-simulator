@@ -567,16 +567,16 @@ fn fixture_subscription_controls(
                 protocols: vec![protocol],
             },
         )),
-        BroadcasterBackend::Rfq => Ok(BroadcasterSubscriptionControls::Rfq(
-            super::RfqBroadcasterSubscriptionControls {
+        BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => Ok(
+            BroadcasterSubscriptionControls::Rfq(super::RfqBroadcasterSubscriptionControls {
                 broadcaster_subscription,
                 state_store,
                 stream_health,
                 tokens,
                 protocols: vec![protocol],
                 simulation_rebuild_gate: Arc::new(RwLock::new(())),
-            },
-        )),
+            }),
+        ),
         BroadcasterBackend::Vm => Err(anyhow!("VM is outside the Phase 2 parity fixture set")),
     }
 }
@@ -2692,6 +2692,83 @@ async fn standalone_rfq_subscription_filters_broadcaster_only_books() -> Result<
         .await?;
     assert_eq!(controls.rfq_state_store.current_block().await, 22);
     assert_eq!(controls.rfq_stream_health.last_block().await, 22);
+    Ok(())
+}
+
+#[tokio::test]
+async fn simulator_consumes_metric_from_legacy_or_partitioned_streams() -> Result<()> {
+    for metric_wire in [BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm] {
+        let controls = TestControls::new();
+        let mut selection = controls.rfq();
+        let BroadcasterSubscriptionControls::Rfq(books) = &mut selection else {
+            return Err(anyhow!("expected book subscription"));
+        };
+        books.protocols.push(ProtocolKind::Metric);
+        let mut processor =
+            BroadcasterSubscriptionProcessor::new(Chain::Ethereum.id(), selection, None);
+        let mut start = rfq_snapshot_start_envelope(1)?;
+        let BroadcasterPayload::SnapshotStart(declared) = &mut start.payload else {
+            return Err(anyhow!("expected start"));
+        };
+        let mut chunk = rfq_snapshot_chunk_envelope(21)?;
+        let BroadcasterPayload::SnapshotChunk(data) = &mut chunk.payload else {
+            return Err(anyhow!("expected chunk"));
+        };
+        let mut component = rfq_component();
+        component.protocol_system = "rfq:metric".into();
+        let metric = BroadcasterStateEntry::new("metric", component, Box::new(DummySim(13)));
+        if metric_wire == BroadcasterBackend::Rfq {
+            data.partitions[0].states.push(metric);
+        } else {
+            declared.backends.push(metric_wire);
+            data.partitions.push(BroadcasterSnapshotPartition::new(
+                metric_wire,
+                21,
+                vec![metric],
+                BTreeMap::new(),
+            ));
+        }
+        processor.observe(start).await?;
+        processor.observe(chunk).await?;
+        processor.observe(snapshot_end_envelope()).await?;
+        assert!(controls.rfq_state_store.has_pool("metric").await);
+        assert!(controls.rfq_state_store.has_pool("pool-rfq").await);
+
+        let update = BroadcasterEnvelope::new(
+            "stream-1",
+            4,
+            BroadcasterPayload::Update(BroadcasterUpdateMessage::new(vec![
+                BroadcasterUpdatePartition::new(
+                    metric_wire,
+                    22,
+                    vec![],
+                    vec![BroadcasterStateDelta::new(
+                        "metric",
+                        metric_wire,
+                        Box::new(DummySim(42)),
+                    )],
+                    vec![],
+                    BTreeMap::new(),
+                ),
+            ])?),
+        );
+        let entry = redis_entry_for_scope(&update, metric_wire.as_str());
+        processor.observe_redis_delta(&entry, &update).await?;
+        let (state, _) = controls
+            .rfq_state_store
+            .pool_by_id("metric")
+            .await
+            .ok_or_else(|| anyhow!("metric missing"))?;
+        assert_eq!(
+            state.as_any().downcast_ref::<DummySim>().map(|s| s.0),
+            Some(42)
+        );
+        if metric_wire == BroadcasterBackend::PropAmm {
+            assert!(processor
+                .participates_in_recovery(&[BroadcasterBackend::Rfq])
+                .is_err());
+        }
+    }
     Ok(())
 }
 

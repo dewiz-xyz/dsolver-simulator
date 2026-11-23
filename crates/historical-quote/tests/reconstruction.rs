@@ -752,3 +752,78 @@ fn executor(source: Arc<FixtureSource>) -> HistoricalQuoteExecutor<FixtureSource
         "phase-4-test",
     )
 }
+
+#[tokio::test]
+async fn independently_timed_book_partitions_preserve_each_others_observations(
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use historical_quote::{api::Backend as PublicBackend, ReconstructionRequest};
+    use serde_json::{json, Value};
+    use std::collections::BTreeSet;
+
+    let mut source = FixtureSource::rfq().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let leg = source
+        .target_plan
+        .legs
+        .first_mut()
+        .context("fixture range")?;
+    leg.checkpoint
+        .backends
+        .push(state_history::Backend::PropAmm);
+    leg.checkpoint.prop_amm_observed_at_ms = Some(4_900);
+    let archive = source
+        .archives
+        .get_mut(&leg.checkpoint.id)
+        .context("fixture archive")?;
+    archive.metadata.backends = leg.checkpoint.backends.clone();
+    archive.metadata.prop_amm_observed_at_ms = Some(4_900);
+    for payload in &mut archive.payloads_json {
+        let mut value: Value = serde_json::from_str(payload)?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("snapshot_start") => value
+                .get_mut("backends")
+                .and_then(Value::as_array_mut)
+                .context("declared backends")?
+                .push(json!("prop_amm")),
+            Some("snapshot_chunk") => value
+                .get_mut("partitions")
+                .and_then(Value::as_array_mut)
+                .context("snapshot partitions")?
+                .push(json!({"backend":"prop_amm","blockNumber":4900,"states":[]})),
+            _ => continue,
+        }
+        *payload = value.to_string();
+    }
+    // This RFQ delta follows its own anchor (1000) but predates the pool-book anchor (4900).
+    let delta = support::rfq_delta(12, 4_500).map_err(|e| anyhow::anyhow!("{e}"))?;
+    leg.deltas = vec![delta];
+    let result = HistoricalReconstructor::new(Arc::new(source), ReadLimits::unbounded())
+        .reconstruct(
+            &ReconstructionRequest {
+                chain_id: 8453,
+                backends: BTreeSet::from([PublicBackend::Rfq, PublicBackend::PropAmm]),
+                required_blocks: BTreeSet::from([100]),
+            },
+            &CancellationToken::new(),
+        )
+        .await?;
+    let state = result
+        .states
+        .get(&100)
+        .context("requested block")?
+        .as_ref()
+        .map_err(|why| anyhow::anyhow!("unexpected unavailable state {why:?}"))?;
+    assert_eq!(
+        state.provenance.rfq_observation_cursor,
+        Some(support::public_position(12))
+    );
+    assert_eq!(state.provenance.rfq_observation_age_ms, Some(500));
+    let pool = state
+        .provenance
+        .prop_amm_observation
+        .as_ref()
+        .context("pool book provenance")?;
+    assert_eq!(pool.cursor, support::public_position(10));
+    assert_eq!(pool.age_ms, 100);
+    Ok(())
+}

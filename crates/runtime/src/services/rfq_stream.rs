@@ -1,4 +1,4 @@
-//! Adapt complete provider books to the broadcaster's existing RFQ state/delta contract.
+//! Adapt complete provider books to the broadcaster's RFQ and proprietary AMM partitions.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -342,7 +342,10 @@ mod tests {
 
     #[tokio::test]
     async fn providers_round_trip_through_broadcast_and_keep_exact_quotes() {
-        let cache = BroadcasterSnapshotCache::new(1, vec![BroadcasterBackend::Rfq]);
+        let cache = BroadcasterSnapshotCache::new(
+            1,
+            vec![BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm],
+        );
         let mut providers = ProviderBooks::default();
         let (base, quote) = tokens();
         let amount = BigUint::from(1_000_000_000_000_000_000u64);
@@ -366,7 +369,10 @@ mod tests {
             let replay: BroadcasterUpdateMessage = serde_json::from_str(&wire).unwrap();
             assert_eq!(replay.partitions.len(), 1);
             let partition = &replay.partitions[0];
-            assert_eq!(partition.backend, BroadcasterBackend::Rfq);
+            assert_eq!(
+                Some(partition.backend),
+                BroadcasterBackend::for_protocol(provider)
+            );
             let entry = &partition.new_pairs[0];
             assert_eq!(entry.component.protocol_system, provider);
             let actual = entry
@@ -572,7 +578,7 @@ mod tests {
         .await?;
         let cache = BroadcasterSnapshotCache::new(
             if chain == Chain::Base { 8453 } else { 1 },
-            vec![BroadcasterBackend::Rfq],
+            vec![BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm],
         );
         let mut seen = HashSet::new();
         tokio::time::timeout(Duration::from_secs(45), async {
@@ -598,9 +604,12 @@ mod tests {
     ) -> Result<Vec<String>> {
         let mut providers = Vec::new();
         for partition in replay.partitions {
-            assert_eq!(partition.backend, BroadcasterBackend::Rfq);
             for entry in partition.new_pairs {
                 let component = &entry.component;
+                assert_eq!(
+                    Some(partition.backend),
+                    BroadcasterBackend::for_protocol(&component.protocol_system)
+                );
                 let base = &component.tokens[0];
                 let quote = &component.tokens[1];
                 let before = update.states[&entry.component_id].spot_price(base, quote)?;

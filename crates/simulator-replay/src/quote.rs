@@ -69,7 +69,7 @@ impl StatePoint {
                 request.component_id.clone(),
             ));
         };
-        let actual_backend = ReplayBackend::from_protocol_kind(kind);
+        let actual_backend = self.stored_backend(kind);
         if actual_backend != request.backend {
             return Err(ReplayQuoteError::BackendMismatch {
                 component_id: request.component_id.clone(),
