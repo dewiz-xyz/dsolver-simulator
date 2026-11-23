@@ -249,6 +249,7 @@ fn history_backend(backend: Backend) -> state_history::Backend {
         Backend::Native => state_history::Backend::Native,
         Backend::Vm => state_history::Backend::Vm,
         Backend::Rfq => state_history::Backend::Rfq,
+        Backend::PropAmm => state_history::Backend::PropAmm,
     }
 }
 

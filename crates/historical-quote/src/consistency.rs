@@ -352,7 +352,9 @@ fn validate_applicable_backends(
                 state_history::Backend::Native | state_history::Backend::Vm => {
                     cursor.block_number.is_some()
                 }
-                state_history::Backend::Rfq => cursor.observed_at_ms.is_some(),
+                state_history::Backend::Rfq | state_history::Backend::PropAmm => {
+                    cursor.observed_at_ms.is_some()
+                }
             };
         if !cursor_is_valid {
             return Err(invalid_storage(
@@ -611,6 +613,9 @@ fn target_world_marker(
         };
         marker = marker.max(rfq_marker);
     }
+    if backends.contains(&Backend::PropAmm) {
+        marker = marker.max(manifest.prop_amm_observed_at_ms.unwrap_or_default());
+    }
     marker
 }
 
@@ -638,6 +643,7 @@ fn canonical_summary(state: &CanonicalState) -> CanonicalStateSummary {
                         simulator_replay::ReplayBackend::Native => Backend::Native,
                         simulator_replay::ReplayBackend::Vm => Backend::Vm,
                         simulator_replay::ReplayBackend::Rfq => Backend::Rfq,
+                        simulator_replay::ReplayBackend::PropAmm => Backend::PropAmm,
                     },
                     u64::try_from(*count).unwrap_or(u64::MAX),
                 )
@@ -844,5 +850,6 @@ fn public_replay_backend(backend: simulator_replay::ReplayBackend) -> Backend {
         simulator_replay::ReplayBackend::Native => Backend::Native,
         simulator_replay::ReplayBackend::Vm => Backend::Vm,
         simulator_replay::ReplayBackend::Rfq => Backend::Rfq,
+        simulator_replay::ReplayBackend::PropAmm => Backend::PropAmm,
     }
 }

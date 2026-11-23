@@ -441,7 +441,9 @@ fn complete_head_update(
     let protocol = match backend {
         BroadcasterBackend::Native => "uniswap_v2",
         BroadcasterBackend::Vm => "vm:balancer_v2",
-        BroadcasterBackend::Rfq => unreachable!("RFQ has no chain head"),
+        BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => {
+            return Err(anyhow!("book partitions have no chain head"))
+        }
     };
     let message = raw_head_message(protocol, number, hash_seed);
     let status = BroadcasterProtocolSyncStatus::from_synchronizer_state(&message.sync_state);
@@ -3024,6 +3026,7 @@ fn update(backend: BroadcasterBackend, block_number: u64, component_id: &str) ->
         BroadcasterBackend::Native => "uniswap_v2",
         BroadcasterBackend::Vm => "vm:balancer_v2",
         BroadcasterBackend::Rfq => "rfq:bebop",
+        BroadcasterBackend::PropAmm => "rfq:metric",
     };
     let mut new_pairs = HashMap::new();
     new_pairs.insert(

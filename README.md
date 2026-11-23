@@ -66,7 +66,7 @@ have been removed.
 
 This branch preserves the current replay bootstrap API and enables 12 hosted on-chain feeds on Base and 21 on Ethereum. Balancer V2 and V3 are disabled. The Ethereum broadcaster subscribes to the three VM systems selected in the manifest.
 
-With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed once; Titan Bebop and Bebop RFQ have distinct identities.
+With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed. Its books and Titan’s named venues use the `prop_amm` partition. Direct Native, Hashflow and Bebop use `rfq`. See the [partition rollout](docs/state_history.md#book-partition-rollout) for the reader and writer deployment sequence.
 
 Set `CHAIN_ID=8453` or `1`, and supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`. Ethereum also requires `HASHFLOW_USER` and `HASHFLOW_KEY`. Titan's public stream needs no API key. The optional `RFQ_MIN_TVL_USD` defaults to 100 USD for direct book providers.
 

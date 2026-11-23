@@ -541,16 +541,17 @@ impl BroadcasterSnapshotCache {
     /// has yet to answer on the new connection. Only a successful publish removes them.
     pub(crate) async fn rfq_withdrawal(&self, max_pairs: usize) -> Option<TychoUpdate> {
         let guard = self.inner.read().await;
-        let partition = guard.partitions.get(&BroadcasterBackend::Rfq)?;
-        if partition.states.is_empty() {
-            return None;
-        }
-        let removed = partition
-            .states
+        let removed: HashMap<_, _> = guard
+            .partitions
             .iter()
+            .filter(|(backend, _)| backend.is_book())
+            .flat_map(|(_, partition)| partition.states.iter())
             .take(max_pairs)
             .map(|(id, entry)| (id.clone(), entry.component.clone()))
             .collect();
+        if removed.is_empty() {
+            return None;
+        }
         Some(
             TychoUpdate::new(
                 super::redis_publisher::current_time_ms(),
@@ -1008,11 +1009,11 @@ impl BroadcasterSnapshotCache {
 
     fn is_ready_locked(&self, guard: &BroadcasterSnapshotCacheData) -> bool {
         self.configured_backends.iter().all(|backend| {
-            guard
-                .partitions
-                .get(backend)
-                .and_then(|partition| partition.block_number)
-                .is_some()
+            backend.is_book()
+                || guard
+                    .partitions
+                    .get(backend)
+                    .is_some_and(|p| p.block_number.is_some())
         })
     }
 
@@ -1671,9 +1672,13 @@ fn build_snapshot_chunks(
     max_payload_bytes: usize,
 ) -> Result<Vec<BroadcasterSnapshotChunk>> {
     let mut chunks = Vec::new();
+    let unobserved = BroadcasterPartitionState::default();
     for backend in configured_backends {
-        let Some(partition) = partitions.get(backend) else {
-            continue;
+        let partition = match partitions.get(backend) {
+            Some(partition) => partition,
+            // Book feeds can arrive independently, after the on-chain bootstrap.
+            None if backend.is_book() => &unobserved,
+            None => continue,
         };
         let partitions = build_partition_snapshot_chunks(
             &SnapshotChunkBuildContext {
@@ -1767,7 +1772,7 @@ fn build_partition_snapshot_chunks(
         )?);
         states.push(state.clone());
     }
-    if !states.is_empty() || !sync_statuses.is_empty() {
+    if !states.is_empty() || !sync_statuses.is_empty() || ctx.backend.is_book() {
         chunks.push(ctx.states_chunk(base_chunk_index + chunks.len(), states, sync_statuses)?);
     }
     Ok(chunks)

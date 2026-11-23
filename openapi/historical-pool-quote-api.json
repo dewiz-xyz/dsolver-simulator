@@ -1014,7 +1014,8 @@
         "enum": [
           "native",
           "vm",
-          "rfq"
+          "rfq",
+          "prop_amm"
         ]
       },
       "BlockBounds": {
@@ -1065,6 +1066,30 @@
         },
         "additionalProperties": false
       },
+      "BookObservation": {
+        "type": "object",
+        "description": "Last accepted observation in a provider-timestamped partition.",
+        "required": [
+          "cursor",
+          "observedAt",
+          "ageMs"
+        ],
+        "properties": {
+          "ageMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cursor": {
+            "$ref": "#/components/schemas/StreamPosition"
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
       "CanonicalStateSummary": {
         "type": "object",
         "description": "Summary of the canonical simulator state on one side of a comparison.",
@@ -1087,7 +1112,8 @@
               "enum": [
                 "native",
                 "vm",
-                "rfq"
+                "rfq",
+                "prop_amm"
               ]
             }
           },
@@ -1265,7 +1291,8 @@
               "enum": [
                 "native",
                 "vm",
-                "rfq"
+                "rfq",
+                "prop_amm"
               ]
             },
             "minItems": 1,
@@ -1613,7 +1640,8 @@
               "enum": [
                 "native",
                 "vm",
-                "rfq"
+                "rfq",
+                "prop_amm"
               ]
             },
             "minItems": 1,
@@ -2535,6 +2563,16 @@
           "finalPosition": {
             "$ref": "#/components/schemas/StreamPosition"
           },
+          "propAmmObservation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BookObservation"
+              }
+            ]
+          },
           "rfqObservationAgeMs": {
             "type": [
               "integer",
@@ -2614,7 +2652,8 @@
               "enum": [
                 "native",
                 "vm",
-                "rfq"
+                "rfq",
+                "prop_amm"
               ]
             },
             "minItems": 1,
@@ -2933,7 +2972,8 @@
               "enum": [
                 "native",
                 "vm",
-                "rfq"
+                "rfq",
+                "prop_amm"
               ]
             },
             "minItems": 1,
@@ -3015,6 +3055,7 @@
           "replica_cutoff",
           "token_snapshot_missing",
           "rfq_observation_missing",
+          "prop_amm_observation_missing",
           "block_boundary_missing",
           "canonical_lineage_invalid",
           "state_application_invalid"

@@ -669,7 +669,17 @@ fn raw_configured_backends(config: &BroadcasterConfig) -> Vec<BroadcasterBackend
 }
 
 fn rfq_configured_backends(config: &BroadcasterConfig) -> Option<Vec<BroadcasterBackend>> {
-    effective_rfq_enabled(config).then_some(vec![BroadcasterBackend::Rfq])
+    effective_rfq_enabled(config).then(|| {
+        let mut backends: Vec<_> = config
+            .chain_profile
+            .broadcaster_rfq_protocols()
+            .into_iter()
+            .map(BroadcasterBackend::from_protocol_kind)
+            .collect();
+        backends.sort_unstable();
+        backends.dedup();
+        backends
+    })
 }
 
 fn effective_rfq_enabled(config: &BroadcasterConfig) -> bool {
@@ -822,7 +832,7 @@ fn spawn_chain_tip_telemetry_task(
                 let label = match backend {
                     BroadcasterBackend::Native => "native",
                     BroadcasterBackend::Vm => "vm",
-                    BroadcasterBackend::Rfq => return None,
+                    BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => return None,
                 };
                 Some((
                     backend,
@@ -939,7 +949,7 @@ fn spawn_promotion_task(
             };
             let requested_block_number =
                 BroadcasterServiceState::state_history_aligned_head(&services).await;
-            let requested_rfq_observed_at_ms = state_history.rfq_high_water_ms();
+            let requested_book_observations = state_history.book_observations();
             let position = StreamPosition {
                 generation: boundary.generation,
                 message_seq: boundary.exclusive_message_seq,
@@ -949,7 +959,7 @@ fn spawn_promotion_task(
                 CheckpointKind::Boundary,
                 Some(position),
                 requested_block_number,
-                requested_rfq_observed_at_ms,
+                requested_book_observations,
             )
             .await;
             // Mirrors the recovery commit path: a promotion boundary that never
@@ -959,7 +969,8 @@ fn spawn_promotion_task(
                     services[0].chain_id(),
                     position,
                     requested_block_number,
-                    requested_rfq_observed_at_ms,
+                    requested_book_observations.rfq,
+                    requested_book_observations.prop_amm,
                 );
             }
             match checkpoint {
@@ -1040,7 +1051,7 @@ fn spawn_state_history_checkpoint_task(
                         CheckpointKind::Boundary,
                         Some(request.position),
                         request.complete_native_block,
-                        request.rfq_high_water_ms,
+                        request.book_observations,
                     )
                     .await;
                     StateHistoryRuntime::respond_to_boundary_request(request, result);
@@ -1064,7 +1075,7 @@ fn spawn_state_history_checkpoint_task(
                         CheckpointKind::Interval,
                         None,
                         None,
-                        None,
+                        Default::default(),
                     )
                     .await
                     {
@@ -1270,6 +1281,22 @@ mod tests {
         assert_eq!(
             rfq_configured_backends(&config),
             Some(vec![BroadcasterBackend::Rfq])
+        );
+    }
+
+    #[test]
+    fn book_partitions_follow_all_broadcaster_protocols() {
+        let mut config = test_config();
+        config.chain_profile.rfq_protocols = vec![ProtocolKind::Metric];
+        assert_eq!(
+            rfq_configured_backends(&config),
+            Some(vec![BroadcasterBackend::PropAmm])
+        );
+        config.chain_profile.broadcaster_only_rfq_protocols =
+            vec![ProtocolKind::TitanBebop, ProtocolKind::Bebop];
+        assert_eq!(
+            rfq_configured_backends(&config),
+            Some(vec![BroadcasterBackend::Rfq, BroadcasterBackend::PropAmm])
         );
     }
 

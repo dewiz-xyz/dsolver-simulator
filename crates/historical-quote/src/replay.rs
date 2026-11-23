@@ -13,7 +13,9 @@ use state_history::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{Backend, GapCause, GapKind, GapReference, StreamPosition, UnavailableReason};
+use crate::api::{
+    Backend, BookObservation, GapCause, GapKind, GapReference, StreamPosition, UnavailableReason,
+};
 use crate::{HistoricalError, HistorySource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,7 @@ pub struct StateProvenance {
     pub rfq_observation_cursor: Option<StreamPosition>,
     pub rfq_observed_at: Option<DateTime<Utc>>,
     pub rfq_observation_age_ms: Option<u64>,
+    pub prop_amm_observation: Option<BookObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +146,8 @@ impl<S: HistorySource> HistoricalReconstructor<S> {
                 Err(UnavailableState {
                     reason: if !gap_refs.is_empty() {
                         UnavailableReason::Gap
+                    } else if request.backends.contains(&Backend::PropAmm) {
+                        UnavailableReason::PropAmmObservationMissing
                     } else if request.backends.contains(&Backend::Rfq) {
                         UnavailableReason::RfqObservationMissing
                     } else {
@@ -244,9 +249,8 @@ pub(crate) struct RestoredWorld {
     pub(crate) anchor_checkpoint_position: HistoryPosition,
     pub(crate) anchor_block: u64,
     pub(crate) token_snapshot_digest: Option<String>,
-    pub(crate) anchor_rfq_observed_at_ms: Option<u64>,
-    pub(crate) rfq_observed_at_ms: Option<u64>,
-    pub(crate) rfq_observation_position: Option<HistoryPosition>,
+    anchor_book_observed_at_ms: Option<u64>,
+    book_observations: BTreeMap<Backend, (u64, HistoryPosition)>,
     pub(crate) checkpoint_application_invalid: bool,
 }
 
@@ -342,6 +346,15 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
         )
     })?;
     let mut world = ReplayWorld::new(tokens, None);
+    world.set_legacy_book_partition(!manifest.backends.contains(&HistoryBackend::PropAmm));
+    let book_observations: BTreeMap<_, _> = backends
+        .iter()
+        .filter_map(|&backend| {
+            // Zero is the wire head of a declared book partition awaiting its first observation.
+            let time = checkpoint_book_time(manifest, backend).filter(|time| *time != 0)?;
+            Some((backend, (time, manifest.position)))
+        })
+        .collect();
     let report = world.restore(update);
     Ok(Some(RestoredWorld {
         archive_schema_version: archive.metadata.schema_version,
@@ -351,9 +364,11 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
         anchor_checkpoint_position: manifest.position,
         anchor_block: manifest.block_number,
         token_snapshot_digest,
-        anchor_rfq_observed_at_ms: manifest.rfq_observed_at_ms,
-        rfq_observed_at_ms: manifest.rfq_observed_at_ms,
-        rfq_observation_position: manifest.rfq_observed_at_ms.map(|_| manifest.position),
+        anchor_book_observed_at_ms: backends
+            .iter()
+            .filter_map(|&backend| checkpoint_book_time(manifest, backend))
+            .min(),
+        book_observations,
         checkpoint_application_invalid: report.has_state_integrity_errors(),
     }))
 }
@@ -429,14 +444,16 @@ async fn apply_deltas_through(
                     Backend::Native | Backend::Vm => cursor
                         .block_number
                         .is_some_and(|block| block <= application.target_block),
-                    Backend::Rfq => application.next_block_timestamp.is_some_and(|boundary| {
-                        cursor.observed_at_ms.is_some_and(|observed| {
+                    Backend::Rfq | Backend::PropAmm => cursor
+                        .observed_at_ms
+                        .zip(application.next_block_timestamp)
+                        .is_some_and(|(observed, boundary)| {
                             observed < boundary
                                 && restored
-                                    .rfq_observed_at_ms
-                                    .is_none_or(|selected| observed >= selected)
-                        })
-                    }),
+                                    .book_observations
+                                    .get(&backend)
+                                    .is_none_or(|(selected, _)| observed >= *selected)
+                        }),
                 };
                 ready.then_some((backend, cursor.observed_at_ms))
             })
@@ -465,9 +482,10 @@ async fn apply_deltas_through(
             restored.final_position = delta.position;
             for (backend, observed_at_ms) in eligible {
                 application.applied.insert((delta.position, backend));
-                if backend == Backend::Rfq {
-                    restored.rfq_observed_at_ms = observed_at_ms;
-                    restored.rfq_observation_position = Some(delta.position);
+                if let Some(time) = observed_at_ms.filter(|_| backend.is_book()) {
+                    restored
+                        .book_observations
+                        .insert(backend, (time, delta.position));
                 }
             }
         }
@@ -493,7 +511,16 @@ fn reconstructed_state(
             gap_refs,
         }));
     }
-    if request.backends.contains(&Backend::Rfq) && restored.rfq_observed_at_ms.is_none() {
+    if request.backends.contains(&Backend::PropAmm)
+        && !restored.book_observations.contains_key(&Backend::PropAmm)
+    {
+        return Ok(Err(unavailable(
+            UnavailableReason::PropAmmObservationMissing,
+        )));
+    }
+    if request.backends.contains(&Backend::Rfq)
+        && !restored.book_observations.contains_key(&Backend::Rfq)
+    {
         return Ok(Err(unavailable(UnavailableReason::RfqObservationMissing)));
     }
     let observation = plan.block_times.get(&block).ok_or_else(|| {
@@ -502,17 +529,8 @@ fn reconstructed_state(
     let block_hash = observation.block_hash.clone().ok_or_else(|| {
         HistoricalError::HistoricalDataInvalid(format!("block {block} has no canonical hash"))
     })?;
-    let (rfq_observation_cursor, rfq_observed_at, rfq_observation_age_ms) =
-        if request.backends.contains(&Backend::Rfq) {
-            let (observed_at, observation_age_ms) = rfq_provenance(restored, next_block_timestamp)?;
-            (
-                restored.rfq_observation_position.map(public_position),
-                observed_at,
-                observation_age_ms,
-            )
-        } else {
-            (None, None, None)
-        };
+    let rfq = book_provenance(restored, Backend::Rfq, next_block_timestamp)?;
+    let prop_amm_observation = book_provenance(restored, Backend::PropAmm, next_block_timestamp)?;
     Ok(Ok(ReconstructedState {
         point: restored.world.pin(),
         provenance: StateProvenance {
@@ -520,9 +538,10 @@ fn reconstructed_state(
             final_position: public_position(restored.final_position),
             anchor_checkpoint_position: public_position(restored.anchor_checkpoint_position),
             token_snapshot_digest: restored.token_snapshot_digest.clone(),
-            rfq_observation_cursor,
-            rfq_observed_at,
-            rfq_observation_age_ms,
+            rfq_observation_cursor: rfq.as_ref().map(|o| o.cursor),
+            rfq_observed_at: rfq.as_ref().map(|o| o.observed_at),
+            rfq_observation_age_ms: rfq.as_ref().map(|o| o.age_ms),
+            prop_amm_observation,
         },
     }))
 }
@@ -543,7 +562,7 @@ fn early_unavailable_states(
         let reason = if *block > plan.visible_through_block {
             Some(UnavailableReason::ReplicaCutoff)
         } else if plan.missing_block_times.contains(block)
-            || request.backends.contains(&Backend::Rfq)
+            || request.backends.iter().any(|backend| backend.is_book())
                 && block
                     .checked_add(1)
                     .is_none_or(|next| plan.missing_block_times.contains(&next))
@@ -582,9 +601,7 @@ fn leg_for_block(plan: &TargetPlan, backends: &BTreeSet<Backend>, block: u64) ->
         .filter(|(_, leg)| {
             backends.iter().all(|backend| match backend {
                 Backend::Native | Backend::Vm => leg.checkpoint.block_number <= block,
-                Backend::Rfq => leg
-                    .checkpoint
-                    .rfq_observed_at_ms
+                Backend::Rfq | Backend::PropAmm => checkpoint_book_time(&leg.checkpoint, *backend)
                     .zip(next_timestamp)
                     .is_some_and(|(observed, boundary)| observed < boundary),
             })
@@ -608,7 +625,7 @@ fn state_gap_refs(
                 restored.final_position,
                 restored.anchor_block,
                 block,
-                restored.anchor_rfq_observed_at_ms,
+                restored.anchor_book_observed_at_ms,
                 next_block_timestamp,
             )
         })
@@ -703,32 +720,45 @@ pub(crate) fn gap_cause(reason: &str) -> Result<GapCause, HistoricalError> {
     }
 }
 
-fn rfq_provenance(
+fn checkpoint_book_time(manifest: &CheckpointManifest, backend: Backend) -> Option<u64> {
+    match backend {
+        Backend::Rfq => manifest.rfq_observed_at_ms,
+        Backend::PropAmm => manifest.prop_amm_observed_at_ms,
+        Backend::Native | Backend::Vm => None,
+    }
+}
+
+fn book_provenance(
     restored: &RestoredWorld,
+    backend: Backend,
     next_block_timestamp: Option<u64>,
-) -> Result<(Option<DateTime<Utc>>, Option<u64>), HistoricalError> {
-    let Some(observed_at_ms) = restored.rfq_observed_at_ms else {
-        return Ok((None, None));
+) -> Result<Option<BookObservation>, HistoricalError> {
+    let Some(&(observed_at_ms, position)) = restored.book_observations.get(&backend) else {
+        return Ok(None);
     };
     let observed_at =
         DateTime::from_timestamp_millis(i64::try_from(observed_at_ms).map_err(|_| {
             HistoricalError::HistoricalDataInvalid(
-                "RFQ observation timestamp exceeds RFC 3339 range".to_owned(),
+                "book observation timestamp exceeds RFC 3339 range".to_owned(),
             )
         })?)
         .ok_or_else(|| {
             HistoricalError::HistoricalDataInvalid(
-                "RFQ observation timestamp exceeds RFC 3339 range".to_owned(),
+                "book observation timestamp exceeds RFC 3339 range".to_owned(),
             )
         })?;
     let age = next_block_timestamp
         .and_then(|boundary| boundary.checked_sub(observed_at_ms))
         .ok_or_else(|| {
             HistoricalError::HistoricalDataInvalid(
-                "RFQ observation is not before the next block boundary".to_owned(),
+                "book observation is not before the next block boundary".to_owned(),
             )
         })?;
-    Ok((Some(observed_at), Some(age)))
+    Ok(Some(BookObservation {
+        cursor: public_position(position),
+        observed_at,
+        age_ms: age,
+    }))
 }
 
 pub(crate) fn history_backend(backend: Backend) -> HistoryBackend {
@@ -736,6 +766,7 @@ pub(crate) fn history_backend(backend: Backend) -> HistoryBackend {
         Backend::Native => HistoryBackend::Native,
         Backend::Vm => HistoryBackend::Vm,
         Backend::Rfq => HistoryBackend::Rfq,
+        Backend::PropAmm => HistoryBackend::PropAmm,
     }
 }
 
@@ -744,6 +775,7 @@ pub(crate) fn public_backend(backend: HistoryBackend) -> Backend {
         HistoryBackend::Native => Backend::Native,
         HistoryBackend::Vm => Backend::Vm,
         HistoryBackend::Rfq => Backend::Rfq,
+        HistoryBackend::PropAmm => Backend::PropAmm,
     }
 }
 
@@ -752,6 +784,7 @@ pub(crate) fn replay_backend(backend: Backend) -> ReplayBackend {
         Backend::Native => ReplayBackend::Native,
         Backend::Vm => ReplayBackend::Vm,
         Backend::Rfq => ReplayBackend::Rfq,
+        Backend::PropAmm => ReplayBackend::PropAmm,
     }
 }
 

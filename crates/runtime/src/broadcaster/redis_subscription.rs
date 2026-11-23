@@ -901,10 +901,9 @@ async fn apply_recovery_message(
             };
 
             for prepared_processor in &prepared.processors {
-                if !start
-                    .manifest
-                    .backends
-                    .contains(&prepared_processor.processor.controls.backend())
+                if !prepared_processor
+                    .processor
+                    .participates_in_recovery(&start.manifest.backends)?
                 {
                     continue;
                 }
@@ -1133,7 +1132,10 @@ async fn commit_recovery(
     let mut candidates = Vec::new();
     for (processor_index, prepared_processor) in prepared.processors.iter().enumerate() {
         let backend = prepared_processor.processor.controls.backend();
-        if !recovery.manifest.backends.contains(&backend) {
+        if !prepared_processor
+            .processor
+            .participates_in_recovery(&recovery.manifest.backends)?
+        {
             continue;
         }
         let mut candidate = prepared_processor
@@ -1174,7 +1176,7 @@ async fn commit_recovery(
             .publish_candidate(candidate, recovery.manifest.target_state_version)
             .await?;
         match backend {
-            BroadcasterBackend::Rfq => {
+            BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => {
                 live.processor
                     .controls
                     .stream_health()

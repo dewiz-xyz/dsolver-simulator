@@ -190,6 +190,7 @@ pub fn emit_broadcaster_health_snapshot(snapshot: &BroadcasterStatusSnapshot) {
     let native = snapshot.backends.get(&BroadcasterBackend::Native);
     let vm = snapshot.backends.get(&BroadcasterBackend::Vm);
     let rfq = snapshot.backends.get(&BroadcasterBackend::Rfq);
+    let prop_amm = snapshot.backends.get(&BroadcasterBackend::PropAmm);
     let mut metrics = vec![
         (
             "BroadcasterNativeReady",
@@ -234,6 +235,11 @@ pub fn emit_broadcaster_health_snapshot(snapshot: &BroadcasterStatusSnapshot) {
         (
             "BroadcasterRfqAvailable",
             u64::from(rfq.and_then(|status| status.block_number).is_some()),
+            UNIT_COUNT,
+        ),
+        (
+            "BroadcasterPropAmmAvailable",
+            u64::from(prop_amm.and_then(|status| status.block_number).is_some()),
             UNIT_COUNT,
         ),
     ];

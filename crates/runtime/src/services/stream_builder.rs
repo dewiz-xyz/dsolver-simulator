@@ -66,11 +66,39 @@ pub async fn build_broadcaster_subscription_decoder(
     backend: BroadcasterBackend,
     protocols: &[ProtocolKind],
 ) -> Result<Arc<ReplayDecoder>> {
-    let config = DecoderConfig::for_backend(ReplayBackend::from(backend), protocols.to_vec(), 0)
-        .with_chain(tokens.chain());
+    let config = subscription_decoder_config(backend, protocols).with_chain(tokens.chain());
     Ok(Arc::new(
         ReplayDecoder::new(config, tokens.snapshot().await).await?,
     ))
+}
+
+pub(crate) fn subscription_decoder_config(
+    backend: BroadcasterBackend,
+    protocols: &[ProtocolKind],
+) -> DecoderConfig {
+    if backend == BroadcasterBackend::Rfq {
+        // The standalone simulator keeps one selected book store. A legacy snapshot
+        // can put every configured book under RFQ, while new snapshots split it.
+        DecoderConfig::new(
+            0,
+            [
+                (ReplayBackend::Rfq, protocols.to_vec()),
+                (
+                    ReplayBackend::PropAmm,
+                    protocols
+                        .iter()
+                        .copied()
+                        .filter(|kind| {
+                            BroadcasterBackend::from_protocol_kind(*kind)
+                                == BroadcasterBackend::PropAmm
+                        })
+                        .collect(),
+                ),
+            ],
+        )
+    } else {
+        DecoderConfig::for_backend(ReplayBackend::from(backend), protocols.to_vec(), 0)
+    }
 }
 
 #[derive(Clone)]

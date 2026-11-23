@@ -242,6 +242,7 @@ impl WriterHandle {
         position: StreamPosition,
         block_number: Option<u64>,
         rfq_observed_at_ms: Option<u64>,
+        prop_amm_observed_at_ms: Option<u64>,
     ) {
         lock(&self.inner.gaps).merge(GapRecord {
             chain_id,
@@ -251,8 +252,11 @@ impl WriterHandle {
             reason: GapReason::CheckpointFailed,
             from_block_number: block_number,
             to_block_number: block_number,
-            from_observed_at_ms: rfq_observed_at_ms,
-            to_observed_at_ms: rfq_observed_at_ms,
+            from_observed_at_ms: rfq_observed_at_ms
+                .into_iter()
+                .chain(prop_amm_observed_at_ms)
+                .min(),
+            to_observed_at_ms: rfq_observed_at_ms.max(prop_amm_observed_at_ms),
         });
     }
 
@@ -682,6 +686,7 @@ impl WriterTask {
         let block_number = capture.state().block_number();
         let state_version = capture.state().state_version();
         let rfq_observed_at_ms = capture.state().rfq_observed_at_ms();
+        let prop_amm_observed_at_ms = capture.state().prop_amm_observed_at_ms();
         let boundary_gap = (capture.state().kind() == CheckpointKind::Boundary)
             .then(|| checkpoint_gap(capture.state(), GapReason::CheckpointFailed));
         match self.execute_checkpoint(capture).await {
@@ -695,6 +700,7 @@ impl WriterTask {
                     ?state_version,
                     block_number,
                     ?rfq_observed_at_ms,
+                    ?prop_amm_observed_at_ms,
                     duration_ms =
                         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "state history checkpoint completed"
@@ -717,6 +723,7 @@ impl WriterTask {
                     ?state_version,
                     block_number,
                     ?rfq_observed_at_ms,
+                    ?prop_amm_observed_at_ms,
                     duration_ms = u64::try_from(started_at.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
                     %error,
@@ -817,6 +824,7 @@ impl WriterTask {
                 kind: capture.kind(),
                 block_number: capture.block_number(),
                 rfq_observed_at_ms: capture.rfq_observed_at_ms(),
+                prop_amm_observed_at_ms: capture.prop_amm_observed_at_ms(),
                 backends: capture.backends().to_vec(),
             },
             payloads_json: capture.payloads_json().to_vec(),
@@ -1162,8 +1170,14 @@ fn checkpoint_gap(capture: &CapturedState, reason: GapReason) -> GapRecord {
         reason,
         from_block_number: Some(capture.block_number()),
         to_block_number: Some(capture.block_number()),
-        from_observed_at_ms: capture.rfq_observed_at_ms(),
-        to_observed_at_ms: capture.rfq_observed_at_ms(),
+        from_observed_at_ms: capture
+            .rfq_observed_at_ms()
+            .into_iter()
+            .chain(capture.prop_amm_observed_at_ms())
+            .min(),
+        to_observed_at_ms: capture
+            .rfq_observed_at_ms()
+            .max(capture.prop_amm_observed_at_ms()),
     }
 }
 
@@ -1182,13 +1196,13 @@ fn delta_gap(delta: &DeltaEntry, reason: GapReason) -> GapRecord {
     let from_observed_at_ms = delta
         .backends()
         .iter()
-        .filter(|cursor| cursor.backend == crate::Backend::Rfq)
+        .filter(|cursor| cursor.backend.uses_observation_time())
         .filter_map(|cursor| cursor.observed_at_ms)
         .min();
     let to_observed_at_ms = delta
         .backends()
         .iter()
-        .filter(|cursor| cursor.backend == crate::Backend::Rfq)
+        .filter(|cursor| cursor.backend.uses_observation_time())
         .filter_map(|cursor| cursor.observed_at_ms)
         .max();
     GapRecord {

@@ -82,7 +82,7 @@ struct PendingGapProjection {
 struct CheckpointPoint {
     position: StreamPosition,
     block_number: u64,
-    rfq_observed_at_ms: Option<u64>,
+    latest_book_observation_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -121,7 +121,9 @@ impl TargetPlanQuery {
         }
         backends.sort_unstable();
         backends.dedup();
-        if backends.binary_search(&Backend::Rfq).is_ok()
+        if backends
+            .iter()
+            .any(|backend| backend.uses_observation_time())
             && target_blocks.last().is_some_and(|block| *block == u64::MAX)
         {
             return Err(ModelError::RfqTargetHasNoSuccessor(u64::MAX));
@@ -186,13 +188,16 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .into_iter()
             .flat_map(|projection| projection.unsafe_intervals)
             .collect::<Vec<_>>();
-        let includes_rfq = query.backends.binary_search(&Backend::Rfq).is_ok();
+        let includes_book = query
+            .backends
+            .iter()
+            .any(|backend| backend.uses_observation_time());
         let block_analysis = coverage_block_analysis(
             &mut transaction,
             query.chain_id,
             retained_start,
             interval_end,
-            includes_rfq,
+            includes_book,
         )
         .await?;
         unsafe_intervals.extend(block_analysis.lineage_invalid_intervals);
@@ -226,9 +231,12 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             .target_blocks
             .last()
             .context("target plan has no end block")?;
-        let includes_rfq = query.backends.binary_search(&Backend::Rfq).is_ok();
+        let includes_book = query
+            .backends
+            .iter()
+            .any(|backend| backend.uses_observation_time());
         let mut required_blocks = query.target_blocks.clone();
-        if includes_rfq {
+        if includes_book {
             for target in &query.target_blocks {
                 required_blocks.insert(
                     target
@@ -274,7 +282,7 @@ impl<P: ReadConnectionProvider> StateHistoryReader<P> {
             range_end,
             query.backends.clone(),
         )?;
-        let rfq_bounds = replay_rfq_bounds(includes_rfq, range_start, range_end, &block_times)?;
+        let rfq_bounds = replay_rfq_bounds(includes_book, range_start, range_end, &block_times)?;
         if let Some((start_timestamp, end_timestamp)) = rfq_bounds {
             range_request = range_request.with_rfq_bounds(start_timestamp, end_timestamp)?;
         }
@@ -305,7 +313,11 @@ fn replay_target_range(
     query: &TargetPlanQuery,
     block_times: &BTreeMap<u64, BlockTimeObservation>,
 ) -> Option<(u64, u64)> {
-    if query.backends.binary_search(&Backend::Rfq).is_err() {
+    if !query
+        .backends
+        .iter()
+        .any(|backend| backend.uses_observation_time())
+    {
         return query
             .target_blocks
             .first()
@@ -322,12 +334,12 @@ fn replay_target_range(
 }
 
 fn replay_rfq_bounds(
-    includes_rfq: bool,
+    includes_book: bool,
     range_start: u64,
     range_end: u64,
     block_times: &BTreeMap<u64, BlockTimeObservation>,
 ) -> anyhow::Result<Option<(u64, u64)>> {
-    if !includes_rfq {
+    if !includes_book {
         return Ok(None);
     }
     let start_plus_one = range_start
@@ -423,14 +435,15 @@ pub(crate) async fn visible_through_block(
                     .map(|value| database_u64(value, "coverage backend cutoff"))
                     .transpose()?
             }
-            Backend::Rfq => {
+            Backend::Rfq | Backend::PropAmm => {
                 let has_anchor: bool = sqlx::query_scalar(
                     "SELECT EXISTS (
                         SELECT 1 FROM state_history.checkpoints
-                        WHERE chain_id = $1 AND status = 'complete' AND 'rfq' = ANY(backends)
+                        WHERE chain_id = $1 AND status = 'complete' AND $2 = ANY(backends)
                     )",
                 )
                 .bind(database_i64(chain_id, "coverage chain_id")?)
+                .bind(backend.as_str())
                 .fetch_one(&mut *connection)
                 .await?;
                 if !has_anchor {
@@ -511,10 +524,13 @@ async fn project_gap_intervals(
         .backends
         .iter()
         .any(|backend| matches!(backend, Backend::Native | Backend::Vm));
-    let includes_rfq = query.backends.binary_search(&Backend::Rfq).is_ok();
+    let includes_book = query
+        .backends
+        .iter()
+        .any(|backend| backend.uses_observation_time());
     let mut pending = gaps
         .iter()
-        .map(|gap| pending_gap_projection(gap, start, end, includes_block_backend, includes_rfq))
+        .map(|gap| pending_gap_projection(gap, start, end, includes_block_backend, includes_book))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let rfq_bounds = pending
@@ -541,7 +557,7 @@ async fn project_gap_intervals(
         .iter()
         .map(|gap| restoring_checkpoint(&checkpoints, gap))
         .collect::<Vec<_>>();
-    let restored_from = if includes_rfq {
+    let restored_from = if includes_book {
         rfq_restoring_blocks(connection, query.chain_id, &restoring).await?
     } else {
         restoring
@@ -588,7 +604,7 @@ fn restoring_checkpoint<'a>(
     checkpoints.get(index)
 }
 
-/// With RFQ in the query, a checkpoint anchors a target only when its RFQ cursor is before the
+/// With books in the query, a checkpoint anchors a target only when all selected cursors precede the
 /// target's next-block timestamp, the rule `fetch_anchor` applies. So restoration starts at the
 /// first block at or after the checkpoint's own block whose successor is later than the cursor.
 async fn rfq_restoring_blocks(
@@ -602,7 +618,7 @@ async fn rfq_restoring_blocks(
     for (gap_index, point) in restoring.iter().enumerate() {
         let Some((block_number, cursor)) = point.and_then(|point| {
             point
-                .rfq_observed_at_ms
+                .latest_book_observation_ms
                 .map(|cursor| (point.block_number, cursor))
         }) else {
             continue;
@@ -679,7 +695,7 @@ fn pending_gap_projection(
     start: u64,
     end: u64,
     includes_block_backend: bool,
-    includes_rfq: bool,
+    includes_book: bool,
 ) -> anyhow::Result<PendingGapProjection> {
     let block_bounds = ordered_bounds(gap.from_block_number, gap.to_block_number);
     let rfq_time_bounds = ordered_bounds(gap.from_observed_at_ms, gap.to_observed_at_ms);
@@ -694,7 +710,7 @@ fn pending_gap_projection(
             _ => projection.needs_conservative_projection = true,
         }
     }
-    if includes_rfq {
+    if includes_book {
         match (gap.from_observed_at_ms, gap.to_observed_at_ms) {
             (Some(from), Some(to)) if from <= to => {
                 projection.rfq_time_bounds = Some((from, to));
@@ -718,7 +734,11 @@ async fn compatible_checkpoint_points(
     // Interval checkpoints bound lost messages as well as boundaries do, and skipping them would
     // stretch a projection across most of a generation.
     let rows = sqlx::query(
-        "SELECT generation, message_seq, block_number, rfq_observed_at_ms, backends
+        "SELECT generation, message_seq, block_number, backends,
+                GREATEST(
+                    CASE WHEN 'rfq' = ANY($2) THEN rfq_observed_at_ms END,
+                    CASE WHEN 'prop_amm' = ANY($2) THEN prop_amm_observed_at_ms END
+                ) AS latest_book_observation_ms
          FROM state_history.checkpoints
          WHERE chain_id = $1 AND status = 'complete'
            AND backends @> $2::text[]
@@ -745,8 +765,8 @@ async fn compatible_checkpoint_points(
                     )?,
                 },
                 block_number: database_u64(row.try_get("block_number")?, "checkpoint block")?,
-                rfq_observed_at_ms: row
-                    .try_get::<Option<i64>, _>("rfq_observed_at_ms")?
+                latest_book_observation_ms: row
+                    .try_get::<Option<i64>, _>("latest_book_observation_ms")?
                     .map(|value| database_u64(value, "checkpoint RFQ cursor"))
                     .transpose()?,
             })
@@ -874,18 +894,18 @@ async fn coverage_block_analysis(
     chain_id: u64,
     start: u64,
     end: u64,
-    includes_rfq: bool,
+    includes_book: bool,
 ) -> anyhow::Result<CoverageBlockAnalysis> {
     if start > end {
         return Ok(CoverageBlockAnalysis::default());
     }
-    let fetch_end = if includes_rfq {
+    let fetch_end = if includes_book {
         end.saturating_add(1)
     } else {
         end
     };
     let rows = coverage_block_rows(connection, chain_id, start, fetch_end).await?;
-    analyze_coverage_blocks(&rows, start, end, includes_rfq)
+    analyze_coverage_blocks(&rows, start, end, includes_book)
 }
 
 async fn coverage_block_rows(
@@ -921,9 +941,9 @@ fn analyze_coverage_blocks(
     rows: &[CoverageBlockRow],
     start: u64,
     end: u64,
-    includes_rfq: bool,
+    includes_book: bool,
 ) -> anyhow::Result<CoverageBlockAnalysis> {
-    let missing_rfq_boundary_intervals = if includes_rfq {
+    let missing_rfq_boundary_intervals = if includes_book {
         missing_rfq_intervals_from_rows(rows, start, end)
     } else {
         Vec::new()
@@ -1112,7 +1132,7 @@ mod tests {
                     message_seq: 5,
                 },
                 block_number: 105,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1120,7 +1140,7 @@ mod tests {
                     message_seq: 20,
                 },
                 block_number: 120,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1128,7 +1148,7 @@ mod tests {
                     message_seq: 1,
                 },
                 block_number: 130,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
         ];
 
@@ -1270,7 +1290,7 @@ mod tests {
                     message_seq: 9,
                 },
                 block_number: 104,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1278,7 +1298,7 @@ mod tests {
                     message_seq: 10,
                 },
                 block_number: 105,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1286,7 +1306,7 @@ mod tests {
                     message_seq: 20,
                 },
                 block_number: 115,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1294,7 +1314,7 @@ mod tests {
                     message_seq: 21,
                 },
                 block_number: 116,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1302,7 +1322,7 @@ mod tests {
                     message_seq: 30,
                 },
                 block_number: 125,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
             CheckpointPoint {
                 position: StreamPosition {
@@ -1310,7 +1330,7 @@ mod tests {
                     message_seq: 31,
                 },
                 block_number: 126,
-                rfq_observed_at_ms: None,
+                latest_book_observation_ms: None,
             },
         ];
 

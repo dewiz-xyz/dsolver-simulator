@@ -324,7 +324,7 @@ impl BroadcasterBackendPayload {
     fn from_backend_status(backend: BroadcasterBackend, status: BroadcasterBackendStatus) -> Self {
         let (block_number, update_timestamp) = match backend {
             BroadcasterBackend::Native | BroadcasterBackend::Vm => (status.block_number, None),
-            BroadcasterBackend::Rfq => (None, status.block_number),
+            BroadcasterBackend::Rfq | BroadcasterBackend::PropAmm => (None, status.block_number),
         };
 
         Self {

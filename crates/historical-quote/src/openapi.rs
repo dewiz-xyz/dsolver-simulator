@@ -9,9 +9,9 @@ use utoipa::{
 };
 
 use crate::api::{
-    ApiError, ApiErrorCode, Backend, BlockBounds, BlockRange, CanonicalStateSummary,
-    CheckpointPair, ComparisonBudgetDetails, ConsistencyCheckProgress, ConsistencyCheckReport,
-    ConsistencyCheckRequest, ConsistencyDifference, ConsistencyPairReport,
+    ApiError, ApiErrorCode, Backend, BlockBounds, BlockRange, BookObservation,
+    CanonicalStateSummary, CheckpointPair, ComparisonBudgetDetails, ConsistencyCheckProgress,
+    ConsistencyCheckReport, ConsistencyCheckRequest, ConsistencyDifference, ConsistencyPairReport,
     ConsistencyQuoteComparison, ConsistencyQuoteOutcome, ConsistencySelection,
     ConsistencySelectionStatus, ConsistencySummary, CoverageRequest, CoverageResponse,
     DependencyHealth, DependencyState, GapCause, GapKind, GapReference, HistoricalQuoteEntry,
@@ -292,6 +292,7 @@ pub(crate) fn get_ready() {}
         QuoteFailureReason,
         QuoteJobRequest,
         QuoteOutcome,
+        BookObservation,
         QuoteProvenance,
         RawHistoryProgress,
         RawSnapshotRequest,

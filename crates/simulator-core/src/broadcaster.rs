@@ -40,6 +40,7 @@ pub enum BroadcasterBackend {
     Native,
     Vm,
     Rfq,
+    PropAmm,
 }
 
 /// Identifies a full chain block, including replacements at the same height.
@@ -227,8 +228,8 @@ impl BroadcasterBackend {
             ProtocolKind::Hashflow
             | ProtocolKind::Bebop
             | ProtocolKind::Liquorice
-            | ProtocolKind::NativeRfq
-            | ProtocolKind::Metric
+            | ProtocolKind::NativeRfq => Self::Rfq,
+            ProtocolKind::Metric
             | ProtocolKind::TitanFermiSwap
             | ProtocolKind::TitanKipseli
             | ProtocolKind::TitanBebop
@@ -236,9 +237,28 @@ impl BroadcasterBackend {
             | ProtocolKind::TitanTempest
             | ProtocolKind::TitanGoliath
             | ProtocolKind::TitanStelaxis
-            | ProtocolKind::TitanElZorro => Self::Rfq,
+            | ProtocolKind::TitanElZorro => Self::PropAmm,
             _ => Self::Native,
         }
+    }
+
+    /// Canonical partition emitted by current writers for an exact protocol system.
+    pub fn for_protocol(protocol: &str) -> Option<Self> {
+        ProtocolKind::from_canonical_protocol_system(protocol).map(Self::from_protocol_kind)
+    }
+
+    /// Older streams stored proprietary AMM books in their RFQ partition.
+    pub fn accepts_protocol(self, protocol: &str) -> bool {
+        Self::for_protocol(protocol).is_some_and(|canonical| self.accepts_canonical(canonical))
+    }
+
+    fn accepts_canonical(self, canonical: Self) -> bool {
+        self == canonical || (self == Self::Rfq && canonical == Self::PropAmm)
+    }
+
+    /// These partitions carry decoded books with observation times in Unix milliseconds.
+    pub const fn is_book(self) -> bool {
+        matches!(self, Self::Rfq | Self::PropAmm)
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -246,6 +266,7 @@ impl BroadcasterBackend {
             Self::Native => "native",
             Self::Vm => "vm",
             Self::Rfq => "rfq",
+            Self::PropAmm => "prop_amm",
         }
     }
 }
@@ -2277,12 +2298,15 @@ fn validate_update_partition_contents(
             )?;
         }
         for state in &partition.updated_states {
-            validate_partition_content_backend(
-                "update.partitions.updated_states",
-                &state.component_id,
-                partition.backend,
-                state.backend,
-            )?;
+            // A state-only delta repeats the actual wire tag, even on legacy streams.
+            if state.backend != partition.backend {
+                return Err(BroadcasterContractError::PartitionContentBackendMismatch {
+                    context: "update.partitions.updated_states",
+                    entry: state.component_id.clone(),
+                    partition_backend: partition.backend,
+                    entry_backend: state.backend,
+                });
+            }
         }
         for removed in &partition.removed_pairs {
             let backend = backend_for_component(&removed.component_id, &removed.component)?;
@@ -2312,7 +2336,7 @@ fn validate_partition_content_backend(
     partition_backend: BroadcasterBackend,
     entry_backend: BroadcasterBackend,
 ) -> Result<(), BroadcasterContractError> {
-    if partition_backend == entry_backend {
+    if partition_backend.accepts_canonical(entry_backend) {
         Ok(())
     } else {
         Err(BroadcasterContractError::PartitionContentBackendMismatch {
@@ -2975,6 +2999,60 @@ mod tests {
         assert_eq!(
             vm.sync_statuses["vm:curve"].kind,
             BroadcasterProtocolSyncStatusKind::Advanced
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_rfq_and_prop_amm_books_have_distinct_wire_partitions() -> Result<()> {
+        for (protocol, backend) in [
+            ("rfq:native", BroadcasterBackend::Rfq),
+            ("rfq:bebop", BroadcasterBackend::Rfq),
+            ("rfq:metric", BroadcasterBackend::PropAmm),
+            ("pricelevelstream:bebop", BroadcasterBackend::PropAmm),
+        ] {
+            assert_eq!(BroadcasterBackend::for_protocol(protocol), Some(backend));
+            assert!(BroadcasterBackend::Rfq.accepts_protocol(protocol));
+            let mut update = tycho_update();
+            update
+                .new_pairs
+                .insert("book".into(), protocol_component("book", protocol));
+            update
+                .states
+                .insert("book".into(), dummy_state("book-state"));
+            let message = BroadcasterUpdateMessage::from_tycho_update(&update, &known_backends())?;
+            let partition = message
+                .partitions
+                .iter()
+                .find(|p| p.backend == backend)
+                .ok_or_else(|| anyhow!("missing {backend} partition for {protocol}"))?;
+            let wire =
+                serde_json::to_value(BroadcasterUpdateMessage::new(vec![partition.clone()])?)?;
+            let mut legacy = wire.clone();
+            legacy["partitions"][0]["backend"] = "rfq".into();
+            serde_json::from_value::<BroadcasterUpdateMessage>(legacy)?;
+            let mut wrong = wire;
+            wrong["partitions"][0]["backend"] = if backend == BroadcasterBackend::Rfq {
+                "prop_amm"
+            } else {
+                "vm"
+            }
+            .into();
+            assert!(serde_json::from_value::<BroadcasterUpdateMessage>(wrong).is_err());
+        }
+        for kind in ProtocolKind::ALL
+            .iter()
+            .filter(|kind| kind.titan_venue().is_some())
+        {
+            assert_eq!(
+                BroadcasterBackend::for_protocol(kind.as_str()),
+                Some(BroadcasterBackend::PropAmm)
+            );
+        }
+        assert!(!BroadcasterBackend::PropAmm.accepts_protocol("rfq:bebop"));
+        assert_eq!(
+            BroadcasterBackend::for_protocol("pricelevelstream:unknown"),
+            None
         );
         Ok(())
     }

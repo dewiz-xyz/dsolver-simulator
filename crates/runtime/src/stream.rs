@@ -1935,7 +1935,8 @@ mod tests {
         let status = service.status_snapshot().await;
         assert!(status.upstream.connected);
         assert!(status.upstream.last_error.is_none());
-        assert!(!status.snapshot.ready);
+        assert!(status.snapshot.ready);
+        assert_eq!(status.backends[&BroadcasterBackend::Rfq].block_number, None);
         Ok(())
     }
 

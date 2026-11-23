@@ -40,7 +40,8 @@ const BLOCK_TIME_UPSERT: &str = r#"
 const UNKNOWN_FLOOR_QUERY: &str = r#"
     SELECT
         CASE WHEN c.block_number <= $4::bigint THEN c.block_number ELSE 0 END,
-        CASE WHEN c.rfq_observed_at_ms <= $5::bigint THEN c.rfq_observed_at_ms ELSE 0 END
+        CASE WHEN LEAST(c.rfq_observed_at_ms, c.prop_amm_observed_at_ms) <= $5::bigint
+             THEN LEAST(c.rfq_observed_at_ms, c.prop_amm_observed_at_ms) ELSE 0 END
     FROM state_history.checkpoints c
     WHERE c.chain_id = $1
       AND c.status = 'complete'
@@ -104,6 +105,28 @@ impl StateHistoryStore {
             );
         }
 
+        // The old writer accepts schema major 2 during a rolling migration.
+        // Probe the additive capabilities using catalogs visible to read-only
+        // roles, which do not need SELECT on SQLx's administrative table.
+        let supports_prop_amm: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_attribute
+                 WHERE attrelid = 'state_history.checkpoints'::regclass
+                   AND attname = 'prop_amm_observed_at_ms' AND NOT attisdropped
+                   AND atttypid = 'bigint'::regtype
+             ) AND EXISTS (
+                 SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'state_history.delta_backends'::regclass
+                   AND conname = 'delta_backends_allow_prop_amm'
+                   AND contype = 'c' AND convalidated
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        ensure!(
+            supports_prop_amm,
+            "state history requires the add_prop_amm_observations migration"
+        );
         Ok(())
     }
 
@@ -440,8 +463,8 @@ impl StateHistoryStore {
         let id = sqlx::query_scalar(
             "INSERT INTO state_history.checkpoints
                 (chain_id, generation, message_seq, state_version, kind, block_number,
-                 rfq_observed_at_ms, backends, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'writing')
+                 rfq_observed_at_ms, prop_amm_observed_at_ms, backends, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'writing')
              RETURNING id",
         )
         .bind(db_i64(capture.chain_id(), "checkpoint chain_id")?)
@@ -459,6 +482,12 @@ impl StateHistoryStore {
             capture
                 .rfq_observed_at_ms()
                 .map(|value| db_i64(value, "checkpoint rfq_observed_at_ms"))
+                .transpose()?,
+        )
+        .bind(
+            capture
+                .prop_amm_observed_at_ms()
+                .map(|value| db_i64(value, "checkpoint prop_amm_observed_at_ms"))
                 .transpose()?,
         )
         .bind(backends)
@@ -824,13 +853,13 @@ mod tests {
     };
 
     #[test]
-    fn embedded_migration_catalog_keeps_initial_migration_and_adds_schema_version_two() {
+    fn embedded_migration_catalog_preserves_existing_migrations() {
         let migrations = STATE_HISTORY_MIGRATOR
             .iter()
             .filter(|migration| migration.migration_type.is_up_migration())
             .collect::<Vec<_>>();
 
-        assert_eq!(migrations.len(), 3);
+        assert_eq!(migrations.len(), 4);
         assert_eq!(migrations[0].version, 20_260_728_000_100);
         assert_eq!(migrations[0].description, "create state history");
         assert_eq!(
@@ -844,6 +873,43 @@ mod tests {
         );
         assert_eq!(migrations[2].version, 20_261_023_000_100);
         assert_eq!(migrations[2].description, "derive unknown slip floors");
+        assert_eq!(migrations[3].version, 20_261_123_000_100);
+        assert_eq!(migrations[3].description, "add prop amm observations");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore]
+    async fn additive_book_migration_preserves_old_startup_and_new_preflight(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let old_major: i32 = sqlx::query_scalar("SELECT version FROM state_history.schema_meta")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            old_major, 2,
+            "the previous release requires exactly schema major 2"
+        );
+        let store = StateHistoryStore::from_pool(pool.clone());
+        store.validate_schema().await?;
+        // Reconstruct the immediately preceding schema in this isolated database.
+        sqlx::raw_sql("ALTER TABLE state_history.checkpoints DROP COLUMN prop_amm_observed_at_ms;
+                      ALTER TABLE state_history.delta_backends
+                      DROP CONSTRAINT delta_backends_allow_prop_amm,
+                      ADD CONSTRAINT delta_backends_backend_check CHECK (backend IN ('native','vm','rfq'));")
+            .execute(&pool).await?;
+        let error = store
+            .validate_schema()
+            .await
+            .err()
+            .context("new binary accepted the old schema")?;
+        assert!(error.to_string().contains("add_prop_amm_observations"));
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261123000100_add_prop_amm_observations.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        store.validate_schema().await?;
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
