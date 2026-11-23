@@ -520,7 +520,142 @@ mod tests {
         let (status, payload) =
             get_json(app, &format!("/snapshot-sessions/{session_id}/payloads/0")).await?;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["backends"], serde_json::json!(["native"]));
+        assert_eq!(payload["backends"], serde_json::json!(["native", "rfq"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable Redis provided through BROADCASTER_REDIS_HANDOFF_TEST_URL"]
+    async fn base_reader_bootstraps_and_replays_metric_books() -> Result<()> {
+        let redis_url = std::env::var("BROADCASTER_REDIS_HANDOFF_TEST_URL")?;
+        for initial_head in [0, 11] {
+            verify_metric_bootstrap(&redis_url, initial_head).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_metric_bootstrap(redis_url: &str, initial_head: u64) -> Result<()> {
+        use broadcaster_replay_client::{
+            BroadcasterReplayClient, BroadcasterReplayConfig, ReplayCheckpoint, ReplayPoll,
+        };
+        use runtime::broadcaster::redis_publisher::TokioRedisStreamWriter;
+        use BroadcasterBackend::{Native, PropAmm, Rfq};
+
+        let chain_id = Chain::Base.id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let publisher = Arc::new(BroadcasterRedisPublisher::new(
+            BroadcasterRedisPublisherConfig {
+                chain_id,
+                stream_key: format!(
+                    "test:metric:{}:{}:{initial_head}",
+                    std::process::id(),
+                    address.port()
+                ),
+                ..redis_publisher_config()
+            },
+            Arc::new(TokioRedisStreamWriter::connect(redis_url).await?),
+        ));
+        let gate = Arc::new(Mutex::new(()));
+        let service = |backends| {
+            BroadcasterServiceState::with_lifecycle_gate(
+                8_388_608,
+                BroadcasterSnapshotCache::new(chain_id, backends),
+                BroadcasterUpstreamState::default(),
+                publisher.clone(),
+                gate.clone(),
+            )
+        };
+        let raw = service(vec![Native]);
+        let books = service(vec![Rfq, PropAmm]);
+        raw.mark_upstream_connected().await;
+        books.mark_upstream_connected().await;
+        raw.apply_update(&market_update(Chain::Base, "uniswap_v2", "native-1", 10, 1))
+            .await?;
+        books
+            .apply_update(&market_update(
+                Chain::Base,
+                "rfq:native",
+                "rfq:native",
+                12,
+                7,
+            ))
+            .await?;
+        if initial_head > 0 {
+            books
+                .apply_update(
+                    &Update::new(initial_head, HashMap::new(), HashMap::new()).set_sync_states(
+                        HashMap::from([("rfq:metric".into(), SynchronizerState::Started)]),
+                    ),
+                )
+                .await?;
+        }
+        let services = [raw.clone(), books.clone()];
+        BroadcasterServiceState::promote_when_ready(&services, "active_writer_promoted").await?;
+        let app = create_broadcaster_router(BroadcasterAppState::with_snapshot_session_ttl(
+            raw,
+            Some(books.clone()),
+            token_store(vec![], "http://127.0.0.1:1".into(), Chain::Base),
+            chain_id,
+            Duration::from_secs(300),
+            publisher,
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = BroadcasterReplayClient::connect(BroadcasterReplayConfig {
+            broadcaster_url: format!("http://{address}"),
+            redis_url: redis_url.into(),
+            block_ms: 100,
+            read_count: 16,
+            request_timeout: Duration::from_secs(5),
+        })
+        .await?;
+        let cold = client.bootstrap(chain_id).await?;
+        assert_eq!(cold.backends()[&Rfq].states.len(), 1);
+        assert!(cold.backends()[&PropAmm].states.is_empty());
+        assert_eq!(cold.backends()[&PropAmm].highest_block_number, initial_head);
+        let mut metric = market_update(Chain::Base, "rfq:metric", "rfq:metric", 12, 7);
+        metric.sync_states.clear();
+        let withdrawal = Update::new(13, HashMap::new(), HashMap::new())
+            .set_removed_pairs(metric.new_pairs.clone());
+        books.apply_update(&metric).await?;
+        books.apply_update(&withdrawal).await?;
+
+        let ReplayPoll::Batch(batch) = client.read_next(cold.checkpoint()).await? else {
+            bail!("expected Metric's first book and withdrawal in Redis")
+        };
+        verify_metric_deltas(&batch)?;
+
+        BroadcasterServiceState::run_snapshot_export_preflight(&services).await?;
+        let fresh = client.bootstrap(chain_id).await?;
+        assert_eq!(
+            Some(fresh.checkpoint().entry_id()),
+            batch.checkpoint_after().map(ReplayCheckpoint::entry_id)
+        );
+        assert_eq!(fresh.backends()[&PropAmm].highest_block_number, 13);
+        assert!(fresh.backends()[&PropAmm].states.is_empty());
+        assert_eq!(fresh.backends()[&Rfq].states[0].component_id, "rfq:native");
+        server.abort();
+        Ok(())
+    }
+
+    fn verify_metric_deltas(batch: &broadcaster_replay_client::ReplayBatch) -> Result<()> {
+        use simulator_core::broadcaster::{BroadcasterBackend::PropAmm, BroadcasterPayload};
+        let updates = batch
+            .items
+            .iter()
+            .filter_map(|item| match &item.envelope.payload {
+                BroadcasterPayload::Update(update) => Some(update.partitions.as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [[added], [removed]] = updates.as_slice() else {
+            bail!("expected two single-partition updates")
+        };
+        assert_eq!((added.backend, added.block_number), (PropAmm, 12));
+        assert_eq!(added.new_pairs[0].component_id, "rfq:metric");
+        assert_eq!((removed.backend, removed.block_number), (PropAmm, 13));
+        assert_eq!(removed.removed_pairs[0].component_id, "rfq:metric");
+
         Ok(())
     }
 
@@ -1487,64 +1622,38 @@ mod tests {
     }
 
     fn native_only_update() -> Update {
-        let mut new_pairs = HashMap::new();
-        new_pairs.insert(
-            "native-1".to_string(),
-            native_component("native-1", "uniswap_v2"),
-        );
-
-        let mut states = HashMap::new();
-        states.insert(
-            "native-1".to_string(),
-            Box::new(DummySim(1)) as Box<dyn ProtocolSim>,
-        );
-
-        Update::new(10, states, new_pairs).set_sync_states(HashMap::from([(
-            "uniswap_v2".to_string(),
-            SynchronizerState::Ready(block_header(10, 1)),
-        )]))
+        market_update(Chain::Ethereum, "uniswap_v2", "native-1", 10, 1)
     }
 
     fn book_only_update(protocol: &str) -> Update {
-        let mut new_pairs = HashMap::new();
-        new_pairs.insert("rfq-1".to_string(), native_component("rfq-1", protocol));
-
-        let mut states = HashMap::new();
-        states.insert(
-            "rfq-1".to_string(),
-            Box::new(DummySim(7)) as Box<dyn ProtocolSim>,
-        );
-
-        Update::new(12, states, new_pairs).set_sync_states(HashMap::from([(
-            protocol.to_string(),
-            SynchronizerState::Ready(block_header(12, 1)),
-        )]))
+        market_update(Chain::Ethereum, protocol, "rfq-1", 12, 7)
     }
 
-    fn native_component(_id: &str, protocol: &str) -> ProtocolComponent {
-        ProtocolComponent::new(
+    fn market_update(chain: Chain, protocol: &str, id: &str, head: u64, price: u8) -> Update {
+        let token = |seed, symbol| Token::new(&address(seed), symbol, 18, 0, &[], chain, 1);
+        let component = ProtocolComponent::new(
             Bytes::from([3u8; 20]),
-            protocol.to_string(),
-            protocol.to_string(),
-            Chain::Ethereum,
-            vec![dummy_token(1, "TKNA"), dummy_token(2, "TKNB")],
+            protocol.to_owned(),
+            protocol.to_owned(),
+            chain,
+            vec![token(1, "TKNA"), token(2, "TKNB")],
             Vec::new(),
             HashMap::new(),
             Bytes::from([9u8; 32]),
             chrono::DateTime::UNIX_EPOCH.naive_utc(),
+        );
+        Update::new(
+            head,
+            HashMap::from([(
+                id.to_owned(),
+                Box::new(DummySim(price)) as Box<dyn ProtocolSim>,
+            )]),
+            HashMap::from([(id.to_owned(), component)]),
         )
-    }
-
-    fn dummy_token(seed: u8, symbol: &str) -> Token {
-        Token::new(
-            &Bytes::from([seed; 20]),
-            symbol,
-            18,
-            0,
-            &[],
-            Chain::Ethereum,
-            1,
-        )
+        .set_sync_states(HashMap::from([(
+            protocol.to_owned(),
+            SynchronizerState::Ready(block_header(head, 1)),
+        )]))
     }
 
     fn address(seed: u8) -> Bytes {

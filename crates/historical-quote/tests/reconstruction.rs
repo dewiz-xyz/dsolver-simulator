@@ -758,45 +758,12 @@ async fn independently_timed_book_partitions_preserve_each_others_observations(
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use historical_quote::{api::Backend as PublicBackend, ReconstructionRequest};
-    use serde_json::{json, Value};
     use std::collections::BTreeSet;
 
-    let mut source = FixtureSource::rfq().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let leg = source
-        .target_plan
-        .legs
-        .first_mut()
-        .context("fixture range")?;
-    leg.checkpoint
-        .backends
-        .push(state_history::Backend::PropAmm);
-    leg.checkpoint.prop_amm_observed_at_ms = Some(4_900);
-    let archive = source
-        .archives
-        .get_mut(&leg.checkpoint.id)
-        .context("fixture archive")?;
-    archive.metadata.backends = leg.checkpoint.backends.clone();
-    archive.metadata.prop_amm_observed_at_ms = Some(4_900);
-    for payload in &mut archive.payloads_json {
-        let mut value: Value = serde_json::from_str(payload)?;
-        match value.get("kind").and_then(Value::as_str) {
-            Some("snapshot_start") => value
-                .get_mut("backends")
-                .and_then(Value::as_array_mut)
-                .context("declared backends")?
-                .push(json!("prop_amm")),
-            Some("snapshot_chunk") => value
-                .get_mut("partitions")
-                .and_then(Value::as_array_mut)
-                .context("snapshot partitions")?
-                .push(json!({"backend":"prop_amm","blockNumber":4900,"states":[]})),
-            _ => continue,
-        }
-        *payload = value.to_string();
-    }
+    let mut source = checkpoint_with_empty_metric(4_900)?;
     // This RFQ delta follows its own anchor (1000) but predates the pool-book anchor (4900).
     let delta = support::rfq_delta(12, 4_500).map_err(|e| anyhow::anyhow!("{e}"))?;
-    leg.deltas = vec![delta];
+    source.target_plan.legs[0].deltas = vec![delta];
     let result = HistoricalReconstructor::new(Arc::new(source), ReadLimits::unbounded())
         .reconstruct(
             &ReconstructionRequest {
@@ -825,5 +792,162 @@ async fn independently_timed_book_partitions_preserve_each_others_observations(
         .context("pool book provenance")?;
     assert_eq!(pool.cursor, support::public_position(10));
     assert_eq!(pool.age_ms, 100);
+    Ok(())
+}
+
+fn checkpoint_with_empty_metric(head: u64) -> anyhow::Result<FixtureSource> {
+    use anyhow::Context as _;
+    use serde_json::{json, Value};
+    let mut source = FixtureSource::rfq().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let leg = source
+        .target_plan
+        .legs
+        .first_mut()
+        .context("fixture range")?;
+    leg.checkpoint
+        .backends
+        .push(state_history::Backend::PropAmm);
+    leg.checkpoint.prop_amm_observed_at_ms = Some(head);
+    let archive = source
+        .archives
+        .get_mut(&leg.checkpoint.id)
+        .context("fixture archive")?;
+    archive.metadata.backends = leg.checkpoint.backends.clone();
+    archive.metadata.prop_amm_observed_at_ms = Some(head);
+    for payload in &mut archive.payloads_json {
+        let mut value: Value = serde_json::from_str(payload)?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("snapshot_start") => value
+                .get_mut("backends")
+                .and_then(Value::as_array_mut)
+                .context("declared backends")?
+                .push(json!("prop_amm")),
+            Some("snapshot_chunk") => value
+                .get_mut("partitions")
+                .and_then(Value::as_array_mut)
+                .context("snapshot partitions")?
+                .push(json!({"backend":"prop_amm","blockNumber":head,"states":[]})),
+            _ => continue,
+        }
+        *payload = value.to_string();
+    }
+    Ok(source)
+}
+
+#[tokio::test]
+async fn unobserved_metric_checkpoint_acquires_provenance_on_its_first_response(
+) -> anyhow::Result<()> {
+    use historical_quote::{api::Backend, ReconstructionRequest};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    let mut source = checkpoint_with_empty_metric(0)?;
+    let empty_response = support::delta(12, state_history::Backend::PropAmm, None, Some(5_000),
+        json!({"partitions":[{"backend":"prop_amm","blockNumber":5000,"syncStatuses":{"rfq:metric":{"kind":"started"}}}]}))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    source.target_plan.legs[0].deltas = vec![empty_response];
+    let result = HistoricalReconstructor::new(Arc::new(source), ReadLimits::unbounded())
+        .reconstruct(
+            &ReconstructionRequest {
+                chain_id: 8453,
+                backends: BTreeSet::from([Backend::PropAmm]),
+                required_blocks: BTreeSet::from([100, 101]),
+            },
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        matches!(&result.states[&100], Err(unavailable) if unavailable.reason == UnavailableReason::PropAmmObservationMissing)
+    );
+    let state = result.states[&101]
+        .as_ref()
+        .map_err(|why| anyhow::anyhow!("unexpected unavailable state {why:?}"))?;
+    assert_eq!(
+        state
+            .provenance
+            .prop_amm_observation
+            .as_ref()
+            .map(|observation| observation.cursor),
+        Some(support::public_position(12))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_quotes_use_the_price_strictly_before_each_block_boundary() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use historical_quote::api::Backend;
+    use serde_json::{json, Value};
+
+    let mut source = checkpoint_with_empty_metric(0)?;
+    let leg = &mut source.target_plan.legs[0];
+    let snapshot: Value =
+        serde_json::from_str(&source.archives[&leg.checkpoint.id].payloads_json[1])?;
+    let mut component = snapshot["partitions"][0]["states"][0]["component"].clone();
+    component["protocol_system"] = json!("rfq:metric");
+    component["protocol_type_name"] = json!("metric_pool");
+    let id = "rfq:metric:WETH-USDC-fixture";
+    leg.deltas.clear();
+    for (seq, time, price) in [(11, 4_800, 3_000_u128), (12, 5_100, 3_100)] {
+        let state = json!({"protocol":"MetricState", "state":{
+            "base_token":component["tokens"][0], "quote_token":component["tokens"][1],
+            "metadata":{"poolAddress": "0x5555555555555555555555555555555555555555",
+                        "token0":support::WETH, "token1":support::USDC, "tvlFiat":30000.0, "pauseLevel":0},
+            "bid_ask":{"bidAdj":(price << 64).to_string(), "askAdj":((price + 1) << 64).to_string(),
+                       "totalToken0Available":"10000000000000000000","totalToken1Available":"40000000000",
+                       "serverTs":time, "priceProviderStatus":"healthy"}
+        }});
+        let mut partition = json!({"backend":"prop_amm","blockNumber":time});
+        if seq == 11 {
+            partition["newPairs"] = json!([{"componentId":id,"component":component,"state":state}]);
+        } else {
+            partition["updatedStates"] =
+                json!([{"componentId":id,"backend":"prop_amm","state":state}]);
+        }
+        leg.deltas.push(
+            support::delta(
+                seq,
+                state_history::Backend::PropAmm,
+                None,
+                Some(time),
+                json!({"partitions":[partition]}),
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
+        );
+    }
+    source
+        .target_plan
+        .block_times
+        .get_mut(&102)
+        .context("missing successor block")?
+        .timestamp_ms = 6_000;
+    let mut request = rfq_quote_request();
+    request.pool.backend = Backend::PropAmm;
+    request.pool.protocol = "rfq:metric".into();
+    request.pool.component_id = id.into();
+    let result = executor(Arc::new(source))
+        .execute(&request, &CancellationToken::new(), &())
+        .await?;
+    let row = &result.results[0];
+    for (outcome, expected, seq) in [
+        (&row.start_outcome, "3000000000", 11),
+        (&row.targets[0].outcome, "3100000000", 12),
+    ] {
+        let QuoteOutcome::Ok {
+            amount_out,
+            provenance,
+        } = outcome
+        else {
+            anyhow::bail!("unexpected Metric quote {outcome:?}")
+        };
+        assert_eq!(amount_out.as_str(), expected);
+        assert_eq!(
+            provenance
+                .prop_amm_observation
+                .as_ref()
+                .map(|obs| obs.cursor),
+            Some(support::public_position(seq))
+        );
+    }
     Ok(())
 }

@@ -124,6 +124,68 @@ async fn independent_book_observations_select_anchors_and_delta_partitions(
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires the state-history integration PostgreSQL"]
+async fn metric_price_before_next_block_is_covered_by_a_later_observation(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let metric = [Backend::PropAmm];
+    seed_block_times(&pool, 100, 102).await?;
+    seed_checkpoint_with_backends(&pool, 1, 1, 100, CheckpointKind::Boundary, false, &metric)
+        .await?;
+    seed_delta(&pool, 1, 2, 100, 1, &metric).await?;
+    sqlx::query(
+        "UPDATE state_history.delta_backends SET observed_at_ms=100800 WHERE message_seq=2",
+    )
+    .execute(&pool)
+    .await?;
+    let reader = StateHistoryReader::new(pool.clone(), object_store().await);
+    let query = TargetPlanQuery::new(
+        CHAIN_ID,
+        metric.to_vec(),
+        BTreeSet::from([100]),
+        ReadLimits::new(1_000_000, 1_000_000)?,
+    )?;
+    let has_tail = |plan: &state_history::TargetPlan| {
+        plan.gaps
+            .iter()
+            .any(|gap| gap.kind == state_history::RangeGapKind::IncompleteTail)
+    };
+
+    // Neither another feed nor another writer can establish continuity for this price.
+    seed_delta(&pool, 1, 3, 102, 1, &[Backend::Rfq]).await?;
+    seed_delta(&pool, 2, 1, 102, 1, &metric).await?;
+    assert!(has_tail(&reader.plan_targets(&query).await?));
+
+    seed_delta(&pool, 1, 5, 101, 1, &metric).await?;
+    sqlx::query(
+        "UPDATE state_history.delta_backends SET observed_at_ms=101100 WHERE message_seq=5",
+    )
+    .execute(&pool)
+    .await?;
+    let plan = reader.plan_targets(&query).await?;
+    assert!(plan.gaps.is_empty(), "{:?}", plan.gaps);
+    let [leg] = &plan.legs[..] else {
+        anyhow::bail!("expected a single replay leg")
+    };
+    let [price] = &leg.deltas[..] else {
+        anyhow::bail!("only the price before the cutoff can be replayed")
+    };
+    assert_eq!(price.position, position(1, 2));
+    assert_eq!(price.applicable_backends[0].observed_at_ms, Some(100_800));
+
+    // Even a break dated after the cutoff invalidates a witness on the far side.
+    seed_gap(&pool, 1, 4, 4, None, Some((101_020, 101_030))).await?;
+    assert!(has_tail(&reader.plan_targets(&query).await?));
+    sqlx::query("DELETE FROM state_history.gaps")
+        .execute(&pool)
+        .await?;
+    seed_checkpoint_with_backends(&pool, 1, 4, 102, CheckpointKind::Boundary, false, &metric)
+        .await?;
+    assert!(has_tail(&reader.plan_targets(&query).await?));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires the state-history integration PostgreSQL"]
 async fn coverage_splits_on_gap_and_reports_cutoff(pool: PgPool) -> anyhow::Result<()> {
     seed_block_times(&pool, 100, 121).await?;
     seed_checkpoint(&pool, 1, 0, 100, CheckpointKind::Boundary, true).await?;

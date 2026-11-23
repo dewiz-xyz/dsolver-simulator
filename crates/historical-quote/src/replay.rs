@@ -350,7 +350,8 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
     let book_observations: BTreeMap<_, _> = backends
         .iter()
         .filter_map(|&backend| {
-            let time = checkpoint_book_time(manifest, backend)?;
+            // Zero is the wire head of a declared book partition awaiting its first observation.
+            let time = checkpoint_book_time(manifest, backend).filter(|time| *time != 0)?;
             Some((backend, (time, manifest.position)))
         })
         .collect();
@@ -363,7 +364,10 @@ pub(crate) async fn restore_checkpoint_with_token_anchor<S: HistorySource>(
         anchor_checkpoint_position: manifest.position,
         anchor_block: manifest.block_number,
         token_snapshot_digest,
-        anchor_book_observed_at_ms: book_observations.values().map(|(time, _)| *time).min(),
+        anchor_book_observed_at_ms: backends
+            .iter()
+            .filter_map(|&backend| checkpoint_book_time(manifest, backend))
+            .min(),
         book_observations,
         checkpoint_application_invalid: report.has_state_integrity_errors(),
     }))

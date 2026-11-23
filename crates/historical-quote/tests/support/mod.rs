@@ -730,7 +730,7 @@ pub fn rfq_delta(
     )
 }
 
-fn delta(
+pub fn delta(
     message_seq: u64,
     backend: Backend,
     block_number: Option<u64>,

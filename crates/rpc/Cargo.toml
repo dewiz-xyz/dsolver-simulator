@@ -18,6 +18,7 @@ simulator_core = { package = "simulator-core", path = "../simulator-core" }
 runtime = { path = "../runtime" }
 
 [dev-dependencies]
+broadcaster-replay-client = { path = "../broadcaster-replay-client" }
 runtime = { path = "../runtime", features = ["test-util"] }
 anyhow.workspace = true
 chrono.workspace = true

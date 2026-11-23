@@ -189,6 +189,10 @@ impl ProviderBooks {
         provider: &str,
         snapshot: Option<BookSnapshot<tycho_simulation::book::ReceivedAt>>,
     ) -> Option<Update> {
+        let first_publication = !self.pairs.contains_key(provider);
+        if first_publication && snapshot.is_none() {
+            return None;
+        }
         let previous = self.pairs.entry(provider.to_string()).or_default();
         let mut pairs = HashMap::new();
         let mut states = HashMap::new();
@@ -213,7 +217,17 @@ impl ProviderBooks {
         if !published && removed.is_empty() {
             return None;
         }
-        Some(Update::new(current_time_ms(), states, added).set_removed_pairs(removed))
+        let first_empty = first_publication && states.is_empty();
+        let mut update = Update::new(current_time_ms(), states, added).set_removed_pairs(removed);
+        if first_empty {
+            // Name the responding feed so its empty book advances the correct partition.
+            // Later empty publications only refresh supervisor liveness.
+            update.sync_states.insert(
+                provider.to_owned(),
+                tycho_simulation::tycho_client::feed::SynchronizerState::Started,
+            );
+        }
+        Some(update)
     }
 }
 
@@ -409,6 +423,21 @@ mod tests {
         assert!(protocols.contains(&"rfq:bebop"));
         assert!(protocols.contains(&"rfq:metric"));
         assert!(protocols.contains(&"rfq:hashflow"));
+    }
+
+    #[test]
+    fn first_empty_publication_records_the_provider_observation() {
+        let mut providers = ProviderBooks::default();
+        assert!(providers.replace("rfq:metric", None).is_none());
+        let empty = providers
+            .replace("rfq:metric", Some(snapshot(vec![])))
+            .unwrap();
+        assert!(empty.sync_states.contains_key("rfq:metric"));
+        assert!(empty.block_number > 0 && empty.states.is_empty());
+        let repeated = providers
+            .replace("rfq:metric", Some(snapshot(vec![])))
+            .unwrap();
+        assert!(repeated.sync_states.is_empty());
     }
 
     #[test]

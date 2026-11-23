@@ -781,9 +781,20 @@ pub(super) async fn resolve_range_in_transaction(
     )
     .await?;
     let gaps = fetch_gap_rows(&mut *transaction, request, &anchor, rfq_bounds).await?;
-    let (legs, gaps) = build_legs(anchor, delta_fetch.rows, boundaries, gaps, request);
+    let mut plan = replay_segments(anchor, &delta_fetch.rows, &boundaries, &gaps, request);
+    for &backend in &request.backends {
+        let Some(gap) = incomplete_tail_gap(backend, request, &plan.legs, &delta_fetch.rows) else {
+            continue;
+        };
+        if let (Some(leg), Some(cutoff)) = (plan.legs.last(), gap.to_observed_at_ms) {
+            if book_observed_through(transaction, &leg.checkpoint, backend, cutoff).await? {
+                continue;
+            }
+        }
+        plan.gaps.push(gap);
+    }
     Ok(RangeResolution {
-        plan: RangePlan { legs, gaps },
+        plan,
         estimated_decoded_bytes: checkpoint_decoded_bytes
             .checked_add(delta_fetch.decoded_bytes)
             .context("state history decoded byte estimate overflowed")?,
@@ -1504,17 +1515,50 @@ fn optional_database_u64(value: Option<i64>, field: &str) -> anyhow::Result<Opti
     value.map(|value| database_u64(value, field)).transpose()
 }
 
-fn build_legs(
+// The next observation proves that the preceding price remained the last known
+// price through the cutoff. Only its cursor is read; its payload is never replayed.
+async fn book_observed_through(
+    connection: &mut PgConnection,
+    anchor: &CheckpointManifest,
+    backend: Backend,
+    end_ms: u64,
+) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM state_history.delta_backends witness
+             WHERE witness.chain_id = $1 AND witness.generation = $2 AND witness.message_seq > $3
+               AND witness.backend = $4 AND witness.observed_at_ms >= $5
+               AND NOT EXISTS (SELECT 1 FROM state_history.checkpoints
+                 WHERE chain_id = $1 AND generation = $2 AND kind = 'boundary'
+                   AND message_seq > $3 AND message_seq <= witness.message_seq)
+               AND NOT EXISTS (SELECT 1 FROM state_history.gaps
+                 WHERE chain_id = $1 AND generation = $2
+                   AND to_message_seq > $3 AND from_message_seq <= witness.message_seq)
+         )",
+    )
+    .bind(database_i64(anchor.chain_id, "chain_id")?)
+    .bind(database_i64(anchor.position.generation, "generation")?)
+    .bind(database_i64(
+        anchor.position.message_seq,
+        "checkpoint sequence",
+    )?)
+    .bind(backend.as_str())
+    .bind(database_i64(end_ms, "end timestamp")?)
+    .fetch_one(connection)
+    .await
+    .context("failed to check retained book coverage")
+}
+
+fn replay_segments(
     anchor: CheckpointManifest,
-    mut deltas: Vec<DeltaRow>,
-    boundaries: Vec<ManifestRow>,
-    gaps: Vec<GapRow>,
+    deltas: &[DeltaRow],
+    boundaries: &[ManifestRow],
+    gaps: &[GapRow],
     request: &RangeRequest,
-) -> (Vec<RangeLeg>, Vec<RangeGap>) {
-    deltas.sort_by_key(|delta| delta.position);
+) -> RangePlan {
     let anchor_block_number = anchor.block_number;
     let anchor_book_observed_at_ms = first_book_cursor(&anchor, &request.backends);
-    let breaks = break_positions(&anchor, &deltas, &boundaries, &gaps, request);
+    let breaks = break_positions(&anchor, deltas, boundaries, gaps, request);
     let mut legs = Vec::with_capacity(breaks.len() + 1);
     let mut range_gaps = Vec::new();
 
@@ -1533,7 +1577,7 @@ fn build_legs(
                 delta.position >= position && next_break.is_none_or(|next| delta.position < next)
             })
             .collect::<Vec<_>>();
-        let checkpoint = complete_boundary_at(&boundaries, position, request);
+        let checkpoint = complete_boundary_at(boundaries, position, request);
         if let Some(checkpoint) = checkpoint {
             let replayable = segment
                 .into_iter()
@@ -1547,14 +1591,15 @@ fn build_legs(
     }
 
     range_gaps.extend(recorded_range_gaps(
-        &gaps,
+        gaps,
         request,
         anchor_block_number,
         anchor_book_observed_at_ms,
     ));
-    range_gaps.extend(incomplete_tail_gaps(request, &legs, &deltas));
-
-    (legs, range_gaps)
+    RangePlan {
+        legs,
+        gaps: range_gaps,
+    }
 }
 
 fn break_positions(
@@ -1814,44 +1859,43 @@ fn ranges_overlap(
         })
 }
 
-fn incomplete_tail_gaps(
+fn incomplete_tail_gap(
+    backend: Backend,
     request: &RangeRequest,
     legs: &[RangeLeg],
     deltas: &[DeltaRow],
-) -> Vec<RangeGap> {
-    request
-        .backends
-        .iter()
-        .filter_map(|backend| {
-            let covered = covered_cursor(*backend, legs, deltas);
-            let requested_end = match backend {
-                Backend::Native | Backend::Vm => Some(request.end_block),
-                Backend::Rfq | Backend::PropAmm => request.rfq_end_ms,
-            }?;
-            (covered.is_none_or(|head| head < requested_end)).then(|| RangeGap {
-                kind: RangeGapKind::IncompleteTail,
-                generation: None,
-                from_message_seq: None,
-                to_message_seq: None,
-                from_position: None,
-                to_position: None,
-                from_block: matches!(backend, Backend::Native | Backend::Vm)
-                    .then_some(covered.map_or(request.start_block, |head| head.saturating_add(1))),
-                to_block_inclusive: matches!(backend, Backend::Native | Backend::Vm)
-                    .then_some(request.end_block),
-                from_observed_at_ms: backend.uses_observation_time().then_some(
-                    covered.map_or(request.rfq_start_ms.unwrap_or_default(), |head| {
-                        head.saturating_add(1)
-                    }),
-                ),
-                to_observed_at_ms: backend.uses_observation_time().then_some(requested_end),
-                reason: incomplete_tail_reason(*backend, covered, requested_end),
-            })
-        })
-        .collect()
+) -> Option<RangeGap> {
+    let requested_end = match backend {
+        Backend::Native | Backend::Vm => request.end_block,
+        Backend::Rfq | Backend::PropAmm => request.rfq_end_ms?,
+    };
+    let covered = covered_cursor(backend, legs, deltas, requested_end);
+    (covered.is_none_or(|head| head < requested_end)).then(|| RangeGap {
+        kind: RangeGapKind::IncompleteTail,
+        generation: None,
+        from_message_seq: None,
+        to_message_seq: None,
+        from_position: None,
+        to_position: None,
+        from_block: (!backend.uses_observation_time())
+            .then_some(covered.map_or(request.start_block, |head| head.saturating_add(1))),
+        to_block_inclusive: (!backend.uses_observation_time()).then_some(request.end_block),
+        from_observed_at_ms: backend.uses_observation_time().then_some(
+            covered.map_or(request.rfq_start_ms.unwrap_or_default(), |head| {
+                head.saturating_add(1)
+            }),
+        ),
+        to_observed_at_ms: backend.uses_observation_time().then_some(requested_end),
+        reason: incomplete_tail_reason(backend, covered, requested_end),
+    })
 }
 
-fn covered_cursor(backend: Backend, legs: &[RangeLeg], deltas: &[DeltaRow]) -> Option<u64> {
+fn covered_cursor(
+    backend: Backend,
+    legs: &[RangeLeg],
+    deltas: &[DeltaRow],
+    requested_end: u64,
+) -> Option<u64> {
     let checkpoint_coverage = legs
         .iter()
         .filter(|leg| leg.checkpoint.backends.binary_search(&backend).is_ok())
@@ -1863,7 +1907,11 @@ fn covered_cursor(backend: Backend, legs: &[RangeLeg], deltas: &[DeltaRow]) -> O
             .filter(move |cursor| cursor.backend == backend)
             .filter_map(move |cursor| delta_cursor(cursor, backend))
     });
-    checkpoint_coverage.chain(delta_coverage).max()
+    checkpoint_coverage
+        .chain(delta_coverage)
+        // A mixed update may carry a future cursor from a different replay segment.
+        .filter(|cursor| !backend.uses_observation_time() || *cursor <= requested_end)
+        .max()
 }
 
 // Gap records carry a shared observation interval. A gap can still overlap the
@@ -1925,6 +1973,24 @@ mod tests {
         EncodedArchiveInfo, GapReason, GapRecord, StateHistoryStore, TokenSnapshot,
         TokenSnapshotCodecError, TokenSnapshotRef, TOKEN_SNAPSHOT_SCHEMA_VERSION,
     };
+
+    fn build_legs(
+        anchor: CheckpointManifest,
+        mut deltas: Vec<DeltaRow>,
+        boundaries: Vec<ManifestRow>,
+        gaps: Vec<GapRow>,
+        request: &RangeRequest,
+    ) -> (Vec<RangeLeg>, Vec<RangeGap>) {
+        deltas.sort_by_key(|d| d.position);
+        let mut plan = replay_segments(anchor, &deltas, &boundaries, &gaps, request);
+        plan.gaps.extend(
+            request
+                .backends
+                .iter()
+                .filter_map(|&backend| incomplete_tail_gap(backend, request, &plan.legs, &deltas)),
+        );
+        (plan.legs, plan.gaps)
+    }
 
     mod backtest {
         use super::*;

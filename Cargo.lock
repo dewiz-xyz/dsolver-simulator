@@ -6164,6 +6164,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "broadcaster-replay-client",
  "chrono",
  "futures 0.3.32",
  "num-bigint",
