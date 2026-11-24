@@ -1941,6 +1941,7 @@ fn split_protocol_tail_for_snapshot(
                 deltas.deleted_protocol_components.insert(key, value);
             },
         )?;
+        builder.append_pause_changes(source)?;
         builder.append_delta_entries(
             "dci.new_entrypoints",
             &source.dci_update.new_entrypoints,
@@ -2008,6 +2009,29 @@ impl<'a> ProtocolTailFragmentBuilder<'a> {
             current_has_payload: false,
             include_sync_for_current: include_sync_statuses,
         }
+    }
+
+    fn append_pause_changes(&mut self, source: &BlockAggregatedChanges) -> Result<()> {
+        let empty = empty_block_changes_fragment(source);
+        let mut changes = source
+            .paused_components
+            .iter()
+            .map(|id| (id, true))
+            .chain(source.unpaused_components.iter().map(|id| (id, false)))
+            .collect::<Vec<_>>();
+        changes.sort_unstable();
+        for (id, paused) in changes {
+            self.append_named("component pause state", id, |fragment| {
+                let deltas = fragment.message.deltas.get_or_insert_with(|| empty.clone());
+                let ids = if paused {
+                    &mut deltas.paused_components
+                } else {
+                    &mut deltas.unpaused_components
+                };
+                ids.insert(id.clone());
+            })?;
+        }
+        Ok(())
     }
 
     fn append_delta_entries<K, V>(
@@ -2132,6 +2156,8 @@ fn empty_block_changes_fragment(source: &BlockAggregatedChanges) -> BlockAggrega
         component_tvl: HashMap::new(),
         dci_update: Default::default(),
         partial_block_index: source.partial_block_index,
+        paused_components: HashSet::new(),
+        unpaused_components: HashSet::new(),
     }
 }
 
@@ -3270,12 +3296,20 @@ mod tests {
             account_address.clone(),
             raw_response_account(account_address, 48, 256),
         );
+        let mut tail = residual_tail_message(24, 384);
+        let changes = tail
+            .message
+            .deltas
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing test deltas"))?;
+        changes.paused_components.insert("paused".into());
+        changes.unpaused_components.insert("resumed".into());
         for (message, backend) in [
             (
                 raw_protocol_message_with_states(states),
                 BroadcasterBackend::Native,
             ),
-            (residual_tail_message(24, 384), BroadcasterBackend::Native),
+            (tail, BroadcasterBackend::Native),
             (vm, BroadcasterBackend::Vm),
         ] {
             let sizing_ctx = snapshot_chunk_build_context_for_backend(usize::MAX, backend);

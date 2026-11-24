@@ -1,6 +1,6 @@
 //! Titan's named Ethereum venues publish decoded books on the proprietary AMM partition.
 
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
 use futures::{stream::BoxStream, StreamExt};
@@ -18,10 +18,6 @@ use tycho_simulation::{
 };
 
 use crate::broadcaster::redis_publisher::current_time_ms;
-
-// Titan's live Fermi router replaced the address in Tycho 0.525.0's built-in registry.
-// https://docs.titanbuilder.xyz/propamms
-const FERMI_ROUTER: &str = "0xf6d5b2fefec7b420d9990b95790adfd3d4c4f977";
 
 pub(super) fn build_titan_stream(
     chain: Chain,
@@ -48,7 +44,7 @@ pub(super) fn build_titan_stream(
 
 fn venue_configs(chain: Chain, protocols: &[ProtocolKind]) -> Result<Vec<PriceLevelStreamConfig>> {
     let mut selected = Vec::new();
-    let mut registry = default_served_pamms();
+    let registry = default_served_pamms();
     for protocol in protocols {
         let Some(venue) = protocol.titan_venue() else {
             continue;
@@ -57,12 +53,9 @@ fn venue_configs(chain: Chain, protocols: &[ProtocolKind]) -> Result<Vec<PriceLe
             bail!("Titan price-level feeds support Ethereum only");
         }
         let config = registry
-            .iter_mut()
+            .iter()
             .find(|config| config.protocol == venue)
             .ok_or_else(|| anyhow!("Tycho has no Titan registration for {venue}"))?;
-        if venue == "fermiswap" {
-            config.address = Bytes::from_str(FERMI_ROUTER)?;
-        }
         selected.push(config.clone());
     }
     Ok(selected)
@@ -77,6 +70,7 @@ mod tests {
         BroadcasterBackend, BroadcasterPayload, BroadcasterUpdateMessage,
     };
     use std::collections::HashSet;
+    use std::str::FromStr;
     use std::time::Duration;
 
     fn protocols() -> Vec<ProtocolKind> {
@@ -88,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn named_venues_exclude_direct_metric_and_use_current_fermi_router() {
+    fn named_venues_use_tychos_registry_and_exclude_direct_metric() {
         let configs = venue_configs(Chain::Ethereum, &protocols()).unwrap();
         let names: HashSet<_> = configs
             .iter()
@@ -107,14 +101,15 @@ mod tests {
                 "elzorro"
             ])
         );
-        assert_eq!(
-            configs
+        let registry = default_served_pamms();
+        for config in configs {
+            let registered = registry
                 .iter()
-                .find(|config| config.protocol == "fermiswap")
-                .unwrap()
-                .address,
-            Bytes::from_str(FERMI_ROUTER).unwrap()
-        );
+                .find(|entry| entry.protocol == config.protocol)
+                .unwrap();
+            assert_eq!(config.address, registered.address);
+            assert_eq!(config.gas_cost, registered.gas_cost);
+        }
         assert!(venue_configs(Chain::Base, &protocols()).is_err());
     }
 

@@ -45,7 +45,7 @@ and exposes HTTP endpoints for quotes and readiness. It uses `tycho-simulation` 
 The local analyzer records readiness, latency, and request evidence.
 
 `POST /encode` has been removed and returns `404 Not Found`. Consumers generate settlement
-calldata themselves. The workspace retains the agreed `tycho-execution = "=0.525.0"` pin,
+calldata themselves. The workspace declares the `tycho-execution = "=0.539.0"` pin,
 but the simulator and broadcaster no longer build it. The private fork and vendored patch
 have been removed.
 
@@ -62,15 +62,15 @@ have been removed.
 | Common optional inputs | `RPC_URL`, `ENABLE_VM_POOLS`, `ENABLE_RFQ_POOLS`, `HOST`, `PORT` |
 | License | MIT |
 
-## Tycho 0.525.0 broadcasting
+## Tycho 0.539.0 broadcasting
 
 This branch preserves the current replay bootstrap API and enables 12 hosted on-chain feeds on Base and 21 on Ethereum. Balancer V2 and V3 are disabled. The Ethereum broadcaster subscribes to the three VM systems selected in the manifest.
 
-With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. Metric uses the direct feed. Its books and Titan’s named venues use the `prop_amm` partition. Direct Native, Hashflow and Bebop use `rfq`. See the [partition rollout](docs/state_history.md#book-partition-rollout) for the reader and writer deployment sequence.
+With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereum broadcasts those providers plus Hashflow and eight Titan propAMMs: FermiSwap, Kipseli, Bebop, TaurusFi, Tempest, Goliath, Stelaxis, and ElZorro. The broadcaster takes FermiSwap’s router and gas estimate from Tycho’s named Titan registry. Metric uses the direct feed. Its books and Titan’s named venues use the `prop_amm` partition. Direct Native, Hashflow and Bebop use `rfq`. See the [partition rollout](docs/state_history.md#book-partition-rollout) for the reader and writer deployment sequence.
 
 Set `CHAIN_ID=8453` or `1`, and supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`. Ethereum also requires `HASHFLOW_USER` and `HASHFLOW_KEY`. Titan's public stream needs no API key. The optional `RFQ_MIN_TVL_USD` defaults to 100 USD for direct book providers.
 
-Consumers must use the matching Tycho 0.525.0 state format and bootstrap fresh snapshots during rollout. Titan snapshots and deltas preserve quote expiry; receiving or replaying a book does not renew it. Downstream consumers own routing and settlement encoding. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list and verification results.
+Consumers must use the matching Tycho 0.539.0 state format and bootstrap fresh snapshots during rollout. Titan snapshots and deltas preserve quote expiry; receiving or replaying a book does not renew it. Downstream consumers own routing and settlement encoding. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list and verification results.
 
 ## Quick Start
 

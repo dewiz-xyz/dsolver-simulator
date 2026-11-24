@@ -61,10 +61,10 @@ toml = "0.8"
 tower = { version = "0.5", features = ["timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-tycho-common = "=0.525.0"
+tycho-common = "=0.539.0"
 # Encoding is handled by consumers; keep the agreed pin without a runtime dependency.
-tycho-execution = "=0.525.0"
-tycho-simulation = "=0.525.0"
+tycho-execution = "=0.539.0"
+tycho-simulation = "=0.539.0"
 typetag = "0.2"
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 uuid = { version = "1", features = ["serde", "v4"] }

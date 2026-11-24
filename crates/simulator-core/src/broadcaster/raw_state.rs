@@ -487,6 +487,8 @@ fn block_changes_has_bootstrap_residue(deltas: &BlockAggregatedChanges) -> bool 
         || !deltas.account_deltas.is_empty()
         || !deltas.state_deltas.is_empty()
         || !deltas.new_protocol_components.is_empty()
+        || !deltas.paused_components.is_empty()
+        || !deltas.unpaused_components.is_empty()
         || !deltas.deleted_protocol_components.is_empty()
         || !deltas.component_balances.is_empty()
         || !deltas.account_balances.is_empty()
@@ -502,6 +504,8 @@ pub fn raw_residue_entry_count(message: &StateSyncMessage<BlockHeader>) -> usize
             + deltas.account_deltas.len()
             + deltas.state_deltas.len()
             + deltas.new_protocol_components.len()
+            + deltas.paused_components.len()
+            + deltas.unpaused_components.len()
             + deltas.deleted_protocol_components.len()
             + deltas.component_balances.len()
             + deltas.account_balances.len()
@@ -543,6 +547,24 @@ mod tests {
         RawCompactionStats, RawResidueGrowth,
     };
     use crate::broadcaster::BroadcasterProtocolMessage;
+
+    #[test]
+    fn pause_only_changes_survive_raw_snapshot_compaction() {
+        let mut message = StateSyncMessage {
+            header: block_header(100, 1),
+            snapshots: Snapshot::default(),
+            deltas: Some(BlockAggregatedChanges {
+                paused_components: HashSet::from(["inactive".into()]),
+                unpaused_components: HashSet::from(["resumed".into()]),
+                ..Default::default()
+            }),
+            removed_components: HashMap::new(),
+        };
+        let before = message.deltas.clone();
+        let stats = compact_raw_state_sync_message(&mut message);
+        assert_eq!(message.deltas, before);
+        assert_eq!(stats.residual_entries, 2);
+    }
 
     #[test]
     fn raw_cache_compacts_protocol_updates_into_snapshot() {
