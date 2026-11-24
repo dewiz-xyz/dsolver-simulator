@@ -8,7 +8,7 @@ Boundary checkpoints start new segments after writer promotion and recovery comm
 
 ## Book partition rollout
 
-Direct Native, Hashflow, Bebop and Liquorice use `rfq`. Direct Metric and the eight named Titan price-level venues use `prop_amm`. Both partition heads carry Unix milliseconds. The writer retains an independent cursor for each in checkpoints and deltas.
+Direct Euclid, Native, Hashflow, Bebop and Liquorice use `rfq`. Direct Metric, BaiBai and the nine selected Titan price-level venues use `prop_amm`. Both partition heads carry Unix milliseconds. The writer retains an independent cursor for each in checkpoints and deltas.
 
 1. Apply the state-history migration and deploy readers that recognize both tags. The upgraded stream readers continue accepting Metric and Titan books from an existing Tycho 0.525 writer’s `rfq` partition.
 2. Promote the upgraded writer onto a fresh Redis generation with a new boundary checkpoint. Keep the chain’s Redis generation counter monotonic because history keys include the generation and sequence. Check the HTTP snapshot’s declared partitions and the corresponding Redis backend scopes. A chain with only one configured book family declares just that family.

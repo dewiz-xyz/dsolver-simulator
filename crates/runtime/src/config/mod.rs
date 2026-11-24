@@ -1209,8 +1209,8 @@ mod tests {
                 ProtocolKind::LiquidityParty
             ]
         );
-        assert_eq!(chain.chain_profile.broadcaster_rfq_protocols().len(), 12);
-        assert_eq!(chain.chain_profile.broadcaster_only_rfq_protocols.len(), 8);
+        assert_eq!(chain.chain_profile.broadcaster_rfq_protocols().len(), 14);
+        assert_eq!(chain.chain_profile.broadcaster_only_rfq_protocols.len(), 10);
         assert!(!chain
             .chain_profile
             .native_protocols
@@ -1304,6 +1304,10 @@ mod tests {
             .chain_profile
             .rfq_protocols
             .contains(&ProtocolKind::Liquorice));
+        assert!(chain
+            .chain_profile
+            .broadcaster_only_rfq_protocols
+            .contains(&ProtocolKind::Baibai));
         assert!(chain.liquorice_url.is_none());
         assert!(chain.chain_profile.erc4626_pair_policies.is_empty());
     }

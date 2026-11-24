@@ -177,11 +177,16 @@ impl DecoderConfig {
                 ReplayBackend::Vm,
                 &[ProtocolKind::LiquidityParty, ProtocolKind::BalancerV3][..],
             ),
-            (ReplayBackend::Rfq, &[ProtocolKind::NativeRfq][..]),
+            (
+                ReplayBackend::Rfq,
+                &[ProtocolKind::NativeRfq, ProtocolKind::Euclid][..],
+            ),
             (
                 ReplayBackend::PropAmm,
                 &[
                     ProtocolKind::Metric,
+                    ProtocolKind::Baibai,
+                    ProtocolKind::TitanWilbrr,
                     ProtocolKind::TitanFermiSwap,
                     ProtocolKind::TitanKipseli,
                     ProtocolKind::TitanBebop,

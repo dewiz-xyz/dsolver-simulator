@@ -895,7 +895,10 @@ async fn metric_quotes_use_the_price_strictly_before_each_block_boundary() -> an
                         "token0":support::WETH, "token1":support::USDC, "tvlFiat":30000.0, "pauseLevel":0},
             "bid_ask":{"bidAdj":(price << 64).to_string(), "askAdj":((price + 1) << 64).to_string(),
                        "totalToken0Available":"10000000000000000000","totalToken1Available":"40000000000",
-                       "serverTs":time, "priceProviderStatus":"healthy"}
+                       "serverTs":time, "priceProviderStatus":"healthy",
+                       "depth":{"bids":[{"binIdx":0, "price":(price << 64).to_string(),
+                           "cumulativeInputVolume":"1000000000000000000",
+                           "cumulativeVolume":(price * 1_000_000).to_string()}]}}
         }});
         let mut partition = json!({"backend":"prop_amm","blockNumber":time});
         if seq == 11 {

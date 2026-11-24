@@ -442,6 +442,8 @@ fn block_changes(
         },
         finalized_block_height: 18_999_900,
         revert: false,
+        paused_components: HashSet::from(["native-pool-paused".into()]),
+        unpaused_components: HashSet::from(["native-pool-resumed".into()]),
         new_tokens: HashMap::new(),
         account_updates: HashMap::from([(
             account_address.clone(),
