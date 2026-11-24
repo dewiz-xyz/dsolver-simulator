@@ -309,7 +309,10 @@ mod tests {
                         "bidAdj": "55340232221128654848000", "askAdj": "55524699661865750400000",
                         "totalToken0Available": "10000000000000000000",
                         "totalToken1Available": "30000000000", "serverTs": 100,
-                        "priceProviderStatus": "healthy"
+                        "priceProviderStatus": "healthy",
+                        "depth": {"bids": [{"binIdx": 0, "price": "55340232221128654848000",
+                            "cumulativeInputVolume": "1000000000000000000",
+                            "cumulativeVolume": "3000000000"}]}
                     }
                 }))
                 .unwrap(),

@@ -70,7 +70,7 @@ With `ENABLE_RFQ_POOLS=true`, Base broadcasts Bebop, Native, and Metric. Ethereu
 
 Set `CHAIN_ID=8453` or `1`, and supply `BEBOP_KEY`, `NATIVE_API_KEY`, and `METRIC_API_KEY`. Ethereum also requires `HASHFLOW_USER` and `HASHFLOW_KEY`. Titan's public stream needs no API key. The optional `RFQ_MIN_TVL_USD` defaults to 100 USD for direct book providers.
 
-Consumers must use the matching Tycho 0.539.0 state format and bootstrap fresh snapshots during rollout. Titan snapshots and deltas preserve quote expiry; receiving or replaying a book does not renew it. Downstream consumers own routing and settlement encoding. See [upgrade scope and compatibility](docs/tycho-simulation-upgrade-research.md) for the complete source list and verification results.
+Consumers must use the matching Tycho 0.539.0 state format and bootstrap fresh snapshots during rollout. Titan snapshots and deltas preserve quote expiry; receiving or replaying a book does not renew it. Downstream consumers own routing and settlement encoding. Metric requires depth on the traded side. The [0.525.0 upgrade report](docs/tycho-simulation-upgrade-research.md) records the original source list and rollout tests.
 
 ## Quick Start
 
