@@ -103,6 +103,7 @@ pub(crate) fn subscription_decoder_config(
 
 #[derive(Clone)]
 pub struct RFQConfig {
+    pub rpc_url: Option<String>,
     pub native_key: String,
     pub metric_key: String,
     pub min_tvl_usd: f64,

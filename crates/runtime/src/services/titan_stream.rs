@@ -98,7 +98,8 @@ mod tests {
                 "tempest",
                 "goliath",
                 "stelaxis",
-                "elzorro"
+                "elzorro",
+                "0x6e27bb694393840e253262361b79187d4899e9cf"
             ])
         );
         let registry = default_served_pamms();

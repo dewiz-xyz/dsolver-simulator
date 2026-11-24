@@ -50,10 +50,13 @@ pub enum ProtocolKind {
     TitanGoliath,
     TitanStelaxis,
     TitanElZorro,
+    TitanWilbrr,
+    Euclid,
+    Baibai,
 }
 
 impl ProtocolKind {
-    pub const ALL: [ProtocolKind; 42] = [
+    pub const ALL: [ProtocolKind; 45] = [
         ProtocolKind::UniswapV2,
         ProtocolKind::UniswapV3,
         ProtocolKind::UniswapV4,
@@ -96,6 +99,9 @@ impl ProtocolKind {
         ProtocolKind::TitanGoliath,
         ProtocolKind::TitanStelaxis,
         ProtocolKind::TitanElZorro,
+        ProtocolKind::TitanWilbrr,
+        ProtocolKind::Euclid,
+        ProtocolKind::Baibai,
     ];
 
     /// A named venue on Titan's Ethereum price-level stream.
@@ -147,6 +153,11 @@ impl ProtocolKind {
             ProtocolKind::TitanGoliath => "pricelevelstream:goliath",
             ProtocolKind::TitanStelaxis => "pricelevelstream:stelaxis",
             ProtocolKind::TitanElZorro => "pricelevelstream:elzorro",
+            ProtocolKind::TitanWilbrr => {
+                "pricelevelstream:0x6e27bb694393840e253262361b79187d4899e9cf"
+            }
+            ProtocolKind::Euclid => "rfq:euclid",
+            ProtocolKind::Baibai => "baibai",
         }
     }
 
@@ -196,6 +207,8 @@ impl ProtocolKind {
             "bebop_pool" => Some(ProtocolKind::Bebop),
             "native_relay_pool" => Some(ProtocolKind::NativeRfq),
             "metric_pool" => Some(ProtocolKind::Metric),
+            "euclid_pool" => Some(ProtocolKind::Euclid),
+            "baibai_pair" => Some(ProtocolKind::Baibai),
             "pancakeswap_infinity_bin_pool" => Some(ProtocolKind::PancakeswapInfinityBin),
             "lunarbase" => Some(ProtocolKind::LunarBase),
             "liquorice_pool" => Some(ProtocolKind::Liquorice),
@@ -247,6 +260,11 @@ impl ProtocolKind {
             "pricelevelstream:goliath" => Some(ProtocolKind::TitanGoliath),
             "pricelevelstream:stelaxis" => Some(ProtocolKind::TitanStelaxis),
             "pricelevelstream:elzorro" => Some(ProtocolKind::TitanElZorro),
+            "pricelevelstream:0x6e27bb694393840e253262361b79187d4899e9cf" => {
+                Some(ProtocolKind::TitanWilbrr)
+            }
+            "rfq:euclid" => Some(ProtocolKind::Euclid),
+            "baibai" => Some(ProtocolKind::Baibai),
             _ => None,
         }
     }
@@ -271,7 +289,7 @@ mod tests {
 
     use super::*;
 
-    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 42] = [
+    const CANONICAL_PROTOCOL_SYSTEM_CASES: [(&str, ProtocolKind); 45] = [
         ("uniswap_v2", ProtocolKind::UniswapV2),
         ("sushiswap_v2", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2", ProtocolKind::PancakeswapV2),
@@ -320,9 +338,15 @@ mod tests {
         ("pricelevelstream:goliath", ProtocolKind::TitanGoliath),
         ("pricelevelstream:stelaxis", ProtocolKind::TitanStelaxis),
         ("pricelevelstream:elzorro", ProtocolKind::TitanElZorro),
+        (
+            "pricelevelstream:0x6e27bb694393840e253262361b79187d4899e9cf",
+            ProtocolKind::TitanWilbrr,
+        ),
+        ("rfq:euclid", ProtocolKind::Euclid),
+        ("baibai", ProtocolKind::Baibai),
     ];
 
-    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 20] = [
+    const CANONICAL_PROTOCOL_TYPE_CASES: [(&str, ProtocolKind); 22] = [
         ("uniswap_v2_pool", ProtocolKind::UniswapV2),
         ("sushiswap_v2_pool", ProtocolKind::SushiswapV2),
         ("pancakeswap_v2_pool", ProtocolKind::PancakeswapV2),
@@ -340,6 +364,8 @@ mod tests {
         ("bebop_pool", ProtocolKind::Bebop),
         ("native_relay_pool", ProtocolKind::NativeRfq),
         ("metric_pool", ProtocolKind::Metric),
+        ("euclid_pool", ProtocolKind::Euclid),
+        ("baibai_pair", ProtocolKind::Baibai),
         (
             "pancakeswap_infinity_bin_pool",
             ProtocolKind::PancakeswapInfinityBin,

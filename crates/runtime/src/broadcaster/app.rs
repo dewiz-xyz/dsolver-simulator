@@ -764,6 +764,7 @@ fn spawn_broadcaster_rfq_stream_task(
     let chain = config.chain_profile.chain;
     let protocols = config.chain_profile.broadcaster_rfq_protocols();
     let rfq_config = RFQConfig {
+        rpc_url: config.rpc_url.clone(),
         native_key: config.native_key.clone(),
         metric_key: config.metric_key.clone(),
         min_tvl_usd: config.rfq_min_tvl_usd,

@@ -228,8 +228,11 @@ impl BroadcasterBackend {
             ProtocolKind::Hashflow
             | ProtocolKind::Bebop
             | ProtocolKind::Liquorice
+            | ProtocolKind::Euclid
             | ProtocolKind::NativeRfq => Self::Rfq,
             ProtocolKind::Metric
+            | ProtocolKind::Baibai
+            | ProtocolKind::TitanWilbrr
             | ProtocolKind::TitanFermiSwap
             | ProtocolKind::TitanKipseli
             | ProtocolKind::TitanBebop

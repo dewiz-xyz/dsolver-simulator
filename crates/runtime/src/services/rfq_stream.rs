@@ -19,11 +19,12 @@ use tycho_simulation::{
         quote_tokens::usd_stablecoins_for_chain, BookFeedConfig, BookFeedEvent, BookFeedStream,
         BookSnapshot,
     },
-    pamm::protocols::metric::feed::MetricFeedBuilder,
+    pamm::protocols::{baibai::BaibaiFeedBuilder, metric::feed::MetricFeedBuilder},
     protocol::models::{ProtocolComponent, Update},
     rfq::protocols::{
-        bebop::feed::BebopFeedBuilder, hashflow::feed::HashflowFeedBuilder,
-        liquorice::feed::LiquoriceFeedBuilder, native::feed::NativeFeedBuilder,
+        bebop::feed::BebopFeedBuilder, euclid::feed::EuclidFeedBuilder,
+        hashflow::feed::HashflowFeedBuilder, liquorice::feed::LiquoriceFeedBuilder,
+        native::feed::NativeFeedBuilder,
     },
     tycho_common::models::Chain,
 };
@@ -72,7 +73,9 @@ pub async fn build_rfq_stream(
             "rfq:bebop" => token_stores.bebop.snapshot().await,
             "rfq:hashflow" => token_stores.hashflow.snapshot().await,
             "rfq:liquorice" => token_stores.liquorice.snapshot().await,
-            "rfq:native" | "rfq:metric" => token_stores.tokens.snapshot().await,
+            "rfq:native" | "rfq:metric" | "rfq:euclid" | "baibai" => {
+                token_stores.tokens.snapshot().await
+            }
             other => bail!("Unknown RFQ protocol in chain profile: {other}"),
         };
         let book_config = BookFeedConfig {
@@ -82,63 +85,86 @@ pub async fn build_rfq_stream(
         };
         let config = config.clone();
         let quote_tokens = Arc::clone(&quote_tokens);
-        let start = move || {
-            let feed = match protocol {
-                "rfq:bebop" => BookFeedStream::spawn(
-                    protocol,
-                    BebopFeedBuilder::new(
-                        book_config.clone(),
-                        Arc::clone(&quote_tokens),
-                        config.bebop_key.clone(),
-                    )
-                    .quote_timeout(RFQ_QUOTE_TIMEOUT)
-                    .build()?,
-                ),
-                "rfq:hashflow" => BookFeedStream::spawn(
-                    protocol,
-                    HashflowFeedBuilder::new(
-                        book_config.clone(),
-                        Arc::clone(&quote_tokens),
-                        config.hashflow_user.clone(),
-                        config.hashflow_key.clone(),
-                    )
-                    .quote_timeout(RFQ_QUOTE_TIMEOUT)
-                    .build()?,
-                ),
-                "rfq:liquorice" => BookFeedStream::spawn(
-                    protocol,
-                    LiquoriceFeedBuilder::new(
-                        book_config.clone(),
-                        Arc::clone(&quote_tokens),
-                        config.liquorice_user.clone(),
-                        config.liquorice_key.clone(),
-                    )
-                    .quote_timeout(RFQ_QUOTE_TIMEOUT)
-                    .quote_expiry_secs(LIQUORICE_QUOTE_EXPIRY_SECS)
-                    .build()?,
-                ),
-                "rfq:native" => BookFeedStream::spawn(
-                    protocol,
-                    NativeFeedBuilder::new(
-                        book_config.clone(),
-                        Arc::clone(&quote_tokens),
-                        config.native_key.clone(),
-                    )
-                    .quote_timeout(RFQ_QUOTE_TIMEOUT)
-                    .build()?,
-                ),
-                "rfq:metric" => BookFeedStream::spawn(
-                    protocol,
-                    MetricFeedBuilder::new(book_config.clone(), config.metric_key.clone())
-                        .build()?,
-                ),
-                other => bail!("Unknown RFQ provider: {other}"),
-            };
-            Ok(feed)
-        };
+        let start = move || start_book(protocol, &book_config, &quote_tokens, &config);
         streams.push(provider_updates(protocol, start)?);
     }
     Ok(stream::select_all(streams).boxed())
+}
+
+fn start_book(
+    protocol: &'static str,
+    book_config: &BookFeedConfig,
+    quote_tokens: &Arc<HashSet<tycho_simulation::tycho_common::Bytes>>,
+    config: &RFQConfig,
+) -> Result<BookFeedStream> {
+    let feed = match protocol {
+        "rfq:bebop" => BookFeedStream::spawn(
+            protocol,
+            BebopFeedBuilder::new(
+                book_config.clone(),
+                Arc::clone(quote_tokens),
+                config.bebop_key.clone(),
+            )
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
+            .build()?,
+        ),
+        "rfq:hashflow" => BookFeedStream::spawn(
+            protocol,
+            HashflowFeedBuilder::new(
+                book_config.clone(),
+                Arc::clone(quote_tokens),
+                config.hashflow_user.clone(),
+                config.hashflow_key.clone(),
+            )
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
+            .build()?,
+        ),
+        "rfq:liquorice" => BookFeedStream::spawn(
+            protocol,
+            LiquoriceFeedBuilder::new(
+                book_config.clone(),
+                Arc::clone(quote_tokens),
+                config.liquorice_user.clone(),
+                config.liquorice_key.clone(),
+            )
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
+            .quote_expiry_secs(LIQUORICE_QUOTE_EXPIRY_SECS)
+            .build()?,
+        ),
+        "rfq:native" => BookFeedStream::spawn(
+            protocol,
+            NativeFeedBuilder::new(
+                book_config.clone(),
+                Arc::clone(quote_tokens),
+                config.native_key.clone(),
+            )
+            .quote_timeout(RFQ_QUOTE_TIMEOUT)
+            .build()?,
+        ),
+        "rfq:euclid" => BookFeedStream::spawn(
+            protocol,
+            EuclidFeedBuilder::new(book_config.clone(), Arc::clone(quote_tokens))
+                .quote_timeout(RFQ_QUOTE_TIMEOUT)
+                .build()?,
+        ),
+        "baibai" => BookFeedStream::spawn(
+            protocol,
+            BaibaiFeedBuilder::new(
+                book_config.clone(),
+                config
+                    .rpc_url
+                    .clone()
+                    .ok_or_else(|| anyhow!("BaiBai requires the broadcaster Base RPC_URL"))?,
+            )
+            .build()?,
+        ),
+        "rfq:metric" => BookFeedStream::spawn(
+            protocol,
+            MetricFeedBuilder::new(book_config.clone(), config.metric_key.clone()).build()?,
+        ),
+        other => bail!("Unknown RFQ provider: {other}"),
+    };
+    Ok(feed)
 }
 
 /// A terminal event withdraws this provider's books. Rebuild only its feed so
@@ -548,6 +574,18 @@ mod tests {
         live_book_broadcast(Chain::Ethereum, &[ProtocolKind::Hashflow]).await
     }
 
+    #[tokio::test]
+    #[ignore = "reads live public Euclid books on Ethereum"]
+    async fn live_ethereum_euclid_broadcast() -> Result<()> {
+        live_book_broadcast(Chain::Ethereum, &[ProtocolKind::Euclid]).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a Base RPC_URL and live BaiBai curves"]
+    async fn live_base_baibai_broadcast() -> Result<()> {
+        live_book_broadcast(Chain::Base, &[ProtocolKind::Baibai]).await
+    }
+
     async fn live_book_broadcast(chain: Chain, protocols: &[ProtocolKind]) -> Result<()> {
         use crate::models::tokens::TokenStore;
         use std::{collections::HashSet, str::FromStr, time::Duration};
@@ -596,10 +634,11 @@ mod tests {
             chain,
             protocols,
             RFQConfig {
+                rpc_url: std::env::var("RPC_URL").ok(),
                 native_key: std::env::var("NATIVE_API_KEY").unwrap_or_default(),
                 metric_key: std::env::var("METRIC_API_KEY").unwrap_or_default(),
-                min_tvl_usd: 100.0,
-
+                // Exercise transport even when the provider currently has little depth.
+                min_tvl_usd: 0.0,
                 bebop_key: String::new(),
                 hashflow_user: std::env::var("HASHFLOW_USER").unwrap_or_default(),
                 hashflow_key: std::env::var("HASHFLOW_KEY").unwrap_or_default(),

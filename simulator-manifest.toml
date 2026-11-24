@@ -59,6 +59,18 @@ id = "pricelevelstream:elzorro"
 backend = "rfq"
 
 [[protocols]]
+id = "pricelevelstream:0x6e27bb694393840e253262361b79187d4899e9cf"
+backend = "rfq"
+
+[[protocols]]
+id = "rfq:euclid"
+backend = "rfq"
+
+[[protocols]]
+id = "baibai"
+backend = "rfq"
+
+[[protocols]]
 id = "rfq:hashflow"
 backend = "rfq"
 
@@ -233,7 +245,7 @@ broadcaster_only_vm_protocols = ["vm:liquidityparty"]
 # TODO: Liquorice simulation is wired, but our current router doesn't support it. We'll revisit it in the future.
 rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric", "rfq:hashflow"]
 # Titan publishes independently of mined blocks. Metric uses its direct book feed once.
-broadcaster_only_rfq_protocols = ["pricelevelstream:fermiswap", "pricelevelstream:kipseli", "pricelevelstream:bebop", "pricelevelstream:taurusfi", "pricelevelstream:tempest", "pricelevelstream:goliath", "pricelevelstream:stelaxis", "pricelevelstream:elzorro"]
+broadcaster_only_rfq_protocols = ["rfq:euclid", "pricelevelstream:fermiswap", "pricelevelstream:kipseli", "pricelevelstream:bebop", "pricelevelstream:taurusfi", "pricelevelstream:tempest", "pricelevelstream:goliath", "pricelevelstream:stelaxis", "pricelevelstream:elzorro", "pricelevelstream:0x6e27bb694393840e253262361b79187d4899e9cf"]
 route_policy = "ethereum"
 
 [[chains]]
@@ -264,4 +276,5 @@ native_protocols = [
 broadcaster_only_native_protocols = ["aerodrome_v1", "sushiswap_v2", "aero_basic", "aero_cl", "pancakeswap_infinity_cl", "lunarbase", "ekubo_v3"]
 vm_protocols = []
 rfq_protocols = ["rfq:bebop", "rfq:native", "rfq:metric"]
+broadcaster_only_rfq_protocols = ["baibai"]
 route_policy = "base"
